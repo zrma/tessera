@@ -1,13 +1,31 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tessera_core::{
     ActorState, CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, Tick, encode_frame,
     try_decode_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{
+    Mutex,
+    mpsc::{UnboundedSender, unbounded_channel},
+};
 use tracing::{error, info, warn};
+
+#[derive(Default)]
+struct SharedState {
+    actors: Mutex<HashMap<EntityId, Position>>,
+    clients: Mutex<Vec<UnboundedSender<ServerMsg>>>,
+}
+
+impl SharedState {
+    async fn broadcast(&self, msg: ServerMsg) {
+        let mut clients = self.clients.lock().await;
+        clients.retain(|tx| tx.send(msg.clone()).is_ok());
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,8 +37,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:5001".to_string())
         .parse()
         .expect("invalid TESSERA_WORKER_ADDR");
+    let state = Arc::new(SharedState::default());
+    let server_state = state.clone();
     let server = tokio::spawn(async move {
-        if let Err(e) = run_server(addr).await {
+        if let Err(e) = run_server(addr, server_state).await {
             error!(target: "worker", error=?e, "server error");
         }
     });
@@ -64,31 +84,59 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_server(addr: SocketAddr) -> Result<()> {
+async fn run_server(addr: SocketAddr, state: Arc<SharedState>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(target: "worker", %addr, "listening upstream");
     loop {
         let (sock, peer) = listener.accept().await?;
         info!(target: "worker", %peer, "upstream accepted");
+        let st = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_upstream(sock, peer).await {
+            if let Err(e) = handle_upstream(sock, peer, st).await {
                 error!(target: "worker", %peer, error=?e, "upstream connection error");
             }
         });
     }
 }
 
-async fn handle_upstream(mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
-    // Per-connection minimal state
-    let mut actors: HashMap<EntityId, Position> = HashMap::new();
+async fn handle_upstream(
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: Arc<SharedState>,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let (tx, mut rx) = unbounded_channel::<ServerMsg>();
+    {
+        let mut clients = state.clients.lock().await;
+        clients.push(tx.clone());
+    }
+
     let cell = CellId::grid(0, 0, 0);
     let epoch: u32 = 0;
     let mut seq_out: u64 = 0;
 
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let env_out = Envelope {
+                cell,
+                seq: seq_out,
+                epoch,
+                payload: msg,
+            };
+            seq_out = seq_out.wrapping_add(1);
+            let frame = encode_frame(&env_out);
+            if let Err(e) = writer.write_all(&frame).await {
+                error!(target: "worker", %peer, error=?e, "write error");
+                break;
+            }
+        }
+        info!(target: "worker", %peer, "writer task ended");
+    });
+
     loop {
         // Read one frame from Gateway
         let mut len_buf = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut len_buf).await {
+        if let Err(e) = reader.read_exact(&mut len_buf).await {
             if e.kind() == std::io::ErrorKind::UnexpectedEof
                 || e.kind() == std::io::ErrorKind::ConnectionReset
             {
@@ -103,7 +151,7 @@ async fn handle_upstream(mut stream: TcpStream, peer: SocketAddr) -> Result<()> 
             return Ok(());
         }
         let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).await?;
+        reader.read_exact(&mut payload).await?;
 
         // Decode as Envelope<ClientMsg>
         let mut buf = bytes::BytesMut::with_capacity(4 + len);
@@ -114,35 +162,45 @@ async fn handle_upstream(mut stream: TcpStream, peer: SocketAddr) -> Result<()> 
             continue;
         };
 
-        // Handle message and reply
-        let reply = match env_in.payload {
-            ClientMsg::Ping { ts } => ServerMsg::Pong { ts },
+        match env_in.payload {
+            ClientMsg::Ping { ts } => {
+                let _ = tx.send(ServerMsg::Pong { ts });
+            }
             ClientMsg::Join { actor, pos } => {
-                actors.insert(actor, pos);
-                ServerMsg::Snapshot {
-                    cell,
-                    actors: vec![ActorState { id: actor, pos }],
+                {
+                    let mut actors = state.actors.lock().await;
+                    actors.insert(actor, pos);
+                    let snapshot = actors
+                        .iter()
+                        .map(|(id, pos)| ActorState { id: *id, pos: *pos })
+                        .collect::<Vec<_>>();
+                    let _ = tx.send(ServerMsg::Snapshot {
+                        cell,
+                        actors: snapshot,
+                    });
                 }
+                state
+                    .broadcast(ServerMsg::Delta {
+                        cell,
+                        moved: vec![ActorState { id: actor, pos }],
+                    })
+                    .await;
             }
             ClientMsg::Move { actor, dx, dy } => {
-                let p = actors.entry(actor).or_insert(Position { x: 0.0, y: 0.0 });
-                p.x += dx;
-                p.y += dy;
-                ServerMsg::Delta {
-                    cell,
-                    moved: vec![ActorState { id: actor, pos: *p }],
-                }
+                let pos = {
+                    let mut actors = state.actors.lock().await;
+                    let p = actors.entry(actor).or_insert(Position { x: 0.0, y: 0.0 });
+                    p.x += dx;
+                    p.y += dy;
+                    *p
+                };
+                state
+                    .broadcast(ServerMsg::Delta {
+                        cell,
+                        moved: vec![ActorState { id: actor, pos }],
+                    })
+                    .await;
             }
-        };
-
-        let env_out = Envelope {
-            cell,
-            seq: seq_out,
-            epoch,
-            payload: reply,
-        };
-        seq_out = seq_out.wrapping_add(1);
-        let frame = encode_frame(&env_out);
-        stream.write_all(&frame).await?;
+        }
     }
 }
