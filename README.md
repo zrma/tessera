@@ -43,7 +43,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Ping: `cargo run -p tessera-client -- ping --ts 123`
 - Join: `cargo run -p tessera-client -- join --actor 1 --x 0 --y 0`
 - Move: `cargo run -p tessera-client -- move --actor 1 --dx 1 --dy 0.5`
-- REPL: `cargo run -p tessera-client -- repl --actor 1`
+- REPL: `cargo run -p tessera-client -- repl --actor 1` (history, `help` 명령 지원)
 - 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`
 
 ## Current Status (V0)

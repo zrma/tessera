@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rustyline::{DefaultEditor, error::ReadlineError};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tessera_core::{CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, encode_frame};
@@ -141,22 +142,22 @@ async fn main() -> Result<()> {
         }
         Cmd::Repl { actor } => {
             println!(
-                "REPL started. Commands: ping <ts> | join <actor?> <x> <y> | move <actor?> <dx> <dy> | quit"
+                "REPL started. Commands: ping <ts> | join <actor?> <x> <y> | move <actor?> <dx> <dy> | quit | help",
             );
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let stdin = tokio::io::stdin();
-            let mut reader = BufReader::new(stdin);
-            let mut line = String::new();
+            let mut rl = DefaultEditor::new()?;
             loop {
-                line.clear();
-                print!("> ");
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                if reader.read_line(&mut line).await? == 0 {
-                    break;
-                }
-                if !handle_line(&line, &mut stream, actor, cell, epoch, &mut seq).await? {
-                    break;
+                match rl.readline("> ") {
+                    Ok(line) => {
+                        let _ = rl.add_history_entry(line.as_str());
+                        if !handle_line(&line, &mut stream, actor, cell, epoch, &mut seq).await? {
+                            break;
+                        }
+                    }
+                    Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+                    Err(e) => {
+                        println!("error: {e:?}");
+                        break;
+                    }
                 }
             }
         }
@@ -222,6 +223,11 @@ async fn handle_line(
     }
     match parts[0] {
         "quit" | "exit" => return Ok(false),
+        "help" => {
+            println!(
+                "commands: ping <ts> | join <actor?> <x> <y> | move <actor?> <dx> <dy> | sleep <ms> | quit"
+            );
+        }
         "ping" => {
             let ts: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
             send_env(stream, cell, epoch, seq, ClientMsg::Ping { ts }).await?;
