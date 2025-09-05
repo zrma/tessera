@@ -63,6 +63,11 @@
 - Worker ↔ Worker(ghost): gRPC stream 또는 NATS(stream)
 - 모든 메시지: `seq`, `epoch`, `cell_id` 포함(멱등/역전 처리)
 
+### 5.3 Envelope (V0 적용)
+- 구조: `Envelope{ cell: CellId, seq: u64, epoch: u32, payload }`
+- 역할: 라우팅·재전송·역전 처리의 공통 래퍼. 현재 V0에서는 워커가 응답 `seq`를 증가시키며 에코.
+- 클라: 기본 `cell/epoch`를 커맨드라인에서 지정(`--world --cx --cy --epoch`).
+
 ---
 
 ## 6. AOI & 셀 크기(초기 값)

@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tessera_core::{
-    ActorState, CellId, ClientMsg, EntityId, Position, ServerMsg, Tick, encode_frame,
+    ActorState, CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, Tick, encode_frame,
     try_decode_frame,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -82,6 +82,8 @@ async fn handle_upstream(mut stream: TcpStream, peer: SocketAddr) -> Result<()> 
     // Per-connection minimal state
     let mut actors: HashMap<EntityId, Position> = HashMap::new();
     let cell = CellId::grid(0, 0, 0);
+    let epoch: u32 = 0;
+    let mut seq_out: u64 = 0;
 
     loop {
         // Read one frame from Gateway
@@ -103,17 +105,17 @@ async fn handle_upstream(mut stream: TcpStream, peer: SocketAddr) -> Result<()> 
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await?;
 
-        // Decode as ClientMsg
+        // Decode as Envelope<ClientMsg>
         let mut buf = bytes::BytesMut::with_capacity(4 + len);
         buf.extend_from_slice(&len_buf);
         buf.extend_from_slice(&payload);
-        let Some(msg) = try_decode_frame::<ClientMsg>(&mut buf) else {
+        let Some(env_in) = try_decode_frame::<Envelope<ClientMsg>>(&mut buf) else {
             warn!(target: "worker", %peer, "failed to decode frame");
             continue;
         };
 
         // Handle message and reply
-        let reply = match msg {
+        let reply = match env_in.payload {
             ClientMsg::Ping { ts } => ServerMsg::Pong { ts },
             ClientMsg::Join { actor, pos } => {
                 actors.insert(actor, pos);
@@ -133,7 +135,14 @@ async fn handle_upstream(mut stream: TcpStream, peer: SocketAddr) -> Result<()> 
             }
         };
 
-        let frame = encode_frame(&reply);
+        let env_out = Envelope {
+            cell,
+            seq: seq_out,
+            epoch,
+            payload: reply,
+        };
+        seq_out = seq_out.wrapping_add(1);
+        let frame = encode_frame(&env_out);
         stream.write_all(&frame).await?;
     }
 }

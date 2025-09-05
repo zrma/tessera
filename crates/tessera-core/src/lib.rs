@@ -86,6 +86,15 @@ pub enum ServerMsg {
     },
 }
 
+// ---------- Envelope ----------
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Envelope<T> {
+    pub cell: CellId,
+    pub seq: u64,
+    pub epoch: u32,
+    pub payload: T,
+}
+
 // ---------- Length-prefixed framing (JSON payload, u32 BE length) ----------
 
 pub fn encode_frame<T: Serialize>(value: &T) -> Bytes {
@@ -139,6 +148,21 @@ mod tests {
         let decoded: ClientMsg = try_decode_frame(&mut buf).expect("decode");
         assert_eq!(msg, decoded);
         // buffer should be drained
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn frame_roundtrip_envelope() {
+        let env = Envelope {
+            cell: CellId::grid(0, 1, 2),
+            seq: 7,
+            epoch: 0,
+            payload: ServerMsg::Pong { ts: 123 },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<ServerMsg> = try_decode_frame(&mut buf).expect("decode");
+        assert_eq!(env, decoded);
         assert_eq!(buf.len(), 0);
     }
 }

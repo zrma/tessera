@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tessera_core::{ClientMsg, EntityId, Position, ServerMsg, encode_frame};
+use tessera_core::{CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, encode_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -12,6 +12,17 @@ struct Cli {
     /// Gateway address (host:port)
     #[arg(long, default_value = "127.0.0.1:4000")]
     addr: String,
+
+    /// Target cell (defaults to world=0,cx=0,cy=0)
+    #[arg(long, default_value_t = 0)]
+    world: u32,
+    #[arg(long, default_value_t = 0)]
+    cx: i32,
+    #[arg(long, default_value_t = 0)]
+    cy: i32,
+    /// Epoch to use in envelopes
+    #[arg(long, default_value_t = 0)]
+    epoch: u32,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -75,19 +86,23 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("connect to {}", addr))?;
 
+    let cell = CellId::grid(cli.world, cli.cx, cli.cy);
+    let epoch = cli.epoch;
+    let mut seq: u64 = 0;
+
     match cli.cmd {
         Cmd::Ping { ts } => {
-            send(&mut stream, ClientMsg::Ping { ts }).await?;
-            let msg: ServerMsg = recv(&mut stream).await?;
-            println!("<- {:?}", msg);
+            send_env(&mut stream, cell, epoch, &mut seq, ClientMsg::Ping { ts }).await?;
+            let env: Envelope<ServerMsg> = recv(&mut stream).await?;
+            println!("<- {:?}", env);
         }
         Cmd::Join { actor, x, y } => {
             let msg = ClientMsg::Join {
                 actor: EntityId(actor),
                 pos: Position { x, y },
             };
-            send(&mut stream, msg).await?;
-            let reply: ServerMsg = recv(&mut stream).await?;
+            send_env(&mut stream, cell, epoch, &mut seq, msg).await?;
+            let reply: Envelope<ServerMsg> = recv(&mut stream).await?;
             println!("<- {:?}", reply);
         }
         Cmd::Move { actor, dx, dy } => {
@@ -96,28 +111,31 @@ async fn main() -> Result<()> {
                 dx,
                 dy,
             };
-            send(&mut stream, msg).await?;
-            let reply: ServerMsg = recv(&mut stream).await?;
+            send_env(&mut stream, cell, epoch, &mut seq, msg).await?;
+            let reply: Envelope<ServerMsg> = recv(&mut stream).await?;
             println!("<- {:?}", reply);
         }
         Cmd::Demo { actor } => {
-            send(
+            send_env(
                 &mut stream,
+                cell,
+                epoch,
+                &mut seq,
                 ClientMsg::Join {
                     actor: EntityId(actor),
                     pos: Position { x: 0.0, y: 0.0 },
                 },
             )
             .await?;
-            let _ = recv::<ServerMsg>(&mut stream).await?; // Snapshot
+            let _ = recv::<Envelope<ServerMsg>>(&mut stream).await?; // Snapshot
             for i in 0..3u32 {
                 let msg = ClientMsg::Move {
                     actor: EntityId(actor),
                     dx: 1.0,
                     dy: 0.5,
                 };
-                send(&mut stream, msg).await?;
-                let reply: ServerMsg = recv(&mut stream).await?;
+                send_env(&mut stream, cell, epoch, &mut seq, msg).await?;
+                let reply: Envelope<ServerMsg> = recv(&mut stream).await?;
                 println!("step {} <- {:?}", i + 1, reply);
             }
         }
@@ -137,7 +155,7 @@ async fn main() -> Result<()> {
                 if reader.read_line(&mut line).await? == 0 {
                     break;
                 }
-                if !handle_line(&line, &mut stream, actor).await? {
+                if !handle_line(&line, &mut stream, actor, cell, epoch, &mut seq).await? {
                     break;
                 }
             }
@@ -150,7 +168,7 @@ async fn main() -> Result<()> {
             let mut reader = BufReader::new(f);
             let mut line = String::new();
             while reader.read_line(&mut line).await? != 0 {
-                if !handle_line(&line, &mut stream, actor).await? {
+                if !handle_line(&line, &mut stream, actor, cell, epoch, &mut seq).await? {
                     break;
                 }
                 line.clear();
@@ -161,8 +179,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn send(stream: &mut TcpStream, msg: ClientMsg) -> Result<()> {
-    let frame = encode_frame(&msg);
+async fn send_env(
+    stream: &mut TcpStream,
+    cell: CellId,
+    epoch: u32,
+    seq: &mut u64,
+    msg: ClientMsg,
+) -> Result<()> {
+    let env = Envelope {
+        cell,
+        seq: *seq,
+        epoch,
+        payload: msg,
+    };
+    *seq = seq.wrapping_add(1);
+    let frame = encode_frame(&env);
     stream.write_all(&frame).await?;
     Ok(())
 }
@@ -177,7 +208,14 @@ async fn recv<T: for<'de> serde::Deserialize<'de>>(stream: &mut TcpStream) -> Re
     Ok(msg)
 }
 
-async fn handle_line(line: &str, stream: &mut TcpStream, actor: Option<u64>) -> Result<bool> {
+async fn handle_line(
+    line: &str,
+    stream: &mut TcpStream,
+    actor: Option<u64>,
+    cell: CellId,
+    epoch: u32,
+    seq: &mut u64,
+) -> Result<bool> {
     let parts: Vec<_> = line.split_whitespace().collect();
     if parts.is_empty() {
         return Ok(true);
@@ -186,8 +224,8 @@ async fn handle_line(line: &str, stream: &mut TcpStream, actor: Option<u64>) -> 
         "quit" | "exit" => return Ok(false),
         "ping" => {
             let ts: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-            send(stream, ClientMsg::Ping { ts }).await?;
-            let r: ServerMsg = recv(stream).await?;
+            send_env(stream, cell, epoch, seq, ClientMsg::Ping { ts }).await?;
+            let r: Envelope<ServerMsg> = recv(stream).await?;
             println!("<- {:?}", r);
         }
         "join" => {
@@ -198,15 +236,18 @@ async fn handle_line(line: &str, stream: &mut TcpStream, actor: Option<u64>) -> 
                 .unwrap_or(1);
             let x: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let y: f32 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            send(
+            send_env(
                 stream,
+                cell,
+                epoch,
+                seq,
                 ClientMsg::Join {
                     actor: EntityId(aid),
                     pos: Position { x, y },
                 },
             )
             .await?;
-            let r: ServerMsg = recv(stream).await?;
+            let r: Envelope<ServerMsg> = recv(stream).await?;
             println!("<- {:?}", r);
         }
         "move" => {
@@ -217,8 +258,11 @@ async fn handle_line(line: &str, stream: &mut TcpStream, actor: Option<u64>) -> 
                 .unwrap_or(1);
             let dx: f32 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
             let dy: f32 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            send(
+            send_env(
                 stream,
+                cell,
+                epoch,
+                seq,
                 ClientMsg::Move {
                     actor: EntityId(aid),
                     dx,
@@ -226,7 +270,7 @@ async fn handle_line(line: &str, stream: &mut TcpStream, actor: Option<u64>) -> 
                 },
             )
             .await?;
-            let r: ServerMsg = recv(stream).await?;
+            let r: Envelope<ServerMsg> = recv(stream).await?;
             println!("<- {:?}", r);
         }
         // Simple pacing helper: sleep <millis>
