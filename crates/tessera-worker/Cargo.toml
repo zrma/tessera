@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
