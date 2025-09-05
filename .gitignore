@@ -1,6 +1,9 @@
 # Created by https://www.toptal.com/developers/gitignore/api/jetbrains+all,visualstudiocode,linux,macos,windows,rust,git,python,go,node
 # Edit at https://www.toptal.com/developers/gitignore?templates=jetbrains+all,visualstudiocode,linux,macos,windows,rust,git,python,go,node
 
+# Tessera local dev artifacts
+.dev/
+
 ### Git ###
 # Created by git for backups. To disable backups in Git:
 # $ git config --global mergetool.keepBackup false
