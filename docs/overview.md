@@ -124,3 +124,11 @@
 - **Ghost**: 이웃 셀에 배포되는 읽기 전용 상태
 - **AOI**: 관심영역(전파 대상 범위)
 - **Registry**: `cell → worker` 매핑 소스(trust anchor)
+
+---
+
+## 부록: 로컬 실행(요약)
+- 올리기: `cargo xt dev up` / 내리기: `cargo xt dev down`
+- 로그: `cargo xt dev logs --target all --follow` (또는 `gateway|worker`)
+- 클라 예시: `cargo run -p tessera-client -- repl --actor 1`
+- 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`
