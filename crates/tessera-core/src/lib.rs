@@ -165,4 +165,35 @@ mod tests {
         assert_eq!(env, decoded);
         assert_eq!(buf.len(), 0);
     }
+
+    #[test]
+    fn incomplete_frame_returns_none() {
+        // Buffer too short to contain length
+        let mut short_buf = BytesMut::from(&[0u8, 1, 2][..]);
+        let result: Option<ClientMsg> = try_decode_frame(&mut short_buf);
+        assert!(result.is_none());
+        assert_eq!(short_buf.len(), 3);
+
+        // Buffer declares a length larger than available payload
+        let mut incomplete = BytesMut::from(&[0, 0, 0, 5, 1, 2, 3][..]);
+        let result: Option<ClientMsg> = try_decode_frame(&mut incomplete);
+        assert!(result.is_none());
+        // Buffer should remain unchanged
+        assert_eq!(incomplete.len(), 7);
+    }
+
+    #[test]
+    fn decode_multiple_frames() {
+        let msg1 = ClientMsg::Ping { ts: 1 };
+        let msg2 = ClientMsg::Ping { ts: 2 };
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&encode_frame(&msg1));
+        buf.extend_from_slice(&encode_frame(&msg2));
+
+        let decoded1: ClientMsg = try_decode_frame(&mut buf).expect("decode first");
+        assert_eq!(decoded1, msg1);
+        let decoded2: ClientMsg = try_decode_frame(&mut buf).expect("decode second");
+        assert_eq!(decoded2, msg2);
+        assert_eq!(buf.len(), 0);
+    }
 }
