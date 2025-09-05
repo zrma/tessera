@@ -4,3 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tessera-core = { path = "../tessera-core" }
+bytes = { workspace = true }
