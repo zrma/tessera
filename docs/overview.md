@@ -57,6 +57,7 @@
 ### 5.1 내부 Control (Orchestrator ↔ Worker)
 - gRPC (bidi stream)
 - 메시지: `AssignCell`, `PreCopy{snapshot}`, `Freeze{epoch}`, `Diff{from_seq}`, `Commit{new_owner, epoch}`, `Ack/Abort`
+- V0 스켈레톤: `RegisterWorker`, `GetAssignments`로 정적 셀 매핑 전송
 
 ### 5.2 데이터 채널
 - 클라 ↔ Gateway: TCP/QUIC + length‑prefixed 바이너리(Protobuf/FlatBuffers)
@@ -90,6 +91,7 @@
 ### V0 — 고정 그리드 + 정적 매핑 + 관측성
 - `CellId`, 패킷 프레이밍, Worker 틱 루프, Gateway 머지 경로
 - 정적 registry(ConfigMap/파일) → Gateway 라우팅
+- Orchestrator gRPC 스켈레톤(정적 `cell → worker` 스냅샷 제공)
 - Prometheus 지표
 
 ### V1 — 리밸런싱(셀 단위 이동)
@@ -135,5 +137,6 @@
 ## 부록: 로컬 실행(요약)
 - 올리기: `cargo xt dev up` / 내리기: `cargo xt dev down`
 - 로그: `cargo xt dev logs --target all --follow` (또는 `gateway|worker`)
+- 오케스트레이터: `cargo run -p tessera-orch` (필요 시 `TESSERA_ORCH_CONFIG[_JSON]` 지정)
 - 클라 예시: `cargo run -p tessera-client -- repl --actor 1`
 - 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`

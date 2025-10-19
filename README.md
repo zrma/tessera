@@ -38,6 +38,23 @@ Cell-based world orchestration for real-time servers in Rust.
   - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
   - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
   - `RUST_LOG` 기본 `info`
+- 오케스트레이터 실행: `cargo run -p tessera-orch` (기본 `TESSERA_ORCH_ADDR=127.0.0.1:6000`)
+- 오케스트레이터 설정: 기본값은 `worker-local → CellId::grid(0, 0, 0)`이며, `TESSERA_ORCH_CONFIG`(파일 경로) 또는 `TESSERA_ORCH_CONFIG_JSON`(직접 JSON)으로 커스텀 매핑 가능
+- 설정 예시:
+```json
+{
+  "workers": [
+    {
+      "id": "worker-a",
+      "addr": "127.0.0.1:5001",
+      "cells": [
+        {"world": 0, "cx": 0, "cy": 0},
+        {"world": 0, "cx": 1, "cy": 0, "depth": 1, "sub": 0}
+      ]
+    }
+  ]
+}
+```
 
 ## Test Client
 - Ping: `cargo run -p tessera-client -- ping --ts 123`
@@ -52,6 +69,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Gateway↔Worker: TCP 프록시(게이트웨이는 바이트 포워딩, 워커는 Join/Move 처리)
 - 테스트 클라: REPL/스크립트 모드로 Ping/Join/Move 전송
 - Dev 툴: `cargo xt dev up/down/logs`로 일괄 실행/정지/로그 보기
+- Orchestrator: gRPC 스켈레톤(`RegisterWorker`/`GetAssignments`)으로 정적 셀 할당 제공
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`

@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package tessera.orch.v1;
+
+option go_package = "tessera/orch/v1";
+
+message WorkerRegistration {
+  string worker_id = 1;
+  string addr = 2;
+}
+
+message AssignmentQuery {
+  string worker_id = 1;
+}
+
+message Assignment {
+  uint32 world = 1;
+  sint32 cx = 2;
+  sint32 cy = 3;
+  uint32 depth = 4;
+  uint32 sub = 5;
+}
+
+message AssignmentSnapshot {
+  repeated Assignment cells = 1;
+}
+
+service Orchestrator {
+  rpc RegisterWorker(WorkerRegistration) returns (AssignmentSnapshot);
+  rpc GetAssignments(AssignmentQuery) returns (AssignmentSnapshot);
+}

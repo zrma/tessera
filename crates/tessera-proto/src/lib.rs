@@ -1,20 +1,10 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#![allow(clippy::all)]
+#![allow(clippy::pedantic)]
+#![allow(clippy::nursery)]
+#![allow(clippy::restriction)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-
-    #[test]
-    fn add_commutative() {
-        assert_eq!(add(1, 2), add(2, 1));
-        assert_eq!(add(0, 5), add(5, 0));
+pub mod orch {
+    pub mod v1 {
+        tonic::include_proto!("tessera.orch.v1");
     }
 }
