@@ -39,7 +39,7 @@
 
 ### 3.2 Gateway / Worker / Orchestrator
 - Gateway(Stateless): 클라와 **단일 소켓** 유지, 여러 셀 업데이트를 머지하여 전송
-- Worker(Stateful): 셀 **소유자**, 틱 루프 + AOI 브로드캐스트 + 이웃 ghost 동기화
+- Worker(Stateful): 셀 **소유자**, 틱 루프 + AOI 브로드캐스트 + 이웃 ghost 동기화, 부팅 시 Orchestrator 등록
 - Orchestrator(Control-plane): `cell → worker` 레지스트리, 리밸런싱/분할 결정·지시
 
 ---
@@ -138,5 +138,6 @@
 - 올리기: `cargo xt dev up` / 내리기: `cargo xt dev down`
 - 로그: `cargo xt dev logs --target all --follow` (또는 `gateway|worker`)
 - 오케스트레이터: `cargo run -p tessera-orch` (필요 시 `TESSERA_ORCH_CONFIG[_JSON]` 지정)
+- 워커: `TESSERA_WORKER_ID`, `TESSERA_ORCH_ADDR`로 Orchestrator 연결 정보 설정 가능
 - 클라 예시: `cargo run -p tessera-client -- repl --actor 1`
 - 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`

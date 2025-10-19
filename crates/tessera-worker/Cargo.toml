@@ -10,3 +10,5 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 tessera-core = { path = "../tessera-core" }
 bytes = { workspace = true }
+tessera-proto = { path = "../tessera-proto" }
+tonic = { workspace = true }
