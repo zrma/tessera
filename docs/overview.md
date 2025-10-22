@@ -17,11 +17,13 @@
 ## 2. 목표(Goals) / 비목표(Non-goals)
 
 ### Goals
-- 셀 파티셔닝: 고정 그리드(V0) → 재배치(V1) → 쿼드트리(V2)
-- Handover: pre-copy → freeze → diff → commit
-- AOI/ghost: 이웃만 증분 전파(브로드캐스트 금지)
-- K8s 친화: L4 노출, StatefulSet, preStop drain
-- 낮은 진입장벽 스켈레톤: Gateway/Worker/Orch/Sim 모노레포
+- ✅ V0: 고정 그리드 셀 파티셔닝, 정적 할당 스냅샷, 기본 Gateway/Worker/Orch 파이프라인
+- 🚧 V1: 셀 재배치 및 Handover(`PreCopy/Freeze/Diff/Commit`)
+- 🚧 V1: AOI/ghost 증분 전파 최적화
+- 🚧 V1: Orchestrator 메트릭 집계, 헬스 체크, 리밸런싱 명령어
+- 🚧 V2: 동적 분할(쿼드트리) 및 병합 로직
+- 🚧 운영 강화: K8s 친화 배포(StatefulSet, preStop drain), Prometheus 지표
+- ✅ 모노레포 스켈레톤: Gateway/Worker/Orch/Sim/Client/xtask 구성
 
 ### Non-goals (초기 버전)
 - 완성형 게임 서버(전투/AI/스킬 제공 ❌)
@@ -89,16 +91,16 @@
 ## 8. MVP 범위 (V0 → V2)
 
 ### V0 — 고정 그리드 + 정적 매핑 + 관측성
-- `CellId`, 패킷 프레이밍, Worker 틱 루프, Gateway 머지 경로
-- 정적 registry(ConfigMap/파일) → Gateway 라우팅
-- Orchestrator gRPC 스켈레톤(정적 `cell → worker` 스냅샷 제공, `ListAssignments` 포함)
-- Prometheus 지표
+- ✅ `CellId`, 패킷 프레이밍, Worker 틱 루프, Gateway 머지 경로
+- ✅ 정적 registry(ConfigMap/파일) → Gateway 라우팅 (`ListAssignments` 스냅샷 기반)
+- ✅ Orchestrator gRPC 스켈레톤(정적 `cell → worker` 스냅샷 제공)
+- 🚧 Prometheus 지표
 
-### V1 — 리밸런싱(셀 단위 이동)
+### V1 — 리밸런싱(셀 단위 이동) *(Planned)*
 - Orchestrator 메트릭 집계 → `PreCopy/Freeze/Diff/Commit`
 - 라우팅 원자 교체(소켓 유지), 롤백(Abort)
 
-### V2 — 동적 분할(쿼드트리)
+### V2 — 동적 분할(쿼드트리) *(Planned)*
 - `depth/sub` 추가, 상/하위 셀 간 handover
 - 병합 조건/쿨다운
 
