@@ -66,15 +66,21 @@ Cell-based world orchestration for real-time servers in Rust.
 - REPL: `cargo run -p tessera-client -- repl --actor 1` (history, `help` 명령 지원)
 - 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`
 
-## Current Status (V0)
-- Core 타입/프레이밍: `CellId`, `ClientMsg/ServerMsg`, length‑prefixed(JSON)
-- Envelope 도입: 모든 전송을 `Envelope{ cell, seq, epoch, payload }`로 래핑
-- Gateway↔Worker: TCP 프록시(게이트웨이는 바이트 포워딩, 워커는 Join/Move 처리)
-- Gateway: 부팅 시 Orchestrator에서 `cell → worker` 라우팅 테이블을 받아 적용
-- Worker: 기동 시 Orchestrator에 등록(`RegisterWorker`)하고 할당 셀만 처리
-- 테스트 클라: REPL/스크립트 모드로 Ping/Join/Move 전송
-- Dev 툴: `cargo xt dev up/down/logs`로 일괄 실행/정지/로그 보기
-- Orchestrator: gRPC 스켈레톤(`RegisterWorker`/`GetAssignments`)으로 정적 셀 할당 제공
+## Status Snapshot
+
+### ✅ Implemented (V0 scope)
+- Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
+- Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
+- Gateway: Orchestrator에서 `ListAssignments` 스냅샷을 받아 셀→워커 라우팅 적용 (실패 시 단일 워커로 폴백)
+- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리
+- Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments` gRPC 엔드포인트 제공
+- 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
+
+### 🚧 Planned / Upcoming
+- Gateway 라우팅 테이블 실시간 갱신(주기적 `ListAssignments`, 스트리밍 watch)
+- Orchestrator 메트릭 집계/헬스 체크 및 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`)
+- Worker 셀 단위 AOI/ghost 브로드캐스트 강화 및 다셀 틱 파이프라인 구조화
+- Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
@@ -87,3 +93,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
 
 자세한 설계와 범위는 `docs/overview.md` 를 참고하세요.
+
+## Contributing & Workflow
+- 팀 작업 관행(커밋 컨벤션, 테스트, 문서 업데이트 등)은 `docs/contributing.md`에 정리돼 있습니다.
+- 새 기능을 추가하거나 문서를 수정하기 전에 해당 가이드를 확인해주세요.
