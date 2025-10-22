@@ -25,7 +25,20 @@ message AssignmentSnapshot {
   repeated Assignment cells = 1;
 }
 
+message AssignmentBundle {
+  string worker_id = 1;
+  string addr = 2;
+  repeated Assignment cells = 3;
+}
+
+message AssignmentListing {
+  repeated AssignmentBundle workers = 1;
+}
+
+message ListAssignmentsRequest {}
+
 service Orchestrator {
   rpc RegisterWorker(WorkerRegistration) returns (AssignmentSnapshot);
   rpc GetAssignments(AssignmentQuery) returns (AssignmentSnapshot);
+  rpc ListAssignments(ListAssignmentsRequest) returns (AssignmentListing);
 }

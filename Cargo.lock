@@ -1146,7 +1146,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tessera-core",
+ "tessera-proto",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

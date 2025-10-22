@@ -38,7 +38,7 @@
 - Ghost: 이웃에 배포되는 **읽기 전용** 상태(AOI 범위만 갱신)
 
 ### 3.2 Gateway / Worker / Orchestrator
-- Gateway(Stateless): 클라와 **단일 소켓** 유지, 여러 셀 업데이트를 머지하여 전송
+- Gateway(Stateless): 클라와 **단일 소켓** 유지, Orchestrator 라우팅 스냅샷 기반으로 셀별 워커 연결
 - Worker(Stateful): 셀 **소유자**, 틱 루프 + AOI 브로드캐스트 + 이웃 ghost 동기화, 부팅 시 Orchestrator 등록
 - Orchestrator(Control-plane): `cell → worker` 레지스트리, 리밸런싱/분할 결정·지시
 
@@ -57,7 +57,7 @@
 ### 5.1 내부 Control (Orchestrator ↔ Worker)
 - gRPC (bidi stream)
 - 메시지: `AssignCell`, `PreCopy{snapshot}`, `Freeze{epoch}`, `Diff{from_seq}`, `Commit{new_owner, epoch}`, `Ack/Abort`
-- V0 스켈레톤: `RegisterWorker`, `GetAssignments`로 정적 셀 매핑 전송
+- V0 스켈레톤: `RegisterWorker`, `GetAssignments`(워커), `ListAssignments`(게이트웨이)로 정적 셀 매핑 전송
 
 ### 5.2 데이터 채널
 - 클라 ↔ Gateway: TCP/QUIC + length‑prefixed 바이너리(Protobuf/FlatBuffers)
@@ -91,7 +91,7 @@
 ### V0 — 고정 그리드 + 정적 매핑 + 관측성
 - `CellId`, 패킷 프레이밍, Worker 틱 루프, Gateway 머지 경로
 - 정적 registry(ConfigMap/파일) → Gateway 라우팅
-- Orchestrator gRPC 스켈레톤(정적 `cell → worker` 스냅샷 제공)
+- Orchestrator gRPC 스켈레톤(정적 `cell → worker` 스냅샷 제공, `ListAssignments` 포함)
 - Prometheus 지표
 
 ### V1 — 리밸런싱(셀 단위 이동)
@@ -139,5 +139,6 @@
 - 로그: `cargo xt dev logs --target all --follow` (또는 `gateway|worker`)
 - 오케스트레이터: `cargo run -p tessera-orch` (필요 시 `TESSERA_ORCH_CONFIG[_JSON]` 지정)
 - 워커: `TESSERA_WORKER_ID`, `TESSERA_ORCH_ADDR`로 Orchestrator 연결 정보 설정 가능
+- 게이트웨이: `TESSERA_ORCH_ADDR`에서 라우팅을 받아오며 실패 시 `TESSERA_WORKER_ADDR`로 폴백
 - 클라 예시: `cargo run -p tessera-client -- repl --actor 1`
 - 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`

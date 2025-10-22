@@ -7,7 +7,8 @@ use std::time::SystemTime;
 use tessera_core::CellId;
 use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorServer};
 use tessera_proto::orch::v1::{
-    Assignment, AssignmentQuery, AssignmentSnapshot, WorkerRegistration,
+    Assignment, AssignmentBundle, AssignmentListing, AssignmentQuery, AssignmentSnapshot,
+    ListAssignmentsRequest, WorkerRegistration,
 };
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, async_trait, transport::Server};
@@ -68,6 +69,10 @@ impl Config {
 
     fn assignments_for(&self, worker_id: &str) -> Option<&[CellId]> {
         self.worker(worker_id).map(|w| w.cells.as_slice())
+    }
+
+    fn all_workers(&self) -> impl Iterator<Item = (&String, &WorkerStatic)> {
+        self.workers.iter()
     }
 }
 
@@ -164,6 +169,23 @@ impl OrchestratorService {
             entries.extend(cells.iter().map(cell_to_assignment));
         }
         AssignmentSnapshot { cells: entries }
+    }
+
+    fn listing(&self) -> AssignmentListing {
+        let mut bundles = Vec::new();
+        for (worker_id, worker) in self.config.all_workers() {
+            let cells = worker
+                .cells
+                .iter()
+                .map(cell_to_assignment)
+                .collect::<Vec<_>>();
+            bundles.push(AssignmentBundle {
+                worker_id: worker_id.clone(),
+                addr: worker.addr.clone(),
+                cells,
+            });
+        }
+        AssignmentListing { workers: bundles }
     }
 }
 
@@ -264,6 +286,14 @@ impl Orchestrator for OrchestratorService {
 
         let snapshot = self.snapshot_for(&req.worker_id);
         Ok(Response::new(snapshot))
+    }
+
+    async fn list_assignments(
+        &self,
+        _request: Request<ListAssignmentsRequest>,
+    ) -> Result<Response<AssignmentListing>, Status> {
+        let listing = self.listing();
+        Ok(Response::new(listing))
     }
 }
 
@@ -388,5 +418,39 @@ mod tests {
             .expect("get assignments for unknown worker")
             .into_inner();
         assert!(empty_snapshot.cells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_assignments_snapshot() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        workers.insert(
+            "worker-b".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.2:5001".to_string(),
+                cells: vec![CellId::grid(0, 1, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+
+        let listing = service
+            .list_assignments(Request::new(ListAssignmentsRequest {}))
+            .await
+            .expect("list assignments")
+            .into_inner();
+        assert_eq!(listing.workers.len(), 2);
+        let mut worker_ids = listing
+            .workers
+            .iter()
+            .map(|b| b.worker_id.as_str())
+            .collect::<Vec<_>>();
+        worker_ids.sort();
+        assert_eq!(worker_ids, vec!["worker-a", "worker-b"]);
     }
 }
