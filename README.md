@@ -31,11 +31,14 @@ Cell-based world orchestration for real-time servers in Rust.
 ## Run Locally
 - 일괄 실행/정지(Worker+Gateway):
   - 올리기: `cargo xt dev up`
+  - Orchestrator까지 포함: `cargo xt dev up --with-orch [--orch-config .dev/orch-config.json]`
   - 내리기: `cargo xt dev down`
+  - Orchestrator 종료: `cargo xt dev down --with-orch`
   - 로그: `.dev/logs/{worker,gateway}.log`
 - 로그 보기: `cargo xt dev logs --target all --follow` (또는 `--target gateway|worker`, `--lines 200`)
 - 환경변수(옵션):
   - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
+  - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
   - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
   - `TESSERA_WORKER_ID` 기본 `worker-local`
   - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
@@ -71,13 +74,13 @@ Cell-based world orchestration for real-time servers in Rust.
 ### ✅ Implemented (V0 scope)
 - Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
-- Gateway: Orchestrator에서 `ListAssignments` 스냅샷을 받아 셀→워커 라우팅 적용 (실패 시 단일 워커로 폴백)
+- Gateway: Orchestrator에서 `ListAssignments` 스냅샷을 받아 셀→워커 라우팅 적용 (실패 시 단일 워커로 폴백) + 주기적 재조회(`TESSERA_GW_REFRESH_SECS` 조절)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리
 - Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments` gRPC 엔드포인트 제공
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Gateway 라우팅 테이블 실시간 갱신(주기적 `ListAssignments`, 스트리밍 watch)
+- Gateway 라우팅 테이블 watch/스트리밍 기반 즉시 반영(Orchestrator push)
 - Orchestrator 메트릭 집계/헬스 체크 및 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`)
 - Worker 셀 단위 AOI/ghost 브로드캐스트 강화 및 다셀 틱 파이프라인 구조화
 - Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
