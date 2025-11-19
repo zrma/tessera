@@ -29,9 +29,20 @@ enum Cmd {
 #[derive(Subcommand)]
 enum DevSub {
     /// Build and start worker+gateway in background
-    Up,
+    Up {
+        /// Also start tessera-orch alongside worker/gateway
+        #[arg(long, default_value_t = false)]
+        with_orch: bool,
+        /// Optional orchestrator config path (passed via TESSERA_ORCH_CONFIG)
+        #[arg(long)]
+        orch_config: Option<PathBuf>,
+    },
     /// Stop worker+gateway using recorded PIDs
-    Down,
+    Down {
+        /// Also stop tessera-orch (if started with --with-orch)
+        #[arg(long, default_value_t = false)]
+        with_orch: bool,
+    },
     /// Tail logs in .dev/logs (gateway/worker/all)
     Logs {
         /// Target to tail: gateway|worker|all
@@ -58,8 +69,11 @@ fn main() -> Result<()> {
         Cmd::Clippy => clippy()?,
         Cmd::Check => check()?,
         Cmd::Dev { sub } => match sub {
-            DevSub::Up => dev_up()?,
-            DevSub::Down => dev_down()?,
+            DevSub::Up {
+                with_orch,
+                orch_config,
+            } => dev_up(with_orch, orch_config)?,
+            DevSub::Down { with_orch } => dev_down(with_orch)?,
             DevSub::Logs {
                 target,
                 follow,
@@ -120,7 +134,7 @@ fn dev_dirs() -> (PathBuf, PathBuf, PathBuf) {
     (dev, logs, pids)
 }
 
-fn dev_up() -> Result<()> {
+fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
     let root = workspace_root();
     let (_dev, logs, pids) = dev_dirs();
     fs::create_dir_all(&logs)?;
@@ -128,7 +142,8 @@ fn dev_up() -> Result<()> {
 
     let gw_pid = pids.join("gateway.pid");
     let wk_pid = pids.join("worker.pid");
-    if gw_pid.exists() || wk_pid.exists() {
+    let orch_pid = pids.join("orch.pid");
+    if gw_pid.exists() || wk_pid.exists() || (with_orch && orch_pid.exists()) {
         bail!("pid files exist (.dev/pids). Run `cargo xt dev down` first.");
     }
 
@@ -140,9 +155,13 @@ fn dev_up() -> Result<()> {
         "--bin",
         "tessera-gateway",
     ]))?;
+    if with_orch {
+        run(Command::new("cargo").args(["build", "--bin", "tessera-orch"]))?;
+    }
 
     let worker_bin = root.join("target/debug/tessera-worker");
     let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
 
     // Start worker
     let worker_log = OpenOptions::new()
@@ -190,19 +209,60 @@ fn dev_up() -> Result<()> {
         .spawn()?;
     fs::write(&gw_pid, format!("{}\n", gchild.id()))?;
 
-    println!(
-        "dev up: started worker(pid={}) and gateway(pid={})",
-        wchild.id(),
-        gchild.id()
-    );
-    println!("logs: .dev/logs/worker.log, .dev/logs/gateway.log");
+    let mut orch_child_pid: Option<u32> = None;
+    if with_orch {
+        let orch_log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs.join("orch.log"))?;
+        let mut ocmd = Command::new(orchestrator_bin);
+        ocmd.current_dir(&root).env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        );
+        if let Some(cfg) = orch_config {
+            let cfg_path = if cfg.is_absolute() {
+                cfg
+            } else {
+                root.join(cfg)
+            };
+            ocmd.env("TESSERA_ORCH_CONFIG", cfg_path);
+        }
+        let ochild = ocmd
+            .stdout(orch_log.try_clone()?)
+            .stderr(orch_log)
+            .spawn()?;
+        fs::write(&orch_pid, format!("{}\n", ochild.id()))?;
+        orch_child_pid = Some(ochild.id());
+    }
+
+    match orch_child_pid {
+        Some(opid) => {
+            println!(
+                "dev up: started worker(pid={}), gateway(pid={}), orchestrator(pid={})",
+                wchild.id(),
+                gchild.id(),
+                opid
+            );
+            println!("logs: .dev/logs/worker.log, .dev/logs/gateway.log, .dev/logs/orch.log");
+        }
+        None => {
+            println!(
+                "dev up: started worker(pid={}) and gateway(pid={})",
+                wchild.id(),
+                gchild.id()
+            );
+            println!("logs: .dev/logs/worker.log, .dev/logs/gateway.log");
+        }
+    }
     Ok(())
 }
 
-fn dev_down() -> Result<()> {
+fn dev_down(with_orch: bool) -> Result<()> {
     let (_dev, _logs, pids) = dev_dirs();
     let gw_pid = pids.join("gateway.pid");
     let wk_pid = pids.join("worker.pid");
+    let orch_pid = pids.join("orch.pid");
 
     let mut killed_any = false;
     if wk_pid.exists() {
@@ -220,6 +280,14 @@ fn dev_down() -> Result<()> {
             killed_any = true;
         }
         let _ = fs::remove_file(&gw_pid);
+    }
+    if with_orch && orch_pid.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&orch_pid) {
+            let pid = pid_str.trim();
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
+            killed_any = true;
+        }
+        let _ = fs::remove_file(&orch_pid);
     }
     if killed_any {
         println!("dev down: sent TERM to recorded PIDs");

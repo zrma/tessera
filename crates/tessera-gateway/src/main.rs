@@ -3,17 +3,20 @@ use bytes::BytesMut;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tessera_core::{CellId, ClientMsg, Envelope, try_decode_frame};
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{Assignment, AssignmentBundle, ListAssignmentsRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info, warn};
+use tokio::sync::RwLock;
+use tokio::time;
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct CellKey(CellId);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkerRoute {
     worker_id: String,
     addr: SocketAddr,
@@ -21,12 +24,27 @@ struct WorkerRoute {
 
 #[derive(Clone)]
 struct RoutingTable {
-    routes: Arc<HashMap<CellKey, WorkerRoute>>,
+    routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>,
 }
 
 impl RoutingTable {
-    fn lookup(&self, cell: &CellId) -> Option<&WorkerRoute> {
-        self.routes.get(&CellKey(*cell))
+    fn new(initial: HashMap<CellKey, WorkerRoute>) -> Self {
+        Self {
+            routes: Arc::new(RwLock::new(initial)),
+        }
+    }
+
+    async fn lookup(&self, cell: &CellId) -> Option<WorkerRoute> {
+        let guard = self.routes.read().await;
+        guard.get(&CellKey(*cell)).cloned()
+    }
+
+    fn handle(&self) -> Arc<RwLock<HashMap<CellKey, WorkerRoute>>> {
+        Arc::clone(&self.routes)
+    }
+
+    async fn len(&self) -> usize {
+        self.routes.read().await.len()
     }
 }
 
@@ -39,27 +57,17 @@ async fn main() -> Result<()> {
         .parse()
         .expect("invalid TESSERA_GW_ADDR");
 
-    let table = match fetch_routing_table().await {
-        Ok(table) if !table.routes.is_empty() => table,
-        Ok(_) => {
-            warn!(target: "gateway", "orchestrator returned empty assignment listing; falling back to static mapping");
-            RoutingTable {
-                routes: Arc::new(default_routes()?),
-            }
-        }
-        Err(e) => {
-            warn!(
-                target: "gateway",
-                error = ?e,
-                "failed to fetch assignments; falling back to static mapping"
-            );
-            RoutingTable {
-                routes: Arc::new(default_routes()?),
-            }
-        }
-    };
+    let initial_routes = load_initial_routes().await?;
+    let table = RoutingTable::new(initial_routes);
+    {
+        let routes = table.handle();
+        tokio::spawn(async move {
+            routing_refresh_loop(routes).await;
+        });
+    }
 
-    info!(target: "gateway", cells = table.routes.len(), "routing table loaded");
+    let cell_count = table.len().await;
+    info!(target: "gateway", cells = cell_count, "routing table loaded");
 
     let listener = TcpListener::bind(addr).await?;
     info!(target: "gateway", %addr, "listening");
@@ -108,7 +116,7 @@ async fn handle_conn(mut stream: TcpStream, peer: SocketAddr, routing: RoutingTa
             continue;
         };
         let cell = env_in.cell;
-        let Some(route) = routing.lookup(&cell) else {
+        let Some(route) = routing.lookup(&cell).await else {
             warn!(
                 target: "gateway",
                 %peer,
@@ -217,38 +225,6 @@ impl UpstreamConn {
     }
 }
 
-async fn fetch_routing_table() -> Result<RoutingTable> {
-    let orchestrator_addr =
-        std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
-    let endpoint =
-        if orchestrator_addr.starts_with("http://") || orchestrator_addr.starts_with("https://") {
-            orchestrator_addr
-        } else {
-            format!("http://{}", orchestrator_addr)
-        };
-
-    let mut client = OrchestratorClient::connect(endpoint.clone())
-        .await
-        .with_context(|| format!("connect orchestrator at {}", endpoint))?;
-    let response = client
-        .list_assignments(ListAssignmentsRequest {})
-        .await
-        .context("list assignments")?
-        .into_inner();
-
-    let mut routes = HashMap::new();
-    for bundle in response.workers {
-        let parsed_addr: SocketAddr = bundle.addr.parse().with_context(|| {
-            format!("parse worker addr {} for {}", bundle.addr, bundle.worker_id)
-        })?;
-        populate_routes(&mut routes, parsed_addr, &bundle)?;
-    }
-
-    Ok(RoutingTable {
-        routes: Arc::new(routes),
-    })
-}
-
 fn populate_routes(
     routes: &mut HashMap<CellKey, WorkerRoute>,
     addr: SocketAddr,
@@ -304,6 +280,104 @@ fn init_tracing() {
         .with_target(true)
         .compact()
         .init();
+}
+
+async fn load_initial_routes() -> Result<HashMap<CellKey, WorkerRoute>> {
+    match fetch_remote_routes().await {
+        Ok(routes) if !routes.is_empty() => Ok(routes),
+        Ok(_) => {
+            warn!(
+                target: "gateway",
+                "orchestrator returned empty assignment listing; falling back to static mapping"
+            );
+            default_routes()
+        }
+        Err(e) => {
+            warn!(
+                target: "gateway",
+                error = ?e,
+                "failed to fetch assignments; falling back to static mapping"
+            );
+            default_routes()
+        }
+    }
+}
+
+async fn fetch_remote_routes() -> Result<HashMap<CellKey, WorkerRoute>> {
+    let endpoint = orchestrator_endpoint();
+    let mut client = OrchestratorClient::connect(endpoint.clone())
+        .await
+        .with_context(|| format!("connect orchestrator at {}", endpoint))?;
+    let response = client
+        .list_assignments(ListAssignmentsRequest {})
+        .await
+        .context("list assignments")?
+        .into_inner();
+
+    let mut routes = HashMap::new();
+    for bundle in response.workers {
+        let parsed_addr: SocketAddr = bundle.addr.parse().with_context(|| {
+            format!("parse worker addr {} for {}", bundle.addr, bundle.worker_id)
+        })?;
+        populate_routes(&mut routes, parsed_addr, &bundle)?;
+    }
+    Ok(routes)
+}
+
+async fn routing_refresh_loop(routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>) {
+    let mut ticker = time::interval(routing_refresh_interval());
+    loop {
+        ticker.tick().await;
+        match fetch_remote_routes().await {
+            Ok(new_routes) if new_routes.is_empty() => {
+                warn!(
+                    target: "gateway",
+                    "orchestrator returned empty assignment listing; keeping existing routes"
+                );
+            }
+            Ok(new_routes) => {
+                let mut guard = routes.write().await;
+                if *guard != new_routes {
+                    let new_len = new_routes.len();
+                    *guard = new_routes;
+                    info!(
+                        target: "gateway",
+                        cells = new_len,
+                        "routing table refreshed from orchestrator"
+                    );
+                } else {
+                    debug!(target: "gateway", "routing table unchanged after refresh");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "gateway",
+                    error = ?e,
+                    "failed to refresh assignments; keeping existing routes"
+                );
+            }
+        }
+    }
+}
+
+fn orchestrator_endpoint() -> String {
+    let orchestrator_addr =
+        std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
+    if orchestrator_addr.starts_with("http://") || orchestrator_addr.starts_with("https://") {
+        orchestrator_addr
+    } else {
+        format!("http://{}", orchestrator_addr)
+    }
+}
+
+fn routing_refresh_interval() -> Duration {
+    const DEFAULT_SECS: u64 = 5;
+    let secs = std::env::var("TESSERA_GW_REFRESH_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|val| *val > 0)
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 #[cfg(test)]
