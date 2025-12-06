@@ -40,10 +40,12 @@ Cell-based world orchestration for real-time servers in Rust.
   - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
   - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
   - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
+  - `TESSERA_WORKER_ADVERTISE_ADDR` 기본 `TESSERA_WORKER_ADDR` (오케스트레이터에 등록할 워커 주소, `TESSERA_WORKER_ADDR`가 `0.0.0.0`/`::`인 경우 반드시 지정)
   - `TESSERA_WORKER_ID` 기본 `worker-local`
+  - `TESSERA_WORKER_REFRESH_SECS` 기본 `5`초(Orchestrator 연결 실패 시 워커가 할당 재등록을 재시도하는 주기)
   - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
   - `RUST_LOG` 기본 `info`
-- 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
+- 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADVERTISE_ADDR`(설정 시) 또는 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
 - 오케스트레이터 실행: `cargo run -p tessera-orch` (기본 `TESSERA_ORCH_ADDR=127.0.0.1:6000`)
 - 오케스트레이터 설정: 기본값은 `worker-local → CellId::grid(0, 0, 0)`이며, `TESSERA_ORCH_CONFIG`(파일 경로) 또는 `TESSERA_ORCH_CONFIG_JSON`(직접 JSON)으로 커스텀 매핑 가능
 - 설정 예시:
@@ -74,13 +76,12 @@ Cell-based world orchestration for real-time servers in Rust.
 ### ✅ Implemented (V0 scope)
 - Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
-- Gateway: Orchestrator에서 `ListAssignments` 스냅샷을 받아 셀→워커 라우팅 적용 (실패 시 단일 워커로 폴백) + 주기적 재조회(`TESSERA_GW_REFRESH_SECS` 조절)
+- Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리
-- Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments` gRPC 엔드포인트 제공
+- Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments` gRPC 엔드포인트 제공
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Gateway 라우팅 테이블 watch/스트리밍 기반 즉시 반영(Orchestrator push)
 - Orchestrator 메트릭 집계/헬스 체크 및 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`)
 - Worker 셀 단위 AOI/ghost 브로드캐스트 강화 및 다셀 틱 파이프라인 구조화
 - Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
@@ -94,12 +95,13 @@ Cell-based world orchestration for real-time servers in Rust.
 - 포트 점유: `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`를 변경하거나 점유 프로세스 종료
 - 로그 확인: `cargo xt dev logs --target all --follow`
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
+- 게이트웨이 라우팅/업스트림 실패가 반복되면 클라이언트 연결을 종료하므로, 클라는 재접속이 필요할 수 있음
 
 ## Design Overview
 - 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.
 - Goals: V0 고정 그리드+정적 매핑(구현), V1 셀 리밸런싱·Handover, V1 AOI/ghost 최적화, V2 동적 분할(쿼드트리) 등.
 - Non-goals(초기): 완성형 게임 서버 기능, 완전 무중단 마이그레이션, 멀티리전 일관성.
-- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator 스냅샷 기반 라우팅, Worker는 틱 루프/AOI/ghost, Orchestrator는 `cell→worker` 레지스트리.
+- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator watch/스냅샷 기반 라우팅, Worker는 틱 루프/AOI/ghost, Orchestrator는 `cell→worker` 레지스트리.
 - 데이터 흐름: Gateway 입력 → 대상 셀 워커 전달 → Worker 틱/델타 → 클라·인접 워커 전파 → 필요 시 Handover(`PreCopy→Freeze→Diff/Commit→라우팅 교체`).
 - 운영 메모: 틱 20–30Hz, 셀 크기는 AOI의 2–3배 권장, 위험요소는 게이트웨이 병목·Handover 순서·분할/병합 플래핑·AOI 폭주(rate cap 필요).
 

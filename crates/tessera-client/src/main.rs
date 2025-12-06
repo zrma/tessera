@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustyline::{DefaultEditor, error::ReadlineError};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use tessera_core::{CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, encode_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,11 +77,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let addr: SocketAddr = cli
-        .addr
-        .parse()
-        .with_context(|| format!("invalid addr: {}", cli.addr))?;
-
+    let addr = cli.addr.trim();
     let mut stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect to {}", addr))?;
@@ -290,4 +285,60 @@ async fn handle_line(
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_ping_defaults() {
+        let cli = Cli::try_parse_from(["tessera-client", "ping"]).expect("parse");
+        assert_eq!(cli.addr, "127.0.0.1:4000");
+        assert_eq!(cli.world, 0);
+        assert_eq!(cli.cx, 0);
+        assert_eq!(cli.cy, 0);
+        assert_eq!(cli.epoch, 0);
+        match cli.cmd {
+            Cmd::Ping { ts } => assert_eq!(ts, 1),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_move_with_overrides() {
+        let cli = Cli::try_parse_from([
+            "tessera-client",
+            "--addr",
+            "10.0.0.1:4000",
+            "--world",
+            "2",
+            "--cx=-1",
+            "--cy",
+            "3",
+            "--epoch",
+            "7",
+            "move",
+            "--actor",
+            "5",
+            "--dx",
+            "1.25",
+            "--dy=-0.5",
+        ])
+        .expect("parse");
+        assert_eq!(cli.addr, "10.0.0.1:4000");
+        assert_eq!(cli.world, 2);
+        assert_eq!(cli.cx, -1);
+        assert_eq!(cli.cy, 3);
+        assert_eq!(cli.epoch, 7);
+        match cli.cmd {
+            Cmd::Move { actor, dx, dy } => {
+                assert_eq!(actor, 5);
+                assert_eq!(dx, 1.25);
+                assert_eq!(dy, -0.5);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

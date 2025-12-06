@@ -10,6 +10,7 @@ serde_json.workspace = true
 tessera-core = { path = "../tessera-core" }
 tessera-proto = { path = "../tessera-proto" }
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
