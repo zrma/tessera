@@ -95,8 +95,16 @@ Cell-based world orchestration for real-time servers in Rust.
 - 로그 확인: `cargo xt dev logs --target all --follow`
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
 
-자세한 설계와 범위는 `docs/overview.md` 를 참고하세요.
+## Design Overview
+- 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.
+- Goals: V0 고정 그리드+정적 매핑(구현), V1 셀 리밸런싱·Handover, V1 AOI/ghost 최적화, V2 동적 분할(쿼드트리) 등.
+- Non-goals(초기): 완성형 게임 서버 기능, 완전 무중단 마이그레이션, 멀티리전 일관성.
+- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator 스냅샷 기반 라우팅, Worker는 틱 루프/AOI/ghost, Orchestrator는 `cell→worker` 레지스트리.
+- 데이터 흐름: Gateway 입력 → 대상 셀 워커 전달 → Worker 틱/델타 → 클라·인접 워커 전파 → 필요 시 Handover(`PreCopy→Freeze→Diff/Commit→라우팅 교체`).
+- 운영 메모: 틱 20–30Hz, 셀 크기는 AOI의 2–3배 권장, 위험요소는 게이트웨이 병목·Handover 순서·분할/병합 플래핑·AOI 폭주(rate cap 필요).
 
 ## Contributing & Workflow
-- 팀 작업 관행(커밋 컨벤션, 테스트, 문서 업데이트 등)은 `docs/contributing.md`에 정리돼 있습니다.
-- 새 기능을 추가하거나 문서를 수정하기 전에 해당 가이드를 확인해주세요.
+- 기본 브랜치 `main`; 커밋 메시지 포맷은 `type: summary`(예: `feat: refresh gateway routing`), 한 커밋에 명확한 변경 세트만 담습니다.
+- 코드 변경 시 문서/테스트를 함께 갱신하고, README의 ✅(구현)/🚧(계획) 구분을 유지합니다.
+- 제출 전 `cargo fmt`, 관련 `cargo test`, 필요 시 `cargo check --workspace`를 실행합니다.
+- 추가 지침과 에이전트 컨텍스트는 `AGENTS.md`를 참고하세요.
