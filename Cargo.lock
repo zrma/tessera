@@ -1148,6 +1148,7 @@ dependencies = [
  "tessera-core",
  "tessera-proto",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1163,6 +1164,7 @@ dependencies = [
  "tessera-core",
  "tessera-proto",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1253,6 +1255,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

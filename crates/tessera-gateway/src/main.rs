@@ -6,11 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tessera_core::{CellId, ClientMsg, Envelope, try_decode_frame};
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
-use tessera_proto::orch::v1::{Assignment, AssignmentBundle, ListAssignmentsRequest};
+use tessera_proto::orch::v1::{
+    Assignment, AssignmentBundle, AssignmentListing, ListAssignmentsRequest,
+    WatchAssignmentsRequest,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::time;
+use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -63,6 +67,12 @@ async fn main() -> Result<()> {
         let routes = table.handle();
         tokio::spawn(async move {
             routing_refresh_loop(routes).await;
+        });
+    }
+    {
+        let routes = table.handle();
+        tokio::spawn(async move {
+            routing_watch_loop(routes).await;
         });
     }
 
@@ -314,14 +324,7 @@ async fn fetch_remote_routes() -> Result<HashMap<CellKey, WorkerRoute>> {
         .context("list assignments")?
         .into_inner();
 
-    let mut routes = HashMap::new();
-    for bundle in response.workers {
-        let parsed_addr: SocketAddr = bundle.addr.parse().with_context(|| {
-            format!("parse worker addr {} for {}", bundle.addr, bundle.worker_id)
-        })?;
-        populate_routes(&mut routes, parsed_addr, &bundle)?;
-    }
-    Ok(routes)
+    routes_from_listing(&response)
 }
 
 async fn routing_refresh_loop(routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>) {
@@ -360,6 +363,42 @@ async fn routing_refresh_loop(routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>
     }
 }
 
+async fn routing_watch_loop(routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>) {
+    loop {
+        match watch_assignments_once(routes.clone()).await {
+            Ok(_) => {
+                warn!(
+                    target: "gateway",
+                    "assignments watch stream ended; reconnecting after backoff"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "gateway",
+                    error = ?e,
+                    "assignments watch failed; reconnecting after backoff"
+                );
+            }
+        }
+        time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn watch_assignments_once(routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>) -> Result<()> {
+    let endpoint = orchestrator_endpoint();
+    let mut client = OrchestratorClient::connect(endpoint.clone())
+        .await
+        .with_context(|| format!("connect orchestrator at {}", endpoint))?;
+    let response = client
+        .watch_assignments(WatchAssignmentsRequest {})
+        .await
+        .context("subscribe to watch_assignments")?;
+    let stream = response.into_inner();
+    apply_listing_stream(routes, stream)
+        .await
+        .context("apply routing updates from watch")
+}
+
 fn orchestrator_endpoint() -> String {
     let orchestrator_addr =
         std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
@@ -380,9 +419,69 @@ fn routing_refresh_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+async fn apply_listing_update(
+    routes: &Arc<RwLock<HashMap<CellKey, WorkerRoute>>>,
+    listing: AssignmentListing,
+) -> Result<bool> {
+    if listing.workers.is_empty() {
+        warn!(
+            target: "gateway",
+            "received empty assignment listing from orchestrator watch; keeping existing routes"
+        );
+        return Ok(false);
+    }
+    let new_routes = routes_from_listing(&listing)?;
+    if new_routes.is_empty() {
+        warn!(
+            target: "gateway",
+            "assignment listing contained no cells; keeping existing routes"
+        );
+        return Ok(false);
+    }
+    let mut guard = routes.write().await;
+    if *guard == new_routes {
+        debug!(target: "gateway", "assignment listing unchanged; skipping route swap");
+        return Ok(false);
+    }
+    let new_len = new_routes.len();
+    *guard = new_routes;
+    info!(
+        target: "gateway",
+        cells = new_len,
+        "routing table updated from orchestrator watch"
+    );
+    Ok(true)
+}
+
+async fn apply_listing_stream<S>(
+    routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>,
+    mut stream: S,
+) -> Result<()>
+where
+    S: tokio_stream::Stream<Item = Result<AssignmentListing, tonic::Status>> + Unpin,
+{
+    while let Some(listing) = stream.next().await {
+        let listing = listing.context("receive assignment listing from watch stream")?;
+        let _ = apply_listing_update(&routes, listing).await?;
+    }
+    Ok(())
+}
+
+fn routes_from_listing(listing: &AssignmentListing) -> Result<HashMap<CellKey, WorkerRoute>> {
+    let mut routes = HashMap::new();
+    for bundle in &listing.workers {
+        let parsed_addr: SocketAddr = bundle.addr.parse().with_context(|| {
+            format!("parse worker addr {} for {}", bundle.addr, bundle.worker_id)
+        })?;
+        populate_routes(&mut routes, parsed_addr, bundle)?;
+    }
+    Ok(routes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::iter;
 
     #[test]
     fn assignment_to_cell_round_trip() {
@@ -399,5 +498,79 @@ mod tests {
         assert_eq!(cell.cy, 4);
         assert_eq!(cell.depth, 1);
         assert_eq!(cell.sub, 2);
+    }
+
+    #[tokio::test]
+    async fn listing_stream_updates_routes() {
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+        let listing_initial = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-a".to_string(),
+                addr: "127.0.0.1:5001".to_string(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 0,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+        };
+        let listing_updated = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-b".to_string(),
+                addr: "127.0.0.1:5002".to_string(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 0,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+        };
+
+        let stream = iter(vec![
+            Ok(listing_initial.clone()),
+            Ok(listing_updated.clone()),
+        ]);
+        apply_listing_stream(routes.clone(), stream)
+            .await
+            .expect("process listing stream");
+
+        let guard = routes.read().await;
+        let route = guard
+            .get(&CellKey(CellId::grid(0, 0, 0)))
+            .expect("route present");
+        assert_eq!(route.worker_id, "worker-b");
+        assert_eq!(route.addr, "127.0.0.1:5002".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn empty_listing_keeps_existing_routes() {
+        let routes = Arc::new(RwLock::new(HashMap::new()));
+        let listing_initial = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-a".to_string(),
+                addr: "127.0.0.1:5001".to_string(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 1,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+        };
+        let stream = iter(vec![
+            Ok(listing_initial.clone()),
+            Ok(AssignmentListing { workers: vec![] }),
+        ]);
+        apply_listing_stream(routes.clone(), stream)
+            .await
+            .expect("process listing stream");
+
+        let guard = routes.read().await;
+        assert_eq!(guard.len(), 1);
     }
 }

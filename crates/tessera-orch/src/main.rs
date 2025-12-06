@@ -2,15 +2,18 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tessera_core::CellId;
 use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorServer};
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, AssignmentQuery, AssignmentSnapshot,
-    ListAssignmentsRequest, WorkerRegistration,
+    ListAssignmentsRequest, WatchAssignmentsRequest, WorkerRegistration,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
+use tokio_stream::Stream;
+use tokio_stream::{StreamExt, wrappers::WatchStream};
 use tonic::{Request, Response, Status, async_trait, transport::Server};
 use tracing::{error, info, warn};
 
@@ -74,6 +77,23 @@ impl Config {
     fn all_workers(&self) -> impl Iterator<Item = (&String, &WorkerStatic)> {
         self.workers.iter()
     }
+}
+
+fn listing_from_config(config: &Config) -> AssignmentListing {
+    let mut bundles = Vec::new();
+    for (worker_id, worker) in config.all_workers() {
+        let cells = worker
+            .cells
+            .iter()
+            .map(cell_to_assignment)
+            .collect::<Vec<_>>();
+        bundles.push(AssignmentBundle {
+            worker_id: worker_id.clone(),
+            addr: worker.addr.clone(),
+            cells,
+        });
+    }
+    AssignmentListing { workers: bundles }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -151,13 +171,18 @@ struct WorkerRuntime {
 struct OrchestratorService {
     config: Arc<Config>,
     runtime: Arc<RwLock<HashMap<String, WorkerRuntime>>>,
+    listing_tx: watch::Sender<AssignmentListing>,
 }
 
 impl OrchestratorService {
     fn new(config: Config) -> Self {
+        let config = Arc::new(config);
+        let initial_listing = listing_from_config(&config);
+        let (listing_tx, _) = watch::channel(initial_listing);
         Self {
-            config: Arc::new(config),
+            config,
             runtime: Arc::new(RwLock::new(HashMap::new())),
+            listing_tx,
         }
     }
 
@@ -172,25 +197,30 @@ impl OrchestratorService {
     }
 
     fn listing(&self) -> AssignmentListing {
-        let mut bundles = Vec::new();
-        for (worker_id, worker) in self.config.all_workers() {
-            let cells = worker
-                .cells
-                .iter()
-                .map(cell_to_assignment)
-                .collect::<Vec<_>>();
-            bundles.push(AssignmentBundle {
-                worker_id: worker_id.clone(),
-                addr: worker.addr.clone(),
-                cells,
-            });
+        listing_from_config(&self.config)
+    }
+
+    fn publish_listing_if_changed(&self) {
+        let listing = self.listing();
+        if *self.listing_tx.borrow() == listing {
+            return;
         }
-        AssignmentListing { workers: bundles }
+        if let Err(e) = self.listing_tx.send(listing) {
+            warn!(target: "orch", error = ?e, "failed to publish assignment listing");
+        }
+    }
+
+    #[cfg(test)]
+    fn push_listing_for_test(&self, listing: AssignmentListing) {
+        let _ = self.listing_tx.send(listing);
     }
 }
 
 #[async_trait]
 impl Orchestrator for OrchestratorService {
+    type WatchAssignmentsStream =
+        Pin<Box<dyn Stream<Item = Result<AssignmentListing, Status>> + Send + 'static>>;
+
     async fn register_worker(
         &self,
         request: Request<WorkerRegistration>,
@@ -253,6 +283,7 @@ impl Orchestrator for OrchestratorService {
             }
         }
 
+        self.publish_listing_if_changed();
         Ok(Response::new(snapshot))
     }
 
@@ -295,6 +326,15 @@ impl Orchestrator for OrchestratorService {
         let listing = self.listing();
         Ok(Response::new(listing))
     }
+
+    async fn watch_assignments(
+        &self,
+        _request: Request<WatchAssignmentsRequest>,
+    ) -> Result<Response<Self::WatchAssignmentsStream>, Status> {
+        let rx = self.listing_tx.subscribe();
+        let stream = WatchStream::new(rx).map(Ok);
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 fn cell_to_assignment(cell: &CellId) -> Assignment {
@@ -319,6 +359,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::StreamExt;
     use tonic::Request;
 
     #[test]
@@ -452,5 +493,55 @@ mod tests {
             .collect::<Vec<_>>();
         worker_ids.sort();
         assert_eq!(worker_ids, vec!["worker-a", "worker-b"]);
+    }
+
+    #[tokio::test]
+    async fn watch_assignments_streams_listing_updates() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+
+        let response = service
+            .watch_assignments(Request::new(
+                tessera_proto::orch::v1::WatchAssignmentsRequest {},
+            ))
+            .await
+            .expect("watch assignments");
+        let mut stream = response.into_inner();
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream closed unexpectedly")
+            .expect("first listing");
+        assert_eq!(first.workers.len(), 1);
+
+        let mut updated = first.clone();
+        updated.workers.push(AssignmentBundle {
+            worker_id: "worker-b".to_string(),
+            addr: "10.0.0.2:5001".to_string(),
+            cells: vec![Assignment {
+                world: 0,
+                cx: 1,
+                cy: 0,
+                depth: 0,
+                sub: 0,
+            }],
+        });
+
+        service.push_listing_for_test(updated.clone());
+
+        let second = stream
+            .next()
+            .await
+            .expect("stream closed unexpectedly")
+            .expect("second listing");
+        assert_eq!(second, updated);
     }
 }

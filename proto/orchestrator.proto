@@ -36,9 +36,11 @@ message AssignmentListing {
 }
 
 message ListAssignmentsRequest {}
+message WatchAssignmentsRequest {}
 
 service Orchestrator {
   rpc RegisterWorker(WorkerRegistration) returns (AssignmentSnapshot);
   rpc GetAssignments(AssignmentQuery) returns (AssignmentSnapshot);
   rpc ListAssignments(ListAssignmentsRequest) returns (AssignmentListing);
+  rpc WatchAssignments(WatchAssignmentsRequest) returns (stream AssignmentListing);
 }

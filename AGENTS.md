@@ -27,7 +27,7 @@
 ## 작업 지침 (Do/Don’t)
 - Do: README의 ✅(구현) / 🚧(계획) 구분을 지키고, 아키텍처 변화 시 Design Overview 갱신.
 - Do: 단일 파일 수정은 `apply_patch` 우선, 검색은 `rg`/`rg --files` 우선.
-- Do: 최소 `cargo fmt`, 관련 `cargo test`; 필요 시 `cargo check --workspace`. dev 헬퍼는 `cargo xt`/`cargo xt dev ...` 활용.
+- Do: 최소 `cargo fmt`, 관련 `cargo test`; 필요 시 `cargo check --workspace`. dev 헬퍼는 `cargo xt`/`cargo xt dev ...` 활용하고, 작업 마무리 시에는 `cargo xt`와 `cargo test`를 반드시 돌려 결과를 확인한다.
 - Do: 커밋 메시지 `type: summary`(예: `feat: refresh gateway routing`). JJ는 `jj commit -m "..."`; 북마크 이동은 지시가 있을 때만(`jj bookmark set main -r <rev>`).
 - Don’t: 기존 변경을 덮어쓰거나 파괴적 명령(`git reset --hard`, 무단 삭제 등) 실행 금지.
 - Don’t: 계획을 구현된 것처럼 문서화하지 말 것.

@@ -14,3 +14,4 @@ serde_json = { workspace = true }
 tessera-core = { path = "../tessera-core" }
 tessera-proto = { path = "../tessera-proto" }
 tonic = { workspace = true }
+tokio-stream = { workspace = true }
