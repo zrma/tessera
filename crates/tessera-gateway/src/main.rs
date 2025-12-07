@@ -11,8 +11,9 @@ use tessera_proto::orch::v1::{
     WatchAssignmentsRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -94,28 +95,30 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, peer: SocketAddr, routing: RoutingTable) -> Result<()> {
+async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable) -> Result<()> {
+    let (mut client_reader, client_writer) = stream.into_split();
+    let client_writer = Arc::new(Mutex::new(client_writer));
     let mut upstream: Option<UpstreamConn> = None;
 
-    loop {
+    let result = loop {
         let mut len_buf = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut len_buf).await {
+        if let Err(e) = client_reader.read_exact(&mut len_buf).await {
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
             ) {
                 info!(target: "gateway", %peer, "closed");
-                return Ok(());
+                break Ok(());
             }
-            return Err(e.into());
+            break Err(e.into());
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > 1_000_000 {
             warn!(target: "gateway", %peer, len, "frame too large");
-            return Ok(());
+            break Ok(());
         }
         let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).await?;
+        client_reader.read_exact(&mut payload).await?;
 
         // Decode to inspect cell for routing.
         let mut buf = BytesMut::with_capacity(4 + len);
@@ -136,103 +139,227 @@ async fn handle_conn(mut stream: TcpStream, peer: SocketAddr, routing: RoutingTa
             continue;
         };
 
-        // Ensure we are connected to the correct worker.
-        let target_worker = route.clone();
-        match upstream.as_mut() {
-            Some(conn) if conn.route.addr == target_worker.addr => {}
-            Some(conn) => {
-                info!(
-                    target: "gateway",
-                    %peer,
-                    old_worker = %conn.route.worker_id,
-                    new_worker = %target_worker.worker_id,
-                    "cell routed to different worker; reconnecting"
-                );
-                conn.close().await;
-                let stream = TcpStream::connect(target_worker.addr).await?;
-                info!(
-                    target: "gateway",
-                    %peer,
-                    worker = %target_worker.worker_id,
-                    addr = %target_worker.addr,
-                    "new upstream connection established"
-                );
-                *conn = UpstreamConn {
-                    stream,
-                    route: target_worker.clone(),
-                };
-            }
-            None => {
-                let stream = TcpStream::connect(target_worker.addr).await?;
-                info!(
-                    target: "gateway",
-                    %peer,
-                    worker = %target_worker.worker_id,
-                    addr = %target_worker.addr,
-                    "connected to upstream worker"
-                );
-                upstream = Some(UpstreamConn {
-                    stream,
-                    route: target_worker.clone(),
-                });
-            }
-        }
-
-        let conn = upstream.as_mut().expect("upstream to be established");
-        conn.stream.write_all(&len_buf).await?;
-        conn.stream.write_all(&payload).await?;
-
-        // Read reply
-        let mut rlen_buf = [0u8; 4];
-        if let Err(e) = conn.stream.read_exact(&mut rlen_buf).await {
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-            ) {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %conn.route.worker_id,
-                    "upstream closed connection"
-                );
-                return Ok(());
-            }
-            return Err(e.into());
-        }
-        let rlen = u32::from_be_bytes(rlen_buf) as usize;
-        if rlen > 1_000_000 {
+        if let Err(e) = ensure_upstream(
+            &mut upstream,
+            route.clone(),
+            Arc::clone(&client_writer),
+            peer,
+        )
+        .await
+        {
             warn!(
                 target: "gateway",
                 %peer,
-                worker = %conn.route.worker_id,
-                len = rlen,
-                "reply frame too large"
+                worker = %route.worker_id,
+                addr = %route.addr,
+                error = ?e,
+                "failed to connect to worker; retrying"
             );
-            return Ok(());
+            upstream = None;
+            time::sleep(Duration::from_millis(50)).await;
+            continue;
         }
-        let mut rpayload = vec![0u8; rlen];
-        conn.stream.read_exact(&mut rpayload).await?;
-        stream.write_all(&rlen_buf).await?;
-        stream.write_all(&rpayload).await?;
+
+        let conn = upstream.as_mut().expect("upstream to be established");
+        if let Err(e) = conn.writer.write_all(&len_buf).await {
+            warn!(
+                target: "gateway",
+                %peer,
+                worker = %route.worker_id,
+                error = ?e,
+                "failed forwarding frame to worker; reconnecting"
+            );
+            conn.close().await;
+            upstream = None;
+            continue;
+        }
+        if let Err(e) = conn.writer.write_all(&payload).await {
+            warn!(
+                target: "gateway",
+                %peer,
+                worker = %route.worker_id,
+                error = ?e,
+                "failed forwarding frame payload to worker; reconnecting"
+            );
+            conn.close().await;
+            upstream = None;
+            continue;
+        }
+    };
+
+    if let Some(mut conn) = upstream {
+        conn.close().await;
     }
+
+    result
 }
 
 struct UpstreamConn {
-    stream: TcpStream,
+    writer: OwnedWriteHalf,
     route: WorkerRoute,
+    reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl UpstreamConn {
     async fn close(&mut self) {
-        if let Err(e) = self.stream.shutdown().await {
-            warn!(
+        self.reader_handle.abort();
+        let _ = self.writer.shutdown().await;
+    }
+}
+
+async fn ensure_upstream(
+    upstream: &mut Option<UpstreamConn>,
+    target_worker: WorkerRoute,
+    client_writer: Arc<Mutex<OwnedWriteHalf>>,
+    peer: SocketAddr,
+) -> Result<()> {
+    // Reconnect if the existing upstream reader task has completed.
+    if upstream
+        .as_ref()
+        .is_some_and(|conn| conn.reader_handle.is_finished())
+    {
+        if let Some(conn) = upstream.as_mut() {
+            info!(
                 target: "gateway",
-                worker = %self.route.worker_id,
-                error = ?e,
-                "failed to shutdown upstream connection"
+                %peer,
+                worker = %conn.route.worker_id,
+                "upstream connection ended; reconnecting"
             );
+            conn.close().await;
+        }
+        *upstream = None;
+    }
+
+    let needs_new = match upstream {
+        Some(conn) if conn.route.addr == target_worker.addr => false,
+        Some(conn) => {
+            info!(
+                target: "gateway",
+                %peer,
+                old_worker = %conn.route.worker_id,
+                new_worker = %target_worker.worker_id,
+                "cell routed to different worker; reconnecting"
+            );
+            conn.close().await;
+            true
+        }
+        None => true,
+    };
+
+    if needs_new {
+        let new_conn = connect_upstream(target_worker.clone(), client_writer, peer).await?;
+        if upstream.replace(new_conn).is_some() {
+            // old connection already closed above
         }
     }
+
+    Ok(())
+}
+
+async fn connect_upstream(
+    target_worker: WorkerRoute,
+    client_writer: Arc<Mutex<OwnedWriteHalf>>,
+    peer: SocketAddr,
+) -> Result<UpstreamConn> {
+    let stream = TcpStream::connect(target_worker.addr).await?;
+    info!(
+        target: "gateway",
+        %peer,
+        worker = %target_worker.worker_id,
+        addr = %target_worker.addr,
+        "connected to upstream worker"
+    );
+    let (reader, writer) = stream.into_split();
+    let reader_handle = spawn_upstream_reader(
+        reader,
+        Arc::clone(&client_writer),
+        peer,
+        target_worker.clone(),
+    );
+    Ok(UpstreamConn {
+        writer,
+        route: target_worker,
+        reader_handle,
+    })
+}
+
+fn spawn_upstream_reader(
+    mut reader: OwnedReadHalf,
+    client_writer: Arc<Mutex<OwnedWriteHalf>>,
+    peer: SocketAddr,
+    route: WorkerRoute,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let mut rlen_buf = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut rlen_buf).await {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) {
+                    info!(
+                        target: "gateway",
+                        %peer,
+                        worker = %route.worker_id,
+                        "upstream closed connection"
+                    );
+                } else {
+                    warn!(
+                        target: "gateway",
+                        %peer,
+                        worker = %route.worker_id,
+                        error = ?e,
+                        "failed reading reply from upstream"
+                    );
+                }
+                break;
+            }
+            let rlen = u32::from_be_bytes(rlen_buf) as usize;
+            if rlen > 1_000_000 {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    len = rlen,
+                    "reply frame too large"
+                );
+                break;
+            }
+            let mut rpayload = vec![0u8; rlen];
+            if let Err(e) = reader.read_exact(&mut rpayload).await {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    error = ?e,
+                    "failed to read reply payload from upstream"
+                );
+                break;
+            }
+
+            let mut writer = client_writer.lock().await;
+            if let Err(e) = writer.write_all(&rlen_buf).await {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    error = ?e,
+                    "failed to write reply length to client"
+                );
+                break;
+            }
+            if let Err(e) = writer.write_all(&rpayload).await {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    error = ?e,
+                    "failed to write reply payload to client"
+                );
+                break;
+            }
+        }
+    })
 }
 
 fn populate_routes(
@@ -294,13 +421,14 @@ fn init_tracing() {
 
 async fn load_initial_routes() -> Result<HashMap<CellKey, WorkerRoute>> {
     match fetch_remote_routes().await {
-        Ok(routes) if !routes.is_empty() => Ok(routes),
-        Ok(_) => {
-            warn!(
-                target: "gateway",
-                "orchestrator returned empty assignment listing; falling back to static mapping"
-            );
-            default_routes()
+        Ok(routes) => {
+            if routes.is_empty() {
+                warn!(
+                    target: "gateway",
+                    "orchestrator returned empty assignment listing; gateway will have no routes"
+                );
+            }
+            Ok(routes)
         }
         Err(e) => {
             warn!(
@@ -332,22 +460,23 @@ async fn routing_refresh_loop(routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>
     loop {
         ticker.tick().await;
         match fetch_remote_routes().await {
-            Ok(new_routes) if new_routes.is_empty() => {
-                warn!(
-                    target: "gateway",
-                    "orchestrator returned empty assignment listing; keeping existing routes"
-                );
-            }
             Ok(new_routes) => {
                 let mut guard = routes.write().await;
                 if *guard != new_routes {
                     let new_len = new_routes.len();
                     *guard = new_routes;
-                    info!(
-                        target: "gateway",
-                        cells = new_len,
-                        "routing table refreshed from orchestrator"
-                    );
+                    if new_len == 0 {
+                        warn!(
+                            target: "gateway",
+                            "routing table refreshed from orchestrator; no routes available"
+                        );
+                    } else {
+                        info!(
+                            target: "gateway",
+                            cells = new_len,
+                            "routing table refreshed from orchestrator"
+                        );
+                    }
                 } else {
                     debug!(target: "gateway", "routing table unchanged after refresh");
                 }
@@ -423,21 +552,7 @@ async fn apply_listing_update(
     routes: &Arc<RwLock<HashMap<CellKey, WorkerRoute>>>,
     listing: AssignmentListing,
 ) -> Result<bool> {
-    if listing.workers.is_empty() {
-        warn!(
-            target: "gateway",
-            "received empty assignment listing from orchestrator watch; keeping existing routes"
-        );
-        return Ok(false);
-    }
     let new_routes = routes_from_listing(&listing)?;
-    if new_routes.is_empty() {
-        warn!(
-            target: "gateway",
-            "assignment listing contained no cells; keeping existing routes"
-        );
-        return Ok(false);
-    }
     let mut guard = routes.write().await;
     if *guard == new_routes {
         debug!(target: "gateway", "assignment listing unchanged; skipping route swap");
@@ -445,11 +560,18 @@ async fn apply_listing_update(
     }
     let new_len = new_routes.len();
     *guard = new_routes;
-    info!(
-        target: "gateway",
-        cells = new_len,
-        "routing table updated from orchestrator watch"
-    );
+    if new_len == 0 {
+        warn!(
+            target: "gateway",
+            "routing table updated from orchestrator watch; no routes available"
+        );
+    } else {
+        info!(
+            target: "gateway",
+            cells = new_len,
+            "routing table updated from orchestrator watch"
+        );
+    }
     Ok(true)
 }
 
@@ -481,6 +603,11 @@ fn routes_from_listing(listing: &AssignmentListing) -> Result<HashMap<CellKey, W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tessera_core::encode_frame;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
     use tokio_stream::iter;
 
     #[test]
@@ -547,7 +674,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_listing_keeps_existing_routes() {
+    async fn upstream_connect_failure_does_not_drop_client() {
+        let unused_addr = {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind unused port");
+            let addr = listener.local_addr().expect("listener addr");
+            drop(listener);
+            addr
+        };
+
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(CellId::grid(0, 0, 0)),
+            WorkerRoute {
+                worker_id: "missing".to_string(),
+                addr: unused_addr,
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                let _ = handle_conn(sock, peer, routing_clone).await;
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+        let env = Envelope {
+            cell: CellId::grid(0, 0, 0),
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 1 },
+        };
+        client
+            .write_all(&encode_frame(&env))
+            .await
+            .expect("send first frame");
+
+        let env2 = Envelope {
+            cell: CellId::grid(0, 0, 0),
+            seq: 1,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 2 },
+        };
+        client
+            .write_all(&encode_frame(&env2))
+            .await
+            .expect("send second frame");
+
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_millis(50), client.read_exact(&mut buf)).await;
+        assert!(
+            read.is_err(),
+            "client connection closed unexpectedly after upstream connect failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_listing_clears_routes() {
         let routes = Arc::new(RwLock::new(HashMap::new()));
         let listing_initial = AssignmentListing {
             workers: vec![AssignmentBundle {
@@ -571,6 +763,6 @@ mod tests {
             .expect("process listing stream");
 
         let guard = routes.read().await;
-        assert_eq!(guard.len(), 1);
+        assert!(guard.is_empty());
     }
 }

@@ -1189,6 +1189,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "serde_json",
  "tessera-core",
  "tessera-proto",
  "tokio",

@@ -79,9 +79,16 @@ impl Config {
     }
 }
 
-fn listing_from_config(config: &Config) -> AssignmentListing {
+fn listing_with_runtime(
+    config: &Config,
+    runtime: &HashMap<String, WorkerRuntime>,
+) -> AssignmentListing {
     let mut bundles = Vec::new();
     for (worker_id, worker) in config.all_workers() {
+        let addr = runtime
+            .get(worker_id)
+            .map(|rt| rt.addr.as_str())
+            .unwrap_or(worker.addr.as_str());
         let cells = worker
             .cells
             .iter()
@@ -89,7 +96,7 @@ fn listing_from_config(config: &Config) -> AssignmentListing {
             .collect::<Vec<_>>();
         bundles.push(AssignmentBundle {
             worker_id: worker_id.clone(),
-            addr: worker.addr.clone(),
+            addr: addr.to_string(),
             cells,
         });
     }
@@ -177,7 +184,7 @@ struct OrchestratorService {
 impl OrchestratorService {
     fn new(config: Config) -> Self {
         let config = Arc::new(config);
-        let initial_listing = listing_from_config(&config);
+        let initial_listing = listing_with_runtime(&config, &HashMap::new());
         let (listing_tx, _) = watch::channel(initial_listing);
         Self {
             config,
@@ -196,12 +203,13 @@ impl OrchestratorService {
         AssignmentSnapshot { cells: entries }
     }
 
-    fn listing(&self) -> AssignmentListing {
-        listing_from_config(&self.config)
+    async fn listing(&self) -> AssignmentListing {
+        let runtime = self.runtime.read().await;
+        listing_with_runtime(&self.config, &runtime)
     }
 
-    fn publish_listing_if_changed(&self) {
-        let listing = self.listing();
+    async fn publish_listing_if_changed(&self) {
+        let listing = self.listing().await;
         if *self.listing_tx.borrow() == listing {
             return;
         }
@@ -283,7 +291,7 @@ impl Orchestrator for OrchestratorService {
             }
         }
 
-        self.publish_listing_if_changed();
+        self.publish_listing_if_changed().await;
         Ok(Response::new(snapshot))
     }
 
@@ -323,7 +331,7 @@ impl Orchestrator for OrchestratorService {
         &self,
         _request: Request<ListAssignmentsRequest>,
     ) -> Result<Response<AssignmentListing>, Status> {
-        let listing = self.listing();
+        let listing = self.listing().await;
         Ok(Response::new(listing))
     }
 

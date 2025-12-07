@@ -84,6 +84,10 @@ pub enum ServerMsg {
         cell: CellId,
         moved: Vec<ActorState>,
     },
+    Despawn {
+        cell: CellId,
+        actors: Vec<EntityId>,
+    },
 }
 
 // ---------- Envelope ----------

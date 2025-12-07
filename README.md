@@ -41,6 +41,7 @@ Cell-based world orchestration for real-time servers in Rust.
   - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
   - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
   - `TESSERA_WORKER_ID` 기본 `worker-local`
+  - `TESSERA_WORKER_REFRESH_SECS` 기본 `5`초(Orchestrator 연결 실패 시 워커가 할당 재등록을 재시도하는 주기)
   - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
   - `RUST_LOG` 기본 `info`
 - 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADDR` 단일 워커로 폴백

@@ -12,3 +12,6 @@ tessera-core = { path = "../tessera-core" }
 bytes = { workspace = true }
 tessera-proto = { path = "../tessera-proto" }
 tonic = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
