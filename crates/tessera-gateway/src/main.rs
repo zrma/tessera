@@ -27,7 +27,7 @@ struct CellKey(CellId);
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkerRoute {
     worker_id: String,
-    addr: SocketAddr,
+    addr: String,
 }
 
 #[derive(Clone)]
@@ -127,9 +127,25 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
         let mut buf = BytesMut::with_capacity(4 + len);
         buf.extend_from_slice(&len_buf);
         buf.extend_from_slice(&payload);
-        let Some(env_in) = try_decode_frame::<Envelope<ClientMsg>>(&mut buf) else {
-            warn!(target: "gateway", %peer, "failed to decode frame for routing");
-            continue;
+        let env_in = match try_decode_frame::<Envelope<ClientMsg>>(&mut buf) {
+            Ok(Some(env_in)) => env_in,
+            Ok(None) => {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    "incomplete frame for routing; closing client connection"
+                );
+                break Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    error = ?e,
+                    "failed to decode frame for routing; closing client connection"
+                );
+                break Ok(());
+            }
         };
         let cell = env_in.cell;
         let mut attempt = 0usize;
@@ -296,7 +312,7 @@ async fn connect_upstream(
     client_writer: Arc<Mutex<OwnedWriteHalf>>,
     peer: SocketAddr,
 ) -> Result<UpstreamConn> {
-    let stream = TcpStream::connect(target_worker.addr).await?;
+    let stream = TcpStream::connect(target_worker.addr.as_str()).await?;
     info!(
         target: "gateway",
         %peer,
@@ -399,16 +415,25 @@ fn spawn_upstream_reader(
 
 fn populate_routes(
     routes: &mut HashMap<CellKey, WorkerRoute>,
-    addr: SocketAddr,
+    addr: &str,
     bundle: &AssignmentBundle,
 ) -> Result<()> {
     for assignment in &bundle.cells {
         let cell = assignment_to_cell(assignment)?;
+        let key = CellKey(cell);
+        if let Some(existing) = routes.get(&key) {
+            return Err(anyhow::anyhow!(
+                "cell {:?} already assigned to worker {} (new worker {})",
+                cell,
+                existing.worker_id,
+                bundle.worker_id
+            ));
+        }
         routes.insert(
-            CellKey(cell),
+            key,
             WorkerRoute {
                 worker_id: bundle.worker_id.clone(),
-                addr,
+                addr: addr.to_string(),
             },
         );
     }
@@ -416,10 +441,13 @@ fn populate_routes(
 }
 
 fn default_routes() -> Result<HashMap<CellKey, WorkerRoute>> {
-    let addr: SocketAddr = std::env::var("TESSERA_WORKER_ADDR")
+    let addr = std::env::var("TESSERA_WORKER_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:5001".to_string())
-        .parse()
-        .context("parse fallback TESSERA_WORKER_ADDR")?;
+        .trim()
+        .to_string();
+    if addr.is_empty() {
+        return Err(anyhow::anyhow!("fallback TESSERA_WORKER_ADDR is empty"));
+    }
     let mut map = HashMap::new();
     map.insert(
         CellKey(CellId::grid(0, 0, 0)),
@@ -627,10 +655,14 @@ where
 fn routes_from_listing(listing: &AssignmentListing) -> Result<HashMap<CellKey, WorkerRoute>> {
     let mut routes = HashMap::new();
     for bundle in &listing.workers {
-        let parsed_addr: SocketAddr = bundle.addr.parse().with_context(|| {
-            format!("parse worker addr {} for {}", bundle.addr, bundle.worker_id)
-        })?;
-        populate_routes(&mut routes, parsed_addr, bundle)?;
+        let addr = bundle.addr.trim();
+        if addr.is_empty() {
+            return Err(anyhow::anyhow!(
+                "worker addr empty for {}",
+                bundle.worker_id
+            ));
+        }
+        populate_routes(&mut routes, addr, bundle)?;
     }
     Ok(routes)
 }
@@ -706,7 +738,63 @@ mod tests {
             .get(&CellKey(CellId::grid(0, 0, 0)))
             .expect("route present");
         assert_eq!(route.worker_id, "worker-b");
-        assert_eq!(route.addr, "127.0.0.1:5002".parse().unwrap());
+        assert_eq!(route.addr, "127.0.0.1:5002");
+    }
+
+    #[test]
+    fn listing_accepts_hostname_addrs() {
+        let listing = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-a".to_string(),
+                addr: "worker-a:5001".to_string(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 0,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+        };
+
+        let routes = routes_from_listing(&listing).expect("parse listing");
+        let route = routes
+            .get(&CellKey(CellId::grid(0, 0, 0)))
+            .expect("route present");
+        assert_eq!(route.addr, "worker-a:5001");
+    }
+
+    #[test]
+    fn listing_rejects_duplicate_cells() {
+        let listing = AssignmentListing {
+            workers: vec![
+                AssignmentBundle {
+                    worker_id: "worker-a".to_string(),
+                    addr: "127.0.0.1:5001".to_string(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+                AssignmentBundle {
+                    worker_id: "worker-b".to_string(),
+                    addr: "127.0.0.1:5002".to_string(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+        };
+
+        let err = routes_from_listing(&listing).expect_err("should reject duplicates");
+        assert!(err.to_string().contains("already assigned"));
     }
 
     #[tokio::test]
@@ -725,7 +813,7 @@ mod tests {
             CellKey(CellId::grid(0, 0, 0)),
             WorkerRoute {
                 worker_id: "missing".to_string(),
-                addr: unused_addr,
+                addr: unused_addr.to_string(),
             },
         );
         let routing = RoutingTable::new(map);
@@ -770,6 +858,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_disconnect_allows_reconnect() {
+        let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+
+        let mut worker_task = tokio::spawn(async move {
+            run_ping_worker_once_per_conn(worker_listener, 2).await;
+        });
+
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(CellId::grid(0, 0, 0)),
+            WorkerRoute {
+                worker_id: "worker-test".to_string(),
+                addr: worker_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        let mut gateway_task = tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                handle_conn(sock, peer, routing_clone)
+                    .await
+                    .expect("handle conn");
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+        let cell = CellId::grid(0, 0, 0);
+
+        let ping1 = Envelope {
+            cell,
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 1 },
+        };
+        client
+            .write_all(&encode_frame(&ping1))
+            .await
+            .expect("send first ping");
+        let reply1 = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert!(matches!(reply1.payload, ServerMsg::Pong { ts } if ts == 1));
+
+        let ping2 = Envelope {
+            cell,
+            seq: 1,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 2 },
+        };
+        client
+            .write_all(&encode_frame(&ping2))
+            .await
+            .expect("send second ping");
+        let reply2 = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert!(matches!(reply2.payload, ServerMsg::Pong { ts } if ts == 2));
+
+        drop(client);
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker", &mut worker_task).await;
+    }
+
+    #[tokio::test]
     async fn gateway_basic_flow_forwards_join_and_move() {
         let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
         let worker_addr = worker_listener.local_addr().expect("worker addr");
@@ -783,7 +940,7 @@ mod tests {
             CellKey(CellId::grid(0, 0, 0)),
             WorkerRoute {
                 worker_id: "worker-test".to_string(),
-                addr: worker_addr,
+                addr: worker_addr.to_string(),
             },
         );
         let routing = RoutingTable::new(map);
@@ -971,6 +1128,31 @@ mod tests {
                 }
                 panic!("worker write error: {e:?}");
             }
+        }
+    }
+
+    async fn run_ping_worker_once_per_conn(listener: TcpListener, expected: usize) {
+        for _ in 0..expected {
+            let (mut socket, _peer) = listener.accept().await.expect("accept worker");
+            let mut len_buf = [0u8; 4];
+            socket.read_exact(&mut len_buf).await.expect("read len");
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            socket.read_exact(&mut payload).await.expect("read payload");
+            let env_in: Envelope<ClientMsg> =
+                serde_json::from_slice(&payload).expect("decode client frame");
+            let ts = match env_in.payload {
+                ClientMsg::Ping { ts } => ts,
+                other => panic!("expected ping, got {other:?}"),
+            };
+            let env_out = Envelope {
+                cell: env_in.cell,
+                seq: 0,
+                epoch: env_in.epoch,
+                payload: ServerMsg::Pong { ts },
+            };
+            let frame = encode_frame(&env_out);
+            socket.write_all(&frame).await.expect("write reply");
         }
     }
 

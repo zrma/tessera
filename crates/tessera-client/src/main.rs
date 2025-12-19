@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustyline::{DefaultEditor, error::ReadlineError};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use tessera_core::{CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, encode_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,11 +77,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let addr: SocketAddr = cli
-        .addr
-        .parse()
-        .with_context(|| format!("invalid addr: {}", cli.addr))?;
-
+    let addr = cli.addr.trim();
     let mut stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect to {}", addr))?;

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -73,10 +73,6 @@ impl Config {
     fn assignments_for(&self, worker_id: &str) -> Option<&[CellId]> {
         self.worker(worker_id).map(|w| w.cells.as_slice())
     }
-
-    fn all_workers(&self) -> impl Iterator<Item = (&String, &WorkerStatic)> {
-        self.workers.iter()
-    }
 }
 
 fn listing_with_runtime(
@@ -84,9 +80,12 @@ fn listing_with_runtime(
     runtime: &HashMap<String, WorkerRuntime>,
 ) -> AssignmentListing {
     let mut bundles = Vec::new();
-    for (worker_id, worker) in config.all_workers() {
+    let mut worker_ids: Vec<&String> = config.workers.keys().collect();
+    worker_ids.sort();
+    for worker_id in worker_ids {
+        let worker = config.workers.get(worker_id).expect("worker id from keys");
         let addr = runtime
-            .get(worker_id)
+            .get(worker_id.as_str())
             .map(|rt| rt.addr.as_str())
             .unwrap_or(worker.addr.as_str());
         let cells = worker
@@ -155,12 +154,41 @@ fn parse_config(raw: &str) -> Result<Config> {
     let parsed: OrchConfig =
         serde_json::from_str(raw).context("parse orchestrator config as JSON")?;
     let mut workers = HashMap::new();
+    let mut assigned_cells: HashMap<CellId, String> = HashMap::new();
     for w in parsed.workers {
-        let cells = w.cells.into_iter().map(CellId::from).collect();
+        let id = w.id.trim();
+        if id.is_empty() {
+            return Err(anyhow!("worker id must not be empty"));
+        }
+        if workers.contains_key(id) {
+            return Err(anyhow!("duplicate worker id: {}", id));
+        }
+        let addr = w.addr.trim();
+        if addr.is_empty() {
+            return Err(anyhow!("worker addr must not be empty for {}", id));
+        }
+        let mut cells = Vec::with_capacity(w.cells.len());
+        for cell_cfg in w.cells {
+            let cell = CellId::from(cell_cfg);
+            if let Some(prev) = assigned_cells.get(&cell) {
+                return Err(anyhow!(
+                    "cell world={},cx={},cy={},depth={},sub={} assigned to both {} and {}",
+                    cell.world,
+                    cell.cx,
+                    cell.cy,
+                    cell.depth,
+                    cell.sub,
+                    prev,
+                    id
+                ));
+            }
+            assigned_cells.insert(cell, id.to_string());
+            cells.push(cell);
+        }
         workers.insert(
-            w.id,
+            id.to_string(),
             WorkerStatic {
-                addr: w.addr,
+                addr: addr.to_string(),
                 cells,
             },
         );
@@ -234,19 +262,24 @@ impl Orchestrator for OrchestratorService {
         request: Request<WorkerRegistration>,
     ) -> Result<Response<AssignmentSnapshot>, Status> {
         let req = request.into_inner();
-        if req.worker_id.is_empty() {
+        let worker_id = req.worker_id.trim();
+        if worker_id.is_empty() {
             return Err(Status::invalid_argument("worker_id must not be empty"));
         }
+        let addr = req.addr.trim();
+        if addr.is_empty() {
+            return Err(Status::invalid_argument("addr must not be empty"));
+        }
 
-        let planned = self.config.worker(&req.worker_id);
-        let snapshot = self.snapshot_for(&req.worker_id);
+        let planned = self.config.worker(worker_id);
+        let snapshot = self.snapshot_for(worker_id);
 
         {
             let mut guard = self.runtime.write().await;
             guard.insert(
-                req.worker_id.clone(),
+                worker_id.to_string(),
                 WorkerRuntime {
-                    addr: req.addr.clone(),
+                    addr: addr.to_string(),
                     last_seen: SystemTime::now(),
                 },
             );
@@ -255,27 +288,27 @@ impl Orchestrator for OrchestratorService {
         let cell_count = snapshot.cells.len();
         match planned {
             Some(expected) => {
-                if expected.addr != req.addr {
+                if expected.addr != addr {
                     warn!(
                         target: "orch",
-                        worker_id = req.worker_id,
+                        worker_id,
                         expected_addr = %expected.addr,
-                        reported_addr = req.addr,
+                        reported_addr = addr,
                         "worker address mismatch"
                     );
                 }
                 if cell_count == 0 {
                     warn!(
                         target: "orch",
-                        worker_id = req.worker_id,
-                        addr = req.addr,
+                        worker_id,
+                        addr,
                         "worker registered but no cells assigned"
                     );
                 } else {
                     info!(
                         target: "orch",
-                        worker_id = req.worker_id,
-                        addr = req.addr,
+                        worker_id,
+                        addr,
                         cells = cell_count,
                         "worker registered"
                     );
@@ -284,8 +317,8 @@ impl Orchestrator for OrchestratorService {
             None => {
                 warn!(
                     target: "orch",
-                    worker_id = req.worker_id,
-                    addr = req.addr,
+                    worker_id,
+                    addr,
                     "worker registered but not defined in config"
                 );
             }
@@ -300,30 +333,31 @@ impl Orchestrator for OrchestratorService {
         request: Request<AssignmentQuery>,
     ) -> Result<Response<AssignmentSnapshot>, Status> {
         let req = request.into_inner();
-        if req.worker_id.is_empty() {
+        let worker_id = req.worker_id.trim();
+        if worker_id.is_empty() {
             return Err(Status::invalid_argument("worker_id must not be empty"));
         }
 
         {
             let mut guard = self.runtime.write().await;
-            if let Some(entry) = guard.get_mut(&req.worker_id) {
+            if let Some(entry) = guard.get_mut(worker_id) {
                 entry.last_seen = SystemTime::now();
                 tracing::debug!(
                     target: "orch",
-                    worker_id = req.worker_id,
+                    worker_id,
                     addr = %entry.addr,
                     "served assignment snapshot"
                 );
             } else {
                 warn!(
                     target: "orch",
-                    worker_id = req.worker_id,
+                    worker_id,
                     "assignment requested before registration"
                 );
             }
         }
 
-        let snapshot = self.snapshot_for(&req.worker_id);
+        let snapshot = self.snapshot_for(worker_id);
         Ok(Response::new(snapshot))
     }
 
@@ -417,6 +451,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_config_rejects_empty_worker_id() {
+        let json = r#"
+        {
+            "workers": [
+                {
+                    "id": "",
+                    "addr": "127.0.0.1:5001",
+                    "cells": [{"world": 0, "cx": 0, "cy": 0}]
+                }
+            ]
+        }"#;
+
+        let err = parse_config(json).expect_err("should fail");
+        assert!(err.to_string().contains("worker id"));
+    }
+
+    #[test]
+    fn parse_config_rejects_empty_worker_addr() {
+        let json = r#"
+        {
+            "workers": [
+                {
+                    "id": "worker-a",
+                    "addr": "   ",
+                    "cells": [{"world": 0, "cx": 0, "cy": 0}]
+                }
+            ]
+        }"#;
+
+        let err = parse_config(json).expect_err("should fail");
+        assert!(err.to_string().contains("worker addr"));
+    }
+
+    #[test]
+    fn parse_config_rejects_duplicate_cells() {
+        let json = r#"
+        {
+            "workers": [
+                {
+                    "id": "worker-a",
+                    "addr": "127.0.0.1:5001",
+                    "cells": [{"world": 0, "cx": 0, "cy": 0}]
+                },
+                {
+                    "id": "worker-b",
+                    "addr": "127.0.0.1:5002",
+                    "cells": [{"world": 0, "cx": 0, "cy": 0}]
+                }
+            ]
+        }"#;
+
+        let err = parse_config(json).expect_err("should fail");
+        assert!(err.to_string().contains("assigned to both"));
+    }
+
     #[tokio::test]
     async fn register_and_get_assignments() {
         let mut workers = HashMap::new();
@@ -467,6 +557,19 @@ mod tests {
             .expect("get assignments for unknown worker")
             .into_inner();
         assert!(empty_snapshot.cells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_worker_rejects_empty_addr() {
+        let service = OrchestratorService::new(Config::default_single_cell());
+        let err = service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-local".into(),
+                addr: "   ".into(),
+            }))
+            .await
+            .expect_err("should reject empty addr");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

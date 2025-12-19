@@ -16,16 +16,18 @@ use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{Assignment, WorkerRegistration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{
     Mutex, RwLock,
-    mpsc::{UnboundedSender, unbounded_channel},
+    mpsc::{Sender, channel},
 };
 use tokio::time;
 use tracing::{error, info, warn};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 type OutboundMsg = (CellId, Option<u32>, ServerMsg);
-type CellSubscribers = HashMap<CellId, Vec<(u64, UnboundedSender<OutboundMsg>)>>;
+type CellSubscribers = HashMap<CellId, Vec<(u64, Sender<OutboundMsg>)>>;
 type CellOwners = HashMap<CellId, HashMap<EntityId, u64>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +45,7 @@ struct SharedState {
 }
 
 impl SharedState {
-    async fn subscribe(&self, cell: CellId, client_id: u64, tx: UnboundedSender<OutboundMsg>) {
+    async fn subscribe(&self, cell: CellId, client_id: u64, tx: Sender<OutboundMsg>) {
         let mut subs = self.subscribers.lock().await;
         let entry = subs.entry(cell).or_default();
         if entry.iter().any(|(id, _)| *id == client_id) {
@@ -67,7 +69,11 @@ impl SharedState {
                 if exclude.is_some_and(|excluded| excluded == *id) {
                     return true;
                 }
-                tx.send((cell, None, msg.clone())).is_ok()
+                match tx.try_send((cell, None, msg.clone())) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Closed(_)) => false,
+                }
             });
             if entries.is_empty() {
                 subs.remove(&cell);
@@ -180,11 +186,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:5001".to_string())
         .parse()
         .expect("invalid TESSERA_WORKER_ADDR");
+    let advertise_addr = resolve_advertise_addr(addr)?;
     let worker_id =
         std::env::var("TESSERA_WORKER_ID").unwrap_or_else(|_| "worker-local".to_string());
 
-    let (assignments, used_fallback) =
-        load_assignments(&worker_id, addr, || fetch_assignments(&worker_id, addr)).await;
+    let (assignments, used_fallback) = load_assignments(&worker_id, addr, &advertise_addr, || {
+        fetch_assignments(&worker_id, &advertise_addr)
+    })
+    .await;
 
     info!(
         target: "worker",
@@ -205,9 +214,11 @@ async fn main() -> Result<()> {
         let owned_for_retry = owned_cells.clone();
         let state_for_retry = state.clone();
         let worker_id_for_retry = worker_id.clone();
+        let advertise_addr_for_retry = advertise_addr.clone();
         let fetcher = move || {
             let worker_id_for_retry = worker_id_for_retry.clone();
-            async move { fetch_assignments(&worker_id_for_retry, addr).await }
+            let advertise_addr_for_retry = advertise_addr_for_retry.clone();
+            async move { fetch_assignments(&worker_id_for_retry, &advertise_addr_for_retry).await }
         };
         tokio::spawn(retry_assignments_until_registered(
             worker_id.clone(),
@@ -257,7 +268,7 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn fetch_assignments(worker_id: &str, worker_addr: SocketAddr) -> Result<Vec<CellId>> {
+async fn fetch_assignments(worker_id: &str, advertise_addr: &str) -> Result<Vec<CellId>> {
     let orchestrator_addr =
         std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
     let endpoint =
@@ -273,7 +284,7 @@ async fn fetch_assignments(worker_id: &str, worker_addr: SocketAddr) -> Result<V
     let response = client
         .register_worker(WorkerRegistration {
             worker_id: worker_id.to_string(),
-            addr: worker_addr.to_string(),
+            addr: advertise_addr.to_string(),
         })
         .await
         .context("register worker with orchestrator")?
@@ -302,7 +313,8 @@ fn assignment_to_cell(assignment: Assignment) -> Result<CellId> {
 
 async fn load_assignments<F, Fut>(
     worker_id: &str,
-    worker_addr: SocketAddr,
+    bind_addr: SocketAddr,
+    advertise_addr: &str,
     fetcher: F,
 ) -> (Vec<CellId>, bool)
 where
@@ -315,7 +327,8 @@ where
                 warn!(
                     target: "worker",
                     worker_id,
-                    addr = %worker_addr,
+                    bind_addr = %bind_addr,
+                    advertise_addr,
                     "orchestrator returned no assignments; worker will idle"
                 );
             }
@@ -325,7 +338,8 @@ where
             warn!(
                 target: "worker",
                 worker_id,
-                addr = %worker_addr,
+                bind_addr = %bind_addr,
+                advertise_addr,
                 error = ?e,
                 "failed to fetch assignments; falling back to default cell"
             );
@@ -337,6 +351,17 @@ where
 /// 오케스트레이터와 통신하지 못할 때 개발/데모 용도로 사용하는 기본 셀 매핑
 fn default_assignments() -> Vec<CellId> {
     vec![CellId::grid(0, 0, 0)]
+}
+
+fn resolve_advertise_addr(bind_addr: SocketAddr) -> Result<String> {
+    if let Ok(raw) = std::env::var("TESSERA_WORKER_ADVERTISE_ADDR") {
+        let addr = raw.trim();
+        if addr.is_empty() {
+            return Err(anyhow!("TESSERA_WORKER_ADVERTISE_ADDR is empty"));
+        }
+        return Ok(addr.to_string());
+    }
+    Ok(bind_addr.to_string())
 }
 
 fn assignment_retry_interval() -> Duration {
@@ -419,6 +444,24 @@ fn delta_is_finite(dx: f32, dy: f32) -> bool {
     dx.is_finite() && dy.is_finite()
 }
 
+fn make_error(code: &str, message: impl Into<String>) -> ServerMsg {
+    ServerMsg::Error {
+        code: code.to_string(),
+        message: message.into(),
+    }
+}
+
+fn enqueue_error(
+    tx: &Sender<OutboundMsg>,
+    cell: CellId,
+    epoch: u32,
+    code: &str,
+    message: impl Into<String>,
+) -> Result<(), ()> {
+    tx.try_send((cell, Some(epoch), make_error(code, message)))
+        .map_err(|_| ())
+}
+
 fn init_tracing() {
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     tracing_subscriber::fmt()
@@ -455,7 +498,7 @@ async fn handle_upstream(
     owned_cells: Arc<RwLock<HashSet<CellId>>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = unbounded_channel::<OutboundMsg>();
+    let (tx, mut rx) = channel::<OutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
     let epoch = Arc::new(AtomicU32::new(0));
     let writer_epoch = Arc::clone(&epoch);
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -505,9 +548,25 @@ async fn handle_upstream(
         let mut buf = BytesMut::with_capacity(4 + len);
         buf.extend_from_slice(&len_buf);
         buf.extend_from_slice(&payload);
-        let Some(env_in) = try_decode_frame::<Envelope<ClientMsg>>(&mut buf) else {
-            warn!(target: "worker", %peer, "failed to decode frame");
-            continue;
+        let env_in = match try_decode_frame::<Envelope<ClientMsg>>(&mut buf) {
+            Ok(Some(env_in)) => env_in,
+            Ok(None) => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "incomplete frame; closing connection"
+                );
+                break Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    error = ?e,
+                    "failed to decode frame; closing connection"
+                );
+                break Ok(());
+            }
         };
         epoch.store(env_in.epoch, Ordering::Relaxed);
         let cell = env_in.cell;
@@ -518,13 +577,29 @@ async fn handle_upstream(
                 cell = ?cell,
                 "received message for cell not owned by this worker"
             );
+            if enqueue_error(
+                &tx,
+                cell,
+                env_in.epoch,
+                "cell_not_owned",
+                "cell not owned by this worker",
+            )
+            .is_err()
+            {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "client response channel closed; closing connection"
+                );
+                break Ok(());
+            }
             continue;
         }
 
         match env_in.payload {
             ClientMsg::Ping { ts } => {
                 if tx
-                    .send((cell, Some(env_in.epoch), ServerMsg::Pong { ts }))
+                    .try_send((cell, Some(env_in.epoch), ServerMsg::Pong { ts }))
                     .is_err()
                 {
                     warn!(
@@ -544,6 +619,22 @@ async fn handle_upstream(
                         actor = actor.0,
                         "join rejected: non-finite position"
                     );
+                    if enqueue_error(
+                        &tx,
+                        cell,
+                        env_in.epoch,
+                        "invalid_position",
+                        "join rejected: invalid position",
+                    )
+                    .is_err()
+                    {
+                        warn!(
+                            target: "worker",
+                            %peer,
+                            "client response channel closed; closing connection"
+                        );
+                        break Ok(());
+                    }
                     continue;
                 }
                 let claim = state.claim_owner(cell, actor, client_id).await;
@@ -556,6 +647,22 @@ async fn handle_upstream(
                         existing_owner = existing,
                         "join rejected: actor owned by different client"
                     );
+                    if enqueue_error(
+                        &tx,
+                        cell,
+                        env_in.epoch,
+                        "actor_owned_by_other",
+                        "join rejected: actor owned by another client",
+                    )
+                    .is_err()
+                    {
+                        warn!(
+                            target: "worker",
+                            %peer,
+                            "client response channel closed; closing connection"
+                        );
+                        break Ok(());
+                    }
                     continue;
                 }
 
@@ -573,7 +680,7 @@ async fn handle_upstream(
                     owned_actors.insert((cell, actor));
                 }
                 if tx
-                    .send((
+                    .try_send((
                         cell,
                         Some(env_in.epoch),
                         ServerMsg::Snapshot {
@@ -614,6 +721,22 @@ async fn handle_upstream(
                         actor = actor.0,
                         "move rejected: non-finite delta"
                     );
+                    if enqueue_error(
+                        &tx,
+                        cell,
+                        env_in.epoch,
+                        "invalid_delta",
+                        "move rejected: invalid delta",
+                    )
+                    .is_err()
+                    {
+                        warn!(
+                            target: "worker",
+                            %peer,
+                            "client response channel closed; closing connection"
+                        );
+                        break Ok(());
+                    }
                     continue;
                 }
                 match state.owner_for(&cell, &actor).await {
@@ -628,6 +751,22 @@ async fn handle_upstream(
                             client_id,
                             "move rejected: actor owned by different client"
                         );
+                        if enqueue_error(
+                            &tx,
+                            cell,
+                            env_in.epoch,
+                            "actor_owned_by_other",
+                            "move rejected: actor owned by another client",
+                        )
+                        .is_err()
+                        {
+                            warn!(
+                                target: "worker",
+                                %peer,
+                                "client response channel closed; closing connection"
+                            );
+                            break Ok(());
+                        }
                         continue;
                     }
                     None => {
@@ -638,6 +777,22 @@ async fn handle_upstream(
                             actor = actor.0,
                             "move rejected: actor not joined"
                         );
+                        if enqueue_error(
+                            &tx,
+                            cell,
+                            env_in.epoch,
+                            "actor_not_joined",
+                            "move rejected: actor not joined",
+                        )
+                        .is_err()
+                        {
+                            warn!(
+                                target: "worker",
+                                %peer,
+                                "client response channel closed; closing connection"
+                            );
+                            break Ok(());
+                        }
                         continue;
                     }
                 }
@@ -656,6 +811,22 @@ async fn handle_upstream(
                                 actor = actor.0,
                                 "move rejected: cell has no actors"
                             );
+                            if enqueue_error(
+                                &tx,
+                                cell,
+                                env_in.epoch,
+                                "actor_not_joined",
+                                "move rejected: actor not joined",
+                            )
+                            .is_err()
+                            {
+                                warn!(
+                                    target: "worker",
+                                    %peer,
+                                    "client response channel closed; closing connection"
+                                );
+                                break Ok(());
+                            }
                             continue;
                         }
                     };
@@ -669,6 +840,22 @@ async fn handle_upstream(
                                 actor = actor.0,
                                 "move rejected: actor not found in cell"
                             );
+                            if enqueue_error(
+                                &tx,
+                                cell,
+                                env_in.epoch,
+                                "actor_not_joined",
+                                "move rejected: actor not joined",
+                            )
+                            .is_err()
+                            {
+                                warn!(
+                                    target: "worker",
+                                    %peer,
+                                    "client response channel closed; closing connection"
+                                );
+                                break Ok(());
+                            }
                             continue;
                         }
                     };
@@ -682,6 +869,22 @@ async fn handle_upstream(
                             actor = actor.0,
                             "move rejected: position overflow"
                         );
+                        if enqueue_error(
+                            &tx,
+                            cell,
+                            env_in.epoch,
+                            "position_overflow",
+                            "move rejected: position overflow",
+                        )
+                        .is_err()
+                        {
+                            warn!(
+                                target: "worker",
+                                %peer,
+                                "client response channel closed; closing connection"
+                            );
+                            break Ok(());
+                        }
                         continue;
                     }
                     entry.x = new_x;
@@ -696,7 +899,10 @@ async fn handle_upstream(
                     cell,
                     moved: vec![moved],
                 };
-                if tx.send((cell, Some(env_in.epoch), delta.clone())).is_err() {
+                if tx
+                    .try_send((cell, Some(env_in.epoch), delta.clone()))
+                    .is_err()
+                {
                     warn!(
                         target: "worker",
                         %peer,
@@ -826,22 +1032,26 @@ mod tests {
 
     #[tokio::test]
     async fn load_assignments_uses_fallback_on_error() {
-        let (cells, used_fallback) =
-            load_assignments("worker-a", "127.0.0.1:5001".parse().unwrap(), || async {
-                Err(anyhow!("boom"))
-            })
-            .await;
+        let (cells, used_fallback) = load_assignments(
+            "worker-a",
+            "127.0.0.1:5001".parse().unwrap(),
+            "127.0.0.1:5001",
+            || async { Err(anyhow!("boom")) },
+        )
+        .await;
         assert_eq!(cells, vec![CellId::grid(0, 0, 0)]);
         assert!(used_fallback);
     }
 
     #[tokio::test]
     async fn load_assignments_allows_empty_list() {
-        let (cells, used_fallback) =
-            load_assignments("worker-b", "127.0.0.1:5001".parse().unwrap(), || async {
-                Ok(vec![])
-            })
-            .await;
+        let (cells, used_fallback) = load_assignments(
+            "worker-b",
+            "127.0.0.1:5001".parse().unwrap(),
+            "127.0.0.1:5001",
+            || async { Ok(vec![]) },
+        )
+        .await;
         assert!(cells.is_empty());
         assert!(!used_fallback);
     }
@@ -849,12 +1059,16 @@ mod tests {
     #[tokio::test]
     async fn load_assignments_keeps_remote_cells_when_present() {
         let expected = vec![CellId::grid(1, 2, 3)];
-        let (cells, used_fallback) =
-            load_assignments("worker-c", "127.0.0.1:5001".parse().unwrap(), || {
+        let (cells, used_fallback) = load_assignments(
+            "worker-c",
+            "127.0.0.1:5001".parse().unwrap(),
+            "127.0.0.1:5001",
+            || {
                 let expected = expected.clone();
                 async move { Ok(expected) }
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(cells, vec![CellId::grid(1, 2, 3)]);
         assert!(!used_fallback);
     }
@@ -1021,6 +1235,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn move_without_join_returns_error() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([CellId::grid(0, 0, 0)])));
+        let server = tokio::spawn(async move {
+            let (sock, peer) = listener.accept().await.expect("accept connection");
+            handle_upstream(sock, peer, state, owned_cells)
+                .await
+                .expect("handle upstream");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect client");
+        let env = Envelope {
+            cell: CellId::grid(0, 0, 0),
+            seq: 0,
+            epoch: 7,
+            payload: ClientMsg::Move {
+                actor: EntityId(1),
+                dx: 1.0,
+                dy: 0.0,
+            },
+        };
+        client
+            .write_all(&encode_frame(&env))
+            .await
+            .expect("send move");
+
+        let reply = read_env(&mut client).await;
+        assert_eq!(reply.epoch, 7);
+        assert!(matches!(
+            reply.payload,
+            ServerMsg::Error { ref code, .. } if code == "actor_not_joined"
+        ));
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn unauthorized_client_does_not_receive_broadcast() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1068,6 +1325,11 @@ mod tests {
             .write_all(&encode_frame(&unauthorized_move))
             .await
             .expect("send unauthorized move");
+        let unauthorized_reply = read_env(&mut unauthorized).await;
+        assert!(matches!(
+            unauthorized_reply.payload,
+            ServerMsg::Error { ref code, .. } if code == "actor_not_joined"
+        ));
 
         let join_env = Envelope {
             cell: CellId::grid(0, 0, 0),
@@ -1301,9 +1563,9 @@ mod tests {
         let state = SharedState::default();
         let cell = CellId::grid(0, 0, 0);
 
-        let (tx, _rx) = unbounded_channel();
+        let (tx, _rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
         state.subscribe(cell, 10, tx).await;
-        let (tx2, _rx2) = unbounded_channel();
+        let (tx2, _rx2) = channel(OUTBOUND_CHANNEL_CAPACITY);
         state.subscribe(cell, 10, tx2).await;
 
         {
@@ -1314,7 +1576,7 @@ mod tests {
         let removed = HashSet::from([cell]);
         state.drop_cells(&removed).await;
 
-        let (tx3, _rx3) = unbounded_channel();
+        let (tx3, _rx3) = channel(OUTBOUND_CHANNEL_CAPACITY);
         state.subscribe(cell, 10, tx3).await;
 
         let subs = state.subscribers.lock().await;
