@@ -20,6 +20,7 @@
 - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
 - `TESSERA_GW_REFRESH_SECS` 기본 `5` (Gateway 라우팅 재조회 주기)
 - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
+- `TESSERA_WORKER_ADVERTISE_ADDR` 기본 `TESSERA_WORKER_ADDR` (오케스트레이터 등록용 워커 주소)
 - `TESSERA_WORKER_ID` 기본 `worker-local`
 - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
 - `RUST_LOG` 기본 `info`
