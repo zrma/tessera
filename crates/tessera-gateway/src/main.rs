@@ -18,6 +18,9 @@ use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
+const UPSTREAM_RETRY_MAX: usize = 3;
+const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct CellKey(CellId);
 
@@ -100,7 +103,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
     let client_writer = Arc::new(Mutex::new(client_writer));
     let mut upstream: Option<UpstreamConn> = None;
 
-    let result = loop {
+    let result = 'conn_loop: loop {
         let mut len_buf = [0u8; 4];
         if let Err(e) = client_reader.read_exact(&mut len_buf).await {
             if matches!(
@@ -129,61 +132,93 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
             continue;
         };
         let cell = env_in.cell;
-        let Some(route) = routing.lookup(&cell).await else {
-            warn!(
-                target: "gateway",
-                %peer,
-                cell = ?cell,
-                "no route available for cell"
-            );
-            continue;
-        };
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let Some(route) = routing.lookup(&cell).await else {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    cell = ?cell,
+                    attempt,
+                    max_attempts = UPSTREAM_RETRY_MAX,
+                    "no route available for cell"
+                );
+                if attempt >= UPSTREAM_RETRY_MAX {
+                    warn!(target: "gateway", %peer, cell = ?cell, "closing client connection");
+                    break 'conn_loop Ok(());
+                }
+                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                continue;
+            };
 
-        if let Err(e) = ensure_upstream(
-            &mut upstream,
-            route.clone(),
-            Arc::clone(&client_writer),
-            peer,
-        )
-        .await
-        {
-            warn!(
-                target: "gateway",
-                %peer,
-                worker = %route.worker_id,
-                addr = %route.addr,
-                error = ?e,
-                "failed to connect to worker; retrying"
-            );
-            upstream = None;
-            time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
+            if let Err(e) = ensure_upstream(
+                &mut upstream,
+                route.clone(),
+                Arc::clone(&client_writer),
+                peer,
+            )
+            .await
+            {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    addr = %route.addr,
+                    attempt,
+                    max_attempts = UPSTREAM_RETRY_MAX,
+                    error = ?e,
+                    "failed to connect to worker; retrying"
+                );
+                upstream = None;
+                if attempt >= UPSTREAM_RETRY_MAX {
+                    warn!(target: "gateway", %peer, "closing client connection");
+                    break 'conn_loop Ok(());
+                }
+                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                continue;
+            }
 
-        let conn = upstream.as_mut().expect("upstream to be established");
-        if let Err(e) = conn.writer.write_all(&len_buf).await {
-            warn!(
-                target: "gateway",
-                %peer,
-                worker = %route.worker_id,
-                error = ?e,
-                "failed forwarding frame to worker; reconnecting"
-            );
-            conn.close().await;
-            upstream = None;
-            continue;
-        }
-        if let Err(e) = conn.writer.write_all(&payload).await {
-            warn!(
-                target: "gateway",
-                %peer,
-                worker = %route.worker_id,
-                error = ?e,
-                "failed forwarding frame payload to worker; reconnecting"
-            );
-            conn.close().await;
-            upstream = None;
-            continue;
+            let conn = upstream.as_mut().expect("upstream to be established");
+            if let Err(e) = conn.writer.write_all(&len_buf).await {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    attempt,
+                    max_attempts = UPSTREAM_RETRY_MAX,
+                    error = ?e,
+                    "failed forwarding frame to worker; reconnecting"
+                );
+                conn.close().await;
+                upstream = None;
+                if attempt >= UPSTREAM_RETRY_MAX {
+                    warn!(target: "gateway", %peer, "closing client connection");
+                    break 'conn_loop Ok(());
+                }
+                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                continue;
+            }
+            if let Err(e) = conn.writer.write_all(&payload).await {
+                warn!(
+                    target: "gateway",
+                    %peer,
+                    worker = %route.worker_id,
+                    attempt,
+                    max_attempts = UPSTREAM_RETRY_MAX,
+                    error = ?e,
+                    "failed forwarding frame payload to worker; reconnecting"
+                );
+                conn.close().await;
+                upstream = None;
+                if attempt >= UPSTREAM_RETRY_MAX {
+                    warn!(target: "gateway", %peer, "closing client connection");
+                    break 'conn_loop Ok(());
+                }
+                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                continue;
+            }
+            break;
         }
     };
 
@@ -603,8 +638,9 @@ fn routes_from_listing(listing: &AssignmentListing) -> Result<HashMap<CellKey, W
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::time::Duration;
-    use tessera_core::encode_frame;
+    use tessera_core::{ActorState, EntityId, Position, ServerMsg, encode_frame};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
@@ -674,7 +710,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_connect_failure_does_not_drop_client() {
+    async fn upstream_connect_failure_closes_client_after_retries() {
         let unused_addr = {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -719,23 +755,116 @@ mod tests {
             .await
             .expect("send first frame");
 
-        let env2 = Envelope {
-            cell: CellId::grid(0, 0, 0),
-            seq: 1,
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_millis(500), client.read_exact(&mut buf)).await;
+        match read {
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Ok(Ok(_)) => panic!("unexpected data from gateway after upstream failures"),
+            Ok(Err(e)) => panic!("unexpected error while waiting for close: {e:?}"),
+            Err(_) => panic!("gateway did not close client connection in time"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_basic_flow_forwards_join_and_move() {
+        let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+
+        let mut worker_task = tokio::spawn(async move {
+            run_stub_worker(worker_listener).await;
+        });
+
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(CellId::grid(0, 0, 0)),
+            WorkerRoute {
+                worker_id: "worker-test".to_string(),
+                addr: worker_addr,
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        let mut gateway_task = tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                handle_conn(sock, peer, routing_clone)
+                    .await
+                    .expect("handle conn");
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+        let cell = CellId::grid(0, 0, 0);
+
+        let join_env = Envelope {
+            cell,
+            seq: 0,
             epoch: 0,
-            payload: ClientMsg::Ping { ts: 2 },
+            payload: ClientMsg::Join {
+                actor: EntityId(1),
+                pos: Position { x: 0.0, y: 0.0 },
+            },
         };
         client
-            .write_all(&encode_frame(&env2))
+            .write_all(&encode_frame(&join_env))
             .await
-            .expect("send second frame");
+            .expect("send join");
+        let snapshot = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        match snapshot.payload {
+            ServerMsg::Snapshot {
+                cell: snap_cell,
+                actors,
+            } => {
+                assert_eq!(snap_cell, cell);
+                assert!(actors.iter().any(|actor| actor.id == EntityId(1)));
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
 
-        let mut buf = [0u8; 1];
-        let read = timeout(Duration::from_millis(50), client.read_exact(&mut buf)).await;
-        assert!(
-            read.is_err(),
-            "client connection closed unexpectedly after upstream connect failure"
-        );
+        let move_env = Envelope {
+            cell,
+            seq: 1,
+            epoch: 0,
+            payload: ClientMsg::Move {
+                actor: EntityId(1),
+                dx: 1.0,
+                dy: 0.5,
+            },
+        };
+        client
+            .write_all(&encode_frame(&move_env))
+            .await
+            .expect("send move");
+        let delta = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        match delta.payload {
+            ServerMsg::Delta {
+                cell: delta_cell,
+                moved,
+            } => {
+                assert_eq!(delta_cell, cell);
+                let moved_actor = moved
+                    .iter()
+                    .find(|actor| actor.id == EntityId(1))
+                    .expect("delta for actor");
+                assert_eq!(moved_actor.pos, Position { x: 1.0, y: 0.5 });
+            }
+            other => panic!("expected delta, got {other:?}"),
+        }
+
+        drop(client);
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker", &mut worker_task).await;
     }
 
     #[tokio::test]
@@ -764,5 +893,111 @@ mod tests {
 
         let guard = routes.read().await;
         assert!(guard.is_empty());
+    }
+
+    async fn run_stub_worker(listener: TcpListener) {
+        let (mut socket, _peer) = listener.accept().await.expect("accept worker");
+        let mut seq_out = 0u64;
+        let mut actors: HashMap<EntityId, Position> = HashMap::new();
+
+        loop {
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = socket.read_exact(&mut len_buf).await {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) {
+                    break;
+                }
+                panic!("worker read len error: {e:?}");
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            if let Err(e) = socket.read_exact(&mut payload).await {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) {
+                    break;
+                }
+                panic!("worker read payload error: {e:?}");
+            }
+
+            let env_in: Envelope<ClientMsg> =
+                serde_json::from_slice(&payload).expect("decode client frame");
+            let cell = env_in.cell;
+
+            let reply = match env_in.payload {
+                ClientMsg::Ping { ts } => ServerMsg::Pong { ts },
+                ClientMsg::Join { actor, pos } => {
+                    actors.insert(actor, pos);
+                    let snapshot = actors
+                        .iter()
+                        .map(|(id, pos)| ActorState { id: *id, pos: *pos })
+                        .collect::<Vec<_>>();
+                    ServerMsg::Snapshot {
+                        cell,
+                        actors: snapshot,
+                    }
+                }
+                ClientMsg::Move { actor, dx, dy } => {
+                    let entry = actors.entry(actor).or_insert(Position { x: 0.0, y: 0.0 });
+                    entry.x += dx;
+                    entry.y += dy;
+                    ServerMsg::Delta {
+                        cell,
+                        moved: vec![ActorState {
+                            id: actor,
+                            pos: *entry,
+                        }],
+                    }
+                }
+            };
+
+            let env_out = Envelope {
+                cell,
+                seq: seq_out,
+                epoch: env_in.epoch,
+                payload: reply,
+            };
+            seq_out = seq_out.wrapping_add(1);
+            let frame = encode_frame(&env_out);
+            if let Err(e) = socket.write_all(&frame).await {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) {
+                    break;
+                }
+                panic!("worker write error: {e:?}");
+            }
+        }
+    }
+
+    async fn read_env_with_timeout(
+        stream: &mut TcpStream,
+        timeout_after: Duration,
+    ) -> Envelope<ServerMsg> {
+        timeout(timeout_after, async {
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.expect("read len");
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).await.expect("read payload");
+            serde_json::from_slice::<Envelope<ServerMsg>>(&payload).expect("decode reply")
+        })
+        .await
+        .expect("read timeout")
+    }
+
+    async fn wait_task(label: &str, handle: &mut tokio::task::JoinHandle<()>) {
+        match timeout(Duration::from_millis(500), &mut *handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{label} task failed: {e:?}"),
+            Err(_) => {
+                handle.abort();
+                panic!("{label} task timeout");
+            }
+        }
     }
 }

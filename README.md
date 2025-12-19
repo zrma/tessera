@@ -94,6 +94,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - 포트 점유: `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`를 변경하거나 점유 프로세스 종료
 - 로그 확인: `cargo xt dev logs --target all --follow`
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
+- 게이트웨이 라우팅/업스트림 실패가 반복되면 클라이언트 연결을 종료하므로, 클라는 재접속이 필요할 수 있음
 
 ## Design Overview
 - 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.

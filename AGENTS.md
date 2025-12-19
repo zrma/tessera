@@ -7,7 +7,7 @@
 - 이 문서(AGENTS.md)에서 명령/지침/금지사항을 확인.
 
 ## 현재 범위 (요약)
-- V0 구현: 고정 그리드 셀, Gateway↔Worker TCP 파이프라인, Orchestrator `ListAssignments` 스냅샷 + 주기적 재조회(`TESSERA_GW_REFRESH_SECS`). *(다음 목표: 라우팅 watch/스트리밍 적용)*
+- V0 구현: 고정 그리드 셀, Gateway↔Worker TCP 파이프라인, Orchestrator `ListAssignments` 스냅샷 + `WatchAssignments` 스트림 + 주기적 재조회(`TESSERA_GW_REFRESH_SECS`).
 - 주요 크레이트: `tessera-gateway`, `tessera-worker`, `tessera-orch`, 공용 타입 `tessera-core`, 테스트 클라이언트 `tessera-client`, 자동화 `xtask`.
 
 ## 로컬 실행/종료
