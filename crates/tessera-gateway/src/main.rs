@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tessera_core::{CellId, ClientMsg, Envelope};
+use tessera_core::{CellId, ClientMsg, Envelope, ServerMsg};
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, ListAssignmentsRequest,
@@ -14,7 +14,7 @@ use tessera_proto::orch::v1::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::RwLock;
 use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
 const MAX_FRAME_LEN: usize = 1_000_000;
+const MAX_PENDING_PINGS: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct CellKey(CellId);
@@ -100,258 +101,390 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable) -> Result<()> {
-    let (client_reader, client_writer) = stream.into_split();
-    let client_writer = Arc::new(Mutex::new(client_writer));
+    let (mut client_reader, mut client_writer) = stream.into_split();
     let mut upstream: Option<UpstreamConn> = None;
     let mut last_cell: Option<CellId> = None;
+    // Ping은 응답(Pong)이 있어 재전송이 비교적 안전하다. 업스트림 커넥션이 끊기면
+    // 아직 Pong을 못 받은 Ping을 재전송해, close 경쟁으로 인한 유실을 완화한다.
+    let mut pending_pings: VecDeque<(u64, Bytes)> = VecDeque::new();
 
-    let (client_tx, mut client_rx) = mpsc::channel::<Result<Bytes, anyhow::Error>>(32);
-    let reader_handle = tokio::spawn(async move {
-        let mut reader = client_reader;
-        let mut buf = BytesMut::with_capacity(8 * 1024);
-        loop {
-            match reader.read_buf(&mut buf).await {
-                Ok(0) => break,
-                Ok(_) => loop {
-                    match try_take_frame(&mut buf) {
-                        Ok(Some(frame)) => {
-                            if client_tx.send(Ok(frame.freeze())).await.is_err() {
-                                return;
+    let mut client_buf = BytesMut::with_capacity(8 * 1024);
+
+    'conn_loop: loop {
+        tokio::select! {
+            // 업스트림 EOF/프레임을 우선 처리해 stale 커넥션에 쓰는 윈도우를 줄인다.
+            biased;
+
+            read = async {
+                let conn = upstream.as_mut().expect("upstream present");
+                conn.reader.read_buf(&mut conn.read_buf).await
+            }, if upstream.is_some() => {
+                match read {
+                    Ok(0) => {
+                        let Some(mut conn) = upstream.take() else { continue };
+                        warn!(
+                            target: "gateway",
+                            %peer,
+                            worker = %conn.route.worker_id,
+                            addr = %conn.route.addr,
+                            "upstream closed connection; attempting reconnect"
+                        );
+                        conn.close().await;
+                        let Some(cell) = last_cell else {
+                            warn!(
+                                target: "gateway",
+                                %peer,
+                                "upstream closed before first client frame; closing connection"
+                            );
+                            break Ok(());
+                        };
+                        let mut attempt = 0usize;
+                        loop {
+                            attempt += 1;
+                            let Some(route) = routing.lookup(&cell).await else {
+                                warn!(
+                                    target: "gateway",
+                                    %peer,
+                                    cell = ?cell,
+                                    attempt,
+                                    max_attempts = UPSTREAM_RETRY_MAX,
+                                    "no route available while reconnecting"
+                                );
+                                if attempt >= UPSTREAM_RETRY_MAX {
+                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    break 'conn_loop Ok(());
+                                }
+                                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                continue;
+                            };
+                            if let Err(e) = ensure_upstream(&mut upstream, route.clone(), peer).await {
+                                warn!(
+                                    target: "gateway",
+                                    %peer,
+                                    worker = %route.worker_id,
+                                    addr = %route.addr,
+                                    attempt,
+                                    max_attempts = UPSTREAM_RETRY_MAX,
+                                    error = ?e,
+                                    "failed to reconnect to worker; retrying"
+                                );
+                                upstream = None;
+                                if attempt >= UPSTREAM_RETRY_MAX {
+                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    break 'conn_loop Ok(());
+                                }
+                                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            if !pending_pings.is_empty() {
+                                let conn = upstream.as_mut().expect("upstream to be established");
+                                let mut replay_failed = None;
+                                for (ts, frame) in pending_pings.iter() {
+                                    if let Err(e) = conn.writer.write_all(frame).await {
+                                        replay_failed = Some((ts, e));
+                                        break;
+                                    }
+                                }
+                                if let Some((ts, e)) = replay_failed {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        worker = %route.worker_id,
+                                        addr = %route.addr,
+                                        ts,
+                                        error = ?e,
+                                        "failed replaying pending ping after reconnect; retrying"
+                                    );
+                                    conn.close().await;
+                                    upstream = None;
+                                    if attempt >= UPSTREAM_RETRY_MAX {
+                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        break 'conn_loop Ok(());
+                                    }
+                                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Ok(_) => {
+                        let conn = upstream.as_mut().expect("upstream present");
+                        loop {
+                            match try_take_frame(&mut conn.read_buf) {
+                                Ok(Some(frame)) => {
+                                    if !pending_pings.is_empty() {
+                                        let payload = &frame[4..];
+                                        if let Ok(env_out) =
+                                            serde_json::from_slice::<Envelope<ServerMsg>>(payload)
+                                            && let ServerMsg::Pong { ts } = env_out.payload
+                                        {
+                                            pending_pings
+                                                .retain(|(pending_ts, _)| *pending_ts != ts);
+                                        }
+                                    }
+                                    if let Err(e) = client_writer.write_all(&frame).await {
+                                        warn!(
+                                            target: "gateway",
+                                            %peer,
+                                            worker = %conn.route.worker_id,
+                                            error = ?e,
+                                            "failed to write reply frame to client; closing connection"
+                                        );
+                                        break 'conn_loop Ok(());
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        worker = %conn.route.worker_id,
+                                        error = ?e,
+                                        "invalid upstream frame; closing connection"
+                                    );
+                                    break 'conn_loop Ok(());
+                                }
                             }
                         }
-                        Ok(None) => break,
-                        Err(e) => {
-                            let _ = client_tx.send(Err(e)).await;
-                            return;
+                    }
+                    Err(e) => {
+                        let Some(mut conn) = upstream.take() else { continue };
+                        warn!(
+                            target: "gateway",
+                            %peer,
+                            worker = %conn.route.worker_id,
+                            addr = %conn.route.addr,
+                            error = ?e,
+                            "failed reading from upstream; attempting reconnect"
+                        );
+                        conn.close().await;
+                        let Some(cell) = last_cell else {
+                            warn!(
+                                target: "gateway",
+                                %peer,
+                                "upstream closed before first client frame; closing connection"
+                            );
+                            break Ok(());
+                        };
+                        let mut attempt = 0usize;
+                        loop {
+                            attempt += 1;
+                            let Some(route) = routing.lookup(&cell).await else {
+                                warn!(
+                                    target: "gateway",
+                                    %peer,
+                                    cell = ?cell,
+                                    attempt,
+                                    max_attempts = UPSTREAM_RETRY_MAX,
+                                    "no route available while reconnecting"
+                                );
+                                if attempt >= UPSTREAM_RETRY_MAX {
+                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    break 'conn_loop Ok(());
+                                }
+                                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                continue;
+                            };
+                            if let Err(e) = ensure_upstream(&mut upstream, route.clone(), peer).await {
+                                warn!(
+                                    target: "gateway",
+                                    %peer,
+                                    worker = %route.worker_id,
+                                    addr = %route.addr,
+                                    attempt,
+                                    max_attempts = UPSTREAM_RETRY_MAX,
+                                    error = ?e,
+                                    "failed to reconnect to worker; retrying"
+                                );
+                                upstream = None;
+                                if attempt >= UPSTREAM_RETRY_MAX {
+                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    break 'conn_loop Ok(());
+                                }
+                                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            if !pending_pings.is_empty() {
+                                let conn = upstream.as_mut().expect("upstream to be established");
+                                let mut replay_failed = None;
+                                for (ts, frame) in pending_pings.iter() {
+                                    if let Err(e) = conn.writer.write_all(frame).await {
+                                        replay_failed = Some((ts, e));
+                                        break;
+                                    }
+                                }
+                                if let Some((ts, e)) = replay_failed {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        worker = %route.worker_id,
+                                        addr = %route.addr,
+                                        ts,
+                                        error = ?e,
+                                        "failed replaying pending ping after reconnect; retrying"
+                                    );
+                                    conn.close().await;
+                                    upstream = None;
+                                    if attempt >= UPSTREAM_RETRY_MAX {
+                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        break 'conn_loop Ok(());
+                                    }
+                                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                    continue;
+                                }
+                            }
+                            break;
                         }
                     }
-                },
-                Err(e) => {
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                    ) {
-                        break;
+                }
+            }
+
+            read = client_reader.read_buf(&mut client_buf) => {
+                match read {
+                    Ok(0) => {
+                        info!(target: "gateway", %peer, "closed");
+                        break Ok(());
                     }
-                    let _ = client_tx.send(Err(e.into())).await;
-                    return;
-                }
-            }
-        }
-    });
+                    Ok(_) => {
+                        loop {
+                            let frame = match try_take_frame(&mut client_buf) {
+                                Ok(Some(frame)) => frame.freeze(),
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        error = ?e,
+                                        "invalid frame; closing client connection"
+                                    );
+                                    break 'conn_loop Ok(());
+                                }
+                            };
 
-    let result = 'conn_loop: loop {
-        let mut upstream_closed: Option<WorkerRoute> = None;
-        let mut client_event = None;
+                            let payload = &frame[4..];
+                            let env_in: Envelope<ClientMsg> = match serde_json::from_slice(payload) {
+                                Ok(env_in) => env_in,
+                                Err(e) => {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        error = ?e,
+                                        "failed to decode frame for routing; closing client connection"
+                                    );
+                                    break 'conn_loop Ok(());
+                                }
+                            };
+                            let cell = env_in.cell;
+                            let ping_ts = match env_in.payload {
+                                ClientMsg::Ping { ts } => Some(ts),
+                                _ => None,
+                            };
+                            last_cell = Some(cell);
 
-        if let Some(conn) = upstream.as_mut() {
-            tokio::select! {
-                // 업스트림 종료를 우선 처리해 stale 커넥션에 쓰는 것을 피한다.
-                biased;
-                _ = &mut conn.closed_rx => {
-                    upstream_closed = Some(conn.route.clone());
-                }
-                event = client_rx.recv() => {
-                    client_event = Some(event);
-                }
-            }
-        } else {
-            client_event = Some(client_rx.recv().await);
-        }
+                            let mut attempt = 0usize;
+                            loop {
+                                attempt += 1;
+                                let Some(route) = routing.lookup(&cell).await else {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        cell = ?cell,
+                                        attempt,
+                                        max_attempts = UPSTREAM_RETRY_MAX,
+                                        "no route available for cell"
+                                    );
+                                    if attempt >= UPSTREAM_RETRY_MAX {
+                                        warn!(target: "gateway", %peer, cell = ?cell, "closing client connection");
+                                        break 'conn_loop Ok(());
+                                    }
+                                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                    continue;
+                                };
 
-        if let Some(route) = upstream_closed {
-            warn!(
-                target: "gateway",
-                %peer,
-                worker = %route.worker_id,
-                addr = %route.addr,
-                "upstream connection ended; attempting reconnect"
-            );
-            if let Some(mut conn) = upstream.take() {
-                conn.close().await;
-            }
-            let Some(cell) = last_cell else {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    "upstream closed before first client frame; closing connection"
-                );
-                break Ok(());
-            };
-            let mut attempt = 0usize;
-            loop {
-                attempt += 1;
-                let Some(route) = routing.lookup(&cell).await else {
-                    warn!(
-                        target: "gateway",
-                        %peer,
-                        cell = ?cell,
-                        attempt,
-                        max_attempts = UPSTREAM_RETRY_MAX,
-                        "no route available while reconnecting"
-                    );
-                    if attempt >= UPSTREAM_RETRY_MAX {
-                        warn!(target: "gateway", %peer, "closing client connection");
-                        break 'conn_loop Ok(());
+                                if let Err(e) = ensure_upstream(&mut upstream, route.clone(), peer).await {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        worker = %route.worker_id,
+                                        addr = %route.addr,
+                                        attempt,
+                                        max_attempts = UPSTREAM_RETRY_MAX,
+                                        error = ?e,
+                                        "failed to connect to worker; retrying"
+                                    );
+                                    upstream = None;
+                                    if attempt >= UPSTREAM_RETRY_MAX {
+                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        break 'conn_loop Ok(());
+                                    }
+                                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                    continue;
+                                }
+
+                                let conn = upstream.as_mut().expect("upstream to be established");
+                                if let Err(e) = conn.writer.write_all(&frame).await {
+                                    warn!(
+                                        target: "gateway",
+                                        %peer,
+                                        worker = %route.worker_id,
+                                        attempt,
+                                        max_attempts = UPSTREAM_RETRY_MAX,
+                                        error = ?e,
+                                        "failed forwarding frame to worker; reconnecting"
+                                    );
+                                    conn.close().await;
+                                    upstream = None;
+                                    if attempt >= UPSTREAM_RETRY_MAX {
+                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        break 'conn_loop Ok(());
+                                    }
+                                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                    continue;
+                                }
+                                if let Some(ts) = ping_ts {
+                                    // 동일 ts가 중복으로 들어오면 최신 frame으로 치환한다.
+                                    pending_pings.retain(|(pending_ts, _)| *pending_ts != ts);
+                                    while pending_pings.len() >= MAX_PENDING_PINGS {
+                                        pending_pings.pop_front();
+                                    }
+                                    pending_pings.push_back((ts, frame.clone()));
+                                }
+                                break;
+                            }
+                        }
                     }
-                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
-                    continue;
-                };
-                if let Err(e) = ensure_upstream(
-                    &mut upstream,
-                    route.clone(),
-                    Arc::clone(&client_writer),
-                    peer,
-                )
-                .await
-                {
-                    warn!(
-                        target: "gateway",
-                        %peer,
-                        worker = %route.worker_id,
-                        addr = %route.addr,
-                        attempt,
-                        max_attempts = UPSTREAM_RETRY_MAX,
-                        error = ?e,
-                        "failed to reconnect to worker; retrying"
-                    );
-                    upstream = None;
-                    if attempt >= UPSTREAM_RETRY_MAX {
-                        warn!(target: "gateway", %peer, "closing client connection");
-                        break 'conn_loop Ok(());
+                    Err(e) => {
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) {
+                            info!(target: "gateway", %peer, "closed");
+                            break Ok(());
+                        }
+                        warn!(
+                            target: "gateway",
+                            %peer,
+                            error = ?e,
+                            "failed reading from client; closing connection"
+                        );
+                        break Ok(());
                     }
-                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
-                    continue;
                 }
-                break;
             }
-            continue;
         }
-
-        let Some(event) = client_event else {
-            continue;
-        };
-        let Some(event) = event else {
-            info!(target: "gateway", %peer, "closed");
-            break Ok(());
-        };
-        let frame = match event {
-            Ok(frame) => frame,
-            Err(e) => {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    error = ?e,
-                    "invalid frame; closing client connection"
-                );
-                break Ok(());
-            }
-        };
-
-        let payload = &frame[4..];
-        let env_in: Envelope<ClientMsg> = match serde_json::from_slice(payload) {
-            Ok(env_in) => env_in,
-            Err(e) => {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    error = ?e,
-                    "failed to decode frame for routing; closing client connection"
-                );
-                break Ok(());
-            }
-        };
-        let cell = env_in.cell;
-        last_cell = Some(cell);
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            let Some(route) = routing.lookup(&cell).await else {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    cell = ?cell,
-                    attempt,
-                    max_attempts = UPSTREAM_RETRY_MAX,
-                    "no route available for cell"
-                );
-                if attempt >= UPSTREAM_RETRY_MAX {
-                    warn!(target: "gateway", %peer, cell = ?cell, "closing client connection");
-                    break 'conn_loop Ok(());
-                }
-                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
-                continue;
-            };
-
-            if let Err(e) = ensure_upstream(
-                &mut upstream,
-                route.clone(),
-                Arc::clone(&client_writer),
-                peer,
-            )
-            .await
-            {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %route.worker_id,
-                    addr = %route.addr,
-                    attempt,
-                    max_attempts = UPSTREAM_RETRY_MAX,
-                    error = ?e,
-                    "failed to connect to worker; retrying"
-                );
-                upstream = None;
-                if attempt >= UPSTREAM_RETRY_MAX {
-                    warn!(target: "gateway", %peer, "closing client connection");
-                    break 'conn_loop Ok(());
-                }
-                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
-                continue;
-            }
-
-            let conn = upstream.as_mut().expect("upstream to be established");
-            if let Err(e) = conn.writer.write_all(&frame).await {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %route.worker_id,
-                    attempt,
-                    max_attempts = UPSTREAM_RETRY_MAX,
-                    error = ?e,
-                    "failed forwarding frame to worker; reconnecting"
-                );
-                conn.close().await;
-                upstream = None;
-                if attempt >= UPSTREAM_RETRY_MAX {
-                    warn!(target: "gateway", %peer, "closing client connection");
-                    break 'conn_loop Ok(());
-                }
-                time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
-                continue;
-            }
-            break;
-        }
-    };
-
-    if let Some(mut conn) = upstream {
-        conn.close().await;
     }
-    reader_handle.abort();
-
-    result
 }
 
 struct UpstreamConn {
+    reader: OwnedReadHalf,
     writer: OwnedWriteHalf,
     route: WorkerRoute,
-    reader_handle: tokio::task::JoinHandle<()>,
-    closed_rx: oneshot::Receiver<()>,
+    read_buf: BytesMut,
 }
 
 impl UpstreamConn {
     async fn close(&mut self) {
-        self.reader_handle.abort();
         let _ = self.writer.shutdown().await;
     }
 }
@@ -359,26 +492,8 @@ impl UpstreamConn {
 async fn ensure_upstream(
     upstream: &mut Option<UpstreamConn>,
     target_worker: WorkerRoute,
-    client_writer: Arc<Mutex<OwnedWriteHalf>>,
     peer: SocketAddr,
 ) -> Result<()> {
-    // Reconnect if the existing upstream reader task has completed.
-    if upstream
-        .as_ref()
-        .is_some_and(|conn| conn.reader_handle.is_finished())
-    {
-        if let Some(conn) = upstream.as_mut() {
-            info!(
-                target: "gateway",
-                %peer,
-                worker = %conn.route.worker_id,
-                "upstream connection ended; reconnecting"
-            );
-            conn.close().await;
-        }
-        *upstream = None;
-    }
-
     let needs_new = match upstream {
         Some(conn) if conn.route.addr == target_worker.addr => false,
         Some(conn) => {
@@ -396,7 +511,7 @@ async fn ensure_upstream(
     };
 
     if needs_new {
-        let new_conn = connect_upstream(target_worker.clone(), client_writer, peer).await?;
+        let new_conn = connect_upstream(target_worker.clone(), peer).await?;
         if upstream.replace(new_conn).is_some() {
             // old connection already closed above
         }
@@ -405,11 +520,7 @@ async fn ensure_upstream(
     Ok(())
 }
 
-async fn connect_upstream(
-    target_worker: WorkerRoute,
-    client_writer: Arc<Mutex<OwnedWriteHalf>>,
-    peer: SocketAddr,
-) -> Result<UpstreamConn> {
+async fn connect_upstream(target_worker: WorkerRoute, peer: SocketAddr) -> Result<UpstreamConn> {
     let stream = TcpStream::connect(target_worker.addr.as_str()).await?;
     info!(
         target: "gateway",
@@ -419,100 +530,11 @@ async fn connect_upstream(
         "connected to upstream worker"
     );
     let (reader, writer) = stream.into_split();
-    let (closed_tx, closed_rx) = oneshot::channel();
-    let reader_handle = spawn_upstream_reader(
-        reader,
-        Arc::clone(&client_writer),
-        peer,
-        target_worker.clone(),
-        closed_tx,
-    );
     Ok(UpstreamConn {
+        reader,
         writer,
         route: target_worker,
-        reader_handle,
-        closed_rx,
-    })
-}
-
-fn spawn_upstream_reader(
-    mut reader: OwnedReadHalf,
-    client_writer: Arc<Mutex<OwnedWriteHalf>>,
-    peer: SocketAddr,
-    route: WorkerRoute,
-    closed_tx: oneshot::Sender<()>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let mut rlen_buf = [0u8; 4];
-            if let Err(e) = reader.read_exact(&mut rlen_buf).await {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) {
-                    info!(
-                        target: "gateway",
-                        %peer,
-                        worker = %route.worker_id,
-                        "upstream closed connection"
-                    );
-                } else {
-                    warn!(
-                        target: "gateway",
-                        %peer,
-                        worker = %route.worker_id,
-                        error = ?e,
-                        "failed reading reply from upstream"
-                    );
-                }
-                break;
-            }
-            let rlen = u32::from_be_bytes(rlen_buf) as usize;
-            if rlen > MAX_FRAME_LEN {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %route.worker_id,
-                    len = rlen,
-                    "reply frame too large"
-                );
-                break;
-            }
-            let mut rpayload = vec![0u8; rlen];
-            if let Err(e) = reader.read_exact(&mut rpayload).await {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %route.worker_id,
-                    error = ?e,
-                    "failed to read reply payload from upstream"
-                );
-                break;
-            }
-
-            let mut writer = client_writer.lock().await;
-            if let Err(e) = writer.write_all(&rlen_buf).await {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %route.worker_id,
-                    error = ?e,
-                    "failed to write reply length to client"
-                );
-                break;
-            }
-            if let Err(e) = writer.write_all(&rpayload).await {
-                warn!(
-                    target: "gateway",
-                    %peer,
-                    worker = %route.worker_id,
-                    error = ?e,
-                    "failed to write reply payload to client"
-                );
-                break;
-            }
-        }
-        let _ = closed_tx.send(());
+        read_buf: BytesMut::with_capacity(8 * 1024),
     })
 }
 
