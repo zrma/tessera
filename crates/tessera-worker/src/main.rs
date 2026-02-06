@@ -9,8 +9,8 @@ use std::sync::{
 };
 use std::time::Duration;
 use tessera_core::{
-    ActorState, CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, Tick, encode_frame,
-    try_decode_frame,
+    ActorState, CellId, ClientMsg, EntityId, Envelope, MAX_FRAME_LEN, Position, ServerMsg, Tick,
+    encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{Assignment, WorkerRegistration};
@@ -730,8 +730,8 @@ async fn handle_upstream_inner(
             break Err(e.into());
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 1_000_000 {
-            warn!(target: "worker", %peer, len, "frame too large");
+        if len > MAX_FRAME_LEN {
+            warn!(target: "worker", %peer, len, max = MAX_FRAME_LEN, "frame too large");
             break Ok(());
         }
         let mut payload = vec![0u8; len];
