@@ -9,6 +9,7 @@ edition = "2024"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 bytes = "1"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
@@ -16,3 +17,4 @@ serde_json = "1"
 tonic = { version = "0.11", features = ["transport"] }
 prost = "0.12"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tonic-build = "0.11"
