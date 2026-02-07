@@ -107,6 +107,10 @@ pub struct Envelope<T> {
 
 // ---------- Length-prefixed framing (JSON payload, u32 BE length) ----------
 
+/// 최대 프레임 길이(페이로드 기준). 네트워크 입력(신뢰할 수 없는 데이터)을 다룰 때
+/// 메모리 DoS를 피하기 위해 상한을 둔다.
+pub const MAX_FRAME_LEN: usize = 1_000_000;
+
 pub fn encode_frame<T: Serialize>(value: &T) -> Bytes {
     let payload = serde_json::to_vec(value).expect("serialize frame");
     let mut buf = BytesMut::with_capacity(4 + payload.len());
@@ -122,6 +126,12 @@ pub fn try_decode_frame<T: for<'de> Deserialize<'de>>(
         return Ok(None);
     }
     let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+            "frame length {} exceeds max {}",
+            len, MAX_FRAME_LEN
+        )));
+    }
     let Some(total_len) = len.checked_add(4) else {
         return Err(<serde_json::Error as serde::de::Error>::custom(
             "frame length overflow",
@@ -252,8 +262,17 @@ mod tests {
     }
 
     #[test]
-    fn max_frame_length_returns_none_without_consuming() {
+    fn max_frame_length_returns_error_without_consuming() {
         let mut buf = BytesMut::from(&[0xFF, 0xFF, 0xFF, 0xFF][..]);
+        let result: Result<Option<ClientMsg>, _> = try_decode_frame(&mut buf);
+        assert!(result.is_err());
+        assert_eq!(buf.len(), 4);
+    }
+
+    #[test]
+    fn max_frame_length_allows_incomplete_frame() {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&(MAX_FRAME_LEN as u32).to_be_bytes());
         let result: Option<ClientMsg> = try_decode_frame(&mut buf).expect("decode");
         assert!(result.is_none());
         assert_eq!(buf.len(), 4);

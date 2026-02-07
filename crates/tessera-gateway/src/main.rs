@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tessera_core::{CellId, ClientMsg, Envelope, ServerMsg};
+use tessera_core::{CellId, ClientMsg, Envelope, MAX_FRAME_LEN, ServerMsg};
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, ListAssignmentsRequest,
@@ -21,7 +21,6 @@ use tracing::{debug, error, info, warn};
 
 const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
-const MAX_FRAME_LEN: usize = 1_000_000;
 const MAX_PENDING_PINGS: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]

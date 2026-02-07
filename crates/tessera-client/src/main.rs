@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rustyline::{DefaultEditor, error::ReadlineError};
 use std::path::PathBuf;
-use tessera_core::{CellId, ClientMsg, EntityId, Envelope, Position, ServerMsg, encode_frame};
+use tessera_core::{
+    CellId, ClientMsg, EntityId, Envelope, MAX_FRAME_LEN, Position, ServerMsg, encode_frame,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -198,6 +200,9 @@ async fn recv<T: for<'de> serde::Deserialize<'de>>(stream: &mut TcpStream) -> Re
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        anyhow::bail!("frame length {} exceeds max {}", len, MAX_FRAME_LEN);
+    }
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await?;
     let msg = serde_json::from_slice::<T>(&payload)?;
