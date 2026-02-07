@@ -21,6 +21,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{
     Mutex, RwLock,
     mpsc::{Receiver, Sender, channel},
+    watch,
 };
 use tokio::time;
 use tracing::{error, info, warn};
@@ -28,8 +29,15 @@ use tracing::{error, info, warn};
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 type OutboundMsg = (CellId, Option<u32>, ServerMsg);
-type CellSubscribers = HashMap<CellId, Vec<(u64, Sender<OutboundMsg>)>>;
+type CellSubscribers = HashMap<CellId, Vec<CellSubscriber>>;
 type CellOwners = HashMap<CellId, HashMap<EntityId, u64>>;
+
+#[derive(Clone)]
+struct CellSubscriber {
+    client_id: u64,
+    tx: Sender<OutboundMsg>,
+    disconnect_tx: watch::Sender<()>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimOutcome {
@@ -46,13 +54,16 @@ struct SharedState {
 }
 
 impl SharedState {
-    async fn subscribe(&self, cell: CellId, client_id: u64, tx: Sender<OutboundMsg>) {
+    async fn subscribe(&self, cell: CellId, subscriber: &CellSubscriber) {
         let mut subs = self.subscribers.lock().await;
         let entry = subs.entry(cell).or_default();
-        if entry.iter().any(|(id, _)| *id == client_id) {
+        if entry
+            .iter()
+            .any(|existing| existing.client_id == subscriber.client_id)
+        {
             return;
         }
-        entry.push((client_id, tx));
+        entry.push(subscriber.clone());
     }
 
     async fn snapshot_and_subscribe(
@@ -60,8 +71,7 @@ impl SharedState {
         cell: CellId,
         actor: EntityId,
         pos: Position,
-        client_id: u64,
-        tx: &Sender<OutboundMsg>,
+        subscriber: &CellSubscriber,
         epoch: u32,
     ) -> Result<bool, ()> {
         let mut actors = self.actors.lock().await;
@@ -90,7 +100,8 @@ impl SharedState {
             vec![ActorState { id: actor, pos }]
         };
 
-        if tx
+        if subscriber
+            .tx
             .try_send((
                 cell,
                 Some(epoch),
@@ -108,8 +119,11 @@ impl SharedState {
         let inserted_new = cell_actors.insert(actor, pos).is_none();
 
         let entry = subs.entry(cell).or_default();
-        if !entry.iter().any(|(id, _)| *id == client_id) {
-            entry.push((client_id, tx.clone()));
+        if !entry
+            .iter()
+            .any(|existing| existing.client_id == subscriber.client_id)
+        {
+            entry.push(subscriber.clone());
         }
 
         Ok(inserted_new)
@@ -132,7 +146,7 @@ impl SharedState {
     async fn remove_client_subscriptions(&self, client_id: u64) {
         let mut subs = self.subscribers.lock().await;
         subs.values_mut().for_each(|entries| {
-            entries.retain(|(id, _)| *id != client_id);
+            entries.retain(|subscriber| subscriber.client_id != client_id);
         });
         subs.retain(|_, entries| !entries.is_empty());
     }
@@ -146,13 +160,22 @@ impl SharedState {
     ) {
         let mut subs = self.subscribers.lock().await;
         if let Some(entries) = subs.get_mut(&cell) {
-            entries.retain(|(id, tx)| {
-                if exclude.is_some_and(|excluded| excluded == *id) {
-                    return !tx.is_closed();
+            entries.retain(|subscriber| {
+                if exclude.is_some_and(|excluded| excluded == subscriber.client_id) {
+                    return !subscriber.tx.is_closed();
                 }
-                match tx.try_send((cell, epoch_override, msg.clone())) {
+                match subscriber.tx.try_send((cell, epoch_override, msg.clone())) {
                     Ok(()) => true,
-                    Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Full(_)) => {
+                        warn!(
+                            target: "worker",
+                            cell = ?cell,
+                            client_id = subscriber.client_id,
+                            "outbound channel full; disconnecting slow subscriber"
+                        );
+                        let _ = subscriber.disconnect_tx.send(());
+                        false
+                    }
                     Err(TrySendError::Closed(_)) => false,
                 }
             });
@@ -644,6 +667,28 @@ fn init_tracing() {
         .init();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadExactOutcome {
+    Read,
+    DisconnectRequested,
+}
+
+async fn read_exact_or_disconnect(
+    reader: &mut OwnedReadHalf,
+    buf: &mut [u8],
+    disconnect_rx: &mut watch::Receiver<()>,
+) -> std::io::Result<ReadExactOutcome> {
+    tokio::select! {
+        biased;
+        changed = disconnect_rx.changed() => {
+            match changed {
+                Ok(()) | Err(_) => Ok(ReadExactOutcome::DisconnectRequested),
+            }
+        }
+        read = reader.read_exact(buf) => read.map(|_| ReadExactOutcome::Read),
+    }
+}
+
 async fn run_server(
     addr: SocketAddr,
     state: Arc<SharedState>,
@@ -690,6 +735,12 @@ async fn handle_upstream_inner(
     let writer_epoch = Arc::clone(&epoch);
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let mut owned_actors: HashSet<(CellId, EntityId)> = HashSet::new();
+    let (disconnect_tx, mut disconnect_rx) = watch::channel(());
+    let subscriber = CellSubscriber {
+        client_id,
+        tx: tx.clone(),
+        disconnect_tx: disconnect_tx.clone(),
+    };
 
     if spawn_writer {
         tokio::spawn(async move {
@@ -719,15 +770,26 @@ async fn handle_upstream_inner(
     let result = loop {
         // Read one frame from Gateway
         let mut len_buf = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut len_buf).await {
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-            ) {
-                info!(target: "worker", %peer, "upstream closed");
+        match read_exact_or_disconnect(&mut reader, &mut len_buf, &mut disconnect_rx).await {
+            Ok(ReadExactOutcome::DisconnectRequested) => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "disconnecting slow subscriber after outbound backpressure"
+                );
                 break Ok(());
             }
-            break Err(e.into());
+            Ok(ReadExactOutcome::Read) => {}
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) {
+                    info!(target: "worker", %peer, "upstream closed");
+                    break Ok(());
+                }
+                break Err(e.into());
+            }
         }
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > MAX_FRAME_LEN {
@@ -735,15 +797,26 @@ async fn handle_upstream_inner(
             break Ok(());
         }
         let mut payload = vec![0u8; len];
-        if let Err(e) = reader.read_exact(&mut payload).await {
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-            ) {
-                info!(target: "worker", %peer, "upstream closed");
+        match read_exact_or_disconnect(&mut reader, &mut payload, &mut disconnect_rx).await {
+            Ok(ReadExactOutcome::DisconnectRequested) => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "disconnecting slow subscriber after outbound backpressure"
+                );
                 break Ok(());
             }
-            break Err(e.into());
+            Ok(ReadExactOutcome::Read) => {}
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) {
+                    info!(target: "worker", %peer, "upstream closed");
+                    break Ok(());
+                }
+                break Err(e.into());
+            }
         }
 
         // Decode as Envelope<ClientMsg>
@@ -875,7 +948,7 @@ async fn handle_upstream_inner(
 
                 // 스냅샷 처리 중 델타 누락을 막기 위해 구독을 같은 락 구간에서 갱신한다.
                 let inserted_new = match state
-                    .snapshot_and_subscribe(cell, actor, pos, client_id, &tx, env_in.epoch)
+                    .snapshot_and_subscribe(cell, actor, pos, &subscriber, env_in.epoch)
                     .await
                 {
                     Ok(inserted_new) => inserted_new,
@@ -993,7 +1066,7 @@ async fn handle_upstream_inner(
                     }
                 }
 
-                state.subscribe(cell, client_id, tx.clone()).await;
+                state.subscribe(cell, &subscriber).await;
 
                 let moved = {
                     let mut actors = state.actors.lock().await;
@@ -1138,6 +1211,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
+
+    fn test_subscriber(
+        client_id: u64,
+        tx: Sender<OutboundMsg>,
+        disconnect_tx: &watch::Sender<()>,
+    ) -> CellSubscriber {
+        CellSubscriber {
+            client_id,
+            tx,
+            disconnect_tx: disconnect_tx.clone(),
+        }
+    }
 
     #[test]
     fn assignment_to_cell_round_trip() {
@@ -2383,9 +2468,12 @@ mod tests {
         let cell = CellId::grid(0, 0, 0);
 
         let (tx, _rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
-        state.subscribe(cell, 10, tx).await;
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(10, tx, &disconnect_tx);
+        state.subscribe(cell, &subscriber).await;
         let (tx2, _rx2) = channel(OUTBOUND_CHANNEL_CAPACITY);
-        state.subscribe(cell, 10, tx2).await;
+        let duplicate_subscriber = test_subscriber(10, tx2, &disconnect_tx);
+        state.subscribe(cell, &duplicate_subscriber).await;
 
         {
             let subs = state.subscribers.lock().await;
@@ -2396,7 +2484,8 @@ mod tests {
         state.drop_cells(&removed).await;
 
         let (tx3, _rx3) = channel(OUTBOUND_CHANNEL_CAPACITY);
-        state.subscribe(cell, 10, tx3).await;
+        let resubscribed = test_subscriber(10, tx3, &disconnect_tx);
+        state.subscribe(cell, &resubscribed).await;
 
         let subs = state.subscribers.lock().await;
         assert_eq!(subs.get(&cell).map(|v| v.len()), Some(1));
@@ -2410,13 +2499,15 @@ mod tests {
         let pos = Position { x: 0.0, y: 0.0 };
 
         let (tx, _rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(1, tx, &disconnect_tx);
 
         let actors_guard = state.actors.lock().await;
 
         let state_clone = Arc::clone(&state);
         let join_handle = tokio::spawn(async move {
             state_clone
-                .snapshot_and_subscribe(cell, actor, pos, 1, &tx, 0)
+                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0)
                 .await
                 .expect("snapshot");
         });
@@ -2441,7 +2532,9 @@ mod tests {
         let cell = CellId::grid(0, 0, 0);
 
         let (tx, rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
-        state.subscribe(cell, 1, tx).await;
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(1, tx, &disconnect_tx);
+        state.subscribe(cell, &subscriber).await;
         drop(rx);
 
         state
@@ -2458,12 +2551,44 @@ mod tests {
         let cell = CellId::grid(0, 0, 0);
 
         let (tx, rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
-        state.subscribe(cell, 1, tx).await;
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(1, tx, &disconnect_tx);
+        state.subscribe(cell, &subscriber).await;
         drop(rx);
 
         state
             .broadcast(cell, ServerMsg::Pong { ts: 2 }, Some(1), None)
             .await;
+
+        let subs = state.subscribers.lock().await;
+        assert!(subs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn broadcast_full_subscriber_requests_disconnect() {
+        let state = SharedState::default();
+        let cell = CellId::grid(0, 0, 0);
+
+        let (tx, mut rx) = channel(1);
+        let tx_for_state = tx.clone();
+        let (disconnect_tx, mut disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(1, tx_for_state, &disconnect_tx);
+        state.subscribe(cell, &subscriber).await;
+
+        tx.try_send((cell, None, ServerMsg::Pong { ts: 0 }))
+            .expect("fill outbound channel");
+        state
+            .broadcast(cell, ServerMsg::Pong { ts: 1 }, None, None)
+            .await;
+
+        disconnect_rx
+            .changed()
+            .await
+            .expect("disconnect signal should be sent");
+        assert!(
+            rx.try_recv().is_ok(),
+            "existing queued message should remain until connection is closed"
+        );
 
         let subs = state.subscribers.lock().await;
         assert!(subs.is_empty());
