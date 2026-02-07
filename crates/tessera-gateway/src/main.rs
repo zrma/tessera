@@ -23,6 +23,13 @@ const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
 const MAX_PENDING_PINGS: usize = 32;
 
+#[derive(Clone, Debug)]
+struct PendingPing {
+    cell: CellId,
+    ts: u64,
+    frame: Bytes,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct CellKey(CellId);
 
@@ -105,7 +112,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
     let mut last_cell: Option<CellId> = None;
     // Ping은 응답(Pong)이 있어 재전송이 비교적 안전하다. 업스트림 커넥션이 끊기면
     // 아직 Pong을 못 받은 Ping을 재전송해, close 경쟁으로 인한 유실을 완화한다.
-    let mut pending_pings: VecDeque<(u64, Bytes)> = VecDeque::new();
+    let mut pending_pings: VecDeque<PendingPing> = VecDeque::new();
 
     let mut client_buf = BytesMut::with_capacity(8 * 1024);
 
@@ -177,20 +184,14 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             }
                             if !pending_pings.is_empty() {
                                 let conn = upstream.as_mut().expect("upstream to be established");
-                                let mut replay_failed = None;
-                                for (ts, frame) in pending_pings.iter() {
-                                    if let Err(e) = conn.writer.write_all(frame).await {
-                                        replay_failed = Some((ts, e));
-                                        break;
-                                    }
-                                }
-                                if let Some((ts, e)) = replay_failed {
+                                if let Err(e) =
+                                    replay_pending_pings(conn, &routing, &pending_pings).await
+                                {
                                     warn!(
                                         target: "gateway",
                                         %peer,
                                         worker = %route.worker_id,
                                         addr = %route.addr,
-                                        ts,
                                         error = ?e,
                                         "failed replaying pending ping after reconnect; retrying"
                                     );
@@ -218,8 +219,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             serde_json::from_slice::<Envelope<ServerMsg>>(payload)
                                             && let ServerMsg::Pong { ts } = env_out.payload
                                         {
-                                            pending_pings
-                                                .retain(|(pending_ts, _)| *pending_ts != ts);
+                                            let pong_cell = env_out.cell;
+                                            pending_pings.retain(|pending| {
+                                                !(pending.cell == pong_cell && pending.ts == ts)
+                                            });
                                         }
                                     }
                                     if let Err(e) = client_writer.write_all(&frame).await {
@@ -306,20 +309,14 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             }
                             if !pending_pings.is_empty() {
                                 let conn = upstream.as_mut().expect("upstream to be established");
-                                let mut replay_failed = None;
-                                for (ts, frame) in pending_pings.iter() {
-                                    if let Err(e) = conn.writer.write_all(frame).await {
-                                        replay_failed = Some((ts, e));
-                                        break;
-                                    }
-                                }
-                                if let Some((ts, e)) = replay_failed {
+                                if let Err(e) =
+                                    replay_pending_pings(conn, &routing, &pending_pings).await
+                                {
                                     warn!(
                                         target: "gateway",
                                         %peer,
                                         worker = %route.worker_id,
                                         addr = %route.addr,
-                                        ts,
                                         error = ?e,
                                         "failed replaying pending ping after reconnect; retrying"
                                     );
@@ -401,24 +398,56 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     continue;
                                 };
 
-                                if let Err(e) = ensure_upstream(&mut upstream, route.clone(), peer).await {
-                                    warn!(
-                                        target: "gateway",
-                                        %peer,
-                                        worker = %route.worker_id,
-                                        addr = %route.addr,
-                                        attempt,
-                                        max_attempts = UPSTREAM_RETRY_MAX,
-                                        error = ?e,
-                                        "failed to connect to worker; retrying"
-                                    );
-                                    upstream = None;
-                                    if attempt >= UPSTREAM_RETRY_MAX {
-                                        warn!(target: "gateway", %peer, "closing client connection");
-                                        break 'conn_loop Ok(());
+                                let connected_new =
+                                    match ensure_upstream(&mut upstream, route.clone(), peer).await
+                                    {
+                                        Ok(changed) => changed,
+                                        Err(e) => {
+                                            warn!(
+                                                target: "gateway",
+                                                %peer,
+                                                worker = %route.worker_id,
+                                                addr = %route.addr,
+                                                attempt,
+                                                max_attempts = UPSTREAM_RETRY_MAX,
+                                                error = ?e,
+                                                "failed to connect to worker; retrying"
+                                            );
+                                            upstream = None;
+                                            if attempt >= UPSTREAM_RETRY_MAX {
+                                                warn!(target: "gateway", %peer, "closing client connection");
+                                                break 'conn_loop Ok(());
+                                            }
+                                            time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                            continue;
+                                        }
+                                    };
+
+                                if connected_new && !pending_pings.is_empty() {
+                                    let conn =
+                                        upstream.as_mut().expect("upstream to be established");
+                                    if let Err(e) =
+                                        replay_pending_pings(conn, &routing, &pending_pings).await
+                                    {
+                                        warn!(
+                                            target: "gateway",
+                                            %peer,
+                                            worker = %route.worker_id,
+                                            addr = %route.addr,
+                                            attempt,
+                                            max_attempts = UPSTREAM_RETRY_MAX,
+                                            error = ?e,
+                                            "failed replaying pending ping after reconnect; reconnecting"
+                                        );
+                                        conn.close().await;
+                                        upstream = None;
+                                        if attempt >= UPSTREAM_RETRY_MAX {
+                                            warn!(target: "gateway", %peer, "closing client connection");
+                                            break 'conn_loop Ok(());
+                                        }
+                                        time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
+                                        continue;
                                     }
-                                    time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
-                                    continue;
                                 }
 
                                 let conn = upstream.as_mut().expect("upstream to be established");
@@ -443,11 +472,17 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 }
                                 if let Some(ts) = ping_ts {
                                     // 동일 ts가 중복으로 들어오면 최신 frame으로 치환한다.
-                                    pending_pings.retain(|(pending_ts, _)| *pending_ts != ts);
+                                    pending_pings.retain(|pending| {
+                                        !(pending.cell == cell && pending.ts == ts)
+                                    });
                                     while pending_pings.len() >= MAX_PENDING_PINGS {
                                         pending_pings.pop_front();
                                     }
-                                    pending_pings.push_back((ts, frame.clone()));
+                                    pending_pings.push_back(PendingPing {
+                                        cell,
+                                        ts,
+                                        frame: frame.clone(),
+                                    });
                                 }
                                 break;
                             }
@@ -492,7 +527,7 @@ async fn ensure_upstream(
     upstream: &mut Option<UpstreamConn>,
     target_worker: WorkerRoute,
     peer: SocketAddr,
-) -> Result<()> {
+) -> Result<bool> {
     let needs_new = match upstream {
         Some(conn) if conn.route.addr == target_worker.addr => false,
         Some(conn) => {
@@ -514,9 +549,10 @@ async fn ensure_upstream(
         if upstream.replace(new_conn).is_some() {
             // old connection already closed above
         }
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 async fn connect_upstream(target_worker: WorkerRoute, peer: SocketAddr) -> Result<UpstreamConn> {
@@ -535,6 +571,26 @@ async fn connect_upstream(target_worker: WorkerRoute, peer: SocketAddr) -> Resul
         route: target_worker,
         read_buf: BytesMut::with_capacity(8 * 1024),
     })
+}
+
+async fn replay_pending_pings(
+    conn: &mut UpstreamConn,
+    routing: &RoutingTable,
+    pending_pings: &VecDeque<PendingPing>,
+) -> Result<()> {
+    for ping in pending_pings {
+        let Some(route) = routing.lookup(&ping.cell).await else {
+            continue;
+        };
+        if route.addr != conn.route.addr {
+            continue;
+        }
+        conn.writer
+            .write_all(ping.frame.as_ref())
+            .await
+            .with_context(|| format!("replay ping cell={:?} ts={}", ping.cell, ping.ts))?;
+    }
+    Ok(())
 }
 
 fn try_take_frame(buf: &mut BytesMut) -> Result<Option<BytesMut>> {
@@ -1500,6 +1556,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_change_replays_pending_ping_after_reconnect() {
+        let worker_a_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker a");
+        let worker_a_addr = worker_a_listener.local_addr().expect("worker a addr");
+        let worker_b_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker b");
+        let worker_b_addr = worker_b_listener.local_addr().expect("worker b addr");
+
+        let (a_received_tx, a_received_rx) = oneshot::channel();
+        let (a_done_tx, a_done_rx) = oneshot::channel();
+        let (b_done_tx, b_done_rx) = oneshot::channel();
+        let mut worker_a_task = tokio::spawn(run_silent_ping_worker_expect_close(
+            worker_a_listener,
+            1,
+            a_received_tx,
+            a_done_tx,
+        ));
+        let mut worker_b_task =
+            tokio::spawn(run_ping_worker_twice(worker_b_listener, 1, 2, b_done_tx));
+
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(CellId::grid(0, 0, 0)),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: worker_a_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        let mut gateway_task = tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                handle_conn(sock, peer, routing_clone)
+                    .await
+                    .expect("handle conn");
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+        let cell = CellId::grid(0, 0, 0);
+
+        let ping1 = Envelope {
+            cell,
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 1 },
+        };
+        client
+            .write_all(&encode_frame(&ping1))
+            .await
+            .expect("send first ping");
+
+        timeout(Duration::from_millis(500), a_received_rx)
+            .await
+            .expect("worker a did not receive first ping")
+            .expect("worker a receive ack");
+
+        let listing_updated = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-b".to_string(),
+                addr: worker_b_addr.to_string(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 0,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+        };
+        apply_listing_update(&routing, listing_updated)
+            .await
+            .expect("apply listing update");
+
+        let ping2 = Envelope {
+            cell,
+            seq: 1,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 2 },
+        };
+        client
+            .write_all(&encode_frame(&ping2))
+            .await
+            .expect("send second ping");
+
+        let reply_a = read_env_with_timeout(&mut client, Duration::from_secs(1)).await;
+        let reply_b = read_env_with_timeout(&mut client, Duration::from_secs(1)).await;
+        let mut ts_values = vec![];
+        for reply in [reply_a, reply_b] {
+            match reply.payload {
+                ServerMsg::Pong { ts } => ts_values.push(ts),
+                other => panic!("expected pong, got {other:?}"),
+            }
+        }
+        ts_values.sort();
+        assert_eq!(ts_values, vec![1, 2]);
+
+        drop(client);
+
+        timeout(Duration::from_millis(500), a_done_rx)
+            .await
+            .expect("worker a timeout")
+            .expect("worker a ack");
+        timeout(Duration::from_millis(500), b_done_rx)
+            .await
+            .expect("worker b timeout")
+            .expect("worker b ack");
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker-a", &mut worker_a_task).await;
+        wait_task("worker-b", &mut worker_b_task).await;
+    }
+
+    #[tokio::test]
     async fn upstream_disconnect_allows_reconnect() {
         let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
         let worker_addr = worker_listener.local_addr().expect("worker addr");
@@ -2047,6 +2226,66 @@ mod tests {
         };
         let frame = encode_frame(&env_out);
         socket.write_all(&frame).await.expect("write push");
+        let _ = done.send(());
+    }
+
+    async fn run_ping_worker_twice(
+        listener: TcpListener,
+        expected_a: u64,
+        expected_b: u64,
+        done: oneshot::Sender<()>,
+    ) {
+        let (mut socket, _peer) = listener.accept().await.expect("accept worker");
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let env_in = read_client_env(&mut socket).await;
+            let ts = match env_in.payload {
+                ClientMsg::Ping { ts } => ts,
+                other => panic!("expected ping, got {other:?}"),
+            };
+            seen.push(ts);
+            let env_out = Envelope {
+                cell: env_in.cell,
+                seq: 0,
+                epoch: env_in.epoch,
+                payload: ServerMsg::Pong { ts },
+            };
+            let frame = encode_frame(&env_out);
+            socket.write_all(&frame).await.expect("write reply");
+        }
+        seen.sort();
+        assert_eq!(seen, vec![expected_a, expected_b]);
+        let _ = done.send(());
+    }
+
+    async fn run_silent_ping_worker_expect_close(
+        listener: TcpListener,
+        expected_ts: u64,
+        received: oneshot::Sender<()>,
+        done: oneshot::Sender<()>,
+    ) {
+        let (mut socket, _peer) = listener.accept().await.expect("accept worker");
+        let env_in = read_client_env(&mut socket).await;
+        let ts = match env_in.payload {
+            ClientMsg::Ping { ts } => ts,
+            other => panic!("expected ping, got {other:?}"),
+        };
+        assert_eq!(ts, expected_ts);
+        let _ = received.send(());
+
+        let mut next_len = [0u8; 4];
+        let read = timeout(Duration::from_millis(500), socket.read_exact(&mut next_len)).await;
+        match read {
+            Ok(Ok(_)) => panic!("unexpected second frame on worker"),
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Ok(Err(e)) => panic!("unexpected worker read error: {e:?}"),
+            Err(_) => panic!("worker did not observe gateway close"),
+        }
+
         let _ = done.send(());
     }
 

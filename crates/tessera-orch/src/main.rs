@@ -300,9 +300,8 @@ impl OrchestratorService {
         if *self.listing_tx.borrow() == listing {
             return;
         }
-        if let Err(e) = self.listing_tx.send(listing) {
-            warn!(target: "orch", error = ?e, "failed to publish assignment listing");
-        }
+        // `send_replace` updates the stored value even when there are no receivers yet.
+        let _ = self.listing_tx.send_replace(listing);
     }
 
     #[cfg(test)]
@@ -335,6 +334,19 @@ impl Orchestrator for OrchestratorService {
 
         let planned = self.config.worker(worker_id);
         let snapshot = self.snapshot_for(worker_id);
+        let cell_count = snapshot.cells.len();
+
+        // Config is the source of truth for assignments. Unknown workers should not be stored in
+        // runtime state (they would never appear in listings anyway) to avoid unbounded growth.
+        let Some(expected) = planned else {
+            warn!(
+                target: "orch",
+                worker_id,
+                addr,
+                "worker registered but not defined in config"
+            );
+            return Ok(Response::new(snapshot));
+        };
 
         {
             let mut guard = self.runtime.write().await;
@@ -347,43 +359,30 @@ impl Orchestrator for OrchestratorService {
             );
         }
 
-        let cell_count = snapshot.cells.len();
-        match planned {
-            Some(expected) => {
-                if expected.addr != addr {
-                    warn!(
-                        target: "orch",
-                        worker_id,
-                        expected_addr = %expected.addr,
-                        reported_addr = addr,
-                        "worker address mismatch"
-                    );
-                }
-                if cell_count == 0 {
-                    warn!(
-                        target: "orch",
-                        worker_id,
-                        addr,
-                        "worker registered but no cells assigned"
-                    );
-                } else {
-                    info!(
-                        target: "orch",
-                        worker_id,
-                        addr,
-                        cells = cell_count,
-                        "worker registered"
-                    );
-                }
-            }
-            None => {
-                warn!(
-                    target: "orch",
-                    worker_id,
-                    addr,
-                    "worker registered but not defined in config"
-                );
-            }
+        if expected.addr != addr {
+            warn!(
+                target: "orch",
+                worker_id,
+                expected_addr = %expected.addr,
+                reported_addr = addr,
+                "worker address mismatch"
+            );
+        }
+        if cell_count == 0 {
+            warn!(
+                target: "orch",
+                worker_id,
+                addr,
+                "worker registered but no cells assigned"
+            );
+        } else {
+            info!(
+                target: "orch",
+                worker_id,
+                addr,
+                cells = cell_count,
+                "worker registered"
+            );
         }
 
         self.publish_listing_if_changed().await;
@@ -727,6 +726,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_unknown_worker_does_not_store_runtime() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+
+        let snapshot = service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-unknown".into(),
+                addr: "10.0.0.9:5001".into(),
+            }))
+            .await
+            .expect("register unknown worker")
+            .into_inner();
+        assert!(snapshot.cells.is_empty());
+
+        let runtime = service.runtime.read().await;
+        assert!(runtime.is_empty());
+    }
+
+    #[tokio::test]
     async fn register_worker_rejects_empty_addr() {
         let service = OrchestratorService::new(Config::default_single_cell());
         let err = service
@@ -822,6 +847,45 @@ mod tests {
             .collect::<Vec<_>>();
         worker_ids.sort();
         assert_eq!(worker_ids, vec!["worker-a", "worker-b"]);
+    }
+
+    #[tokio::test]
+    async fn watch_assignments_initial_value_reflects_prior_register() {
+        use tokio::time::{Duration, timeout};
+
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+
+        service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-a".into(),
+                addr: "10.0.0.9:5001".into(),
+            }))
+            .await
+            .expect("register worker");
+
+        let response = service
+            .watch_assignments(Request::new(
+                tessera_proto::orch::v1::WatchAssignmentsRequest {},
+            ))
+            .await
+            .expect("watch assignments");
+        let mut stream = response.into_inner();
+
+        let first = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("timeout waiting for first listing")
+            .expect("stream closed")
+            .expect("first listing");
+        assert_eq!(first.workers.len(), 1);
+        assert_eq!(first.workers[0].addr, "10.0.0.9:5001");
     }
 
     #[tokio::test]
