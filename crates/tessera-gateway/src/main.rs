@@ -422,20 +422,51 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     continue;
                                 };
 
-                                if let Some(conn) = upstream.as_mut()
-                                    && conn.route.addr != route.addr
-                                    && conn.has_non_ping_traffic
+                                if let Some(current) = upstream
+                                    .as_ref()
+                                    .map(|conn| (conn.route.clone(), conn.has_non_ping_traffic))
+                                    && current.0.addr != route.addr
                                 {
-                                    warn!(
-                                        target: "gateway",
-                                        %peer,
-                                        cell = ?cell,
-                                        old_worker = %conn.route.worker_id,
-                                        new_worker = %route.worker_id,
-                                        "route changed after non-ping traffic; closing client to avoid dropping replies"
-                                    );
-                                    conn.close().await;
-                                    break 'conn_loop Ok(());
+                                    if current.1 {
+                                        warn!(
+                                            target: "gateway",
+                                            %peer,
+                                            cell = ?cell,
+                                            old_worker = %current.0.worker_id,
+                                            new_worker = %route.worker_id,
+                                            "route changed after non-ping traffic; closing client to avoid dropping replies"
+                                        );
+                                        upstream
+                                            .as_mut()
+                                            .expect("upstream to be established")
+                                            .close()
+                                            .await;
+                                        break 'conn_loop Ok(());
+                                    }
+
+                                    if pending_pings_conflict_with_route(
+                                        &routing,
+                                        &pending_pings,
+                                        &route.addr,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            target: "gateway",
+                                            %peer,
+                                            cell = ?cell,
+                                            old_worker = %current.0.worker_id,
+                                            new_worker = %route.worker_id,
+                                            pending = pending_pings.len(),
+                                            "route changed while earlier ping replies are still pending; closing client to avoid silently dropping pongs"
+                                        );
+                                        upstream
+                                            .as_mut()
+                                            .expect("upstream to be established")
+                                            .close()
+                                            .await;
+                                        break 'conn_loop Ok(());
+                                    }
                                 }
 
                                 let connected_new =
@@ -638,6 +669,22 @@ async fn replay_pending_pings(
             .with_context(|| format!("replay ping cell={:?} ts={}", ping.cell, ping.ts))?;
     }
     Ok(())
+}
+
+async fn pending_pings_conflict_with_route(
+    routing: &RoutingTable,
+    pending_pings: &VecDeque<PendingPing>,
+    target_addr: &str,
+) -> bool {
+    for ping in pending_pings {
+        let Some(route) = routing.lookup(&ping.cell).await else {
+            return true;
+        };
+        if route.addr != target_addr {
+            return true;
+        }
+    }
+    false
 }
 
 fn acknowledge_pending_ping(pending_pings: &mut VecDeque<PendingPing>, cell: CellId, ts: u64) {
@@ -1711,6 +1758,105 @@ mod tests {
         };
         let _ = client.write_all(&encode_frame(&ping)).await;
         expect_client_close(&mut client).await;
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker-a", &mut worker_a_task).await;
+        wait_task("worker-b", &mut worker_b_task).await;
+    }
+
+    #[tokio::test]
+    async fn switching_workers_with_pending_ping_closes_client() {
+        let worker_a_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker a");
+        let worker_a_addr = worker_a_listener.local_addr().expect("worker a addr");
+        let worker_b_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker b");
+        let worker_b_addr = worker_b_listener.local_addr().expect("worker b addr");
+
+        let (a_received_tx, a_received_rx) = oneshot::channel();
+        let (a_done_tx, a_done_rx) = oneshot::channel();
+        let mut worker_a_task = tokio::spawn(run_silent_ping_worker_expect_close(
+            worker_a_listener,
+            1,
+            a_received_tx,
+            a_done_tx,
+        ));
+        let mut worker_b_task = tokio::spawn(run_worker_expect_no_connection(
+            worker_b_listener,
+            "worker-b",
+        ));
+
+        let cell_a = CellId::grid(0, 0, 0);
+        let cell_b = CellId::grid(0, 1, 0);
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(cell_a),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: worker_a_addr.to_string(),
+            },
+        );
+        map.insert(
+            CellKey(cell_b),
+            WorkerRoute {
+                worker_id: "worker-b".to_string(),
+                addr: worker_b_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        let mut gateway_task = tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                handle_conn(sock, peer, routing_clone)
+                    .await
+                    .expect("handle conn");
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+
+        let ping_a = Envelope {
+            cell: cell_a,
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 1 },
+        };
+        client
+            .write_all(&encode_frame(&ping_a))
+            .await
+            .expect("send first ping");
+
+        timeout(Duration::from_millis(500), a_received_rx)
+            .await
+            .expect("worker a did not receive first ping")
+            .expect("worker a receive ack");
+
+        let ping_b = Envelope {
+            cell: cell_b,
+            seq: 1,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 2 },
+        };
+        client
+            .write_all(&encode_frame(&ping_b))
+            .await
+            .expect("send second ping");
+
+        expect_client_close(&mut client).await;
+
+        timeout(Duration::from_millis(500), a_done_rx)
+            .await
+            .expect("worker a timeout")
+            .expect("worker a ack");
 
         wait_task("gateway", &mut gateway_task).await;
         wait_task("worker-a", &mut worker_a_task).await;
