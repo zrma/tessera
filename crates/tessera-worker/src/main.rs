@@ -28,15 +28,26 @@ use tracing::{error, info, warn};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
+const DEFAULT_AOI_RADIUS_CELLS: i32 = 1;
+const DEFAULT_AOI_CELL_SPAN_UNITS: f32 = 32.0;
 type OutboundMsg = (CellId, Option<u32>, ServerMsg);
 type CellSubscribers = HashMap<CellId, Vec<CellSubscriber>>;
 type CellOwners = HashMap<CellId, HashMap<EntityId, u64>>;
+type PendingMoveQueues = HashMap<CellId, HashMap<EntityId, PendingMoveBroadcast>>;
+type OwnedActors = HashSet<(CellId, EntityId)>;
 
 #[derive(Clone)]
 struct CellSubscriber {
     client_id: u64,
     tx: Sender<OutboundMsg>,
     disconnect_tx: watch::Sender<()>,
+}
+
+#[derive(Clone)]
+struct ClientSession {
+    subscriber: CellSubscriber,
+    root_actors: OwnedActors,
+    last_epoch: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,14 +57,46 @@ enum ClaimOutcome {
     Denied(u64),
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone)]
+struct PendingMoveBroadcast {
+    exclude_client_id: u64,
+    epoch: u32,
+}
+
 struct SharedState {
     actors: Mutex<HashMap<CellId, HashMap<EntityId, Position>>>,
     owners: Mutex<CellOwners>,
     subscribers: Mutex<CellSubscribers>,
+    pending_moves: Mutex<PendingMoveQueues>,
+    client_sessions: Mutex<HashMap<u64, ClientSession>>,
+    aoi_radius_cells: i32,
+    aoi_cell_span_units: f32,
+    aoi_edge_margin_units: Option<f32>,
 }
 
 impl SharedState {
+    fn with_aoi_config(
+        aoi_radius_cells: i32,
+        aoi_cell_span_units: f32,
+        aoi_edge_margin_units: Option<f32>,
+    ) -> Self {
+        Self {
+            actors: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
+            subscribers: Mutex::new(HashMap::new()),
+            pending_moves: Mutex::new(HashMap::new()),
+            client_sessions: Mutex::new(HashMap::new()),
+            aoi_radius_cells,
+            aoi_cell_span_units,
+            aoi_edge_margin_units,
+        }
+    }
+
+    fn new(aoi_radius_cells: i32) -> Self {
+        Self::with_aoi_config(aoi_radius_cells, DEFAULT_AOI_CELL_SPAN_UNITS, None)
+    }
+
+    #[cfg(test)]
     async fn subscribe(&self, cell: CellId, subscriber: &CellSubscriber) {
         let mut subs = self.subscribers.lock().await;
         let entry = subs.entry(cell).or_default();
@@ -129,6 +172,61 @@ impl SharedState {
         Ok(inserted_new)
     }
 
+    async fn subscribe_with_snapshot(
+        &self,
+        cell: CellId,
+        subscriber: &CellSubscriber,
+        epoch: u32,
+    ) -> Result<bool, ()> {
+        let actors = self.actors.lock().await;
+        let mut subs = self.subscribers.lock().await;
+        let snapshot = actors
+            .get(&cell)
+            .map(|cell_actors| {
+                cell_actors
+                    .iter()
+                    .map(|(id, pos)| ActorState { id: *id, pos: *pos })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if snapshot.is_empty() {
+            let entry = subs.entry(cell).or_default();
+            let already_subscribed = entry
+                .iter()
+                .any(|existing| existing.client_id == subscriber.client_id);
+            if !already_subscribed {
+                entry.push(subscriber.clone());
+            }
+            return Ok(!already_subscribed);
+        }
+
+        if subscriber
+            .tx
+            .try_send((
+                cell,
+                Some(epoch),
+                ServerMsg::Snapshot {
+                    cell,
+                    actors: snapshot,
+                },
+            ))
+            .is_err()
+        {
+            return Err(());
+        }
+
+        let entry = subs.entry(cell).or_default();
+        let already_subscribed = entry
+            .iter()
+            .any(|existing| existing.client_id == subscriber.client_id);
+        if !already_subscribed {
+            entry.push(subscriber.clone());
+        }
+
+        Ok(!already_subscribed)
+    }
+
     async fn release_owner(&self, cell: CellId, actor: EntityId, client_id: u64) {
         let mut owners = self.owners.lock().await;
         let mut remove_cell = false;
@@ -144,11 +242,160 @@ impl SharedState {
     }
 
     async fn remove_client_subscriptions(&self, client_id: u64) {
+        {
+            let mut sessions = self.client_sessions.lock().await;
+            sessions.remove(&client_id);
+        }
         let mut subs = self.subscribers.lock().await;
         subs.values_mut().for_each(|entries| {
             entries.retain(|subscriber| subscriber.client_id != client_id);
         });
         subs.retain(|_, entries| !entries.is_empty());
+    }
+
+    async fn remove_subscriptions_for_cells(&self, client_id: u64, cells: &HashSet<CellId>) {
+        if cells.is_empty() {
+            return;
+        }
+
+        let mut subs = self.subscribers.lock().await;
+        for cell in cells {
+            let mut remove_cell = false;
+            if let Some(entries) = subs.get_mut(cell) {
+                entries.retain(|subscriber| subscriber.client_id != client_id);
+                remove_cell = entries.is_empty();
+            }
+            if remove_cell {
+                subs.remove(cell);
+            }
+        }
+    }
+
+    async fn upsert_client_root(
+        &self,
+        subscriber: &CellSubscriber,
+        cell: CellId,
+        actor: EntityId,
+        epoch: u32,
+    ) {
+        let mut sessions = self.client_sessions.lock().await;
+        let entry = sessions
+            .entry(subscriber.client_id)
+            .or_insert_with(|| ClientSession {
+                subscriber: subscriber.clone(),
+                root_actors: HashSet::new(),
+                last_epoch: epoch,
+            });
+        entry.subscriber = subscriber.clone();
+        entry.root_actors.insert((cell, actor));
+        entry.last_epoch = epoch;
+    }
+
+    async fn touch_client_epoch(&self, subscriber: &CellSubscriber, epoch: u32) {
+        let mut sessions = self.client_sessions.lock().await;
+        if let Some(entry) = sessions.get_mut(&subscriber.client_id) {
+            entry.subscriber = subscriber.clone();
+            entry.last_epoch = epoch;
+        }
+    }
+
+    async fn prune_client_roots(&self, removed_cells: &HashSet<CellId>) {
+        if removed_cells.is_empty() {
+            return;
+        }
+
+        let removed_clients = {
+            let mut sessions = self.client_sessions.lock().await;
+            let mut removed_clients = HashSet::new();
+            sessions.retain(|client_id, session| {
+                session
+                    .root_actors
+                    .retain(|(cell, _)| !removed_cells.contains(cell));
+                let keep = !session.root_actors.is_empty();
+                if !keep {
+                    removed_clients.insert(*client_id);
+                }
+                keep
+            });
+            removed_clients
+        };
+
+        if removed_clients.is_empty() {
+            return;
+        }
+
+        let mut subs = self.subscribers.lock().await;
+        subs.values_mut().for_each(|entries| {
+            entries.retain(|subscriber| !removed_clients.contains(&subscriber.client_id));
+        });
+        subs.retain(|_, entries| !entries.is_empty());
+    }
+
+    async fn actor_positions(&self, actors: &OwnedActors) -> Vec<(CellId, Position)> {
+        let actor_map = self.actors.lock().await;
+        actors
+            .iter()
+            .filter_map(|(cell, actor)| {
+                actor_map
+                    .get(cell)
+                    .and_then(|cell_actors| cell_actors.get(actor))
+                    .copied()
+                    .map(|pos| (*cell, pos))
+            })
+            .collect::<Vec<_>>()
+    }
+
+    async fn client_subscribed_cells(&self, client_id: u64) -> HashSet<CellId> {
+        let subs = self.subscribers.lock().await;
+        subs.iter()
+            .filter_map(|(cell, entries)| {
+                entries
+                    .iter()
+                    .any(|subscriber| subscriber.client_id == client_id)
+                    .then_some(*cell)
+            })
+            .collect::<HashSet<_>>()
+    }
+
+    async fn resync_client_interests(&self, owned_cells: &HashSet<CellId>) {
+        let sessions = {
+            let sessions = self.client_sessions.lock().await;
+            sessions
+                .iter()
+                .map(|(client_id, session)| {
+                    (
+                        *client_id,
+                        session.subscriber.clone(),
+                        session.root_actors.clone(),
+                        session.last_epoch,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (client_id, subscriber, root_actors, epoch) in sessions {
+            let root_positions = self.actor_positions(&root_actors).await;
+            let desired_cells = desired_aoi_cells(
+                &root_positions,
+                owned_cells,
+                self.aoi_radius_cells,
+                self.aoi_cell_span_units,
+                self.aoi_edge_margin_units,
+            );
+            let mut subscribed_cells = self.client_subscribed_cells(client_id).await;
+            if sync_interest_cells(
+                self,
+                &subscriber,
+                &mut subscribed_cells,
+                &desired_cells,
+                epoch,
+            )
+            .await
+            .is_err()
+            {
+                self.remove_client_subscriptions(client_id).await;
+            }
+        }
     }
 
     async fn broadcast(
@@ -183,6 +430,43 @@ impl SharedState {
                 subs.remove(&cell);
             }
         }
+    }
+
+    async fn enqueue_move_broadcast(
+        &self,
+        cell: CellId,
+        actor: EntityId,
+        exclude_client_id: u64,
+        epoch: u32,
+    ) {
+        let mut pending = self.pending_moves.lock().await;
+        pending.entry(cell).or_default().insert(
+            actor,
+            PendingMoveBroadcast {
+                exclude_client_id,
+                epoch,
+            },
+        );
+    }
+
+    async fn drain_move_broadcasts(&self) -> PendingMoveQueues {
+        let mut pending = self.pending_moves.lock().await;
+        std::mem::take(&mut *pending)
+    }
+
+    async fn drop_pending_moves_for_actors(
+        &self,
+        removed_by_cell: &HashMap<CellId, Vec<EntityId>>,
+    ) {
+        let mut pending = self.pending_moves.lock().await;
+        pending.retain(|cell, queued| {
+            if let Some(removed) = removed_by_cell.get(cell) {
+                for entity in removed {
+                    queued.remove(entity);
+                }
+            }
+            !queued.is_empty()
+        });
     }
 
     async fn remove_owned_actors(
@@ -228,6 +512,8 @@ impl SharedState {
         }
         drop(actors);
 
+        self.drop_pending_moves_for_actors(&removed_by_cell).await;
+
         // 소유권 맵을 잠근 상태에서 despawn을 전파해 재조인 경쟁으로 인한 순서 역전을 막는다.
         for (cell, actors) in removed_by_cell {
             if !actors.is_empty() {
@@ -266,8 +552,15 @@ impl SharedState {
             self.broadcast(cell, ServerMsg::Despawn { cell, actors }, None, None)
                 .await;
         }
+        {
+            let mut pending = self.pending_moves.lock().await;
+            pending.retain(|cell, _| !cells.contains(cell));
+        }
         let mut subs = self.subscribers.lock().await;
         subs.retain(|cell, _| !cells.contains(cell));
+        drop(subs);
+
+        self.prune_client_roots(cells).await;
     }
 
     async fn claim_owner(&self, cell: CellId, actor: EntityId, client_id: u64) -> ClaimOutcome {
@@ -292,6 +585,12 @@ impl SharedState {
     }
 }
 
+impl Default for SharedState {
+    fn default() -> Self {
+        Self::new(DEFAULT_AOI_RADIUS_CELLS)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -305,6 +604,10 @@ async fn main() -> Result<()> {
     let advertise_addr = resolve_advertise_addr(addr)?;
     let worker_id =
         std::env::var("TESSERA_WORKER_ID").unwrap_or_else(|_| "worker-local".to_string());
+    let aoi_radius_cells = load_aoi_radius_cells().context("load worker AOI radius")?;
+    let aoi_cell_span_units = load_aoi_cell_span_units().context("load worker AOI cell span")?;
+    let aoi_edge_margin_units =
+        load_aoi_edge_margin_units().context("load worker AOI edge margin")?;
 
     let (assignments, used_fallback) = load_assignments(&worker_id, addr, &advertise_addr, || {
         fetch_assignments(&worker_id, &advertise_addr)
@@ -321,7 +624,11 @@ async fn main() -> Result<()> {
         assignments.iter().copied().collect::<HashSet<_>>(),
     ));
 
-    let state = Arc::new(SharedState::default());
+    let state = Arc::new(SharedState::with_aoi_config(
+        aoi_radius_cells,
+        aoi_cell_span_units,
+        aoi_edge_margin_units,
+    ));
     let server_state = state.clone();
     let owned_for_server = owned_cells.clone();
     let mut server = tokio::spawn(run_server(addr, server_state, owned_for_server));
@@ -369,7 +676,7 @@ async fn main() -> Result<()> {
             }
             _ = interval.tick() => {
                 tick.0 += 1;
-                on_tick(tick).await;
+                on_tick(tick, state.as_ref()).await;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!(target: "worker", "shutdown signal received");
@@ -570,6 +877,81 @@ fn assignment_retry_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn load_aoi_radius_cells() -> Result<i32> {
+    let raw = std::env::var("TESSERA_WORKER_AOI_RADIUS_CELLS").ok();
+    parse_aoi_radius_cells(raw.as_deref())
+}
+
+fn load_aoi_cell_span_units() -> Result<f32> {
+    let raw = std::env::var("TESSERA_WORKER_AOI_CELL_SPAN_UNITS").ok();
+    parse_aoi_cell_span_units(raw.as_deref())
+}
+
+fn load_aoi_edge_margin_units() -> Result<Option<f32>> {
+    let raw = std::env::var("TESSERA_WORKER_AOI_EDGE_MARGIN_UNITS").ok();
+    parse_aoi_edge_margin_units(raw.as_deref())
+}
+
+fn parse_aoi_radius_cells(raw: Option<&str>) -> Result<i32> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_AOI_RADIUS_CELLS);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_AOI_RADIUS_CELLS);
+    }
+
+    let radius = trimmed
+        .parse::<i32>()
+        .with_context(|| format!("invalid AOI radius `{trimmed}`"))?;
+    if radius < 0 {
+        return Err(anyhow!("AOI radius must be >= 0"));
+    }
+    Ok(radius)
+}
+
+fn parse_aoi_cell_span_units(raw: Option<&str>) -> Result<f32> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_AOI_CELL_SPAN_UNITS);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_AOI_CELL_SPAN_UNITS);
+    }
+
+    let span = trimmed
+        .parse::<f32>()
+        .with_context(|| format!("invalid AOI cell span `{trimmed}`"))?;
+    if !span.is_finite() {
+        return Err(anyhow!("AOI cell span must be finite"));
+    }
+    if span <= 0.0 {
+        return Err(anyhow!("AOI cell span must be > 0"));
+    }
+    Ok(span)
+}
+
+fn parse_aoi_edge_margin_units(raw: Option<&str>) -> Result<Option<f32>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let margin = trimmed
+        .parse::<f32>()
+        .with_context(|| format!("invalid AOI edge margin `{trimmed}`"))?;
+    if !margin.is_finite() {
+        return Err(anyhow!("AOI edge margin must be finite"));
+    }
+    if margin < 0.0 {
+        return Err(anyhow!("AOI edge margin must be >= 0"));
+    }
+    Ok(Some(margin))
+}
+
 async fn retry_assignments_until_registered<F, Fut>(
     worker_id: String,
     owned_cells: Arc<RwLock<HashSet<CellId>>>,
@@ -586,16 +968,20 @@ async fn retry_assignments_until_registered<F, Fut>(
         match fetcher().await {
             Ok(cells) => {
                 let updated = cells.iter().copied().collect::<HashSet<_>>();
-                let removed = {
+                let (changed, removed) = {
                     let mut guard = owned_cells.write().await;
                     let removed = guard.difference(&updated).copied().collect::<HashSet<_>>();
-                    if *guard != updated {
-                        *guard = updated;
+                    let changed = *guard != updated;
+                    if changed {
+                        *guard = updated.clone();
                     }
-                    removed
+                    (changed, removed)
                 };
                 if !removed.is_empty() {
                     state.drop_cells(&removed).await;
+                }
+                if changed {
+                    state.resync_client_interests(&updated).await;
                 }
                 if cells.is_empty() {
                     warn!(
@@ -625,10 +1011,56 @@ async fn retry_assignments_until_registered<F, Fut>(
     }
 }
 
-async fn on_tick(tick: Tick) {
-    // TODO: cell queues, AOI broadcasting, metrics
+async fn on_tick(tick: Tick, state: &SharedState) {
+    let pending = state.drain_move_broadcasts().await;
+    let queued_cells = pending.len();
+    let queued_moves = pending.values().map(HashMap::len).sum::<usize>();
+
+    for (cell, queued) in pending {
+        let queued_events = {
+            let actors = state.actors.lock().await;
+            let Some(cell_actors) = actors.get(&cell) else {
+                continue;
+            };
+            queued
+                .into_iter()
+                .filter_map(|(actor_id, event)| {
+                    cell_actors.get(&actor_id).map(|pos| {
+                        (
+                            ActorState {
+                                id: actor_id,
+                                pos: *pos,
+                            },
+                            event,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (actor, event) in queued_events {
+            state
+                .broadcast(
+                    cell,
+                    ServerMsg::Delta {
+                        cell,
+                        moved: vec![actor],
+                    },
+                    Some(event.exclude_client_id),
+                    Some(event.epoch),
+                )
+                .await;
+        }
+    }
+
     if tick.0 % 30 == 0 {
-        info!(target: "worker", tick = tick.0, "tick heartbeat");
+        info!(
+            target: "worker",
+            tick = tick.0,
+            queued_cells,
+            queued_moves,
+            "tick heartbeat"
+        );
     }
 }
 
@@ -638,6 +1070,136 @@ fn position_is_finite(pos: &Position) -> bool {
 
 fn delta_is_finite(dx: f32, dy: f32) -> bool {
     dx.is_finite() && dy.is_finite()
+}
+
+fn aoi_cells_for(cell: CellId, radius_cells: i32) -> Vec<CellId> {
+    let mut visible = Vec::with_capacity(((radius_cells * 2 + 1).pow(2)) as usize);
+    for dy in -radius_cells..=radius_cells {
+        for dx in -radius_cells..=radius_cells {
+            visible.push(CellId {
+                world: cell.world,
+                cx: cell.cx + dx,
+                cy: cell.cy + dy,
+                depth: cell.depth,
+                sub: cell.sub,
+            });
+        }
+    }
+    visible
+}
+
+fn aoi_cells_for_position(
+    cell: CellId,
+    pos: Position,
+    radius_cells: i32,
+    cell_span_units: f32,
+    edge_margin_units: Option<f32>,
+) -> Vec<CellId> {
+    let Some(edge_margin_units) = edge_margin_units else {
+        return aoi_cells_for(cell, radius_cells);
+    };
+    // 현재 프로토콜의 위치는 셀 로컬 좌표로 보고 `0..cell_span_units` 경계를 기준으로
+    // 인접 방향 셀 구독 여부를 결정한다.
+    let edge_margin_units = edge_margin_units.min(cell_span_units);
+    let west = pos.x <= edge_margin_units;
+    let east = pos.x >= cell_span_units - edge_margin_units;
+    let south = pos.y <= edge_margin_units;
+    let north = pos.y >= cell_span_units - edge_margin_units;
+
+    let mut visible = Vec::with_capacity(((radius_cells * 2 + 1).pow(2)) as usize);
+    for dy in -radius_cells..=radius_cells {
+        if (dy < 0 && !south) || (dy > 0 && !north) {
+            continue;
+        }
+        for dx in -radius_cells..=radius_cells {
+            if (dx < 0 && !west) || (dx > 0 && !east) {
+                continue;
+            }
+            visible.push(CellId {
+                world: cell.world,
+                cx: cell.cx + dx,
+                cy: cell.cy + dy,
+                depth: cell.depth,
+                sub: cell.sub,
+            });
+        }
+    }
+    visible
+}
+
+fn desired_aoi_cells_for_positions(
+    root_positions: &[(CellId, Position)],
+    owned_cells: &HashSet<CellId>,
+    radius_cells: i32,
+    cell_span_units: f32,
+    edge_margin_units: Option<f32>,
+) -> HashSet<CellId> {
+    let mut desired = HashSet::new();
+    for (cell, pos) in root_positions {
+        for visible in aoi_cells_for_position(
+            *cell,
+            *pos,
+            radius_cells,
+            cell_span_units,
+            edge_margin_units,
+        ) {
+            if owned_cells.contains(&visible) {
+                desired.insert(visible);
+            }
+        }
+    }
+    desired
+}
+
+fn desired_aoi_cells(
+    owned_actor_positions: &[(CellId, Position)],
+    owned_cells: &HashSet<CellId>,
+    radius_cells: i32,
+    cell_span_units: f32,
+    edge_margin_units: Option<f32>,
+) -> HashSet<CellId> {
+    desired_aoi_cells_for_positions(
+        owned_actor_positions,
+        owned_cells,
+        radius_cells,
+        cell_span_units,
+        edge_margin_units,
+    )
+}
+
+async fn sync_interest_cells(
+    state: &SharedState,
+    subscriber: &CellSubscriber,
+    subscribed_cells: &mut HashSet<CellId>,
+    desired_cells: &HashSet<CellId>,
+    epoch: u32,
+) -> Result<(), ()> {
+    let mut to_unsubscribe = subscribed_cells
+        .difference(desired_cells)
+        .copied()
+        .collect::<Vec<_>>();
+    to_unsubscribe.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    let to_unsubscribe_set = to_unsubscribe.iter().copied().collect::<HashSet<_>>();
+    state
+        .remove_subscriptions_for_cells(subscriber.client_id, &to_unsubscribe_set)
+        .await;
+    for cell in &to_unsubscribe {
+        subscribed_cells.remove(cell);
+    }
+
+    let mut to_subscribe = desired_cells
+        .difference(subscribed_cells)
+        .copied()
+        .collect::<Vec<_>>();
+    to_subscribe.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    for cell in to_subscribe {
+        state
+            .subscribe_with_snapshot(cell, subscriber, epoch)
+            .await?;
+        subscribed_cells.insert(cell);
+    }
+
+    Ok(())
 }
 
 fn make_error(code: &str, message: impl Into<String>) -> ServerMsg {
@@ -735,6 +1297,7 @@ async fn handle_upstream_inner(
     let writer_epoch = Arc::clone(&epoch);
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let mut owned_actors: HashSet<(CellId, EntityId)> = HashSet::new();
+    let mut subscribed_cells: HashSet<CellId> = HashSet::new();
     let (disconnect_tx, mut disconnect_rx) = watch::channel(());
     let subscriber = CellSubscriber {
         client_id,
@@ -887,6 +1450,7 @@ async fn handle_upstream_inner(
                     );
                     break Ok(());
                 }
+                state.touch_client_epoch(&subscriber, env_in.epoch).await;
             }
             ClientMsg::Join { actor, pos } => {
                 if !position_is_finite(&pos) {
@@ -967,6 +1531,36 @@ async fn handle_upstream_inner(
                 if inserted_new || matches!(claim, ClaimOutcome::GrantedNew) {
                     owned_actors.insert((cell, actor));
                 }
+                subscribed_cells.insert(cell);
+
+                let owned_actor_positions = state.actor_positions(&owned_actors).await;
+                let desired_cells = desired_aoi_cells(
+                    &owned_actor_positions,
+                    &owned_guard,
+                    state.aoi_radius_cells,
+                    state.aoi_cell_span_units,
+                    state.aoi_edge_margin_units,
+                );
+                if sync_interest_cells(
+                    state.as_ref(),
+                    &subscriber,
+                    &mut subscribed_cells,
+                    &desired_cells,
+                    env_in.epoch,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        target: "worker",
+                        %peer,
+                        "client response channel closed while syncing AOI snapshots"
+                    );
+                    break Ok(());
+                }
+                state
+                    .upsert_client_root(&subscriber, cell, actor, env_in.epoch)
+                    .await;
 
                 let moved = ActorState { id: actor, pos };
                 state
@@ -1065,8 +1659,6 @@ async fn handle_upstream_inner(
                         continue;
                     }
                 }
-
-                state.subscribe(cell, &subscriber).await;
 
                 let moved = {
                     let mut actors = state.actors.lock().await;
@@ -1168,7 +1760,7 @@ async fn handle_upstream_inner(
 
                 let delta = ServerMsg::Delta {
                     cell,
-                    moved: vec![moved],
+                    moved: vec![moved.clone()],
                 };
                 let mut outbound_failed = false;
                 if tx
@@ -1183,9 +1775,35 @@ async fn handle_upstream_inner(
                     outbound_failed = true;
                 }
                 state
-                    .broadcast(cell, delta, Some(client_id), Some(env_in.epoch))
+                    .enqueue_move_broadcast(cell, actor, client_id, env_in.epoch)
                     .await;
                 if outbound_failed {
+                    break Ok(());
+                }
+                state.touch_client_epoch(&subscriber, env_in.epoch).await;
+                let owned_actor_positions = state.actor_positions(&owned_actors).await;
+                let desired_cells = desired_aoi_cells(
+                    &owned_actor_positions,
+                    &owned_guard,
+                    state.aoi_radius_cells,
+                    state.aoi_cell_span_units,
+                    state.aoi_edge_margin_units,
+                );
+                if sync_interest_cells(
+                    state.as_ref(),
+                    &subscriber,
+                    &mut subscribed_cells,
+                    &desired_cells,
+                    env_in.epoch,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        target: "worker",
+                        %peer,
+                        "client response channel closed while syncing AOI after move"
+                    );
                     break Ok(());
                 }
             }
@@ -1210,6 +1828,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     fn test_subscriber(
@@ -1222,6 +1841,18 @@ mod tests {
             tx,
             disconnect_tx: disconnect_tx.clone(),
         }
+    }
+
+    fn spawn_test_tick_loop(state: Arc<SharedState>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = Tick(0);
+            let mut interval = time::interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                tick.0 += 1;
+                on_tick(tick, state.as_ref()).await;
+            }
+        })
     }
 
     #[test]
@@ -1331,6 +1962,93 @@ mod tests {
         let bind: SocketAddr = "127.0.0.1:5001".parse().unwrap();
         let addr = resolve_advertise_addr_inner(bind, None).expect("should default");
         assert_eq!(addr, "127.0.0.1:5001");
+    }
+
+    #[test]
+    fn parse_aoi_radius_cells_defaults_and_rejects_negative() {
+        assert_eq!(
+            parse_aoi_radius_cells(None).unwrap(),
+            DEFAULT_AOI_RADIUS_CELLS
+        );
+        assert_eq!(
+            parse_aoi_radius_cells(Some("   ")).unwrap(),
+            DEFAULT_AOI_RADIUS_CELLS
+        );
+        assert_eq!(parse_aoi_radius_cells(Some("2")).unwrap(), 2);
+        let err = parse_aoi_radius_cells(Some("-1")).expect_err("negative radius should fail");
+        assert!(err.to_string().contains(">= 0"));
+    }
+
+    #[test]
+    fn parse_aoi_edge_settings_defaults_and_reject_invalid() {
+        assert_eq!(
+            parse_aoi_cell_span_units(None).unwrap(),
+            DEFAULT_AOI_CELL_SPAN_UNITS
+        );
+        assert_eq!(
+            parse_aoi_cell_span_units(Some("  ")).unwrap(),
+            DEFAULT_AOI_CELL_SPAN_UNITS
+        );
+        assert_eq!(parse_aoi_cell_span_units(Some("48")).unwrap(), 48.0);
+        let err = parse_aoi_cell_span_units(Some("0")).expect_err("zero span should fail");
+        assert!(err.to_string().contains("> 0"));
+
+        assert_eq!(parse_aoi_edge_margin_units(None).unwrap(), None);
+        assert_eq!(parse_aoi_edge_margin_units(Some("")).unwrap(), None);
+        assert_eq!(parse_aoi_edge_margin_units(Some("4")).unwrap(), Some(4.0));
+        let err = parse_aoi_edge_margin_units(Some("-1")).expect_err("negative margin should fail");
+        assert!(err.to_string().contains(">= 0"));
+    }
+
+    #[test]
+    fn desired_aoi_cells_respects_radius() {
+        let origin = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        let far = CellId::grid(0, 3, 0);
+        let root_positions = vec![(origin, Position { x: 16.0, y: 16.0 })];
+        let owned_cells = HashSet::from([origin, adjacent, far]);
+
+        assert_eq!(
+            desired_aoi_cells(
+                &root_positions,
+                &owned_cells,
+                0,
+                DEFAULT_AOI_CELL_SPAN_UNITS,
+                None,
+            ),
+            HashSet::from([origin])
+        );
+        assert_eq!(
+            desired_aoi_cells(
+                &root_positions,
+                &owned_cells,
+                1,
+                DEFAULT_AOI_CELL_SPAN_UNITS,
+                None,
+            ),
+            HashSet::from([origin, adjacent])
+        );
+    }
+
+    #[test]
+    fn desired_aoi_cells_respects_edge_margin() {
+        let origin = CellId::grid(0, 0, 0);
+        let east = CellId::grid(0, 1, 0);
+        let north = CellId::grid(0, 0, 1);
+        let northeast = CellId::grid(0, 1, 1);
+        let owned_cells = HashSet::from([origin, east, north, northeast]);
+
+        let centered = vec![(origin, Position { x: 16.0, y: 16.0 })];
+        assert_eq!(
+            desired_aoi_cells(&centered, &owned_cells, 1, 32.0, Some(4.0)),
+            HashSet::from([origin])
+        );
+
+        let edge = vec![(origin, Position { x: 30.0, y: 30.0 })];
+        assert_eq!(
+            desired_aoi_cells(&edge, &owned_cells, 1, 32.0, Some(4.0)),
+            HashSet::from([origin, east, north, northeast])
+        );
     }
 
     #[tokio::test]
@@ -1500,6 +2218,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_assignments_resyncs_existing_client_aoi() {
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(primary)
+                .or_default()
+                .insert(EntityId(1), Position { x: 16.0, y: 16.0 });
+            actors
+                .entry(adjacent)
+                .or_default()
+                .insert(EntityId(2), Position { x: 3.0, y: 4.0 });
+        }
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(41, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(primary, &watcher).await;
+        state
+            .upsert_client_root(&watcher, primary, EntityId(1), 77)
+            .await;
+
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary])));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+
+        retry_assignments_until_registered(
+            "worker-retry-aoi".to_string(),
+            Arc::clone(&owned_cells),
+            Arc::clone(&state),
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err(anyhow!("orch unreachable"))
+                    } else {
+                        Ok(vec![primary, adjacent])
+                    }
+                }
+            },
+            Duration::from_millis(10),
+        )
+        .await;
+
+        let snapshot = watcher_rx
+            .try_recv()
+            .expect("existing client should receive adjacent snapshot after resync");
+        assert_eq!(snapshot.0, adjacent);
+        assert_eq!(snapshot.1, Some(77));
+        match snapshot.2 {
+            ServerMsg::Snapshot { cell, actors } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(actors.len(), 1);
+                assert_eq!(actors[0].id, EntityId(2));
+                assert_eq!(actors[0].pos, Position { x: 3.0, y: 4.0 });
+            }
+            other => panic!("expected adjacent snapshot, got {other:?}"),
+        }
+
+        let subscribed = state.client_subscribed_cells(watcher.client_id).await;
+        assert_eq!(subscribed, HashSet::from([primary, adjacent]));
+    }
+
+    #[tokio::test]
+    async fn drop_cells_prunes_client_roots_before_future_resync() {
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(primary)
+                .or_default()
+                .insert(EntityId(1), Position { x: 16.0, y: 16.0 });
+            actors
+                .entry(adjacent)
+                .or_default()
+                .insert(EntityId(2), Position { x: 9.0, y: 1.0 });
+        }
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(42, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(primary, &watcher).await;
+        state
+            .upsert_client_root(&watcher, primary, EntityId(1), 88)
+            .await;
+
+        state
+            .resync_client_interests(&HashSet::from([primary, adjacent]))
+            .await;
+        let initial_snapshot = watcher_rx
+            .try_recv()
+            .expect("initial resync should subscribe adjacent cell");
+        assert_eq!(initial_snapshot.0, adjacent);
+
+        state.drop_cells(&HashSet::from([primary])).await;
+        let despawn = watcher_rx
+            .try_recv()
+            .expect("dropping the root cell should broadcast despawn");
+        assert_eq!(despawn.0, primary);
+        assert!(matches!(
+            despawn.2,
+            ServerMsg::Despawn { ref actors, .. } if actors == &vec![EntityId(1)]
+        ));
+        state
+            .resync_client_interests(&HashSet::from([adjacent]))
+            .await;
+
+        let subscribed = state.client_subscribed_cells(watcher.client_id).await;
+        assert!(
+            subscribed.is_empty(),
+            "rootless client should be unsubscribed"
+        );
+        let sessions = state.client_sessions.lock().await;
+        assert!(
+            !sessions.contains_key(&watcher.client_id),
+            "dropping a root cell should forget the client session"
+        );
+        drop(sessions);
+
+        state
+            .resync_client_interests(&HashSet::from([primary, adjacent]))
+            .await;
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "stale roots must not resubscribe ghost cells after reassignment"
+        );
+    }
+
+    #[tokio::test]
+    async fn resync_client_interests_respects_edge_margin() {
+        let state = Arc::new(SharedState::with_aoi_config(1, 32.0, Some(4.0)));
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(primary)
+                .or_default()
+                .insert(EntityId(1), Position { x: 16.0, y: 16.0 });
+            actors
+                .entry(adjacent)
+                .or_default()
+                .insert(EntityId(2), Position { x: 7.0, y: 8.0 });
+        }
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(43, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(primary, &watcher).await;
+        state
+            .upsert_client_root(&watcher, primary, EntityId(1), 90)
+            .await;
+
+        state
+            .resync_client_interests(&HashSet::from([primary, adjacent]))
+            .await;
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "centered actor should not subscribe adjacent cell under edge AOI"
+        );
+
+        {
+            let mut actors = state.actors.lock().await;
+            let pos = actors
+                .get_mut(&primary)
+                .and_then(|cell_actors| cell_actors.get_mut(&EntityId(1)))
+                .expect("primary actor");
+            pos.x = 29.0;
+        }
+        state.touch_client_epoch(&watcher, 91).await;
+        state
+            .resync_client_interests(&HashSet::from([primary, adjacent]))
+            .await;
+
+        let snapshot = watcher_rx
+            .try_recv()
+            .expect("edge actor should receive adjacent snapshot");
+        assert_eq!(snapshot.0, adjacent);
+        assert_eq!(snapshot.1, Some(91));
+    }
+
+    #[tokio::test]
     async fn responses_echo_client_epoch() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1536,6 +2441,86 @@ mod tests {
         assert_eq!(reply.epoch, 99);
         assert_eq!(reply.seq, 0);
         assert!(matches!(reply.payload, ServerMsg::Pong { ts } if ts == 123));
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn aoi_resync_uses_latest_client_epoch_after_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary])));
+        let accept_state = Arc::clone(&state);
+        let accept_owned = Arc::clone(&owned_cells);
+
+        let server = tokio::spawn(async move {
+            let (sock, peer) = listener.accept().await.expect("accept connection");
+            handle_upstream(sock, peer, accept_state, accept_owned)
+                .await
+                .expect("handle upstream");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect client");
+        client
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 0,
+                epoch: 10,
+                payload: ClientMsg::Join {
+                    actor: EntityId(1),
+                    pos: Position { x: 0.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("send join");
+        let join_snapshot = read_env(&mut client).await;
+        assert_eq!(join_snapshot.epoch, 10);
+
+        client
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 1,
+                epoch: 25,
+                payload: ClientMsg::Ping { ts: 1234 },
+            }))
+            .await
+            .expect("send ping");
+        let pong = read_env(&mut client).await;
+        assert_eq!(pong.epoch, 25);
+        assert!(matches!(pong.payload, ServerMsg::Pong { ts } if ts == 1234));
+
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(adjacent)
+                .or_default()
+                .insert(EntityId(2), Position { x: 7.0, y: 8.0 });
+        }
+        let updated = {
+            let mut guard = owned_cells.write().await;
+            *guard = HashSet::from([primary, adjacent]);
+            guard.clone()
+        };
+        state.resync_client_interests(&updated).await;
+
+        let ghost_snapshot = read_env(&mut client).await;
+        assert_eq!(ghost_snapshot.epoch, 25);
+        match ghost_snapshot.payload {
+            ServerMsg::Snapshot { cell, actors } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(actors.len(), 1);
+                assert_eq!(actors[0].id, EntityId(2));
+                assert_eq!(actors[0].pos, Position { x: 7.0, y: 8.0 });
+            }
+            other => panic!("expected ghost snapshot, got {other:?}"),
+        }
 
         drop(client);
         let _ = server.await;
@@ -1599,6 +2584,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
 
         let state = Arc::new(SharedState::default());
+        let ticker = spawn_test_tick_loop(Arc::clone(&state));
         let owned_cells = Arc::new(RwLock::new(HashSet::from([CellId::grid(0, 0, 0)])));
         let accept_state = Arc::clone(&state);
         let accept_owned = Arc::clone(&owned_cells);
@@ -1682,6 +2668,7 @@ mod tests {
         drop(client_a);
         drop(client_b);
         let _ = server.await;
+        ticker.abort();
     }
 
     #[tokio::test]
@@ -2168,6 +3155,533 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_receives_adjacent_owned_cell_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary, adjacent])));
+        let accept_state = Arc::clone(&state);
+        let accept_owned = Arc::clone(&owned_cells);
+
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (sock, peer) = listener.accept().await.expect("accept connection");
+                let st = Arc::clone(&accept_state);
+                let owned = Arc::clone(&accept_owned);
+                tasks.push(tokio::spawn(async move {
+                    let _ = handle_upstream(sock, peer, st, owned).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+
+        let mut adjacent_owner = TcpStream::connect(addr)
+            .await
+            .expect("connect adjacent owner");
+        let mut watcher = TcpStream::connect(addr).await.expect("connect watcher");
+
+        let adjacent_join = Envelope {
+            cell: adjacent,
+            seq: 0,
+            epoch: 10,
+            payload: ClientMsg::Join {
+                actor: EntityId(2),
+                pos: Position { x: 10.0, y: 0.0 },
+            },
+        };
+        adjacent_owner
+            .write_all(&encode_frame(&adjacent_join))
+            .await
+            .expect("adjacent join");
+        let adjacent_snapshot = read_env(&mut adjacent_owner).await;
+        assert!(matches!(
+            adjacent_snapshot.payload,
+            ServerMsg::Snapshot { cell, .. } if cell == adjacent
+        ));
+
+        let watcher_join = Envelope {
+            cell: primary,
+            seq: 0,
+            epoch: 11,
+            payload: ClientMsg::Join {
+                actor: EntityId(1),
+                pos: Position { x: 0.0, y: 0.0 },
+            },
+        };
+        watcher
+            .write_all(&encode_frame(&watcher_join))
+            .await
+            .expect("watcher join");
+
+        let own_snapshot = read_env(&mut watcher).await;
+        assert!(matches!(
+            own_snapshot.payload,
+            ServerMsg::Snapshot { cell, .. } if cell == primary
+        ));
+
+        let ghost_snapshot = read_env(&mut watcher).await;
+        match ghost_snapshot.payload {
+            ServerMsg::Snapshot { cell, actors } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(ghost_snapshot.epoch, 11);
+                assert!(
+                    actors.iter().any(|actor| actor.id == EntityId(2)),
+                    "adjacent cell snapshot should include existing neighbor actor"
+                );
+            }
+            other => panic!("expected adjacent snapshot, got {other:?}"),
+        }
+
+        drop(adjacent_owner);
+        drop(watcher);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn move_resyncs_edge_based_aoi_subscriptions() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::with_aoi_config(1, 32.0, Some(4.0)));
+        let ticker = spawn_test_tick_loop(Arc::clone(&state));
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary, adjacent])));
+        let accept_state = Arc::clone(&state);
+        let accept_owned = Arc::clone(&owned_cells);
+
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (sock, peer) = listener.accept().await.expect("accept connection");
+                let st = Arc::clone(&accept_state);
+                let owned = Arc::clone(&accept_owned);
+                tasks.push(tokio::spawn(async move {
+                    let _ = handle_upstream(sock, peer, st, owned).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+
+        let mut adjacent_owner = TcpStream::connect(addr)
+            .await
+            .expect("connect adjacent owner");
+        let mut watcher = TcpStream::connect(addr).await.expect("connect watcher");
+
+        adjacent_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 0,
+                epoch: 70,
+                payload: ClientMsg::Join {
+                    actor: EntityId(2),
+                    pos: Position { x: 10.0, y: 10.0 },
+                },
+            }))
+            .await
+            .expect("adjacent join");
+        let _ = read_env(&mut adjacent_owner).await;
+
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 0,
+                epoch: 71,
+                payload: ClientMsg::Join {
+                    actor: EntityId(1),
+                    pos: Position { x: 16.0, y: 16.0 },
+                },
+            }))
+            .await
+            .expect("watcher join");
+        let own_snapshot = read_env(&mut watcher).await;
+        assert!(matches!(
+            own_snapshot.payload,
+            ServerMsg::Snapshot { cell, .. } if cell == primary
+        ));
+        let leaked_snapshot = timeout(Duration::from_millis(150), read_env(&mut watcher)).await;
+        assert!(
+            leaked_snapshot.is_err(),
+            "centered actor should not receive adjacent ghost snapshot"
+        );
+
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 1,
+                epoch: 72,
+                payload: ClientMsg::Move {
+                    actor: EntityId(1),
+                    dx: 13.0,
+                    dy: 0.0,
+                },
+            }))
+            .await
+            .expect("watcher move to edge");
+        let self_delta = read_env(&mut watcher).await;
+        assert!(matches!(
+            self_delta.payload,
+            ServerMsg::Delta { cell, moved }
+            if cell == primary && moved.iter().any(|actor| actor.id == EntityId(1))
+        ));
+        let ghost_snapshot = read_env(&mut watcher).await;
+        assert_eq!(ghost_snapshot.epoch, 72);
+        assert!(matches!(
+            ghost_snapshot.payload,
+            ServerMsg::Snapshot { cell, ref actors }
+            if cell == adjacent && actors.iter().any(|actor| actor.id == EntityId(2))
+        ));
+
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 2,
+                epoch: 73,
+                payload: ClientMsg::Move {
+                    actor: EntityId(1),
+                    dx: -20.0,
+                    dy: 0.0,
+                },
+            }))
+            .await
+            .expect("watcher move away from edge");
+        let self_delta = read_env(&mut watcher).await;
+        assert!(matches!(
+            self_delta.payload,
+            ServerMsg::Delta { cell, moved }
+            if cell == primary && moved.iter().any(|actor| actor.id == EntityId(1))
+        ));
+
+        adjacent_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 1,
+                epoch: 74,
+                payload: ClientMsg::Move {
+                    actor: EntityId(2),
+                    dx: 1.0,
+                    dy: 0.0,
+                },
+            }))
+            .await
+            .expect("adjacent move");
+        let _ = read_env(&mut adjacent_owner).await;
+
+        let leaked_delta = timeout(Duration::from_millis(200), read_env(&mut watcher)).await;
+        assert!(
+            leaked_delta.is_err(),
+            "moving away from the edge should unsubscribe adjacent AOI updates"
+        );
+
+        drop(adjacent_owner);
+        drop(watcher);
+        let _ = server.await;
+        ticker.abort();
+    }
+
+    #[tokio::test]
+    async fn adjacent_cell_move_reaches_aoi_subscriber() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let ticker = spawn_test_tick_loop(Arc::clone(&state));
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary, adjacent])));
+        let accept_state = Arc::clone(&state);
+        let accept_owned = Arc::clone(&owned_cells);
+
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (sock, peer) = listener.accept().await.expect("accept connection");
+                let st = Arc::clone(&accept_state);
+                let owned = Arc::clone(&accept_owned);
+                tasks.push(tokio::spawn(async move {
+                    let _ = handle_upstream(sock, peer, st, owned).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+
+        let mut adjacent_owner = TcpStream::connect(addr)
+            .await
+            .expect("connect adjacent owner");
+        let mut watcher = TcpStream::connect(addr).await.expect("connect watcher");
+
+        adjacent_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 0,
+                epoch: 20,
+                payload: ClientMsg::Join {
+                    actor: EntityId(2),
+                    pos: Position { x: 10.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("adjacent join");
+        let _ = read_env(&mut adjacent_owner).await;
+
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 0,
+                epoch: 21,
+                payload: ClientMsg::Join {
+                    actor: EntityId(1),
+                    pos: Position { x: 0.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("watcher join");
+        let _ = read_env(&mut watcher).await;
+        let _ = read_env(&mut watcher).await;
+        let owner_ghost_delta = read_env(&mut adjacent_owner).await;
+        assert_eq!(owner_ghost_delta.epoch, 21);
+        assert!(matches!(
+            owner_ghost_delta.payload,
+            ServerMsg::Delta { cell, moved }
+            if cell == primary && moved.iter().any(|actor| actor.id == EntityId(1))
+        ));
+
+        adjacent_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 1,
+                epoch: 22,
+                payload: ClientMsg::Move {
+                    actor: EntityId(2),
+                    dx: 1.0,
+                    dy: 0.5,
+                },
+            }))
+            .await
+            .expect("adjacent move");
+
+        let owner_delta = read_env(&mut adjacent_owner).await;
+        assert_eq!(owner_delta.epoch, 22);
+
+        let mut watcher_delta = None;
+        for _ in 0..3 {
+            let candidate = read_env(&mut watcher).await;
+            if candidate.epoch == 22 {
+                watcher_delta = Some(candidate);
+                break;
+            }
+        }
+        let watcher_delta = watcher_delta.expect("watcher should receive adjacent move delta");
+        assert_eq!(watcher_delta.epoch, 22);
+        match watcher_delta.payload {
+            ServerMsg::Delta { cell, moved } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, EntityId(2));
+                assert_eq!(moved[0].pos, Position { x: 11.0, y: 0.5 });
+            }
+            other => panic!("expected adjacent delta, got {other:?}"),
+        }
+
+        drop(adjacent_owner);
+        drop(watcher);
+        let _ = server.await;
+        ticker.abort();
+    }
+
+    #[tokio::test]
+    async fn adjacent_cell_despawn_reaches_aoi_subscriber() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary, adjacent])));
+        let accept_state = Arc::clone(&state);
+        let accept_owned = Arc::clone(&owned_cells);
+
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (sock, peer) = listener.accept().await.expect("accept connection");
+                let st = Arc::clone(&accept_state);
+                let owned = Arc::clone(&accept_owned);
+                tasks.push(tokio::spawn(async move {
+                    let _ = handle_upstream(sock, peer, st, owned).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+
+        let mut adjacent_owner = TcpStream::connect(addr)
+            .await
+            .expect("connect adjacent owner");
+        let mut watcher = TcpStream::connect(addr).await.expect("connect watcher");
+
+        adjacent_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 0,
+                epoch: 40,
+                payload: ClientMsg::Join {
+                    actor: EntityId(2),
+                    pos: Position { x: 10.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("adjacent join");
+        let _ = read_env(&mut adjacent_owner).await;
+
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 0,
+                epoch: 41,
+                payload: ClientMsg::Join {
+                    actor: EntityId(1),
+                    pos: Position { x: 0.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("watcher join");
+        let _ = read_env(&mut watcher).await;
+        let _ = read_env(&mut watcher).await;
+        let _ = read_env(&mut adjacent_owner).await;
+
+        drop(adjacent_owner);
+
+        let despawn = read_env(&mut watcher).await;
+        assert_eq!(despawn.epoch, 40);
+        match despawn.payload {
+            ServerMsg::Despawn { cell, actors } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(actors, vec![EntityId(2)]);
+            }
+            other => panic!("expected adjacent despawn, got {other:?}"),
+        }
+
+        drop(watcher);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn distant_cell_updates_do_not_reach_non_aoi_subscriber() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let ticker = spawn_test_tick_loop(Arc::clone(&state));
+        let primary = CellId::grid(0, 0, 0);
+        let distant = CellId::grid(0, 3, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary, distant])));
+        let accept_state = Arc::clone(&state);
+        let accept_owned = Arc::clone(&owned_cells);
+
+        let server = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (sock, peer) = listener.accept().await.expect("accept connection");
+                let st = Arc::clone(&accept_state);
+                let owned = Arc::clone(&accept_owned);
+                tasks.push(tokio::spawn(async move {
+                    let _ = handle_upstream(sock, peer, st, owned).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+
+        let mut distant_owner = TcpStream::connect(addr)
+            .await
+            .expect("connect distant owner");
+        let mut watcher = TcpStream::connect(addr).await.expect("connect watcher");
+
+        distant_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: distant,
+                seq: 0,
+                epoch: 30,
+                payload: ClientMsg::Join {
+                    actor: EntityId(2),
+                    pos: Position { x: 30.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("distant join");
+        let _ = read_env(&mut distant_owner).await;
+
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 0,
+                epoch: 31,
+                payload: ClientMsg::Join {
+                    actor: EntityId(1),
+                    pos: Position { x: 0.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("watcher join");
+        let _ = read_env(&mut watcher).await;
+
+        let leaked_snapshot = timeout(Duration::from_millis(150), read_env(&mut watcher)).await;
+        assert!(
+            leaked_snapshot.is_err(),
+            "non-adjacent cell should not be subscribed as AOI"
+        );
+
+        distant_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: distant,
+                seq: 1,
+                epoch: 32,
+                payload: ClientMsg::Move {
+                    actor: EntityId(2),
+                    dx: 1.0,
+                    dy: 0.0,
+                },
+            }))
+            .await
+            .expect("distant move");
+        let _ = read_env(&mut distant_owner).await;
+
+        let leaked_delta = timeout(Duration::from_millis(150), read_env(&mut watcher)).await;
+        assert!(
+            leaked_delta.is_err(),
+            "non-adjacent cell delta should not leak to watcher"
+        );
+
+        drop(distant_owner);
+        drop(watcher);
+        let _ = server.await;
+        ticker.abort();
+    }
+
+    #[tokio::test]
     async fn disconnecting_owner_broadcasts_despawn() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2257,6 +3771,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
 
         let state = Arc::new(SharedState::default());
+        let ticker = spawn_test_tick_loop(Arc::clone(&state));
         let owned_cells = Arc::new(RwLock::new(HashSet::from([CellId::grid(0, 0, 0)])));
         let accept_state = Arc::clone(&state);
         let accept_owned = Arc::clone(&owned_cells);
@@ -2352,6 +3867,7 @@ mod tests {
 
         drop(watcher);
         let _ = server.await;
+        ticker.abort();
     }
 
     #[tokio::test]
@@ -2592,6 +4108,211 @@ mod tests {
 
         let subs = state.subscribers.lock().await;
         assert!(subs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_move_broadcast_flushes_on_tick() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(7);
+
+        let (owner_tx, mut owner_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (owner_disconnect_tx, _owner_disconnect_rx) = watch::channel(());
+        let owner = test_subscriber(1, owner_tx, &owner_disconnect_tx);
+        state.subscribe(cell, &owner).await;
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(2, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(cell, &watcher).await;
+
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(actor, Position { x: 3.0, y: 4.0 });
+        }
+        state.enqueue_move_broadcast(cell, actor, 1, 55).await;
+
+        assert!(watcher_rx.try_recv().is_err());
+        assert!(owner_rx.try_recv().is_err());
+
+        on_tick(Tick(1), state.as_ref()).await;
+
+        let queued = watcher_rx.try_recv().expect("watcher delta should flush");
+        assert_eq!(queued.0, cell);
+        assert_eq!(queued.1, Some(55));
+        match queued.2 {
+            ServerMsg::Delta {
+                cell: delta_cell,
+                moved,
+            } => {
+                assert_eq!(delta_cell, cell);
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, actor);
+                assert_eq!(moved[0].pos, Position { x: 3.0, y: 4.0 });
+            }
+            other => panic!("expected queued delta, got {other:?}"),
+        }
+
+        assert!(
+            owner_rx.try_recv().is_err(),
+            "origin client should stay excluded from queued move broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_move_broadcast_keeps_latest_actor_state_per_tick() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(7);
+
+        let (owner_tx, mut owner_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (owner_disconnect_tx, _owner_disconnect_rx) = watch::channel(());
+        let owner = test_subscriber(1, owner_tx, &owner_disconnect_tx);
+        state.subscribe(cell, &owner).await;
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(2, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(cell, &watcher).await;
+
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(actor, Position { x: 1.0, y: 1.0 });
+        }
+        state.enqueue_move_broadcast(cell, actor, 1, 10).await;
+        {
+            let mut actors = state.actors.lock().await;
+            let cell_actors = actors.get_mut(&cell).expect("cell actors");
+            let pos = cell_actors.get_mut(&actor).expect("actor");
+            pos.x = 5.0;
+            pos.y = 8.0;
+        }
+        state.enqueue_move_broadcast(cell, actor, 1, 11).await;
+
+        on_tick(Tick(1), state.as_ref()).await;
+
+        let queued = watcher_rx
+            .try_recv()
+            .expect("watcher should receive coalesced delta");
+        assert_eq!(queued.1, Some(11));
+        match queued.2 {
+            ServerMsg::Delta { moved, .. } => {
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, actor);
+                assert_eq!(moved[0].pos, Position { x: 5.0, y: 8.0 });
+            }
+            other => panic!("expected coalesced delta, got {other:?}"),
+        }
+
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "watcher should only receive the latest state once per actor"
+        );
+        assert!(
+            owner_rx.try_recv().is_err(),
+            "origin client should stay excluded from queued move broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_cells_clears_pending_move_broadcasts() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(2, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(cell, &watcher).await;
+
+        state.enqueue_move_broadcast(cell, EntityId(7), 1, 21).await;
+
+        state.drop_cells(&HashSet::from([cell])).await;
+        on_tick(Tick(1), state.as_ref()).await;
+
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "dropped cell should not flush stale pending moves"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_owned_actors_clears_pending_moves_before_despawn() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(7);
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(2, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(cell, &watcher).await;
+
+        state.claim_owner(cell, actor, 1).await;
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(actor, Position { x: 0.0, y: 0.0 });
+        }
+        state.enqueue_move_broadcast(cell, actor, 1, 31).await;
+
+        state
+            .remove_owned_actors(1, &HashSet::from([(cell, actor)]), Some(30))
+            .await;
+
+        let despawn = watcher_rx.try_recv().expect("despawn should be broadcast");
+        assert_eq!(despawn.0, cell);
+        assert_eq!(despawn.1, Some(30));
+        assert!(matches!(
+            despawn.2,
+            ServerMsg::Despawn { ref actors, .. } if actors == &vec![actor]
+        ));
+
+        on_tick(Tick(1), state.as_ref()).await;
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "despawn should remove stale pending move broadcasts"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_move_broadcast_skips_removed_actor() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(9);
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(2, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(cell, &watcher).await;
+
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(actor, Position { x: 2.0, y: 2.0 });
+        }
+        state.enqueue_move_broadcast(cell, actor, 1, 22).await;
+
+        {
+            let mut actors = state.actors.lock().await;
+            let cell_actors = actors.get_mut(&cell).expect("cell actors");
+            cell_actors.remove(&actor);
+        }
+
+        on_tick(Tick(1), state.as_ref()).await;
+
+        assert!(
+            watcher_rx.try_recv().is_err(),
+            "removed actor should not emit stale queued move"
+        );
     }
 
     #[tokio::test]
