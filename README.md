@@ -43,6 +43,9 @@ Cell-based world orchestration for real-time servers in Rust.
   - `TESSERA_WORKER_ADVERTISE_ADDR` 기본 `TESSERA_WORKER_ADDR` (오케스트레이터에 등록할 워커 주소, `TESSERA_WORKER_ADDR`가 `0.0.0.0`/`::`인 경우 반드시 지정)
   - `TESSERA_WORKER_ID` 기본 `worker-local`
   - `TESSERA_WORKER_REFRESH_SECS` 기본 `5`초(Orchestrator 연결 실패 시 워커가 할당 재등록을 재시도하는 주기)
+  - `TESSERA_WORKER_AOI_RADIUS_CELLS` 기본 `1` (현재 셀 기준 AOI ghost로 구독할 인접 셀 반경, `1`이면 3x3)
+  - `TESSERA_WORKER_AOI_CELL_SPAN_UNITS` 기본 `32` (경계 기반 AOI에서 사용할 셀 로컬 좌표 범위)
+  - `TESSERA_WORKER_AOI_EDGE_MARGIN_UNITS` 기본 unset (설정 시 root actor가 셀 경계에 가까울 때만 해당 방향 ghost 셀을 구독, 좌표계는 `0..TESSERA_WORKER_AOI_CELL_SPAN_UNITS`)
   - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
   - `RUST_LOG` 기본 `info`
 - 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADVERTISE_ADDR`(설정 시) 또는 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
@@ -77,13 +80,13 @@ Cell-based world orchestration for real-time servers in Rust.
 - Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
-- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리
+- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화
 - Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments` gRPC 엔드포인트 제공
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
 - Orchestrator 메트릭 집계/헬스 체크 및 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`)
-- Worker 셀 단위 AOI/ghost 브로드캐스트 강화 및 다셀 틱 파이프라인 구조화
+- Worker AOI/ghost를 셀 경계 기반에서 더 정밀한 거리/가시성 기반으로 고도화하고, 다셀 틱 파이프라인을 구조화
 - Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
 
 ## Protocol Snapshot
@@ -101,7 +104,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.
 - Goals: V0 고정 그리드+정적 매핑(구현), V1 셀 리밸런싱·Handover, V1 AOI/ghost 최적화, V2 동적 분할(쿼드트리) 등.
 - Non-goals(초기): 완성형 게임 서버 기능, 완전 무중단 마이그레이션, 멀티리전 일관성.
-- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator watch/스냅샷 기반 라우팅, Worker는 틱 루프/AOI/ghost, Orchestrator는 `cell→worker` 레지스트리.
+- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator watch/스냅샷 기반 라우팅, Worker는 틱 루프에서 셀별 이동 브로드캐스트를 actor별 최신 상태로 flush하고 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하며 assignment refresh와 root actor 이동 때 기존 세션의 AOI 구독을 다시 맞추고, 필요하면 셀 경계 기반 edge margin으로 ghost 범위를 좁히고, Orchestrator는 `cell→worker` 레지스트리.
 - 데이터 흐름: Gateway 입력 → 대상 셀 워커 전달 → Worker 틱/델타 → 클라·인접 워커 전파 → 필요 시 Handover(`PreCopy→Freeze→Diff/Commit→라우팅 교체`).
 - 운영 메모: 틱 20–30Hz, 셀 크기는 AOI의 2–3배 권장, 위험요소는 게이트웨이 병목·Handover 순서·분할/병합 플래핑·AOI 폭주(rate cap 필요).
 
