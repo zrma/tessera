@@ -96,6 +96,29 @@ pub enum ServerMsg {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkerRelayMsg {
+    Subscribe {
+        cells: Vec<CellId>,
+    },
+    Unsubscribe {
+        cells: Vec<CellId>,
+    },
+    Snapshot {
+        cell: CellId,
+        actors: Vec<ActorState>,
+    },
+    Delta {
+        cell: CellId,
+        moved: Vec<ActorState>,
+    },
+    Despawn {
+        cell: CellId,
+        actors: Vec<EntityId>,
+    },
+}
+
 // ---------- Envelope ----------
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Envelope<T> {
@@ -190,6 +213,24 @@ mod tests {
         let b = encode_frame(&env);
         let mut buf = BytesMut::from(&b[..]);
         let decoded: Envelope<ServerMsg> =
+            try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(env, decoded);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn frame_roundtrip_worker_relay() {
+        let env = Envelope {
+            cell: CellId::grid(0, 1, 0),
+            seq: 3,
+            epoch: 9,
+            payload: WorkerRelayMsg::Subscribe {
+                cells: vec![CellId::grid(0, 1, 0), CellId::grid(0, 2, 0)],
+            },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<WorkerRelayMsg> =
             try_decode_frame(&mut buf).expect("decode").expect("frame");
         assert_eq!(env, decoded);
         assert_eq!(buf.len(), 0);
