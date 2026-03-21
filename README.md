@@ -80,14 +80,14 @@ Cell-based world orchestration for real-time servers in Rust.
 - Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
-- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계
+- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 중복 연결을 줄임
 - Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments` gRPC 엔드포인트 제공
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
 - Orchestrator 메트릭 집계/헬스 체크 및 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`)
-- Worker 간 ghost relay를 클라이언트별 연결에서 peer-shared 세션/집계 구독으로 최적화
 - Worker AOI/ghost를 셀 경계 기반에서 더 정밀한 거리/가시성 기반으로 고도화하고, 다셀 틱 파이프라인을 구조화
+- Worker 간 ghost relay의 backpressure/헬스/재연결 관측성을 메트릭으로 노출
 - Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
 
 ## Protocol Snapshot
@@ -105,7 +105,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.
 - Goals: V0 고정 그리드+정적 매핑(구현), V1 셀 리밸런싱·Handover, V1 AOI/ghost 최적화, V2 동적 분할(쿼드트리) 등.
 - Non-goals(초기): 완성형 게임 서버 기능, 완전 무중단 마이그레이션, 멀티리전 일관성.
-- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator watch/스냅샷 기반 라우팅, Worker는 틱 루프에서 셀별 이동 브로드캐스트를 actor별 최신 상태로 flush하고 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하며 assignment refresh와 root actor 이동 때 기존 세션의 AOI 구독을 다시 맞추고, 필요하면 셀 경계 기반 edge margin으로 ghost 범위를 좁히며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 ghost `Subscribe/Unsubscribe/Snapshot/Delta/Despawn`를 TCP relay로 주고받으며, Orchestrator는 `cell→worker` 레지스트리.
+- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator watch/스냅샷 기반 라우팅, Worker는 틱 루프에서 셀별 이동 브로드캐스트를 actor별 최신 상태로 flush하고 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하며 assignment refresh와 root actor 이동 때 기존 세션의 AOI 구독을 다시 맞추고, 필요하면 셀 경계 기반 edge margin으로 ghost 범위를 좁히며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 ghost `Subscribe/Unsubscribe/Snapshot/Delta/Despawn`를 TCP relay로 주고받되 route별 shared 세션과 remote actor cache로 fanout을 재사용하며, Orchestrator는 `cell→worker` 레지스트리.
 - 데이터 흐름: Gateway 입력 → 대상 셀 워커 전달 → Worker 틱/델타 → 클라·인접 워커 전파 → 필요 시 Handover(`PreCopy→Freeze→Diff/Commit→라우팅 교체`).
 - 운영 메모: 틱 20–30Hz, 셀 크기는 AOI의 2–3배 권장, 위험요소는 게이트웨이 병목·Handover 순서·분할/병합 플래핑·AOI 폭주(rate cap 필요).
 
