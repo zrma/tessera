@@ -10,10 +10,13 @@ use std::sync::{
 use std::time::Duration;
 use tessera_core::{
     ActorState, CellId, ClientMsg, EntityId, Envelope, MAX_FRAME_LEN, Position, ServerMsg, Tick,
-    encode_frame, try_decode_frame,
+    WorkerRelayMsg, encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
-use tessera_proto::orch::v1::{Assignment, WorkerRegistration};
+use tessera_proto::orch::v1::{
+    Assignment, AssignmentListing, ListAssignmentsRequest, WatchAssignmentsRequest,
+    WorkerRegistration,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,19 +30,32 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_RELAY_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_AOI_RADIUS_CELLS: i32 = 1;
 const DEFAULT_AOI_CELL_SPAN_UNITS: f32 = 32.0;
 type OutboundMsg = (CellId, Option<u32>, ServerMsg);
+type RelayOutboundMsg = (CellId, Option<u32>, WorkerRelayMsg);
 type CellSubscribers = HashMap<CellId, Vec<CellSubscriber>>;
+type RelaySubscribers = HashMap<CellId, Vec<RelaySubscriber>>;
 type CellOwners = HashMap<CellId, HashMap<EntityId, u64>>;
 type PendingMoveQueues = HashMap<CellId, HashMap<EntityId, PendingMoveBroadcast>>;
 type OwnedActors = HashSet<(CellId, EntityId)>;
+type PeerRoutes = HashMap<CellId, PeerRoute>;
+type RemoteInterestMap = HashMap<u64, HashMap<CellId, PeerRoute>>;
+type RemotePeerSessionMap = HashMap<u64, HashMap<String, RemotePeerSessionHandle>>;
 
 #[derive(Clone)]
 struct CellSubscriber {
     client_id: u64,
     tx: Sender<OutboundMsg>,
+    disconnect_tx: watch::Sender<()>,
+}
+
+#[derive(Clone)]
+struct RelaySubscriber {
+    connection_id: u64,
+    tx: Sender<RelayOutboundMsg>,
     disconnect_tx: watch::Sender<()>,
 }
 
@@ -63,12 +79,33 @@ struct PendingMoveBroadcast {
     epoch: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerRoute {
+    worker_id: String,
+    addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemotePeerDesired {
+    cells: HashSet<CellId>,
+    epoch: u32,
+}
+
+#[derive(Clone)]
+struct RemotePeerSessionHandle {
+    desired_tx: watch::Sender<RemotePeerDesired>,
+}
+
 struct SharedState {
     actors: Mutex<HashMap<CellId, HashMap<EntityId, Position>>>,
     owners: Mutex<CellOwners>,
     subscribers: Mutex<CellSubscribers>,
+    relay_subscribers: Mutex<RelaySubscribers>,
     pending_moves: Mutex<PendingMoveQueues>,
     client_sessions: Mutex<HashMap<u64, ClientSession>>,
+    peer_routes: RwLock<PeerRoutes>,
+    remote_interests: Mutex<RemoteInterestMap>,
+    remote_peer_sessions: Mutex<RemotePeerSessionMap>,
     aoi_radius_cells: i32,
     aoi_cell_span_units: f32,
     aoi_edge_margin_units: Option<f32>,
@@ -84,8 +121,12 @@ impl SharedState {
             actors: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
             subscribers: Mutex::new(HashMap::new()),
+            relay_subscribers: Mutex::new(HashMap::new()),
             pending_moves: Mutex::new(HashMap::new()),
             client_sessions: Mutex::new(HashMap::new()),
+            peer_routes: RwLock::new(HashMap::new()),
+            remote_interests: Mutex::new(HashMap::new()),
+            remote_peer_sessions: Mutex::new(HashMap::new()),
             aoi_radius_cells,
             aoi_cell_span_units,
             aoi_edge_margin_units,
@@ -227,6 +268,51 @@ impl SharedState {
         Ok(!already_subscribed)
     }
 
+    async fn relay_subscribe_with_snapshot(
+        &self,
+        cell: CellId,
+        subscriber: &RelaySubscriber,
+        epoch: u32,
+    ) -> Result<bool, ()> {
+        let actors = self.actors.lock().await;
+        let mut subs = self.relay_subscribers.lock().await;
+        let snapshot = actors
+            .get(&cell)
+            .map(|cell_actors| {
+                cell_actors
+                    .iter()
+                    .map(|(id, pos)| ActorState { id: *id, pos: *pos })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        if !snapshot.is_empty()
+            && subscriber
+                .tx
+                .try_send((
+                    cell,
+                    Some(epoch),
+                    WorkerRelayMsg::Snapshot {
+                        cell,
+                        actors: snapshot,
+                    },
+                ))
+                .is_err()
+        {
+            return Err(());
+        }
+
+        let entry = subs.entry(cell).or_default();
+        let already_subscribed = entry
+            .iter()
+            .any(|existing| existing.connection_id == subscriber.connection_id);
+        if !already_subscribed {
+            entry.push(subscriber.clone());
+        }
+
+        Ok(!already_subscribed)
+    }
+
     async fn release_owner(&self, cell: CellId, actor: EntityId, client_id: u64) {
         let mut owners = self.owners.lock().await;
         let mut remove_cell = false;
@@ -246,11 +332,17 @@ impl SharedState {
             let mut sessions = self.client_sessions.lock().await;
             sessions.remove(&client_id);
         }
+        {
+            let mut remote_interests = self.remote_interests.lock().await;
+            remote_interests.remove(&client_id);
+        }
         let mut subs = self.subscribers.lock().await;
         subs.values_mut().for_each(|entries| {
             entries.retain(|subscriber| subscriber.client_id != client_id);
         });
         subs.retain(|_, entries| !entries.is_empty());
+
+        self.remove_remote_peer_sessions(client_id).await;
     }
 
     async fn remove_subscriptions_for_cells(&self, client_id: u64, cells: &HashSet<CellId>) {
@@ -263,6 +355,36 @@ impl SharedState {
             let mut remove_cell = false;
             if let Some(entries) = subs.get_mut(cell) {
                 entries.retain(|subscriber| subscriber.client_id != client_id);
+                remove_cell = entries.is_empty();
+            }
+            if remove_cell {
+                subs.remove(cell);
+            }
+        }
+    }
+
+    async fn remove_relay_subscriptions(&self, connection_id: u64) {
+        let mut subs = self.relay_subscribers.lock().await;
+        subs.values_mut().for_each(|entries| {
+            entries.retain(|subscriber| subscriber.connection_id != connection_id);
+        });
+        subs.retain(|_, entries| !entries.is_empty());
+    }
+
+    async fn remove_relay_subscriptions_for_cells(
+        &self,
+        connection_id: u64,
+        cells: &HashSet<CellId>,
+    ) {
+        if cells.is_empty() {
+            return;
+        }
+
+        let mut subs = self.relay_subscribers.lock().await;
+        for cell in cells {
+            let mut remove_cell = false;
+            if let Some(entries) = subs.get_mut(cell) {
+                entries.retain(|subscriber| subscriber.connection_id != connection_id);
                 remove_cell = entries.is_empty();
             }
             if remove_cell {
@@ -324,6 +446,17 @@ impl SharedState {
             return;
         }
 
+        {
+            let mut remote_interests = self.remote_interests.lock().await;
+            for client_id in &removed_clients {
+                remote_interests.remove(client_id);
+            }
+        }
+
+        for client_id in &removed_clients {
+            self.remove_remote_peer_sessions(*client_id).await;
+        }
+
         let mut subs = self.subscribers.lock().await;
         subs.values_mut().for_each(|entries| {
             entries.retain(|subscriber| !removed_clients.contains(&subscriber.client_id));
@@ -345,6 +478,61 @@ impl SharedState {
             .collect::<Vec<_>>()
     }
 
+    async fn update_peer_routes(&self, routes: PeerRoutes) -> bool {
+        let mut peer_routes = self.peer_routes.write().await;
+        if *peer_routes == routes {
+            return false;
+        }
+        *peer_routes = routes;
+        true
+    }
+
+    async fn sync_remote_interests(
+        self: &Arc<Self>,
+        subscriber: &CellSubscriber,
+        client_id: u64,
+        desired_targets: &HashSet<CellId>,
+        owned_cells: &HashSet<CellId>,
+        epoch: u32,
+    ) -> bool {
+        let desired_remote = {
+            let peer_routes = self.peer_routes.read().await;
+            desired_targets
+                .iter()
+                .filter(|cell| !owned_cells.contains(cell))
+                .filter_map(|cell| peer_routes.get(cell).cloned().map(|route| (*cell, route)))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let mut remote_interests = self.remote_interests.lock().await;
+        let changed = remote_interests.get(&client_id) != Some(&desired_remote);
+        let desired_remote_for_relay = desired_remote.clone();
+        if desired_remote.is_empty() {
+            remote_interests.remove(&client_id);
+        } else {
+            remote_interests.insert(client_id, desired_remote);
+        }
+        drop(remote_interests);
+
+        self.sync_remote_peer_sessions(
+            subscriber.clone(),
+            client_id,
+            desired_remote_for_relay,
+            epoch,
+        )
+        .await;
+        changed
+    }
+
+    #[cfg(test)]
+    async fn remote_interest_cells(&self, client_id: u64) -> HashSet<CellId> {
+        let remote_interests = self.remote_interests.lock().await;
+        remote_interests
+            .get(&client_id)
+            .map(|cells| cells.keys().copied().collect::<HashSet<_>>())
+            .unwrap_or_default()
+    }
+
     async fn client_subscribed_cells(&self, client_id: u64) -> HashSet<CellId> {
         let subs = self.subscribers.lock().await;
         subs.iter()
@@ -357,7 +545,65 @@ impl SharedState {
             .collect::<HashSet<_>>()
     }
 
-    async fn resync_client_interests(&self, owned_cells: &HashSet<CellId>) {
+    async fn remove_remote_peer_sessions(&self, client_id: u64) {
+        let mut sessions = self.remote_peer_sessions.lock().await;
+        sessions.remove(&client_id);
+    }
+
+    async fn sync_remote_peer_sessions(
+        self: &Arc<Self>,
+        subscriber: CellSubscriber,
+        client_id: u64,
+        desired_remote: HashMap<CellId, PeerRoute>,
+        epoch: u32,
+    ) {
+        let mut desired_by_route: HashMap<String, (PeerRoute, HashSet<CellId>)> = HashMap::new();
+        for (cell, route) in desired_remote {
+            let key = peer_route_key(&route);
+            let (_, cells) = desired_by_route
+                .entry(key)
+                .or_insert_with(|| (route, HashSet::new()));
+            cells.insert(cell);
+        }
+
+        let mut sessions = self.remote_peer_sessions.lock().await;
+        let client_sessions = sessions.entry(client_id).or_default();
+
+        client_sessions.retain(|route_key, handle| {
+            if let Some((_, cells)) = desired_by_route.get(route_key) {
+                handle
+                    .desired_tx
+                    .send(RemotePeerDesired {
+                        cells: cells.clone(),
+                        epoch,
+                    })
+                    .is_ok()
+            } else {
+                false
+            }
+        });
+
+        for (route_key, (route, cells)) in desired_by_route {
+            if client_sessions.contains_key(&route_key) {
+                continue;
+            }
+            let desired = RemotePeerDesired { cells, epoch };
+            let (desired_tx, desired_rx) = watch::channel(desired);
+            tokio::spawn(remote_peer_session_loop(
+                Arc::clone(self),
+                subscriber.clone(),
+                route,
+                desired_rx,
+            ));
+            client_sessions.insert(route_key, RemotePeerSessionHandle { desired_tx });
+        }
+
+        if client_sessions.is_empty() {
+            sessions.remove(&client_id);
+        }
+    }
+
+    async fn resync_client_interests(self: &Arc<Self>, owned_cells: &HashSet<CellId>) {
         let sessions = {
             let sessions = self.client_sessions.lock().await;
             sessions
@@ -375,13 +621,16 @@ impl SharedState {
 
         for (client_id, subscriber, root_actors, epoch) in sessions {
             let root_positions = self.actor_positions(&root_actors).await;
-            let desired_cells = desired_aoi_cells(
+            let desired_targets = desired_aoi_targets_for_positions(
                 &root_positions,
-                owned_cells,
                 self.aoi_radius_cells,
                 self.aoi_cell_span_units,
                 self.aoi_edge_margin_units,
             );
+            let desired_cells = desired_targets
+                .intersection(owned_cells)
+                .copied()
+                .collect::<HashSet<_>>();
             let mut subscribed_cells = self.client_subscribed_cells(client_id).await;
             if sync_interest_cells(
                 self,
@@ -394,6 +643,17 @@ impl SharedState {
             .is_err()
             {
                 self.remove_client_subscriptions(client_id).await;
+                continue;
+            }
+            if self
+                .sync_remote_interests(&subscriber, client_id, &desired_targets, owned_cells, epoch)
+                .await
+            {
+                info!(
+                    target: "worker",
+                    client_id,
+                    "remote AOI interests updated"
+                );
             }
         }
     }
@@ -419,6 +679,36 @@ impl SharedState {
                             cell = ?cell,
                             client_id = subscriber.client_id,
                             "outbound channel full; disconnecting slow subscriber"
+                        );
+                        let _ = subscriber.disconnect_tx.send(());
+                        false
+                    }
+                    Err(TrySendError::Closed(_)) => false,
+                }
+            });
+            if entries.is_empty() {
+                subs.remove(&cell);
+            }
+        }
+    }
+
+    async fn broadcast_relay(
+        &self,
+        cell: CellId,
+        msg: WorkerRelayMsg,
+        epoch_override: Option<u32>,
+    ) {
+        let mut subs = self.relay_subscribers.lock().await;
+        if let Some(entries) = subs.get_mut(&cell) {
+            entries.retain(|subscriber| {
+                match subscriber.tx.try_send((cell, epoch_override, msg.clone())) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(_)) => {
+                        warn!(
+                            target: "worker",
+                            cell = ?cell,
+                            connection_id = subscriber.connection_id,
+                            "relay outbound channel full; disconnecting slow peer"
                         );
                         let _ = subscriber.disconnect_tx.send(());
                         false
@@ -517,10 +807,20 @@ impl SharedState {
         // 소유권 맵을 잠근 상태에서 despawn을 전파해 재조인 경쟁으로 인한 순서 역전을 막는다.
         for (cell, actors) in removed_by_cell {
             if !actors.is_empty() {
+                let relay_actors = actors.clone();
                 self.broadcast(
                     cell,
                     ServerMsg::Despawn { cell, actors },
                     None,
+                    epoch_override,
+                )
+                .await;
+                self.broadcast_relay(
+                    cell,
+                    WorkerRelayMsg::Despawn {
+                        cell,
+                        actors: relay_actors,
+                    },
                     epoch_override,
                 )
                 .await;
@@ -549,8 +849,18 @@ impl SharedState {
             }
         }
         for (cell, actors) in removed_by_cell {
+            let relay_actors = actors.clone();
             self.broadcast(cell, ServerMsg::Despawn { cell, actors }, None, None)
                 .await;
+            self.broadcast_relay(
+                cell,
+                WorkerRelayMsg::Despawn {
+                    cell,
+                    actors: relay_actors,
+                },
+                None,
+            )
+            .await;
         }
         {
             let mut pending = self.pending_moves.lock().await;
@@ -559,6 +869,9 @@ impl SharedState {
         let mut subs = self.subscribers.lock().await;
         subs.retain(|cell, _| !cells.contains(cell));
         drop(subs);
+        let mut relay_subs = self.relay_subscribers.lock().await;
+        relay_subs.retain(|cell, _| !cells.contains(cell));
+        drop(relay_subs);
 
         self.prune_client_roots(cells).await;
     }
@@ -629,9 +942,41 @@ async fn main() -> Result<()> {
         aoi_cell_span_units,
         aoi_edge_margin_units,
     ));
+    match fetch_assignment_listing().await {
+        Ok(listing) => {
+            if let Err(e) =
+                apply_peer_routes_update(&state, &owned_cells, &worker_id, listing).await
+            {
+                warn!(
+                    target: "worker",
+                    worker_id = worker_id.as_str(),
+                    error = ?e,
+                    "failed to apply initial peer routes"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                target: "worker",
+                worker_id = worker_id.as_str(),
+                error = ?e,
+                "failed to fetch initial peer routes"
+            );
+        }
+    }
     let server_state = state.clone();
     let owned_for_server = owned_cells.clone();
     let mut server = tokio::spawn(run_server(addr, server_state, owned_for_server));
+    tokio::spawn(peer_routes_watch_loop(
+        state.clone(),
+        owned_cells.clone(),
+        worker_id.clone(),
+    ));
+    tokio::spawn(peer_routes_refresh_loop(
+        state.clone(),
+        owned_cells.clone(),
+        worker_id.clone(),
+    ));
 
     if used_fallback {
         let owned_for_retry = owned_cells.clone();
@@ -692,15 +1037,7 @@ async fn main() -> Result<()> {
 }
 
 async fn fetch_assignments(worker_id: &str, advertise_addr: &str) -> Result<Vec<CellId>> {
-    let orchestrator_addr =
-        std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
-    let endpoint =
-        if orchestrator_addr.starts_with("http://") || orchestrator_addr.starts_with("https://") {
-            orchestrator_addr
-        } else {
-            format!("http://{}", orchestrator_addr)
-        };
-
+    let endpoint = orchestrator_endpoint();
     let mut client = OrchestratorClient::connect(endpoint.clone())
         .await
         .with_context(|| format!("connect orchestrator at {}", endpoint))?;
@@ -720,15 +1057,212 @@ async fn fetch_assignments(worker_id: &str, advertise_addr: &str) -> Result<Vec<
     Ok(cells)
 }
 
+async fn fetch_assignment_listing() -> Result<AssignmentListing> {
+    let endpoint = orchestrator_endpoint();
+    let mut client = OrchestratorClient::connect(endpoint.clone())
+        .await
+        .with_context(|| format!("connect orchestrator at {}", endpoint))?;
+    let response = client
+        .list_assignments(ListAssignmentsRequest {})
+        .await
+        .context("list assignments")?
+        .into_inner();
+    Ok(response)
+}
+
+async fn watch_assignment_listing_once(
+    state: Arc<SharedState>,
+    owned_cells: Arc<RwLock<HashSet<CellId>>>,
+    worker_id: String,
+) -> Result<()> {
+    let endpoint = orchestrator_endpoint();
+    let mut client = OrchestratorClient::connect(endpoint.clone())
+        .await
+        .with_context(|| format!("connect orchestrator at {}", endpoint))?;
+    let response = client
+        .watch_assignments(WatchAssignmentsRequest {})
+        .await
+        .context("subscribe to watch_assignments")?;
+    let mut stream = response.into_inner();
+    while let Some(listing) = stream
+        .message()
+        .await
+        .context("receive assignment listing from watch stream")?
+    {
+        apply_peer_routes_update(&state, &owned_cells, &worker_id, listing).await?;
+    }
+    Ok(())
+}
+
+async fn peer_routes_watch_loop(
+    state: Arc<SharedState>,
+    owned_cells: Arc<RwLock<HashSet<CellId>>>,
+    worker_id: String,
+) {
+    loop {
+        match watch_assignment_listing_once(
+            Arc::clone(&state),
+            Arc::clone(&owned_cells),
+            worker_id.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                warn!(
+                    target: "worker",
+                    worker_id = worker_id.as_str(),
+                    "assignment listing watch ended; reconnecting after backoff"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "worker",
+                    worker_id = worker_id.as_str(),
+                    error = ?e,
+                    "assignment listing watch failed; reconnecting after backoff"
+                );
+            }
+        }
+        time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn peer_routes_refresh_loop(
+    state: Arc<SharedState>,
+    owned_cells: Arc<RwLock<HashSet<CellId>>>,
+    worker_id: String,
+) {
+    let mut ticker = time::interval(assignment_retry_interval());
+    loop {
+        ticker.tick().await;
+        match fetch_assignment_listing().await {
+            Ok(listing) => {
+                if let Err(e) =
+                    apply_peer_routes_update(&state, &owned_cells, &worker_id, listing).await
+                {
+                    warn!(
+                        target: "worker",
+                        worker_id = worker_id.as_str(),
+                        error = ?e,
+                        "failed to refresh peer routes from listing"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "worker",
+                    worker_id = worker_id.as_str(),
+                    error = ?e,
+                    "failed to refresh peer routes; keeping existing routes"
+                );
+            }
+        }
+    }
+}
+
+async fn apply_peer_routes_update(
+    state: &Arc<SharedState>,
+    owned_cells: &Arc<RwLock<HashSet<CellId>>>,
+    worker_id: &str,
+    listing: AssignmentListing,
+) -> Result<bool> {
+    let routes = peer_routes_from_listing(&listing, worker_id)?;
+    let route_count = routes.len();
+    let changed = state.update_peer_routes(routes).await;
+    if changed {
+        let owned_snapshot = owned_cells.read().await.clone();
+        state.resync_client_interests(&owned_snapshot).await;
+        if route_count == 0 {
+            warn!(
+                target: "worker",
+                worker_id,
+                "peer route table updated; no remote cells available"
+            );
+        } else {
+            info!(
+                target: "worker",
+                worker_id,
+                remote_cells = route_count,
+                "peer route table updated from orchestrator listing"
+            );
+        }
+    }
+    Ok(changed)
+}
+
+fn peer_routes_from_listing(
+    listing: &AssignmentListing,
+    self_worker_id: &str,
+) -> Result<PeerRoutes> {
+    let mut routes = HashMap::new();
+    for bundle in &listing.workers {
+        if bundle.worker_id == self_worker_id {
+            continue;
+        }
+        let addr = bundle.addr.trim();
+        if addr.is_empty() {
+            return Err(anyhow!("worker addr empty for {}", bundle.worker_id));
+        }
+        for assignment in &bundle.cells {
+            let cell = assignment_to_cell_ref(assignment)?;
+            let prev = routes.insert(
+                cell,
+                PeerRoute {
+                    worker_id: bundle.worker_id.clone(),
+                    addr: addr.to_string(),
+                },
+            );
+            if let Some(prev) = prev {
+                return Err(anyhow!(
+                    "duplicate remote route for {:?}: {} and {}",
+                    cell,
+                    prev.worker_id,
+                    bundle.worker_id
+                ));
+            }
+        }
+    }
+    Ok(routes)
+}
+
+fn orchestrator_endpoint() -> String {
+    let orchestrator_addr =
+        std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
+    if orchestrator_addr.starts_with("http://") || orchestrator_addr.starts_with("https://") {
+        orchestrator_addr
+    } else {
+        format!("http://{}", orchestrator_addr)
+    }
+}
+
 fn assignment_to_cell(assignment: Assignment) -> Result<CellId> {
-    let depth = u8::try_from(assignment.depth)
-        .map_err(|_| anyhow!("assignment depth {} out of range", assignment.depth))?;
-    let sub = u8::try_from(assignment.sub)
-        .map_err(|_| anyhow!("assignment sub {} out of range", assignment.sub))?;
+    assignment_to_cell_parts(
+        assignment.world,
+        assignment.cx,
+        assignment.cy,
+        assignment.depth,
+        assignment.sub,
+    )
+}
+
+fn assignment_to_cell_ref(assignment: &Assignment) -> Result<CellId> {
+    assignment_to_cell_parts(
+        assignment.world,
+        assignment.cx,
+        assignment.cy,
+        assignment.depth,
+        assignment.sub,
+    )
+}
+
+fn assignment_to_cell_parts(world: u32, cx: i32, cy: i32, depth: u32, sub: u32) -> Result<CellId> {
+    let depth =
+        u8::try_from(depth).map_err(|_| anyhow!("assignment depth {} out of range", depth))?;
+    let sub = u8::try_from(sub).map_err(|_| anyhow!("assignment sub {} out of range", sub))?;
     Ok(CellId {
-        world: assignment.world,
-        cx: assignment.cx,
-        cy: assignment.cy,
+        world,
+        cx,
+        cy,
         depth,
         sub,
     })
@@ -1039,6 +1573,7 @@ async fn on_tick(tick: Tick, state: &SharedState) {
         };
 
         for (actor, event) in queued_events {
+            let relay_actor = actor.clone();
             state
                 .broadcast(
                     cell,
@@ -1047,6 +1582,16 @@ async fn on_tick(tick: Tick, state: &SharedState) {
                         moved: vec![actor],
                     },
                     Some(event.exclude_client_id),
+                    Some(event.epoch),
+                )
+                .await;
+            state
+                .broadcast_relay(
+                    cell,
+                    WorkerRelayMsg::Delta {
+                        cell,
+                        moved: vec![relay_actor],
+                    },
                     Some(event.epoch),
                 )
                 .await;
@@ -1127,6 +1672,7 @@ fn aoi_cells_for_position(
     visible
 }
 
+#[cfg(test)]
 fn desired_aoi_cells_for_positions(
     root_positions: &[(CellId, Position)],
     owned_cells: &HashSet<CellId>,
@@ -1151,6 +1697,26 @@ fn desired_aoi_cells_for_positions(
     desired
 }
 
+fn desired_aoi_targets_for_positions(
+    root_positions: &[(CellId, Position)],
+    radius_cells: i32,
+    cell_span_units: f32,
+    edge_margin_units: Option<f32>,
+) -> HashSet<CellId> {
+    let mut desired = HashSet::new();
+    for (cell, pos) in root_positions {
+        desired.extend(aoi_cells_for_position(
+            *cell,
+            *pos,
+            radius_cells,
+            cell_span_units,
+            edge_margin_units,
+        ));
+    }
+    desired
+}
+
+#[cfg(test)]
 fn desired_aoi_cells(
     owned_actor_positions: &[(CellId, Position)],
     owned_cells: &HashSet<CellId>,
@@ -1202,6 +1768,45 @@ async fn sync_interest_cells(
     Ok(())
 }
 
+async fn sync_relay_interest_cells(
+    state: &SharedState,
+    subscriber: &RelaySubscriber,
+    subscribed_cells: &mut HashSet<CellId>,
+    desired_cells: &HashSet<CellId>,
+    epoch: u32,
+) -> Result<(), ()> {
+    let mut to_unsubscribe = subscribed_cells
+        .difference(desired_cells)
+        .copied()
+        .collect::<Vec<_>>();
+    to_unsubscribe.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    let to_unsubscribe_set = to_unsubscribe.iter().copied().collect::<HashSet<_>>();
+    state
+        .remove_relay_subscriptions_for_cells(subscriber.connection_id, &to_unsubscribe_set)
+        .await;
+    for cell in &to_unsubscribe {
+        subscribed_cells.remove(cell);
+    }
+
+    let mut to_subscribe = desired_cells
+        .difference(subscribed_cells)
+        .copied()
+        .collect::<Vec<_>>();
+    to_subscribe.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    for cell in to_subscribe {
+        state
+            .relay_subscribe_with_snapshot(cell, subscriber, epoch)
+            .await?;
+        subscribed_cells.insert(cell);
+    }
+
+    Ok(())
+}
+
+fn peer_route_key(route: &PeerRoute) -> String {
+    format!("{}@{}", route.worker_id, route.addr)
+}
+
 fn make_error(code: &str, message: impl Into<String>) -> ServerMsg {
     ServerMsg::Error {
         code: code.to_string(),
@@ -1251,6 +1856,117 @@ async fn read_exact_or_disconnect(
     }
 }
 
+async fn read_frame_bytes(reader: &mut OwnedReadHalf) -> Result<Option<BytesMut>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(anyhow!(
+            "frame length {} exceeds max {}",
+            len,
+            MAX_FRAME_LEN
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    match reader.read_exact(&mut payload).await {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let mut buf = BytesMut::with_capacity(4 + len);
+    buf.extend_from_slice(&len_buf);
+    buf.extend_from_slice(&payload);
+    Ok(Some(buf))
+}
+
+async fn read_frame_bytes_or_disconnect(
+    reader: &mut OwnedReadHalf,
+    disconnect_rx: &mut watch::Receiver<()>,
+) -> Result<Option<BytesMut>> {
+    let mut len_buf = [0u8; 4];
+    match read_exact_or_disconnect(reader, &mut len_buf, disconnect_rx).await {
+        Ok(ReadExactOutcome::DisconnectRequested) => return Ok(None),
+        Ok(ReadExactOutcome::Read) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(anyhow!(
+            "frame length {} exceeds max {}",
+            len,
+            MAX_FRAME_LEN
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    match read_exact_or_disconnect(reader, &mut payload, disconnect_rx).await {
+        Ok(ReadExactOutcome::DisconnectRequested) => return Ok(None),
+        Ok(ReadExactOutcome::Read) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let mut buf = BytesMut::with_capacity(4 + len);
+    buf.extend_from_slice(&len_buf);
+    buf.extend_from_slice(&payload);
+    Ok(Some(buf))
+}
+
+fn decode_client_frame_from_bytes(frame: &BytesMut) -> Result<Envelope<ClientMsg>> {
+    let mut buf = frame.clone();
+    match try_decode_frame::<Envelope<ClientMsg>>(&mut buf) {
+        Ok(Some(env)) => Ok(env),
+        Ok(None) => Err(anyhow!("incomplete client frame")),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn decode_worker_relay_frame_from_bytes(frame: &BytesMut) -> Result<Envelope<WorkerRelayMsg>> {
+    let mut buf = frame.clone();
+    match try_decode_frame::<Envelope<WorkerRelayMsg>>(&mut buf) {
+        Ok(Some(env)) => Ok(env),
+        Ok(None) => Err(anyhow!("incomplete worker relay frame")),
+        Err(e) => Err(e.into()),
+    }
+}
+
 async fn run_server(
     addr: SocketAddr,
     state: Arc<SharedState>,
@@ -1264,13 +1980,66 @@ async fn run_server(
         let st = state.clone();
         let owned = owned_cells.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_upstream(sock, peer, st, owned).await {
+            if let Err(e) = handle_incoming(sock, peer, st, owned).await {
                 error!(target: "worker", %peer, error = ?e, "upstream connection error");
             }
         });
     }
 }
 
+async fn handle_incoming(
+    stream: TcpStream,
+    peer: SocketAddr,
+    state: Arc<SharedState>,
+    owned_cells: Arc<RwLock<HashSet<CellId>>>,
+) -> Result<()> {
+    let (mut reader, writer) = stream.into_split();
+    let Some(first_frame) = read_frame_bytes(&mut reader).await? else {
+        info!(target: "worker", %peer, "upstream closed before first frame");
+        return Ok(());
+    };
+
+    if let Ok(first_env) = decode_client_frame_from_bytes(&first_frame) {
+        let (tx, rx) = channel::<OutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
+        return handle_upstream_inner(
+            reader,
+            writer,
+            peer,
+            state,
+            owned_cells,
+            tx,
+            rx,
+            true,
+            Some(first_env),
+        )
+        .await;
+    }
+
+    if let Ok(first_env) = decode_worker_relay_frame_from_bytes(&first_frame) {
+        let (tx, rx) = channel::<RelayOutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
+        return handle_worker_relay_inner(
+            reader,
+            writer,
+            peer,
+            state,
+            owned_cells,
+            tx,
+            rx,
+            true,
+            Some(first_env),
+        )
+        .await;
+    }
+
+    warn!(
+        target: "worker",
+        %peer,
+        "failed to decode first frame as client or worker relay; closing connection"
+    );
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_upstream(
     stream: TcpStream,
     peer: SocketAddr,
@@ -1279,7 +2048,358 @@ async fn handle_upstream(
 ) -> Result<()> {
     let (tx, rx) = channel::<OutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
     let (reader, writer) = stream.into_split();
-    handle_upstream_inner(reader, writer, peer, state, owned_cells, tx, rx, true).await
+    handle_upstream_inner(reader, writer, peer, state, owned_cells, tx, rx, true, None).await
+}
+
+async fn forward_worker_relay_to_client(
+    subscriber: &CellSubscriber,
+    env_in: Envelope<WorkerRelayMsg>,
+) -> bool {
+    let msg = match env_in.payload {
+        WorkerRelayMsg::Snapshot { cell, actors } => ServerMsg::Snapshot { cell, actors },
+        WorkerRelayMsg::Delta { cell, moved } => ServerMsg::Delta { cell, moved },
+        WorkerRelayMsg::Despawn { cell, actors } => ServerMsg::Despawn { cell, actors },
+        WorkerRelayMsg::Subscribe { .. } | WorkerRelayMsg::Unsubscribe { .. } => {
+            return true;
+        }
+    };
+
+    match subscriber
+        .tx
+        .try_send((env_in.cell, Some(env_in.epoch), msg))
+    {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            warn!(
+                target: "worker",
+                client_id = subscriber.client_id,
+                cell = ?env_in.cell,
+                "relay forward channel full; disconnecting slow client"
+            );
+            let _ = subscriber.disconnect_tx.send(());
+            false
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
+}
+
+async fn send_relay_interest_delta(
+    tx: &Sender<RelayOutboundMsg>,
+    previous: &HashSet<CellId>,
+    next: &HashSet<CellId>,
+    epoch: u32,
+) -> Result<()> {
+    let mut to_unsubscribe = previous.difference(next).copied().collect::<Vec<_>>();
+    to_unsubscribe.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    if !to_unsubscribe.is_empty() {
+        tx.send((
+            to_unsubscribe[0],
+            Some(epoch),
+            WorkerRelayMsg::Unsubscribe {
+                cells: to_unsubscribe,
+            },
+        ))
+        .await
+        .map_err(|_| anyhow!("relay writer closed before unsubscribe"))?;
+    }
+
+    let mut to_subscribe = next.difference(previous).copied().collect::<Vec<_>>();
+    to_subscribe.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    if !to_subscribe.is_empty() {
+        tx.send((
+            to_subscribe[0],
+            Some(epoch),
+            WorkerRelayMsg::Subscribe {
+                cells: to_subscribe,
+            },
+        ))
+        .await
+        .map_err(|_| anyhow!("relay writer closed before subscribe"))?;
+    }
+
+    Ok(())
+}
+
+async fn remote_peer_session_loop(
+    state: Arc<SharedState>,
+    subscriber: CellSubscriber,
+    route: PeerRoute,
+    mut desired_rx: watch::Receiver<RemotePeerDesired>,
+) {
+    let mut desired = desired_rx.borrow().clone();
+
+    loop {
+        if desired.cells.is_empty() {
+            match desired_rx.changed().await {
+                Ok(()) => {
+                    desired = desired_rx.borrow().clone();
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+
+        match TcpStream::connect(route.addr.as_str()).await {
+            Ok(stream) => {
+                info!(
+                    target: "worker",
+                    client_id = subscriber.client_id,
+                    peer_worker = route.worker_id.as_str(),
+                    peer_addr = route.addr.as_str(),
+                    "connected remote ghost relay peer"
+                );
+                if let Err(e) = run_remote_peer_session(
+                    stream,
+                    &subscriber,
+                    &route,
+                    &mut desired_rx,
+                    &mut desired,
+                )
+                .await
+                {
+                    warn!(
+                        target: "worker",
+                        client_id = subscriber.client_id,
+                        peer_worker = route.worker_id.as_str(),
+                        peer_addr = route.addr.as_str(),
+                        error = ?e,
+                        "remote ghost relay session ended; reconnecting"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "worker",
+                    client_id = subscriber.client_id,
+                    peer_worker = route.worker_id.as_str(),
+                    peer_addr = route.addr.as_str(),
+                    error = ?e,
+                    "failed to connect remote ghost relay peer"
+                );
+            }
+        }
+
+        let removed = {
+            let remote_interests = state.remote_interests.lock().await;
+            !remote_interests.contains_key(&subscriber.client_id)
+        };
+        if removed {
+            break;
+        }
+
+        tokio::select! {
+            _ = time::sleep(Duration::from_millis(250)) => {}
+            changed = desired_rx.changed() => {
+                match changed {
+                    Ok(()) => desired = desired_rx.borrow().clone(),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn run_remote_peer_session(
+    stream: TcpStream,
+    subscriber: &CellSubscriber,
+    route: &PeerRoute,
+    desired_rx: &mut watch::Receiver<RemotePeerDesired>,
+    desired: &mut RemotePeerDesired,
+) -> Result<()> {
+    let (mut reader, writer) = stream.into_split();
+    let (tx, mut rx) = channel::<RelayOutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
+
+    let writer_task = tokio::spawn(async move {
+        let mut seq_out: u64 = 0;
+        let mut writer = writer;
+        while let Some((cell, epoch_override, msg)) = rx.recv().await {
+            let env_out = Envelope {
+                cell,
+                seq: seq_out,
+                epoch: epoch_override.unwrap_or(0),
+                payload: msg,
+            };
+            seq_out = seq_out.wrapping_add(1);
+            let frame = encode_frame(&env_out);
+            if let Err(e) = writer.write_all(&frame).await {
+                return Err(anyhow!(e).context("write remote relay frame"));
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut subscribed_cells = HashSet::new();
+    send_relay_interest_delta(&tx, &subscribed_cells, &desired.cells, desired.epoch).await?;
+    subscribed_cells = desired.cells.clone();
+
+    let result = loop {
+        tokio::select! {
+            frame = read_frame_bytes(&mut reader) => {
+                let Some(frame) = frame? else {
+                    break Ok(());
+                };
+                let env_in = decode_worker_relay_frame_from_bytes(&frame)
+                    .context("decode worker relay frame from peer")?;
+                if !subscribed_cells.contains(&env_in.cell) {
+                    continue;
+                }
+                if !forward_worker_relay_to_client(subscriber, env_in).await {
+                    break Ok(());
+                }
+            }
+            changed = desired_rx.changed() => {
+                match changed {
+                    Ok(()) => {
+                        let next = desired_rx.borrow().clone();
+                        send_relay_interest_delta(&tx, &subscribed_cells, &next.cells, next.epoch).await?;
+                        *desired = next.clone();
+                        subscribed_cells = next.cells;
+                        if subscribed_cells.is_empty() {
+                            break Ok(());
+                        }
+                    }
+                    Err(_) => break Ok(()),
+                }
+            }
+        }
+    };
+
+    drop(tx);
+    match writer_task.await {
+        Ok(Ok(())) => result,
+        Ok(Err(e)) => Err(e),
+        Err(join_err) => Err(anyhow!(join_err).context(format!(
+            "join remote relay writer task for {} / client {}",
+            route.addr, subscriber.client_id
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_worker_relay_inner(
+    mut reader: OwnedReadHalf,
+    writer: OwnedWriteHalf,
+    peer: SocketAddr,
+    state: Arc<SharedState>,
+    owned_cells: Arc<RwLock<HashSet<CellId>>>,
+    tx: Sender<RelayOutboundMsg>,
+    mut rx: Receiver<RelayOutboundMsg>,
+    spawn_writer: bool,
+    mut first_env: Option<Envelope<WorkerRelayMsg>>,
+) -> Result<()> {
+    let epoch = Arc::new(AtomicU32::new(0));
+    let writer_epoch = Arc::clone(&epoch);
+    let connection_id = NEXT_RELAY_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
+    let (disconnect_tx, mut disconnect_rx) = watch::channel(());
+    let subscriber = RelaySubscriber {
+        connection_id,
+        tx: tx.clone(),
+        disconnect_tx: disconnect_tx.clone(),
+    };
+    let mut subscribed_cells: HashSet<CellId> = HashSet::new();
+
+    if spawn_writer {
+        tokio::spawn(async move {
+            let mut seq_out: u64 = 0;
+            let mut writer = writer;
+            while let Some((cell, epoch_override, msg)) = rx.recv().await {
+                let env_out = Envelope {
+                    cell,
+                    seq: seq_out,
+                    epoch: epoch_override.unwrap_or_else(|| writer_epoch.load(Ordering::Relaxed)),
+                    payload: msg,
+                };
+                seq_out = seq_out.wrapping_add(1);
+                let frame = encode_frame(&env_out);
+                if let Err(e) = writer.write_all(&frame).await {
+                    error!(target: "worker", %peer, error = ?e, "relay write error");
+                    break;
+                }
+            }
+            info!(target: "worker", %peer, "relay writer task ended");
+        });
+    } else {
+        drop(rx);
+        drop(writer);
+    }
+
+    let result = loop {
+        let env_in = if let Some(env_in) = first_env.take() {
+            env_in
+        } else {
+            let Some(frame) =
+                read_frame_bytes_or_disconnect(&mut reader, &mut disconnect_rx).await?
+            else {
+                break Ok(());
+            };
+            match decode_worker_relay_frame_from_bytes(&frame) {
+                Ok(env_in) => env_in,
+                Err(e) => {
+                    warn!(
+                        target: "worker",
+                        %peer,
+                        error = ?e,
+                        "failed to decode worker relay frame; closing connection"
+                    );
+                    break Ok(());
+                }
+            }
+        };
+
+        epoch.store(env_in.epoch, Ordering::Relaxed);
+
+        match env_in.payload {
+            WorkerRelayMsg::Subscribe { cells } => {
+                let owned_guard = owned_cells.read().await;
+                let mut desired_cells = subscribed_cells.clone();
+                for cell in cells {
+                    if owned_guard.contains(&cell) {
+                        desired_cells.insert(cell);
+                    } else {
+                        warn!(
+                            target: "worker",
+                            %peer,
+                            cell = ?cell,
+                            "relay subscribe requested for cell not owned by this worker"
+                        );
+                    }
+                }
+                if sync_relay_interest_cells(
+                    state.as_ref(),
+                    &subscriber,
+                    &mut subscribed_cells,
+                    &desired_cells,
+                    env_in.epoch,
+                )
+                .await
+                .is_err()
+                {
+                    break Ok(());
+                }
+            }
+            WorkerRelayMsg::Unsubscribe { cells } => {
+                let removed = cells.into_iter().collect::<HashSet<_>>();
+                state
+                    .remove_relay_subscriptions_for_cells(connection_id, &removed)
+                    .await;
+                for cell in removed {
+                    subscribed_cells.remove(&cell);
+                }
+            }
+            WorkerRelayMsg::Snapshot { .. }
+            | WorkerRelayMsg::Delta { .. }
+            | WorkerRelayMsg::Despawn { .. } => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "unexpected worker relay payload from subscriber connection"
+                );
+            }
+        }
+    };
+
+    state.remove_relay_subscriptions(connection_id).await;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1292,6 +2412,7 @@ async fn handle_upstream_inner(
     tx: Sender<OutboundMsg>,
     mut rx: Receiver<OutboundMsg>,
     spawn_writer: bool,
+    mut first_env: Option<Envelope<ClientMsg>>,
 ) -> Result<()> {
     let epoch = Arc::new(AtomicU32::new(0));
     let writer_epoch = Arc::clone(&epoch);
@@ -1331,79 +2452,26 @@ async fn handle_upstream_inner(
     }
 
     let result = loop {
-        // Read one frame from Gateway
-        let mut len_buf = [0u8; 4];
-        match read_exact_or_disconnect(&mut reader, &mut len_buf, &mut disconnect_rx).await {
-            Ok(ReadExactOutcome::DisconnectRequested) => {
-                warn!(
-                    target: "worker",
-                    %peer,
-                    "disconnecting slow subscriber after outbound backpressure"
-                );
+        let env_in = if let Some(env_in) = first_env.take() {
+            env_in
+        } else {
+            let Some(frame) =
+                read_frame_bytes_or_disconnect(&mut reader, &mut disconnect_rx).await?
+            else {
+                info!(target: "worker", %peer, "upstream closed");
                 break Ok(());
-            }
-            Ok(ReadExactOutcome::Read) => {}
-            Err(e) => {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) {
-                    info!(target: "worker", %peer, "upstream closed");
+            };
+            match decode_client_frame_from_bytes(&frame) {
+                Ok(env_in) => env_in,
+                Err(e) => {
+                    warn!(
+                        target: "worker",
+                        %peer,
+                        error = ?e,
+                        "failed to decode client frame; closing connection"
+                    );
                     break Ok(());
                 }
-                break Err(e.into());
-            }
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_FRAME_LEN {
-            warn!(target: "worker", %peer, len, max = MAX_FRAME_LEN, "frame too large");
-            break Ok(());
-        }
-        let mut payload = vec![0u8; len];
-        match read_exact_or_disconnect(&mut reader, &mut payload, &mut disconnect_rx).await {
-            Ok(ReadExactOutcome::DisconnectRequested) => {
-                warn!(
-                    target: "worker",
-                    %peer,
-                    "disconnecting slow subscriber after outbound backpressure"
-                );
-                break Ok(());
-            }
-            Ok(ReadExactOutcome::Read) => {}
-            Err(e) => {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) {
-                    info!(target: "worker", %peer, "upstream closed");
-                    break Ok(());
-                }
-                break Err(e.into());
-            }
-        }
-
-        // Decode as Envelope<ClientMsg>
-        let mut buf = BytesMut::with_capacity(4 + len);
-        buf.extend_from_slice(&len_buf);
-        buf.extend_from_slice(&payload);
-        let env_in = match try_decode_frame::<Envelope<ClientMsg>>(&mut buf) {
-            Ok(Some(env_in)) => env_in,
-            Ok(None) => {
-                warn!(
-                    target: "worker",
-                    %peer,
-                    "incomplete frame; closing connection"
-                );
-                break Ok(());
-            }
-            Err(e) => {
-                warn!(
-                    target: "worker",
-                    %peer,
-                    error = ?e,
-                    "failed to decode frame; closing connection"
-                );
-                break Ok(());
             }
         };
         let cell = env_in.cell;
@@ -1534,13 +2602,16 @@ async fn handle_upstream_inner(
                 subscribed_cells.insert(cell);
 
                 let owned_actor_positions = state.actor_positions(&owned_actors).await;
-                let desired_cells = desired_aoi_cells(
+                let desired_targets = desired_aoi_targets_for_positions(
                     &owned_actor_positions,
-                    &owned_guard,
                     state.aoi_radius_cells,
                     state.aoi_cell_span_units,
                     state.aoi_edge_margin_units,
                 );
+                let desired_cells = desired_targets
+                    .intersection(&owned_guard)
+                    .copied()
+                    .collect::<HashSet<_>>();
                 if sync_interest_cells(
                     state.as_ref(),
                     &subscriber,
@@ -1561,8 +2632,18 @@ async fn handle_upstream_inner(
                 state
                     .upsert_client_root(&subscriber, cell, actor, env_in.epoch)
                     .await;
+                let _ = state
+                    .sync_remote_interests(
+                        &subscriber,
+                        client_id,
+                        &desired_targets,
+                        &owned_guard,
+                        env_in.epoch,
+                    )
+                    .await;
 
                 let moved = ActorState { id: actor, pos };
+                let relay_moved = moved.clone();
                 state
                     .broadcast(
                         cell,
@@ -1571,6 +2652,16 @@ async fn handle_upstream_inner(
                             moved: vec![moved],
                         },
                         Some(client_id),
+                        Some(env_in.epoch),
+                    )
+                    .await;
+                state
+                    .broadcast_relay(
+                        cell,
+                        WorkerRelayMsg::Delta {
+                            cell,
+                            moved: vec![relay_moved],
+                        },
                         Some(env_in.epoch),
                     )
                     .await;
@@ -1782,13 +2873,16 @@ async fn handle_upstream_inner(
                 }
                 state.touch_client_epoch(&subscriber, env_in.epoch).await;
                 let owned_actor_positions = state.actor_positions(&owned_actors).await;
-                let desired_cells = desired_aoi_cells(
+                let desired_targets = desired_aoi_targets_for_positions(
                     &owned_actor_positions,
-                    &owned_guard,
                     state.aoi_radius_cells,
                     state.aoi_cell_span_units,
                     state.aoi_edge_margin_units,
                 );
+                let desired_cells = desired_targets
+                    .intersection(&owned_guard)
+                    .copied()
+                    .collect::<HashSet<_>>();
                 if sync_interest_cells(
                     state.as_ref(),
                     &subscriber,
@@ -1806,6 +2900,15 @@ async fn handle_upstream_inner(
                     );
                     break Ok(());
                 }
+                let _ = state
+                    .sync_remote_interests(
+                        &subscriber,
+                        client_id,
+                        &desired_targets,
+                        &owned_guard,
+                        env_in.epoch,
+                    )
+                    .await;
             }
         }
     };
@@ -1851,6 +2954,28 @@ mod tests {
                 interval.tick().await;
                 tick.0 += 1;
                 on_tick(tick, state.as_ref()).await;
+            }
+        })
+    }
+
+    fn spawn_incoming_test_server(
+        listener: TcpListener,
+        state: Arc<SharedState>,
+        owned_cells: Arc<RwLock<HashSet<CellId>>>,
+        accept_count: usize,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..accept_count {
+                let (sock, peer) = listener.accept().await.expect("accept connection");
+                let st = Arc::clone(&state);
+                let owned = Arc::clone(&owned_cells);
+                tasks.push(tokio::spawn(async move {
+                    let _ = handle_incoming(sock, peer, st, owned).await;
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
             }
         })
     }
@@ -2049,6 +3174,205 @@ mod tests {
             desired_aoi_cells(&edge, &owned_cells, 1, 32.0, Some(4.0)),
             HashSet::from([origin, east, north, northeast])
         );
+    }
+
+    #[test]
+    fn peer_routes_from_listing_excludes_self_and_maps_remote_cells() {
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-a".into(),
+                    addr: "127.0.0.1:5001".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 1,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+        };
+
+        let routes = peer_routes_from_listing(&listing, "worker-a").expect("peer routes");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes.get(&CellId::grid(0, 1, 0)),
+            Some(&PeerRoute {
+                worker_id: "worker-b".into(),
+                addr: "127.0.0.1:5002".into(),
+            })
+        );
+        assert!(!routes.contains_key(&CellId::grid(0, 0, 0)));
+    }
+
+    #[test]
+    fn peer_routes_from_listing_rejects_duplicate_remote_cells() {
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 1,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-c".into(),
+                    addr: "127.0.0.1:5003".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 1,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+        };
+
+        let err = peer_routes_from_listing(&listing, "worker-a").expect_err("duplicate route");
+        assert!(err.to_string().contains("duplicate remote route"));
+    }
+
+    #[tokio::test]
+    async fn resync_client_interests_tracks_remote_cells() {
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let remote = CellId::grid(0, 1, 0);
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(primary)
+                .or_default()
+                .insert(EntityId(1), Position { x: 16.0, y: 16.0 });
+        }
+        state
+            .update_peer_routes(HashMap::from([(
+                remote,
+                PeerRoute {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                },
+            )]))
+            .await;
+
+        let (watcher_tx, _watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(51, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(primary, &watcher).await;
+        state
+            .upsert_client_root(&watcher, primary, EntityId(1), 10)
+            .await;
+
+        state
+            .resync_client_interests(&HashSet::from([primary]))
+            .await;
+
+        assert_eq!(
+            state.remote_interest_cells(watcher.client_id).await,
+            HashSet::from([remote])
+        );
+        assert_eq!(
+            state.client_subscribed_cells(watcher.client_id).await,
+            HashSet::from([primary])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_resyncs_remote_interests() {
+        let state = Arc::new(SharedState::default());
+        let primary = CellId::grid(0, 0, 0);
+        let remote = CellId::grid(0, 1, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([primary])));
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(primary)
+                .or_default()
+                .insert(EntityId(1), Position { x: 16.0, y: 16.0 });
+        }
+
+        let (watcher_tx, _watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(52, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(primary, &watcher).await;
+        state
+            .upsert_client_root(&watcher, primary, EntityId(1), 11)
+            .await;
+
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-a".into(),
+                    addr: "127.0.0.1:5001".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 1,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+        };
+
+        apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+            .await
+            .expect("apply peer routes");
+
+        assert_eq!(
+            state.remote_interest_cells(watcher.client_id).await,
+            HashSet::from([remote])
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_client_subscriptions_clears_remote_interests() {
+        let state = SharedState::default();
+        let remote = CellId::grid(0, 1, 0);
+        {
+            let mut remote_interests = state.remote_interests.lock().await;
+            remote_interests.insert(
+                77,
+                HashMap::from([(
+                    remote,
+                    PeerRoute {
+                        worker_id: "worker-b".into(),
+                        addr: "127.0.0.1:5002".into(),
+                    },
+                )]),
+            );
+        }
+
+        state.remove_client_subscriptions(77).await;
+        assert!(state.remote_interest_cells(77).await.is_empty());
     }
 
     #[tokio::test]
@@ -3243,6 +4567,160 @@ mod tests {
         drop(adjacent_owner);
         drop(watcher);
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cross_worker_relay_forwards_snapshot_delta_and_despawn() {
+        let primary = CellId::grid(0, 0, 0);
+        let adjacent = CellId::grid(0, 1, 0);
+
+        let remote_state = Arc::new(SharedState::default());
+        let remote_ticker = spawn_test_tick_loop(Arc::clone(&remote_state));
+        let remote_owned = Arc::new(RwLock::new(HashSet::from([adjacent])));
+        let remote_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote listener");
+        let remote_addr = remote_listener.local_addr().expect("remote addr");
+        let remote_server = spawn_incoming_test_server(
+            remote_listener,
+            Arc::clone(&remote_state),
+            Arc::clone(&remote_owned),
+            2,
+        );
+
+        let local_state = Arc::new(SharedState::default());
+        let local_ticker = spawn_test_tick_loop(Arc::clone(&local_state));
+        let local_owned = Arc::new(RwLock::new(HashSet::from([primary])));
+        local_state
+            .update_peer_routes(HashMap::from([(
+                adjacent,
+                PeerRoute {
+                    worker_id: "worker-b".into(),
+                    addr: remote_addr.to_string(),
+                },
+            )]))
+            .await;
+        let local_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let local_addr = local_listener.local_addr().expect("local addr");
+        let local_server = spawn_incoming_test_server(
+            local_listener,
+            Arc::clone(&local_state),
+            Arc::clone(&local_owned),
+            1,
+        );
+
+        let mut remote_owner = TcpStream::connect(remote_addr)
+            .await
+            .expect("connect remote owner");
+        remote_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 0,
+                epoch: 50,
+                payload: ClientMsg::Join {
+                    actor: EntityId(2),
+                    pos: Position { x: 4.0, y: 8.0 },
+                },
+            }))
+            .await
+            .expect("remote join");
+        let _ = read_env(&mut remote_owner).await;
+
+        let mut watcher = TcpStream::connect(local_addr)
+            .await
+            .expect("connect watcher");
+        watcher
+            .write_all(&encode_frame(&Envelope {
+                cell: primary,
+                seq: 0,
+                epoch: 51,
+                payload: ClientMsg::Join {
+                    actor: EntityId(1),
+                    pos: Position { x: 0.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("watcher join");
+
+        let own_snapshot = read_env(&mut watcher).await;
+        assert!(matches!(
+            own_snapshot.payload,
+            ServerMsg::Snapshot { cell, .. } if cell == primary
+        ));
+
+        let remote_snapshot = timeout(Duration::from_secs(1), read_env(&mut watcher))
+            .await
+            .expect("wait for remote snapshot");
+        match remote_snapshot.payload {
+            ServerMsg::Snapshot { cell, actors } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(remote_snapshot.epoch, 51);
+                assert_eq!(actors.len(), 1);
+                assert_eq!(actors[0].id, EntityId(2));
+                assert_eq!(actors[0].pos, Position { x: 4.0, y: 8.0 });
+            }
+            other => panic!("expected relayed snapshot, got {other:?}"),
+        }
+
+        remote_owner
+            .write_all(&encode_frame(&Envelope {
+                cell: adjacent,
+                seq: 1,
+                epoch: 52,
+                payload: ClientMsg::Move {
+                    actor: EntityId(2),
+                    dx: 3.0,
+                    dy: -2.0,
+                },
+            }))
+            .await
+            .expect("remote move");
+        let _ = read_env(&mut remote_owner).await;
+
+        let remote_delta = timeout(Duration::from_secs(1), read_env(&mut watcher))
+            .await
+            .expect("wait for remote delta");
+        match remote_delta.payload {
+            ServerMsg::Delta { cell, moved } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(remote_delta.epoch, 52);
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, EntityId(2));
+                assert_eq!(moved[0].pos, Position { x: 7.0, y: 6.0 });
+            }
+            other => panic!("expected relayed delta, got {other:?}"),
+        }
+
+        drop(remote_owner);
+        let remote_despawn = timeout(Duration::from_secs(1), read_env(&mut watcher))
+            .await
+            .expect("wait for remote despawn");
+        match remote_despawn.payload {
+            ServerMsg::Despawn { cell, actors } => {
+                assert_eq!(cell, adjacent);
+                assert_eq!(remote_despawn.epoch, 52);
+                assert_eq!(actors, vec![EntityId(2)]);
+            }
+            other => panic!("expected relayed despawn, got {other:?}"),
+        }
+
+        drop(watcher);
+        timeout(Duration::from_secs(1), local_server)
+            .await
+            .expect("local server timeout")
+            .expect("local server join");
+        timeout(Duration::from_secs(1), remote_server)
+            .await
+            .expect("remote server timeout")
+            .expect("remote server join");
+
+        let relay_subscribers = remote_state.relay_subscribers.lock().await;
+        assert!(relay_subscribers.is_empty());
+
+        local_ticker.abort();
+        remote_ticker.abort();
     }
 
     #[tokio::test]
@@ -4476,6 +5954,7 @@ mod tests {
                 tx,
                 rx,
                 false,
+                None,
             )
             .await
             .expect("handle upstream");
@@ -4544,6 +6023,7 @@ mod tests {
                     tx,
                     rx,
                     false,
+                    None,
                 )
                 .await;
             });
