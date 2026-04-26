@@ -631,9 +631,18 @@ fn dev_metrics_smoke() -> Result<()> {
             "gateway",
             gateway_metrics_addr,
             &[
+                "tessera_gateway_ready",
                 "tessera_gateway_routes",
                 "tessera_gateway_accepted_connections_total",
+                "tessera_gateway_upstream_connect_attempts_total",
+                "tessera_gateway_client_closes_no_route_total",
             ],
+        )?;
+        assert_http_status_endpoint(
+            "gateway readiness",
+            gateway_metrics_addr,
+            "/ready",
+            "200 OK",
         )?;
         assert_metrics_endpoint(
             "worker",
@@ -657,7 +666,7 @@ fn dev_metrics_smoke() -> Result<()> {
 
     smoke_result?;
     down_result?;
-    println!("metrics smoke: gateway, worker, and orchestrator /metrics are valid");
+    println!("metrics smoke: gateway, worker, orchestrator /metrics and gateway /ready are valid");
     Ok(())
 }
 
@@ -665,6 +674,21 @@ fn assert_metrics_endpoint(service: &str, raw_addr: &str, required_metrics: &[&s
     let addr = readiness_addr(raw_addr)?;
     let response = http_get(addr, "/metrics")?;
     assert_prometheus_response(service, &response, required_metrics)
+}
+
+fn assert_http_status_endpoint(
+    service: &str,
+    raw_addr: &str,
+    path: &str,
+    expected_status: &str,
+) -> Result<()> {
+    let addr = readiness_addr(raw_addr)?;
+    let response = http_get(addr, path)?;
+    let expected = format!("HTTP/1.1 {expected_status}");
+    if !response.starts_with(&expected) {
+        bail!("{service} smoke failed: expected HTTP {expected_status} response");
+    }
+    Ok(())
 }
 
 fn http_get(addr: SocketAddr, path: &str) -> Result<String> {

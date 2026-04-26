@@ -29,9 +29,11 @@ static NEXT_GATEWAY_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Default)]
 struct GatewayMetricsCounters {
     accepted_connections: AtomicU64,
+    upstream_connect_attempts: AtomicU64,
     upstream_connects: AtomicU64,
     upstream_connect_failures: AtomicU64,
     upstream_route_changes: AtomicU64,
+    upstream_route_change_reconnects: AtomicU64,
     upstream_reconnect_attempts: AtomicU64,
     upstream_closed: AtomicU64,
     upstream_read_errors: AtomicU64,
@@ -39,16 +41,23 @@ struct GatewayMetricsCounters {
     invalid_client_frames: AtomicU64,
     no_route_lookup_failures: AtomicU64,
     pending_ping_replays: AtomicU64,
+    client_closes_no_route: AtomicU64,
+    client_closes_upstream_retry_exhausted: AtomicU64,
+    client_closes_pending_ping_route_change: AtomicU64,
+    client_closes_ambiguous_upstream: AtomicU64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct GatewayMetricsSnapshot {
+    ready: u64,
     routes: u64,
     routing_version: u64,
     accepted_connections: u64,
+    upstream_connect_attempts: u64,
     upstream_connects: u64,
     upstream_connect_failures: u64,
     upstream_route_changes: u64,
+    upstream_route_change_reconnects: u64,
     upstream_reconnect_attempts: u64,
     upstream_closed: u64,
     upstream_read_errors: u64,
@@ -56,6 +65,36 @@ struct GatewayMetricsSnapshot {
     invalid_client_frames: u64,
     no_route_lookup_failures: u64,
     pending_ping_replays: u64,
+    client_closes_no_route: u64,
+    client_closes_upstream_retry_exhausted: u64,
+    client_closes_pending_ping_route_change: u64,
+    client_closes_ambiguous_upstream: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GatewayReadinessSnapshot {
+    ready: bool,
+    routes: u64,
+    routing_version: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GatewayClientCloseReason {
+    NoRoute,
+    UpstreamRetryExhausted,
+    PendingPingRouteChange,
+    AmbiguousUpstream,
+}
+
+impl GatewayClientCloseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::UpstreamRetryExhausted => "upstream_retry_exhausted",
+            Self::PendingPingRouteChange => "pending_ping_route_change",
+            Self::AmbiguousUpstream => "ambiguous_upstream",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,16 +139,26 @@ impl RoutingTable {
     }
 
     async fn metrics_snapshot(&self) -> GatewayMetricsSnapshot {
+        let routes = self.len().await as u64;
         GatewayMetricsSnapshot {
-            routes: self.len().await as u64,
+            ready: u64::from(routes > 0),
+            routes,
             routing_version: self.version.load(Ordering::Relaxed),
             accepted_connections: self.metrics.accepted_connections.load(Ordering::Relaxed),
+            upstream_connect_attempts: self
+                .metrics
+                .upstream_connect_attempts
+                .load(Ordering::Relaxed),
             upstream_connects: self.metrics.upstream_connects.load(Ordering::Relaxed),
             upstream_connect_failures: self
                 .metrics
                 .upstream_connect_failures
                 .load(Ordering::Relaxed),
             upstream_route_changes: self.metrics.upstream_route_changes.load(Ordering::Relaxed),
+            upstream_route_change_reconnects: self
+                .metrics
+                .upstream_route_change_reconnects
+                .load(Ordering::Relaxed),
             upstream_reconnect_attempts: self
                 .metrics
                 .upstream_reconnect_attempts
@@ -123,6 +172,28 @@ impl RoutingTable {
                 .no_route_lookup_failures
                 .load(Ordering::Relaxed),
             pending_ping_replays: self.metrics.pending_ping_replays.load(Ordering::Relaxed),
+            client_closes_no_route: self.metrics.client_closes_no_route.load(Ordering::Relaxed),
+            client_closes_upstream_retry_exhausted: self
+                .metrics
+                .client_closes_upstream_retry_exhausted
+                .load(Ordering::Relaxed),
+            client_closes_pending_ping_route_change: self
+                .metrics
+                .client_closes_pending_ping_route_change
+                .load(Ordering::Relaxed),
+            client_closes_ambiguous_upstream: self
+                .metrics
+                .client_closes_ambiguous_upstream
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    async fn readiness_snapshot(&self) -> GatewayReadinessSnapshot {
+        let routes = self.len().await as u64;
+        GatewayReadinessSnapshot {
+            ready: routes > 0,
+            routes,
+            routing_version: self.version.load(Ordering::Relaxed),
         }
     }
 }
@@ -214,11 +285,16 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             .upstream_closed
                             .fetch_add(1, Ordering::Relaxed);
                         if conn.has_non_ping_traffic {
+                            let close_reason = record_client_close(
+                                routing.metrics.as_ref(),
+                                GatewayClientCloseReason::AmbiguousUpstream,
+                            );
                             warn!(
                                 target: "gateway",
                                 %peer,
                                 worker = %conn.route.worker_id,
                                 addr = %conn.route.addr,
+                                close_reason,
                                 "upstream closed after non-ping traffic; closing client to avoid dropping replies"
                             );
                             conn.close().await;
@@ -257,7 +333,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     "no route available while reconnecting"
                                 );
                                 if attempt >= UPSTREAM_RETRY_MAX {
-                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    let close_reason = record_client_close(
+                                        routing.metrics.as_ref(),
+                                        GatewayClientCloseReason::NoRoute,
+                                    );
+                                    warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                     break 'conn_loop Ok(());
                                 }
                                 time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -287,7 +367,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 );
                                 upstream = None;
                                 if attempt >= UPSTREAM_RETRY_MAX {
-                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    let close_reason = record_client_close(
+                                        routing.metrics.as_ref(),
+                                        GatewayClientCloseReason::UpstreamRetryExhausted,
+                                    );
+                                    warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                     break 'conn_loop Ok(());
                                 }
                                 time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -309,7 +393,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     conn.close().await;
                                     upstream = None;
                                     if attempt >= UPSTREAM_RETRY_MAX {
-                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        let close_reason = record_client_close(
+                                            routing.metrics.as_ref(),
+                                            GatewayClientCloseReason::UpstreamRetryExhausted,
+                                        );
+                                        warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                         break 'conn_loop Ok(());
                                     }
                                     time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -377,12 +465,17 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             .upstream_read_errors
                             .fetch_add(1, Ordering::Relaxed);
                         if conn.has_non_ping_traffic {
+                            let close_reason = record_client_close(
+                                routing.metrics.as_ref(),
+                                GatewayClientCloseReason::AmbiguousUpstream,
+                            );
                             warn!(
                                 target: "gateway",
                                 %peer,
                                 worker = %conn.route.worker_id,
                                 addr = %conn.route.addr,
                                 error = ?e,
+                                close_reason,
                                 "failed reading from upstream after non-ping traffic; closing client to avoid dropping replies"
                             );
                             conn.close().await;
@@ -422,7 +515,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     "no route available while reconnecting"
                                 );
                                 if attempt >= UPSTREAM_RETRY_MAX {
-                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    let close_reason = record_client_close(
+                                        routing.metrics.as_ref(),
+                                        GatewayClientCloseReason::NoRoute,
+                                    );
+                                    warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                     break 'conn_loop Ok(());
                                 }
                                 time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -452,7 +549,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 );
                                 upstream = None;
                                 if attempt >= UPSTREAM_RETRY_MAX {
-                                    warn!(target: "gateway", %peer, "closing client connection");
+                                    let close_reason = record_client_close(
+                                        routing.metrics.as_ref(),
+                                        GatewayClientCloseReason::UpstreamRetryExhausted,
+                                    );
+                                    warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                     break 'conn_loop Ok(());
                                 }
                                 time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -474,7 +575,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     conn.close().await;
                                     upstream = None;
                                     if attempt >= UPSTREAM_RETRY_MAX {
-                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        let close_reason = record_client_close(
+                                            routing.metrics.as_ref(),
+                                            GatewayClientCloseReason::UpstreamRetryExhausted,
+                                        );
+                                        warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                         break 'conn_loop Ok(());
                                     }
                                     time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -556,7 +661,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         "no route available for cell"
                                     );
                                     if attempt >= UPSTREAM_RETRY_MAX {
-                                        warn!(target: "gateway", %peer, cell = ?cell, "closing client connection");
+                                        let close_reason = record_client_close(
+                                            routing.metrics.as_ref(),
+                                            GatewayClientCloseReason::NoRoute,
+                                        );
+                                        warn!(target: "gateway", %peer, cell = ?cell, close_reason, "closing client connection");
                                         break 'conn_loop Ok(());
                                     }
                                     time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -578,6 +687,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             session_id,
                                             "route changed after non-ping traffic; reconnecting upstream with stable session"
                                         );
+                                        routing
+                                            .metrics
+                                            .upstream_route_change_reconnects
+                                            .fetch_add(1, Ordering::Relaxed);
                                         upstream
                                             .as_mut()
                                             .expect("upstream to be established")
@@ -593,6 +706,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     )
                                     .await
                                     {
+                                        let close_reason = record_client_close(
+                                            routing.metrics.as_ref(),
+                                            GatewayClientCloseReason::PendingPingRouteChange,
+                                        );
                                         warn!(
                                             target: "gateway",
                                             %peer,
@@ -600,6 +717,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             old_worker = %current.0.worker_id,
                                             new_worker = %route.worker_id,
                                             pending = pending_pings.len(),
+                                            close_reason,
                                             "route changed while earlier ping replies are still pending; closing client to avoid silently dropping pongs"
                                         );
                                         upstream
@@ -634,7 +752,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             );
                                             upstream = None;
                                             if attempt >= UPSTREAM_RETRY_MAX {
-                                                warn!(target: "gateway", %peer, "closing client connection");
+                                                let close_reason = record_client_close(
+                                                    routing.metrics.as_ref(),
+                                                    GatewayClientCloseReason::UpstreamRetryExhausted,
+                                                );
+                                                warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                                 break 'conn_loop Ok(());
                                             }
                                             time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -661,7 +783,11 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         conn.close().await;
                                         upstream = None;
                                         if attempt >= UPSTREAM_RETRY_MAX {
-                                            warn!(target: "gateway", %peer, "closing client connection");
+                                            let close_reason = record_client_close(
+                                                routing.metrics.as_ref(),
+                                                GatewayClientCloseReason::UpstreamRetryExhausted,
+                                            );
+                                            warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                             break 'conn_loop Ok(());
                                         }
                                         time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -689,15 +815,24 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     conn.close().await;
                                     upstream = None;
                                     if has_non_ping_traffic {
+                                        let close_reason = record_client_close(
+                                            routing.metrics.as_ref(),
+                                            GatewayClientCloseReason::AmbiguousUpstream,
+                                        );
                                         warn!(
                                             target: "gateway",
                                             %peer,
+                                            close_reason,
                                             "closing client connection after ambiguous non-ping write failure"
                                         );
                                         break 'conn_loop Ok(());
                                     }
                                     if attempt >= UPSTREAM_RETRY_MAX {
-                                        warn!(target: "gateway", %peer, "closing client connection");
+                                        let close_reason = record_client_close(
+                                            routing.metrics.as_ref(),
+                                            GatewayClientCloseReason::UpstreamRetryExhausted,
+                                        );
+                                        warn!(target: "gateway", %peer, close_reason, "closing client connection");
                                         break 'conn_loop Ok(());
                                     }
                                     time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
@@ -793,6 +928,9 @@ async fn connect_upstream(
     peer: SocketAddr,
     metrics: &GatewayMetricsCounters,
 ) -> Result<UpstreamConn> {
+    metrics
+        .upstream_connect_attempts
+        .fetch_add(1, Ordering::Relaxed);
     let stream = match TcpStream::connect(target_worker.addr.as_str()).await {
         Ok(stream) => {
             metrics.upstream_connects.fetch_add(1, Ordering::Relaxed);
@@ -820,6 +958,27 @@ async fn connect_upstream(
         read_buf: BytesMut::with_capacity(8 * 1024),
         has_non_ping_traffic: false,
     })
+}
+
+fn record_client_close(
+    metrics: &GatewayMetricsCounters,
+    reason: GatewayClientCloseReason,
+) -> &'static str {
+    match reason {
+        GatewayClientCloseReason::NoRoute => metrics
+            .client_closes_no_route
+            .fetch_add(1, Ordering::Relaxed),
+        GatewayClientCloseReason::UpstreamRetryExhausted => metrics
+            .client_closes_upstream_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed),
+        GatewayClientCloseReason::PendingPingRouteChange => metrics
+            .client_closes_pending_ping_route_change
+            .fetch_add(1, Ordering::Relaxed),
+        GatewayClientCloseReason::AmbiguousUpstream => metrics
+            .client_closes_ambiguous_upstream
+            .fetch_add(1, Ordering::Relaxed),
+    };
+    reason.as_str()
 }
 
 async fn replay_pending_pings(
@@ -1071,6 +1230,15 @@ async fn handle_prometheus_metrics_request(
             &body,
         )
         .await?;
+    } else if method == "GET" && path == "/ready" {
+        let snapshot = routing.readiness_snapshot().await;
+        let status = if snapshot.ready {
+            "200 OK"
+        } else {
+            "503 Service Unavailable"
+        };
+        let body = format_gateway_readiness(&snapshot);
+        write_http_response(&mut stream, status, "text/plain; charset=utf-8", &body).await?;
     } else {
         write_http_response(
             &mut stream,
@@ -1110,6 +1278,13 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
     push_prometheus_metric(
         &mut out,
         "gauge",
+        "tessera_gateway_ready",
+        "Gateway readiness state derived from currently loaded routes.",
+        metrics.ready,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
         "tessera_gateway_routes",
         "Cell routes currently loaded by the gateway.",
         metrics.routes,
@@ -1131,6 +1306,13 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
     push_prometheus_metric(
         &mut out,
         "counter",
+        "tessera_gateway_upstream_connect_attempts_total",
+        "Total upstream worker connection attempts.",
+        metrics.upstream_connect_attempts,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
         "tessera_gateway_upstream_connects_total",
         "Successful upstream worker connections opened by the gateway.",
         metrics.upstream_connects,
@@ -1148,6 +1330,13 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
         "tessera_gateway_upstream_route_changes_total",
         "Upstream worker connection swaps caused by routing changes.",
         metrics.upstream_route_changes,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_route_change_reconnects_total",
+        "Route changes that required reconnecting an established non-ping upstream session.",
+        metrics.upstream_route_change_reconnects,
     );
     push_prometheus_metric(
         &mut out,
@@ -1198,7 +1387,43 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
         "Pending ping frames replayed after upstream reconnect.",
         metrics.pending_ping_replays,
     );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_client_closes_no_route_total",
+        "Client connections closed after route lookup failed for all retry attempts.",
+        metrics.client_closes_no_route,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+        "Client connections closed after upstream reconnect or write retry budget was exhausted.",
+        metrics.client_closes_upstream_retry_exhausted,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_client_closes_pending_ping_route_change_total",
+        "Client connections closed because a route changed while ping replies were pending.",
+        metrics.client_closes_pending_ping_route_change,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_client_closes_ambiguous_upstream_total",
+        "Client connections closed when upstream state could not be retried without risking dropped replies.",
+        metrics.client_closes_ambiguous_upstream,
+    );
     out
+}
+
+fn format_gateway_readiness(snapshot: &GatewayReadinessSnapshot) -> String {
+    let status = if snapshot.ready { "ready" } else { "not_ready" };
+    format!(
+        "status {status}\nroutes {}\nrouting_version {}\n",
+        snapshot.routes, snapshot.routing_version
+    )
 }
 
 fn push_prometheus_metric(out: &mut String, metric_type: &str, name: &str, help: &str, value: u64) {
@@ -1537,12 +1762,15 @@ mod tests {
     #[test]
     fn gateway_prometheus_metrics_text_uses_snapshot_values() {
         let metrics = GatewayMetricsSnapshot {
+            ready: 1,
             routes: 2,
             routing_version: 3,
             accepted_connections: 5,
+            upstream_connect_attempts: 6,
             upstream_connects: 7,
             upstream_connect_failures: 11,
             upstream_route_changes: 13,
+            upstream_route_change_reconnects: 15,
             upstream_reconnect_attempts: 17,
             upstream_closed: 19,
             upstream_read_errors: 23,
@@ -1550,14 +1778,85 @@ mod tests {
             invalid_client_frames: 31,
             no_route_lookup_failures: 37,
             pending_ping_replays: 41,
+            client_closes_no_route: 43,
+            client_closes_upstream_retry_exhausted: 47,
+            client_closes_pending_ping_route_change: 53,
+            client_closes_ambiguous_upstream: 59,
         };
 
         let text = format_gateway_prometheus_metrics(&metrics);
+        assert!(text.contains("# TYPE tessera_gateway_ready gauge\n"));
+        assert!(text.contains("tessera_gateway_ready 1\n"));
         assert!(text.contains("# TYPE tessera_gateway_routes gauge\n"));
         assert!(text.contains("tessera_gateway_routes 2\n"));
+        assert!(text.contains("tessera_gateway_upstream_connect_attempts_total 6\n"));
         assert!(text.contains("# TYPE tessera_gateway_upstream_connects_total counter\n"));
         assert!(text.contains("tessera_gateway_upstream_connect_failures_total 11\n"));
+        assert!(text.contains("tessera_gateway_upstream_route_change_reconnects_total 15\n"));
         assert!(text.contains("tessera_gateway_pending_ping_replays_total 41\n"));
+        assert!(text.contains("tessera_gateway_client_closes_no_route_total 43\n"));
+        assert!(text.contains("tessera_gateway_client_closes_upstream_retry_exhausted_total 47\n"));
+        assert!(
+            text.contains("tessera_gateway_client_closes_pending_ping_route_change_total 53\n")
+        );
+        assert!(text.contains("tessera_gateway_client_closes_ambiguous_upstream_total 59\n"));
+    }
+
+    #[test]
+    fn gateway_readiness_text_uses_route_state() {
+        let ready = format_gateway_readiness(&GatewayReadinessSnapshot {
+            ready: true,
+            routes: 1,
+            routing_version: 2,
+        });
+        assert_eq!(ready, "status ready\nroutes 1\nrouting_version 2\n");
+
+        let not_ready = format_gateway_readiness(&GatewayReadinessSnapshot {
+            ready: false,
+            routes: 0,
+            routing_version: 3,
+        });
+        assert_eq!(not_ready, "status not_ready\nroutes 0\nrouting_version 3\n");
+    }
+
+    #[tokio::test]
+    async fn gateway_readiness_snapshot_tracks_route_availability() {
+        let routing = RoutingTable::new(HashMap::new());
+        assert_eq!(
+            routing.readiness_snapshot().await,
+            GatewayReadinessSnapshot {
+                ready: false,
+                routes: 0,
+                routing_version: 0,
+            }
+        );
+
+        let listing = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-a".to_string(),
+                addr: "127.0.0.1:5001".to_string(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 0,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+            handovers: vec![],
+        };
+        apply_listing_update(&routing, listing)
+            .await
+            .expect("apply listing update");
+
+        assert_eq!(
+            routing.readiness_snapshot().await,
+            GatewayReadinessSnapshot {
+                ready: true,
+                routes: 1,
+                routing_version: 1,
+            }
+        );
     }
 
     #[test]
@@ -1989,6 +2288,11 @@ mod tests {
             Ok(Err(e)) => panic!("unexpected error while waiting for close: {e:?}"),
             Err(_) => panic!("gateway did not close client connection in time"),
         }
+
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.upstream_connect_attempts, UPSTREAM_RETRY_MAX as u64);
+        assert_eq!(metrics.upstream_connect_failures, UPSTREAM_RETRY_MAX as u64);
+        assert_eq!(metrics.client_closes_upstream_retry_exhausted, 1);
     }
 
     #[tokio::test]
@@ -2192,6 +2496,9 @@ mod tests {
             .expect("send ping after route change");
         let pong = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
         assert_eq!(pong.payload, ServerMsg::Pong { ts: 1 });
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.upstream_route_change_reconnects, 1);
+
         timeout(Duration::from_millis(500), b_done_rx)
             .await
             .expect("worker b did not receive routed ping")
@@ -2291,6 +2598,8 @@ mod tests {
             .expect("send second ping");
 
         expect_client_close(&mut client).await;
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.client_closes_pending_ping_route_change, 1);
 
         timeout(Duration::from_millis(500), a_done_rx)
             .await
