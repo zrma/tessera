@@ -400,6 +400,7 @@ mod split_merge_planner {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum SplitMergePlanKind {
         Split,
+        Merge,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +413,14 @@ mod split_merge_planner {
         pub min_split_pressure_signals: u8,
         pub required_split_windows: u32,
         pub min_cell_age_secs: u64,
+        pub low_actor_count: u64,
+        pub low_move_queue_pressure: u64,
+        pub low_tick_stage_micros: u64,
+        pub low_relay_fanout: u64,
+        pub low_handover_failures: u64,
+        pub min_merge_low_pressure_signals: u8,
+        pub required_merge_windows: u32,
+        pub min_merge_cell_age_secs: u64,
         pub max_active_plans_per_world: usize,
         pub max_handover_ops_per_interval: usize,
         pub max_cells_moved_per_interval: usize,
@@ -428,6 +437,14 @@ mod split_merge_planner {
                 min_split_pressure_signals: 2,
                 required_split_windows: 3,
                 min_cell_age_secs: 60,
+                low_actor_count: 20,
+                low_move_queue_pressure: 4,
+                low_tick_stage_micros: 5_000,
+                low_relay_fanout: 8,
+                low_handover_failures: 0,
+                min_merge_low_pressure_signals: 4,
+                required_merge_windows: 5,
+                min_merge_cell_age_secs: 120,
                 max_active_plans_per_world: 1,
                 max_handover_ops_per_interval: 1,
                 max_cells_moved_per_interval: 1,
@@ -450,9 +467,11 @@ mod split_merge_planner {
         pub relay_fanout: u64,
         pub handover_failures: u64,
         pub high_pressure_windows: u32,
+        pub low_pressure_windows: u32,
         pub cell_age_secs: u64,
         pub cooldown_remaining_secs: u64,
         pub active_handover: bool,
+        pub owner_worker_id: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,20 +528,27 @@ mod split_merge_planner {
                 })
             })
             .collect::<Vec<_>>();
+        candidates.extend(merge_candidates(snapshot, config, &blocked_families));
 
         candidates.sort_by(|left, right| {
             right
                 .score
                 .cmp(&left.score)
+                .then_with(|| plan_kind_sort_key(left.kind).cmp(&plan_kind_sort_key(right.kind)))
                 .then_with(|| cell_family_key(&left.cell).cmp(&cell_family_key(&right.cell)))
         });
 
         let mut planned_by_world: HashMap<u32, usize> = HashMap::new();
+        let mut planned_families = HashSet::new();
         let mut remaining_handover_ops = config.max_handover_ops_per_interval;
         let mut remaining_cells_moved = config.max_cells_moved_per_interval;
         let mut plans = Vec::new();
 
         for candidate in candidates {
+            let family = cell_family_key(&candidate.cell);
+            if planned_families.contains(&family) {
+                continue;
+            }
             let active_in_world = active_plans_by_world
                 .get(&candidate.cell.world)
                 .copied()
@@ -543,10 +569,82 @@ mod split_merge_planner {
             remaining_handover_ops -= candidate.required_handover_ops;
             remaining_cells_moved -= candidate.cells_moved;
             *planned_by_world.entry(candidate.cell.world).or_default() += 1;
+            planned_families.insert(family);
             plans.push(candidate);
         }
 
         plans
+    }
+
+    fn merge_candidates(
+        snapshot: &SplitMergeMetricsSnapshot,
+        config: &SplitMergePlannerConfig,
+        blocked_families: &HashSet<(u32, i32, i32, u8, u8)>,
+    ) -> Vec<SplitMergePlan> {
+        let mut groups: HashMap<(u32, i32, i32, u8), HashMap<u8, &SplitMergeCellMetrics>> =
+            HashMap::new();
+        let mut duplicate_groups = HashSet::new();
+        for cell in &snapshot.cells {
+            let Some(group_key) = merge_sibling_group_key(&cell.cell) else {
+                continue;
+            };
+            let siblings = groups.entry(group_key).or_default();
+            if siblings.insert(cell.cell.sub, cell).is_some() {
+                duplicate_groups.insert(group_key);
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for (group_key, siblings_by_sub) in groups {
+            if duplicate_groups.contains(&group_key)
+                || siblings_by_sub.len() != 4
+                || ![0, 1, 2, 3]
+                    .into_iter()
+                    .all(|sub| siblings_by_sub.contains_key(&sub))
+            {
+                continue;
+            }
+
+            let parent = merge_parent_cell(group_key);
+            if blocked_families.contains(&cell_family_key(&parent)) {
+                continue;
+            }
+
+            let siblings = [0, 1, 2, 3]
+                .into_iter()
+                .map(|sub| siblings_by_sub[&sub])
+                .collect::<Vec<_>>();
+            if !merge_siblings_share_owner(&siblings) {
+                continue;
+            }
+            if siblings.iter().any(|cell| {
+                cell.cooldown_remaining_secs > 0
+                    || cell.active_handover
+                    || cell.cell_age_secs < config.min_merge_cell_age_secs
+                    || cell.low_pressure_windows < config.required_merge_windows
+            }) {
+                continue;
+            }
+
+            let low_signals = siblings
+                .iter()
+                .map(|cell| merge_low_pressure_signals(cell, config))
+                .min()
+                .unwrap_or_default();
+            if low_signals < config.min_merge_low_pressure_signals {
+                continue;
+            }
+
+            candidates.push(SplitMergePlan {
+                kind: SplitMergePlanKind::Merge,
+                cell: parent,
+                pressure_signals: low_signals,
+                score: merge_cold_score(&siblings, low_signals, config),
+                required_handover_ops: 1,
+                cells_moved: siblings.len(),
+            });
+        }
+        candidates
     }
 
     fn split_pressure_signals(
@@ -574,8 +672,87 @@ mod split_merge_planner {
             + cell.handover_failures * 10
     }
 
+    fn merge_low_pressure_signals(
+        cell: &SplitMergeCellMetrics,
+        config: &SplitMergePlannerConfig,
+    ) -> u8 {
+        [
+            cell.actor_count <= config.low_actor_count,
+            cell.move_queue_pressure <= config.low_move_queue_pressure,
+            cell.tick_stage_micros <= config.low_tick_stage_micros,
+            cell.relay_fanout <= config.low_relay_fanout,
+            cell.handover_failures <= config.low_handover_failures,
+        ]
+        .into_iter()
+        .filter(|signal| *signal)
+        .count() as u8
+    }
+
+    fn merge_cold_score(
+        siblings: &[&SplitMergeCellMetrics],
+        low_signals: u8,
+        config: &SplitMergePlannerConfig,
+    ) -> u64 {
+        let cold_headroom = siblings.iter().fold(0_u64, |sum, cell| {
+            sum + config.low_actor_count.saturating_sub(cell.actor_count) * 10_000
+                + config
+                    .low_move_queue_pressure
+                    .saturating_sub(cell.move_queue_pressure)
+                    * 1_000
+                + config.low_relay_fanout.saturating_sub(cell.relay_fanout) * 100
+                + config
+                    .low_tick_stage_micros
+                    .saturating_sub(cell.tick_stage_micros)
+                    / 1_000
+                + config
+                    .low_handover_failures
+                    .saturating_sub(cell.handover_failures)
+                    * 10
+        });
+        let sustained_windows = siblings
+            .iter()
+            .map(|cell| cell.low_pressure_windows)
+            .min()
+            .unwrap_or_default();
+
+        u64::from(low_signals) * 1_000_000 + u64::from(sustained_windows) * 10_000 + cold_headroom
+    }
+
+    fn merge_siblings_share_owner(siblings: &[&SplitMergeCellMetrics]) -> bool {
+        let Some(owner) = siblings
+            .first()
+            .and_then(|cell| cell.owner_worker_id.as_deref())
+        else {
+            return false;
+        };
+        siblings
+            .iter()
+            .all(|cell| cell.owner_worker_id.as_deref() == Some(owner))
+    }
+
+    fn merge_sibling_group_key(cell: &CellId) -> Option<(u32, i32, i32, u8)> {
+        (cell.depth > 0).then_some((cell.world, cell.cx, cell.cy, cell.depth))
+    }
+
+    fn merge_parent_cell((world, cx, cy, depth): (u32, i32, i32, u8)) -> CellId {
+        CellId {
+            world,
+            cx,
+            cy,
+            depth: depth.saturating_sub(1),
+            sub: 0,
+        }
+    }
+
     fn cell_family_key(cell: &CellId) -> (u32, i32, i32, u8, u8) {
         (cell.world, cell.cx, cell.cy, cell.depth, cell.sub)
+    }
+
+    fn plan_kind_sort_key(kind: SplitMergePlanKind) -> u8 {
+        match kind {
+            SplitMergePlanKind::Split => 0,
+            SplitMergePlanKind::Merge => 1,
+        }
     }
 }
 
@@ -1481,9 +1658,38 @@ mod tests {
             relay_fanout: 0,
             handover_failures: 0,
             high_pressure_windows: 3,
+            low_pressure_windows: 0,
             cell_age_secs: 60,
             cooldown_remaining_secs: 0,
             active_handover: false,
+            owner_worker_id: Some("worker-a".to_string()),
+        }
+    }
+
+    fn merge_child_cell(world: u32, cx: i32, cy: i32, sub: u8) -> CellId {
+        CellId {
+            world,
+            cx,
+            cy,
+            depth: 1,
+            sub,
+        }
+    }
+
+    fn merge_metrics(world: u32, cx: i32, cy: i32, sub: u8, owner: &str) -> SplitMergeCellMetrics {
+        SplitMergeCellMetrics {
+            cell: merge_child_cell(world, cx, cy, sub),
+            actor_count: 5,
+            move_queue_pressure: 1,
+            tick_stage_micros: 1_000,
+            relay_fanout: 1,
+            handover_failures: 0,
+            high_pressure_windows: 0,
+            low_pressure_windows: 5,
+            cell_age_secs: 120,
+            cooldown_remaining_secs: 0,
+            active_handover: false,
+            owner_worker_id: Some(owner.to_string()),
         }
     }
 
@@ -1614,6 +1820,98 @@ mod tests {
         assert!(plans.is_empty());
     }
 
+    #[test]
+    fn split_merge_planner_requires_complete_cold_siblings_for_merge() {
+        let config = SplitMergePlannerConfig {
+            max_active_plans_per_world: 3,
+            max_handover_ops_per_interval: 3,
+            max_cells_moved_per_interval: 8,
+            ..SplitMergePlannerConfig::default()
+        };
+        let mut hot_sibling = merge_metrics(0, 2, 0, 3, "worker-a");
+        hot_sibling.actor_count = 80;
+        hot_sibling.move_queue_pressure = 20;
+        let mut too_young = merge_metrics(0, 3, 0, 0, "worker-a");
+        too_young.cell_age_secs = 30;
+
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![
+                    merge_metrics(0, 0, 0, 0, "worker-a"),
+                    merge_metrics(0, 0, 0, 1, "worker-a"),
+                    merge_metrics(0, 0, 0, 2, "worker-a"),
+                    merge_metrics(0, 0, 0, 3, "worker-a"),
+                    merge_metrics(0, 1, 0, 0, "worker-a"),
+                    merge_metrics(0, 1, 0, 1, "worker-a"),
+                    merge_metrics(0, 1, 0, 2, "worker-a"),
+                    merge_metrics(0, 2, 0, 0, "worker-a"),
+                    merge_metrics(0, 2, 0, 1, "worker-a"),
+                    merge_metrics(0, 2, 0, 2, "worker-a"),
+                    hot_sibling,
+                    too_young,
+                    merge_metrics(0, 3, 0, 1, "worker-a"),
+                    merge_metrics(0, 3, 0, 2, "worker-a"),
+                    merge_metrics(0, 3, 0, 3, "worker-a"),
+                    merge_metrics(0, 4, 0, 0, "worker-a"),
+                    merge_metrics(0, 4, 0, 1, "worker-a"),
+                    merge_metrics(0, 4, 0, 2, "worker-b"),
+                    merge_metrics(0, 4, 0, 3, "worker-a"),
+                ],
+                active_plans: Vec::new(),
+            },
+            &config,
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, SplitMergePlanKind::Merge);
+        assert_eq!(plans[0].cell, CellId::grid(0, 0, 0));
+        assert_eq!(plans[0].pressure_signals, 5);
+        assert_eq!(plans[0].required_handover_ops, 1);
+        assert_eq!(plans[0].cells_moved, 4);
+    }
+
+    #[test]
+    fn split_merge_planner_rejects_merge_budget_and_overlap() {
+        let over_budget = SplitMergePlannerConfig {
+            max_active_plans_per_world: 1,
+            max_handover_ops_per_interval: 1,
+            max_cells_moved_per_interval: 3,
+            ..SplitMergePlannerConfig::default()
+        };
+        let cells = vec![
+            merge_metrics(0, 0, 0, 0, "worker-a"),
+            merge_metrics(0, 0, 0, 1, "worker-a"),
+            merge_metrics(0, 0, 0, 2, "worker-a"),
+            merge_metrics(0, 0, 0, 3, "worker-a"),
+        ];
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: cells.clone(),
+                active_plans: Vec::new(),
+            },
+            &over_budget,
+        );
+        assert!(plans.is_empty());
+
+        let blocked = SplitMergePlannerConfig {
+            max_active_plans_per_world: 2,
+            max_handover_ops_per_interval: 2,
+            max_cells_moved_per_interval: 4,
+            ..SplitMergePlannerConfig::default()
+        };
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells,
+                active_plans: vec![SplitMergeActivePlan {
+                    kind: SplitMergePlanKind::Split,
+                    cell: CellId::grid(0, 0, 0),
+                }],
+            },
+            &blocked,
+        );
+        assert!(plans.is_empty());
+    }
+
     #[tokio::test]
     async fn split_merge_planner_is_not_connected_to_assignment_listing() {
         let service = OrchestratorService::new(two_worker_handover_config());
@@ -1629,9 +1927,27 @@ mod tests {
             },
             &SplitMergePlannerConfig::default(),
         );
+        let merge_plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![
+                    merge_metrics(0, 0, 0, 0, "worker-a"),
+                    merge_metrics(0, 0, 0, 1, "worker-a"),
+                    merge_metrics(0, 0, 0, 2, "worker-a"),
+                    merge_metrics(0, 0, 0, 3, "worker-a"),
+                ],
+                active_plans: Vec::new(),
+            },
+            &SplitMergePlannerConfig {
+                max_active_plans_per_world: 1,
+                max_handover_ops_per_interval: 1,
+                max_cells_moved_per_interval: 4,
+                ..SplitMergePlannerConfig::default()
+            },
+        );
         let after = service.listing().await;
 
         assert_eq!(plans.len(), 1);
+        assert_eq!(merge_plans.len(), 1);
         assert_eq!(before, after);
     }
 
