@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -395,9 +396,11 @@ fn handover_statuses(handovers: &HashMap<CellId, HandoverRuntime>) -> Vec<Handov
 #[allow(dead_code)]
 mod split_merge_planner {
     use super::CellId;
+    use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub(super) enum SplitMergePlanKind {
         Split,
         Merge,
@@ -452,35 +455,47 @@ mod split_merge_planner {
         }
     }
 
-    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
     pub(super) struct SplitMergeMetricsSnapshot {
         pub cells: Vec<SplitMergeCellMetrics>,
+        #[serde(default)]
         pub active_plans: Vec<SplitMergeActivePlan>,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
     pub(super) struct SplitMergeCellMetrics {
         pub cell: CellId,
+        #[serde(default)]
         pub actor_count: u64,
+        #[serde(default)]
         pub move_queue_pressure: u64,
+        #[serde(default)]
         pub tick_stage_micros: u64,
+        #[serde(default)]
         pub relay_fanout: u64,
+        #[serde(default)]
         pub handover_failures: u64,
+        #[serde(default)]
         pub high_pressure_windows: u32,
+        #[serde(default)]
         pub low_pressure_windows: u32,
+        #[serde(default)]
         pub cell_age_secs: u64,
+        #[serde(default)]
         pub cooldown_remaining_secs: u64,
+        #[serde(default)]
         pub active_handover: bool,
+        #[serde(default)]
         pub owner_worker_id: Option<String>,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
     pub(super) struct SplitMergeActivePlan {
         pub kind: SplitMergePlanKind,
         pub cell: CellId,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     pub(super) struct SplitMergePlan {
         pub kind: SplitMergePlanKind,
         pub cell: CellId,
@@ -776,6 +791,14 @@ struct OrchestratorService {
     metrics: Arc<OrchestratorMetricsCounters>,
 }
 
+#[derive(Debug, Serialize)]
+struct SplitMergePreviewResponse {
+    mode: &'static str,
+    source: String,
+    assignments_changed: bool,
+    plans: Vec<split_merge_planner::SplitMergePlan>,
+}
+
 impl OrchestratorService {
     fn new(config: Config) -> Self {
         let config = Arc::new(config);
@@ -913,6 +936,87 @@ impl OrchestratorService {
             watch_streams_started: self.metrics.watch_streams_started.load(Ordering::Relaxed),
             listing_updates: self.metrics.listing_updates.load(Ordering::Relaxed),
         }
+    }
+
+    async fn split_merge_preview(&self) -> Result<SplitMergePreviewResponse, String> {
+        let (source, snapshot) = self.split_merge_preview_snapshot().await?;
+        let plans = split_merge_planner::plan_split_merge(
+            &snapshot,
+            &split_merge_planner::SplitMergePlannerConfig::default(),
+        );
+        Ok(SplitMergePreviewResponse {
+            mode: "dry_run",
+            source,
+            assignments_changed: false,
+            plans,
+        })
+    }
+
+    async fn split_merge_preview_snapshot(
+        &self,
+    ) -> Result<(String, split_merge_planner::SplitMergeMetricsSnapshot), String> {
+        if let Ok(raw) = std::env::var("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON")
+            && !raw.trim().is_empty()
+        {
+            return parse_split_merge_preview_snapshot(
+                "env:TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON",
+                &raw,
+            );
+        }
+        if let Ok(path) = std::env::var("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH") {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                let raw = fs::read_to_string(trimmed)
+                    .map_err(|err| format!("read split/merge preview snapshot {trimmed}: {err}"))?;
+                return parse_split_merge_preview_snapshot(
+                    &format!("env:TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH:{trimmed}"),
+                    &raw,
+                );
+            }
+        }
+
+        let handovers = self.handovers.read().await.clone();
+        let assignments = self.assignments.read().await.clone();
+        let mut worker_ids = assignments.keys().collect::<Vec<_>>();
+        worker_ids.sort();
+        let mut cells = Vec::new();
+        for worker_id in worker_ids {
+            let Some(assigned_cells) = assignments.get(worker_id) else {
+                continue;
+            };
+            for cell in assigned_cells {
+                cells.push(split_merge_planner::SplitMergeCellMetrics {
+                    cell: *cell,
+                    actor_count: 0,
+                    move_queue_pressure: 0,
+                    tick_stage_micros: 0,
+                    relay_fanout: 0,
+                    handover_failures: 0,
+                    high_pressure_windows: 0,
+                    low_pressure_windows: 0,
+                    cell_age_secs: 0,
+                    cooldown_remaining_secs: 0,
+                    active_handover: handovers.contains_key(cell),
+                    owner_worker_id: Some(worker_id.to_string()),
+                });
+            }
+        }
+        cells.sort_by_key(|cell| {
+            (
+                cell.cell.world,
+                cell.cell.cy,
+                cell.cell.cx,
+                cell.cell.depth,
+                cell.cell.sub,
+            )
+        });
+        Ok((
+            "assignment_listing_zero_metrics".to_string(),
+            split_merge_planner::SplitMergeMetricsSnapshot {
+                cells,
+                active_plans: Vec::new(),
+            },
+        ))
     }
 
     async fn apply_handover_command(
@@ -1110,6 +1214,15 @@ impl OrchestratorService {
             assignments_changed,
         ))
     }
+}
+
+fn parse_split_merge_preview_snapshot(
+    source: &str,
+    raw: &str,
+) -> Result<(String, split_merge_planner::SplitMergeMetricsSnapshot), String> {
+    let snapshot = serde_json::from_str(raw)
+        .map_err(|err| format!("parse split/merge preview snapshot from {source}: {err}"))?;
+    Ok((source.to_string(), snapshot))
 }
 
 struct ParsedHandoverCommand {
@@ -1459,7 +1572,8 @@ async fn handle_prometheus_metrics_request(
         .unwrap_or_default()
         .split_whitespace();
     let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
+    let raw_path = parts.next().unwrap_or_default();
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
 
     if method == "GET" && path == "/metrics" {
         let snapshot = service.metrics_snapshot().await;
@@ -1471,6 +1585,24 @@ async fn handle_prometheus_metrics_request(
             &body,
         )
         .await?;
+    } else if method == "GET" && path == "/split-merge/preview" {
+        match service.split_merge_preview().await {
+            Ok(preview) => {
+                let body = serde_json::to_string_pretty(&preview)
+                    .context("serialize split/merge preview response")?;
+                write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
+            }
+            Err(reason) => {
+                let body = format!("split/merge preview unavailable: {reason}\n");
+                write_http_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    &body,
+                )
+                .await?;
+            }
+        }
     } else {
         write_http_response(
             &mut stream,
@@ -1910,6 +2042,48 @@ mod tests {
             &blocked,
         );
         assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn split_merge_preview_snapshot_json_drives_dry_run_plans() {
+        let raw = r#"
+        {
+            "cells": [
+                {
+                    "cell": {"world": 0, "cx": 0, "cy": 0},
+                    "actor_count": 140,
+                    "move_queue_pressure": 70,
+                    "high_pressure_windows": 3,
+                    "cell_age_secs": 120,
+                    "owner_worker_id": "worker-a"
+                }
+            ]
+        }
+        "#;
+
+        let (source, snapshot) =
+            parse_split_merge_preview_snapshot("test-snapshot", raw).expect("parse snapshot");
+        let plans = plan_split_merge(&snapshot, &SplitMergePlannerConfig::default());
+
+        assert_eq!(source, "test-snapshot");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, SplitMergePlanKind::Split);
+        assert_eq!(plans[0].cell, CellId::grid(0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn split_merge_preview_uses_assignment_listing_without_mutation() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        let before = service.listing().await;
+
+        let preview = service.split_merge_preview().await.expect("preview");
+        let after = service.listing().await;
+
+        assert_eq!(preview.mode, "dry_run");
+        assert_eq!(preview.source, "assignment_listing_zero_metrics");
+        assert!(!preview.assignments_changed);
+        assert!(preview.plans.is_empty());
+        assert_eq!(before, after);
     }
 
     #[tokio::test]
@@ -2940,5 +3114,40 @@ mod tests {
         assert!(response.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
         assert!(response.contains("tessera_orch_registered_workers 1\n"));
         assert!(response.contains("tessera_orch_registration_attempts_total 1\n"));
+    }
+
+    #[tokio::test]
+    async fn split_merge_preview_http_serves_dry_run_json() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind preview listener");
+        let addr = listener.local_addr().expect("preview listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept preview request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle preview request");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect preview");
+        client
+            .write_all(b"GET /split-merge/preview HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write preview request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read preview response");
+        server.await.expect("preview server task");
+
+        let response = String::from_utf8(response).expect("utf8 preview response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains(r#""mode": "dry_run""#));
+        assert!(response.contains(r#""assignments_changed": false"#));
+        assert!(response.contains(r#""plans": []"#));
     }
 }

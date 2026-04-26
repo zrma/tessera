@@ -82,4 +82,5 @@ Last reviewed: 2026-04-26
 - [done 2026-04-26] Metrics smoke latency path: `cargo xt dev metrics-smoke`가 실제 Ping/Pong latency histogram 증가까지 확인하도록 강화했다.
 - [done 2026-04-26] Split/merge planner skeleton: Orchestrator-local inactive planner와 deterministic ranking/hysteresis/budget/overlap tests를 추가했다.
 - [done 2026-04-26] Merge planner skeleton: runtime assignment 변경 없이 complete sibling set의 cold/low-water 조건과 churn budget을 deterministic planner test로 고정했다.
+- [done 2026-04-26] Split/merge dry-run preview: Orchestrator `GET /split-merge/preview`로 assignment 변경 없는 planner JSON preview를 노출했다.
 - 에스컬레이션 필요: 비-Ping request latency correlation, production Kubernetes manifests, runtime split/merge activation.

@@ -661,6 +661,12 @@ fn dev_metrics_smoke() -> Result<()> {
                 "tessera_orch_registration_attempts_total",
             ],
         )?;
+        assert_json_endpoint_contains(
+            "orchestrator split/merge preview",
+            orch_metrics_addr,
+            "/split-merge/preview",
+            &["\"mode\": \"dry_run\"", "\"assignments_changed\": false"],
+        )?;
         run_client_ping(987)?;
         let gateway_metrics = assert_metrics_endpoint_body(
             "gateway",
@@ -680,7 +686,7 @@ fn dev_metrics_smoke() -> Result<()> {
     smoke_result?;
     down_result?;
     println!(
-        "metrics smoke: gateway, worker, orchestrator /metrics, gateway /ready, and ping latency histogram are valid"
+        "metrics smoke: gateway, worker, orchestrator /metrics, gateway /ready, orchestrator split/merge preview, and ping latency histogram are valid"
     );
     Ok(())
 }
@@ -722,6 +728,31 @@ fn assert_http_status_endpoint(
     let expected = format!("HTTP/1.1 {expected_status}");
     if !response.starts_with(&expected) {
         bail!("{service} smoke failed: expected HTTP {expected_status} response");
+    }
+    Ok(())
+}
+
+fn assert_json_endpoint_contains(
+    service: &str,
+    raw_addr: &str,
+    path: &str,
+    required_fragments: &[&str],
+) -> Result<()> {
+    let addr = readiness_addr(raw_addr)?;
+    let response = http_get(addr, path)?;
+    if !response.starts_with("HTTP/1.1 200 OK") {
+        bail!("{service} smoke failed: expected HTTP 200 response");
+    }
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        bail!("{service} smoke failed: missing HTTP body separator");
+    };
+    if !headers.contains("Content-Type: application/json") {
+        bail!("{service} smoke failed: expected application/json content type");
+    }
+    for fragment in required_fragments {
+        if !body.contains(fragment) {
+            bail!("{service} smoke failed: missing JSON fragment `{fragment}`");
+        }
     }
     Ok(())
 }

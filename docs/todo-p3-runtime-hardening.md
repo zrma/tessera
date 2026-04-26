@@ -124,3 +124,33 @@ Deferred:
 - Runtime merge activation, target worker selection, real rolling metrics
   ingestion, and multi-depth child encoding beyond the current `CellId.depth/sub`
   shape still require a later explicit runtime slice.
+
+## P3.6 Split/merge dry-run preview
+
+Goal: expose the inactive planner through an operator-visible dry-run endpoint
+without changing assignments or starting handovers.
+
+Status: done 2026-04-26.
+
+Implemented slice:
+
+1. Add `GET /split-merge/preview` to the Orchestrator HTTP listener that is
+   enabled by `TESSERA_ORCH_METRICS_ADDR`.
+2. Return JSON with `mode="dry_run"`, `assignments_changed=false`, and planner
+   output ranked from a metrics snapshot.
+3. Use `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON` or
+   `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH` as optional dry-run inputs. When both
+   are unset, preview the current assignment listing as a zero-metric snapshot.
+4. Extend `cargo xt dev metrics-smoke` to assert the preview endpoint is served.
+
+Completion conditions:
+
+- Preview never mutates assignment listing/watch state.
+- Invalid preview snapshot config fails the endpoint instead of publishing a
+  partial plan.
+- `cargo xt`, `cargo test`, and the local runtime smoke pass.
+
+Deferred:
+
+- Runtime split/merge activation, real metrics ingestion, target worker
+  selection, and production exposure policy remain separate follow-up slices.
