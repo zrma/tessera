@@ -20,11 +20,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run cargo fmt, clippy, check in order (default)
+    /// Run cargo fmt, clippy, check, and harness in order (default)
     Verify,
     Fmt,
     Clippy,
     Check,
+    /// Verify repo-local agent harness docs, CI, and architecture guardrails
+    Harness,
     /// Dev helpers: up/down worker+gateway, optionally with orchestrator
     Dev {
         #[command(subcommand)]
@@ -70,10 +72,12 @@ fn main() -> Result<()> {
             fmt()?;
             clippy()?;
             check()?;
+            harness()?;
         }
         Cmd::Fmt => fmt()?,
         Cmd::Clippy => clippy()?,
         Cmd::Check => check()?,
+        Cmd::Harness => harness()?,
         Cmd::Dev { sub } => match sub {
             DevSub::Up {
                 with_orch,
@@ -130,6 +134,185 @@ fn has_workspace_toml(p: impl AsRef<Path>) -> bool {
     fs::read_to_string(p)
         .map(|s| s.contains("[workspace]"))
         .unwrap_or(false)
+}
+
+const INTERNAL_CRATES: &[&str] = &[
+    "tessera-client",
+    "tessera-core",
+    "tessera-gateway",
+    "tessera-orch",
+    "tessera-proto",
+    "tessera-sim",
+    "tessera-worker",
+];
+
+struct CrateBoundary<'a> {
+    manifest: &'a str,
+    allowed_internal_deps: &'a [&'a str],
+}
+
+fn harness() -> Result<()> {
+    let root = workspace_root();
+    check_harness_docs(&root)?;
+    check_crate_boundaries(&root)?;
+    println!("harness: docs, CI, and crate dependency guardrails are valid");
+    Ok(())
+}
+
+fn check_harness_docs(root: &Path) -> Result<()> {
+    let required_files: &[(&str, &[&str])] = &[
+        (
+            "README.md",
+            &[
+                "## Run Locally",
+                "## Status Snapshot",
+                "## Design Overview",
+                "## Automation Harness",
+                "cargo xt harness",
+                "cargo xt dev up --with-orch",
+                "cargo run -p tessera-client -- ping --ts 123",
+                "자동화 에이전트",
+            ],
+        ),
+        (
+            "AGENTS.md",
+            &[
+                "## 자율 수행 원칙",
+                "기본값은 자율 진행",
+                "사용자를 호출하는 경우",
+                "cargo xt harness",
+                "cargo test",
+                "jj status",
+            ],
+        ),
+        (
+            "docs/quality.md",
+            &[
+                "# Tessera Quality Harness",
+                "Last verified: 2026-04-26",
+                "Autonomy contract",
+                "Feedback loops",
+                "Crate boundary policy",
+                "cargo xt harness",
+            ],
+        ),
+        (
+            ".github/workflows/ci.yml",
+            &[
+                "cargo xt",
+                "cargo test",
+                "cargo xt dev up --with-orch",
+                "cargo run -p tessera-client -- ping --ts 123",
+                "cargo xt dev down --with-orch",
+            ],
+        ),
+    ];
+
+    for (relative_path, needles) in required_files {
+        check_file_contains(root, relative_path, needles)?;
+    }
+
+    Ok(())
+}
+
+fn check_file_contains(root: &Path, relative_path: &str, needles: &[&str]) -> Result<()> {
+    let path = root.join(relative_path);
+    let contents = fs::read_to_string(&path)
+        .map_err(|err| anyhow::anyhow!("harness check failed: read {relative_path}: {err}"))?;
+
+    for needle in needles {
+        if !contents.contains(needle) {
+            bail!(
+                "harness check failed: {relative_path} must mention `{needle}` for agent legibility"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn check_crate_boundaries(root: &Path) -> Result<()> {
+    let boundaries = [
+        CrateBoundary {
+            manifest: "crates/tessera-core/Cargo.toml",
+            allowed_internal_deps: &[],
+        },
+        CrateBoundary {
+            manifest: "crates/tessera-proto/Cargo.toml",
+            allowed_internal_deps: &[],
+        },
+        CrateBoundary {
+            manifest: "crates/tessera-gateway/Cargo.toml",
+            allowed_internal_deps: &["tessera-core", "tessera-proto"],
+        },
+        CrateBoundary {
+            manifest: "crates/tessera-worker/Cargo.toml",
+            allowed_internal_deps: &["tessera-core", "tessera-proto"],
+        },
+        CrateBoundary {
+            manifest: "crates/tessera-orch/Cargo.toml",
+            allowed_internal_deps: &["tessera-core", "tessera-proto"],
+        },
+        CrateBoundary {
+            manifest: "crates/tessera-client/Cargo.toml",
+            allowed_internal_deps: &["tessera-core"],
+        },
+        CrateBoundary {
+            manifest: "crates/tessera-sim/Cargo.toml",
+            allowed_internal_deps: &["tessera-core", "tessera-client"],
+        },
+    ];
+
+    for boundary in boundaries {
+        let contents = fs::read_to_string(root.join(boundary.manifest)).map_err(|err| {
+            anyhow::anyhow!("harness check failed: read {}: {err}", boundary.manifest)
+        })?;
+        let disallowed =
+            disallowed_internal_dependencies(&contents, boundary.allowed_internal_deps);
+        if !disallowed.is_empty() {
+            bail!(
+                "harness check failed: {} has disallowed internal deps {:?}; allowed deps are {:?}. Update README Design Overview and xtask harness if this edge is intentional.",
+                boundary.manifest,
+                disallowed,
+                boundary.allowed_internal_deps
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn disallowed_internal_dependencies(
+    manifest_contents: &str,
+    allowed: &[&str],
+) -> Vec<&'static str> {
+    internal_crate_dependencies(manifest_contents)
+        .into_iter()
+        .filter(|dep| !allowed.contains(dep))
+        .collect()
+}
+
+fn internal_crate_dependencies(manifest_contents: &str) -> Vec<&'static str> {
+    let mut deps = Vec::new();
+
+    for line in manifest_contents.lines() {
+        let trimmed = line.trim_start();
+        for &name in INTERNAL_CRATES {
+            if is_dependency_line(trimmed, name) && !deps.contains(&name) {
+                deps.push(name);
+            }
+        }
+    }
+
+    deps
+}
+
+fn is_dependency_line(line: &str, dependency_name: &str) -> bool {
+    let Some(rest) = line.strip_prefix(dependency_name) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.starts_with('=') || rest.starts_with('.')
 }
 
 fn dev_dirs() -> (PathBuf, PathBuf, PathBuf) {
@@ -475,6 +658,38 @@ mod tests {
             "127.0.0.1:4000"
                 .parse::<SocketAddr>()
                 .expect("parse socket addr")
+        );
+    }
+
+    #[test]
+    fn internal_crate_dependencies_extracts_unique_manifest_edges() {
+        let manifest = r#"
+[package]
+name = "tessera-gateway"
+
+[dependencies]
+tessera-core = { path = "../tessera-core" }
+tessera-proto = { path = "../tessera-proto" }
+tessera-core = { path = "../tessera-core" }
+        "#;
+
+        assert_eq!(
+            internal_crate_dependencies(manifest),
+            vec!["tessera-core", "tessera-proto"]
+        );
+    }
+
+    #[test]
+    fn disallowed_internal_dependencies_rejects_runtime_cycles() {
+        let manifest = r#"
+[dependencies]
+tessera-core = { path = "../tessera-core" }
+tessera-worker = { path = "../tessera-worker" }
+        "#;
+
+        assert_eq!(
+            disallowed_internal_dependencies(manifest, &["tessera-core"]),
+            vec!["tessera-worker"]
         );
     }
 }

@@ -18,11 +18,12 @@ Cell-based world orchestration for real-time servers in Rust.
 - `crates/tessera-proto`: (선택) gRPC/IDL 코드젠
 - `crates/tessera-sim`: 부하/플레이어 시뮬레이터
 - `crates/tessera-client`: 테스트용 CLI 클라이언트
-- `xtask`: 포맷/린트/체크 헬퍼
+- `xtask`: 포맷/린트/체크/harness 헬퍼
 
 ## Quick Start
 - 빌드: `cargo build`
-- 검증: `cargo xt` (fmt → clippy → check)
+- 검증: `cargo xt` (fmt → clippy → check → harness)
+- Harness만 확인: `cargo xt harness`
 - 전체 테스트: `cargo test`
 - 실행 예시:
   - `cargo run -p tessera-gateway`
@@ -106,6 +107,13 @@ Cell-based world orchestration for real-time servers in Rust.
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
 - 게이트웨이 라우팅/업스트림 실패가 반복되면 클라이언트 연결을 종료하므로, 클라는 재접속이 필요할 수 있음
 
+## Automation Harness
+- 에이전트 기본 루프: `README.md`와 `AGENTS.md`를 읽고, 기존 패턴을 따라 구현한 뒤, `cargo xt`, `cargo test`, 필요 시 로컬 스모크로 검증한다.
+- `docs/quality.md`는 자율 수행 계약, feedback loop, crate boundary policy의 repo-local 기준 문서다.
+- `cargo xt harness`는 README/AGENTS/docs/CI discoverability와 내부 크레이트 의존 방향을 검사한다.
+- 현재 기계적 crate boundary: `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, `tessera-gateway`/`tessera-worker`/`tessera-orch`는 `tessera-core`와 `tessera-proto`만 공유 의존성으로 사용하며 서로 직접 의존하지 않는다.
+- CI는 push/PR에서 `cargo xt`, `cargo test`, `cargo xt dev up --with-orch` + `cargo run -p tessera-client -- ping --ts 123` 스모크를 실행한다.
+
 ## Design Overview
 - 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.
 - Goals: V0 고정 그리드+정적 매핑(구현), V1 셀 리밸런싱·Handover, V1 AOI/ghost 최적화, V2 동적 분할(쿼드트리) 등.
@@ -117,6 +125,6 @@ Cell-based world orchestration for real-time servers in Rust.
 ## Contributing & Workflow
 - 기본 브랜치 `main`; 커밋 메시지 포맷은 `type: summary`(예: `feat: refresh gateway routing`), 한 커밋에 명확한 변경 세트만 담습니다.
 - 코드 변경 시 문서/테스트를 함께 갱신하고, README의 ✅(구현)/🚧(계획) 구분을 유지합니다.
-- 제출 전 `cargo xt`와 `cargo test`를 실행합니다. 런타임/네트워크/dev helper 변경은 Run Locally의 로컬 스모크까지 확인합니다.
+- 제출 전 `cargo xt`와 `cargo test`를 실행합니다. `cargo xt`에는 `cargo xt harness`가 포함됩니다. 런타임/네트워크/dev helper 변경은 Run Locally의 로컬 스모크까지 확인합니다.
 - 자동화 에이전트는 목표와 제약이 충분하면 자율적으로 구현/검증/문서화를 진행하고, 파괴적 작업·published history rewrite·명시되지 않은 원격 bookmark 이동·외부 운영/비용 리스크처럼 되돌리기 어려운 경우에만 사용자 확인을 요청합니다.
 - 추가 지침과 에이전트 컨텍스트는 `AGENTS.md`를 참고하세요.

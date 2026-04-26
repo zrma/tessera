@@ -1,6 +1,7 @@
 # Tessera — Agent Quick Context
 
 이 리포지토리에서 자동화 에이전트가 작업할 때 필요한 최소 컨텍스트. “최소 읽기 세트”: `README.md`(현재 상태/로드맵) + AGENTS.md.
+Harness나 아키텍처/검증 정책을 건드릴 때는 `docs/quality.md`도 함께 확인한다.
 
 ## 읽기 우선
 - 작업 전 `README.md`의 Status/Design Overview/Run Locally를 확인.
@@ -34,8 +35,9 @@
 
 ## 작업 지침 (Do/Don’t)
 - Do: README의 ✅(구현) / 🚧(계획) 구분을 지키고, 아키텍처 변화 시 Design Overview 갱신.
+- Do: 내부 crate 의존 방향을 지킨다. `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, gateway/worker/orch는 서로 직접 의존하지 않는다.
 - Do: 단일 파일 수정은 `apply_patch` 우선, 검색은 `rg`/`rg --files` 우선.
-- Do: 최소 `cargo fmt`, 관련 `cargo test`; 필요 시 `cargo check --workspace`. dev 헬퍼는 `cargo xt`/`cargo xt dev ...` 활용하고, 작업 마무리 시에는 `cargo xt`와 `cargo test`를 반드시 돌려 결과를 확인한다.
+- Do: 최소 `cargo fmt`, 관련 `cargo test`; 필요 시 `cargo check --workspace`. dev 헬퍼는 `cargo xt`/`cargo xt dev ...` 활용하고, 작업 마무리 시에는 `cargo xt`와 `cargo test`를 반드시 돌려 결과를 확인한다. `cargo xt`는 fmt/clippy/check와 `cargo xt harness`를 포함한다.
 - Do: 런타임/네트워크/dev helper를 바꾸면 `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, `cargo xt dev down --with-orch` 스모크를 추가로 확인한다.
 - Do: 커밋 메시지 `type: summary`(예: `feat: refresh gateway routing`). JJ는 `jj commit -m "..."`; 북마크 이동은 지시가 있을 때만(`jj bookmark set main -r <rev>`).
 - Don’t: 기존 변경을 덮어쓰거나 파괴적 명령(`git reset --hard`, 무단 삭제 등) 실행 금지.
@@ -44,7 +46,7 @@
 ## 완료 조건
 - 코드 변경: `cargo xt`와 `cargo test`가 통과해야 한다. 실패하거나 비용이 너무 크면 이유와 가장 가까운 대체 검증을 남긴다.
 - 런타임 변경: dev stack이 실제로 살아 있고 테스트 클라이언트가 gateway에 연결되는지 확인한다.
-- 문서 변경: README/AGENTS의 구현/계획/명령이 현재 동작과 어긋나지 않는지 확인한다.
+- 문서 변경: README/AGENTS/docs의 구현/계획/명령이 현재 동작과 어긋나지 않는지 확인하고, `cargo xt harness`로 discoverability와 crate boundary를 확인한다.
 - VCS 정리: `jj status`와 `jj diff`로 변경 범위를 확인하고, 사용자가 push까지 요청한 경우 `jj git fetch` 후 지정 bookmark를 push한다.
 
 ## 소통/결정 기록
