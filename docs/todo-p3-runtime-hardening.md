@@ -19,7 +19,9 @@ correlation changes, or automatic split/merge policy activation.
 Goal: make `cargo xt dev metrics-smoke` prove that the Gateway latency histogram
 is not only exported but also increments on a real Ping/Pong path.
 
-Recommended slice:
+Status: done 2026-04-26.
+
+Implemented slice:
 
 1. Start the metrics-enabled dev stack as it does today.
 2. Run `tessera-client ping --ts <fixed>` against the Gateway.

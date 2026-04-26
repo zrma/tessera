@@ -627,7 +627,7 @@ fn dev_metrics_smoke() -> Result<()> {
 
     dev_up_inner(true, None, options)?;
     let smoke_result = (|| -> Result<()> {
-        assert_metrics_endpoint(
+        assert_metrics_endpoint_body(
             "gateway",
             gateway_metrics_addr,
             &[
@@ -645,7 +645,7 @@ fn dev_metrics_smoke() -> Result<()> {
             "/ready",
             "200 OK",
         )?;
-        assert_metrics_endpoint(
+        assert_metrics_endpoint_body(
             "worker",
             worker_metrics_addr,
             &[
@@ -653,7 +653,7 @@ fn dev_metrics_smoke() -> Result<()> {
                 "tessera_worker_accepted_connections_total",
             ],
         )?;
-        assert_metrics_endpoint(
+        assert_metrics_endpoint_body(
             "orchestrator",
             orch_metrics_addr,
             &[
@@ -661,20 +661,54 @@ fn dev_metrics_smoke() -> Result<()> {
                 "tessera_orch_registration_attempts_total",
             ],
         )?;
+        run_client_ping(987)?;
+        let gateway_metrics = assert_metrics_endpoint_body(
+            "gateway",
+            gateway_metrics_addr,
+            &["tessera_gateway_ping_roundtrip_seconds_count"],
+        )?;
+        assert_prometheus_sample_at_least(
+            "gateway",
+            &gateway_metrics,
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            1.0,
+        )?;
         Ok(())
     })();
     let down_result = dev_down(true);
 
     smoke_result?;
     down_result?;
-    println!("metrics smoke: gateway, worker, orchestrator /metrics and gateway /ready are valid");
+    println!(
+        "metrics smoke: gateway, worker, orchestrator /metrics, gateway /ready, and ping latency histogram are valid"
+    );
     Ok(())
 }
 
-fn assert_metrics_endpoint(service: &str, raw_addr: &str, required_metrics: &[&str]) -> Result<()> {
+fn assert_metrics_endpoint_body(
+    service: &str,
+    raw_addr: &str,
+    required_metrics: &[&str],
+) -> Result<String> {
     let addr = readiness_addr(raw_addr)?;
     let response = http_get(addr, "/metrics")?;
-    assert_prometheus_response(service, &response, required_metrics)
+    assert_prometheus_response(service, &response, required_metrics)?;
+    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+        bail!("{service} metrics smoke failed: missing HTTP body separator");
+    };
+    Ok(body.to_string())
+}
+
+fn run_client_ping(ts: u64) -> Result<()> {
+    let root = workspace_root();
+    let mut build = Command::new("cargo");
+    build.args(["build", "--bin", "tessera-client"]);
+    run(&mut build)?;
+
+    let client = root.join("target/debug/tessera-client");
+    let mut ping = Command::new(client);
+    ping.args(["ping", "--ts", &ts.to_string()]);
+    run(&mut ping)
 }
 
 fn assert_http_status_endpoint(
@@ -690,6 +724,44 @@ fn assert_http_status_endpoint(
         bail!("{service} smoke failed: expected HTTP {expected_status} response");
     }
     Ok(())
+}
+
+fn assert_prometheus_sample_at_least(
+    service: &str,
+    body: &str,
+    metric_name: &str,
+    min: f64,
+) -> Result<()> {
+    let value = prometheus_sample_value(body, metric_name)?;
+    if value < min {
+        bail!(
+            "{service} metrics smoke failed: metric `{metric_name}` value {value} is below {min}"
+        );
+    }
+    Ok(())
+}
+
+fn prometheus_sample_value(body: &str, metric_name: &str) -> Result<f64> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if name != metric_name {
+            continue;
+        }
+        let Some(value) = parts.next() else {
+            bail!("metric `{metric_name}` has no value");
+        };
+        return value
+            .parse::<f64>()
+            .map_err(|err| anyhow::anyhow!("metric `{metric_name}` has invalid value: {err}"));
+    }
+    bail!("metric `{metric_name}` not found")
 }
 
 fn http_get(addr: SocketAddr, path: &str) -> Result<String> {
@@ -834,6 +906,24 @@ mod tests {
         let err = assert_prometheus_response("demo", invalid, &["demo"])
             .expect_err("invalid metric value should fail");
         assert!(err.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn prometheus_sample_value_reads_plain_metric() {
+        let body = r#"
+# TYPE demo_count counter
+demo_bucket{le="0.1"} 3
+demo_count 4
+"#;
+
+        assert_eq!(
+            prometheus_sample_value(body, "demo_count").expect("metric value"),
+            4.0
+        );
+
+        let err =
+            prometheus_sample_value(body, "missing_count").expect_err("missing metric should fail");
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]

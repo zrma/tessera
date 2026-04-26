@@ -79,5 +79,5 @@ Last reviewed: 2026-04-26
 ## P3
 
 - 실행 계획: `docs/todo-p3-runtime-hardening.md`
-- 바로 진행 가능: `cargo xt dev metrics-smoke`가 실제 Ping/Pong latency histogram 증가까지 확인하도록 강화한다.
+- [done 2026-04-26] Metrics smoke latency path: `cargo xt dev metrics-smoke`가 실제 Ping/Pong latency histogram 증가까지 확인하도록 강화했다.
 - 에스컬레이션 필요: 비-Ping request latency correlation, production Kubernetes manifests, runtime split/merge activation.
