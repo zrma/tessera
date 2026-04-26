@@ -33,4 +33,5 @@ This document is the repo-local quality map for agents. It keeps the expected au
 ## Known gaps
 
 - Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints and Gateway has a `/ready` endpoint, but long-running scrape/tracing assertions and request latency histograms are not covered yet.
+- Docker/Compose/Kubernetes sample packaging exists, but production manifests are intentionally deferred until target cluster conventions are known.
 - `docs/todo-next.md` is the current execution-plan index; keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

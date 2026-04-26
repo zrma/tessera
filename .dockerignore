@@ -1,0 +1,10 @@
+.dev/
+.git/
+.github/
+.history/
+.jj/
+target/
+
+*.log
+*.pid
+.DS_Store

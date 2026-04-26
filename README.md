@@ -44,6 +44,11 @@ Cell-based world orchestration for real-time servers in Rust.
   - `cargo xt dev down --with-orch`
 - Metrics 스모크:
   - `cargo xt dev metrics-smoke` (Gateway `127.0.0.1:4100`, Worker `127.0.0.1:5100`, Orchestrator `127.0.0.1:6100`의 `/metrics`와 Gateway `/ready`를 확인)
+- Packaging 예시:
+  - 컨테이너 이미지: `docker build -t tessera:local .`
+  - Compose smoke: `docker compose -f deploy/docker-compose.yml up --build`
+  - Kubernetes sample: `deploy/kubernetes/tessera-sample.yaml`
+  - 상세: `docs/packaging.md`
 - 환경변수(옵션):
   - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
   - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
@@ -102,6 +107,7 @@ Cell-based world orchestration for real-time servers in Rust.
 
 ### 🚧 Planned / Upcoming
 - Worker 간 ghost relay의 장기 scrape/tracing assertions와 Gateway latency histogram 고도화
+- Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로만 제공되며, production target별 manifests는 아직 미구현
 - 리밸런싱 자동화, 동적 분할(V1/V2) 구현은 아직 미구현 (`docs/dynamic-split-merge.md`에 설계 노트)
 
 ## Protocol Snapshot
@@ -126,6 +132,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - `cargo xt harness`는 README/AGENTS/docs/CI discoverability와 내부 크레이트 의존 방향을 검사한다.
 - 현재 기계적 crate boundary: `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, `tessera-gateway`/`tessera-worker`/`tessera-orch`는 `tessera-core`와 `tessera-proto`만 공유 의존성으로 사용하며 서로 직접 의존하지 않는다.
 - `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready` 응답을 확인한다.
+- `docs/packaging.md`와 `deploy/`는 Docker/Compose/Kubernetes packaging sample을 제공한다. 실제 클러스터용 manifest는 target convention을 확인한 뒤 별도 작업으로 추가한다.
 - CI는 push/PR에서 `cargo xt`, `cargo test`, `cargo xt dev up --with-orch` + `cargo run -p tessera-client -- ping --ts 123` 스모크를 실행한다.
 
 ## Design Overview

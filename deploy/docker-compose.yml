@@ -1,0 +1,52 @@
+services:
+  orchestrator:
+    build:
+      context: ..
+    image: tessera:local
+    command: ["tessera-orch"]
+    environment:
+      RUST_LOG: info
+      TESSERA_ORCH_ADDR: 0.0.0.0:6000
+      TESSERA_ORCH_METRICS_ADDR: 0.0.0.0:6100
+      TESSERA_ORCH_CONFIG_JSON: >
+        {"workers":[{"id":"worker-a","addr":"worker:5001","cells":[{"world":0,"cx":0,"cy":0}]}]}
+    ports:
+      - "6000:6000"
+      - "6100:6100"
+
+  worker:
+    image: tessera:local
+    command: ["tessera-worker"]
+    depends_on:
+      - orchestrator
+    environment:
+      RUST_LOG: info
+      TESSERA_ORCH_ADDR: orchestrator:6000
+      TESSERA_WORKER_ID: worker-a
+      TESSERA_WORKER_ADDR: 0.0.0.0:5001
+      TESSERA_WORKER_ADVERTISE_ADDR: worker:5001
+      TESSERA_WORKER_METRICS_ADDR: 0.0.0.0:5100
+    ports:
+      - "5001:5001"
+      - "5100:5100"
+
+  gateway:
+    image: tessera:local
+    command: ["tessera-gateway"]
+    depends_on:
+      - orchestrator
+      - worker
+    environment:
+      RUST_LOG: info
+      TESSERA_ORCH_ADDR: orchestrator:6000
+      TESSERA_GW_ADDR: 0.0.0.0:4000
+      TESSERA_GW_METRICS_ADDR: 0.0.0.0:4100
+      TESSERA_WORKER_ADDR: worker:5001
+    ports:
+      - "4000:4000"
+      - "4100:4100"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4100/ready >/dev/null"]
+      interval: 10s
+      timeout: 2s
+      retries: 6

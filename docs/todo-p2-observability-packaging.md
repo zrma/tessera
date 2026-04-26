@@ -73,14 +73,17 @@ Deferred:
 Goal: document a deployable shape without pretending production automation is
 done.
 
-Recommended slice:
+Status: done 2026-04-26.
 
-1. Keep Dockerfile build path current for all runtime binaries.
-2. Add example environment config for Gateway, Worker, and Orchestrator.
-3. Add Kubernetes examples only as non-authoritative samples unless a target
-   cluster convention is provided.
-4. Include Prometheus scrape annotations, readiness/liveness endpoints, and
-   config mount examples once endpoints exist.
+Implemented slice:
+
+1. `Dockerfile` builds all runtime binaries into one sample runtime image.
+2. `deploy/docker-compose.yml` runs Orchestrator, Worker, and Gateway with
+   metrics endpoints enabled.
+3. `deploy/kubernetes/tessera-sample.yaml` documents a non-production
+   single-worker shape with Prometheus scrape annotations, Gateway readiness,
+   TCP liveness checks, and Orchestrator config mount.
+4. `docs/packaging.md` records build, smoke, and Kubernetes sample commands.
 
 Completion conditions:
 
@@ -89,7 +92,21 @@ Completion conditions:
   target.
 - `cargo xt` validates documentation discoverability.
 
+Deferred:
+
+- Production manifests remain blocked on target cluster conventions: image
+  registry, ingress/Service type, resource requests, rollout policy,
+  PodDisruptionBudget, and Prometheus discovery.
+
+Original recommendation:
+
+1. Keep Dockerfile build path current for all runtime binaries.
+2. Add example environment config for Gateway, Worker, and Orchestrator.
+3. Add Kubernetes examples only as non-authoritative samples unless a target
+   cluster convention is provided.
+4. Include Prometheus scrape annotations, readiness/liveness endpoints, and
+   config mount examples once endpoints exist.
+
 ## Suggested Order
 
-1. P2.3 packaging examples after readiness endpoints exist.
-2. Gateway latency histogram after the Prometheus histogram format is chosen.
+1. Gateway latency histogram after the Prometheus histogram format is chosen.

@@ -1,0 +1,215 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tessera-sample
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tessera-orch-config
+  namespace: tessera-sample
+data:
+  orch-config.json: |
+    {
+      "workers": [
+        {
+          "id": "worker-a",
+          "addr": "tessera-worker:5001",
+          "cells": [
+            {"world": 0, "cx": 0, "cy": 0}
+          ]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera-orch
+  namespace: tessera-sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tessera-orch
+  template:
+    metadata:
+      labels:
+        app: tessera-orch
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "6100"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: orch
+          image: ghcr.io/example/tessera:dev
+          imagePullPolicy: IfNotPresent
+          command: ["tessera-orch"]
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: TESSERA_ORCH_ADDR
+              value: 0.0.0.0:6000
+            - name: TESSERA_ORCH_METRICS_ADDR
+              value: 0.0.0.0:6100
+            - name: TESSERA_ORCH_CONFIG
+              value: /etc/tessera/orch-config.json
+          ports:
+            - name: grpc
+              containerPort: 6000
+            - name: metrics
+              containerPort: 6100
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+          volumeMounts:
+            - name: orch-config
+              mountPath: /etc/tessera
+              readOnly: true
+      volumes:
+        - name: orch-config
+          configMap:
+            name: tessera-orch-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-orch
+  namespace: tessera-sample
+spec:
+  selector:
+    app: tessera-orch
+  ports:
+    - name: grpc
+      port: 6000
+      targetPort: grpc
+    - name: metrics
+      port: 6100
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera-worker
+  namespace: tessera-sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tessera-worker
+  template:
+    metadata:
+      labels:
+        app: tessera-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5100"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/example/tessera:dev
+          imagePullPolicy: IfNotPresent
+          command: ["tessera-worker"]
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: TESSERA_ORCH_ADDR
+              value: tessera-orch:6000
+            - name: TESSERA_WORKER_ID
+              value: worker-a
+            - name: TESSERA_WORKER_ADDR
+              value: 0.0.0.0:5001
+            - name: TESSERA_WORKER_ADVERTISE_ADDR
+              value: tessera-worker:5001
+            - name: TESSERA_WORKER_METRICS_ADDR
+              value: 0.0.0.0:5100
+          ports:
+            - name: tcp
+              containerPort: 5001
+            - name: metrics
+              containerPort: 5100
+          livenessProbe:
+            tcpSocket:
+              port: tcp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-worker
+  namespace: tessera-sample
+spec:
+  selector:
+    app: tessera-worker
+  ports:
+    - name: tcp
+      port: 5001
+      targetPort: tcp
+    - name: metrics
+      port: 5100
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tessera-gateway
+  namespace: tessera-sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tessera-gateway
+  template:
+    metadata:
+      labels:
+        app: tessera-gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4100"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/example/tessera:dev
+          imagePullPolicy: IfNotPresent
+          command: ["tessera-gateway"]
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: TESSERA_ORCH_ADDR
+              value: tessera-orch:6000
+            - name: TESSERA_GW_ADDR
+              value: 0.0.0.0:4000
+            - name: TESSERA_GW_METRICS_ADDR
+              value: 0.0.0.0:4100
+            - name: TESSERA_WORKER_ADDR
+              value: tessera-worker:5001
+          ports:
+            - name: tcp
+              containerPort: 4000
+            - name: metrics
+              containerPort: 4100
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+          livenessProbe:
+            tcpSocket:
+              port: tcp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tessera-gateway
+  namespace: tessera-sample
+spec:
+  selector:
+    app: tessera-gateway
+  ports:
+    - name: tcp
+      port: 4000
+      targetPort: tcp
+    - name: metrics
+      port: 4100
+      targetPort: metrics
