@@ -4,18 +4,19 @@ Last reviewed: 2026-04-26
 
 ## Scope
 
-This plan covers the next P0 handover milestone: target-side replay and bounded
-commit retry. The current code already moves route ownership on `Commit`, but
-source-side buffered moves are not transferred to the target Worker.
+This plan records the completed P0/P1 handover replay milestones: target-side
+replay, bounded commit retry, stable Gateway sessions, and explicit owner
+transfer.
 
 ## Assumptions
 
 - Target-side replay is a state-transfer path, not a guarantee that the current
-  client socket stays open across every route switch. The Gateway still has a
-  conservative close path when a route changes after non-ping traffic.
-- Replayed actors on the target must not keep the source Worker's local
-  `client_id` owner. The target should store the replayed state and allow the
-  first post-handover client session that references the actor to claim it.
+  client socket stays open across every route switch. The Gateway reconnects
+  upstream with its stable session id when a route changes after non-ping
+  traffic.
+- Replayed actors on the target should receive explicit owner sessions from the
+  source replay manifest. Actors missing owner entries keep the legacy
+  claim-on-first-use compatibility path.
 - Replay must be idempotent per operation/cell so a source retry cannot apply
   buffered moves twice.
 - Commit retry budget is enforced before assignment transfer. Once assignment
@@ -47,12 +48,18 @@ source-side buffered moves are not transferred to the target Worker.
      local/relay subscribers.
    - Ignore duplicate operation/cell replays without applying moves twice.
 
-4. [later] Stable session handover
+4. [done 2026-04-26] Stable session handover
    - Add an explicit client/session identity or Gateway handover protocol so
      post-route-switch ownership can be preserved without relying on actor
      claim-on-first-use.
    - Revisit the Gateway route-change close path after stable session transfer
      exists.
+
+5. [done 2026-04-26] Explicit owner transfer
+   - Include actor owner sessions in `HandoverReplay`.
+   - Apply target owner map during replay before post-handover traffic arrives.
+   - Preserve legacy claim-on-first-use only for replay payloads without owner
+     entries.
 
 ## Verification
 

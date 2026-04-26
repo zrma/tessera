@@ -39,17 +39,18 @@ Last reviewed: 2026-04-26
    - 목표: source buffered move를 target Worker에 넘기는 replay 경로와 commit retry/abort 정책을 runtime 경로에 연결한다.
    - 작업 계획: `docs/todo-handover-replay.md`에 retry budget, replay payload, target apply, stable session 후속 작업을 분리했다.
    - 완료 조건: target replay ordering, retry budget/timeout, abort-before-assignment-transfer tests가 고정된다.
-   - 주의: client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다. 이번 milestone은 replayed actor를 target에서 claim-on-first-use로 처리하고, stable session handover는 별도 후속으로 둔다.
+   - 주의: client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다. 이후 stable session handover와 explicit owner transfer가 P1에서 별도 완료됐다.
 
 ## P1
 
 1. [done 2026-04-26] Stable session handover baseline
    - 목표: Gateway route change 뒤 client socket/actor ownership을 stable session identity로 보존한다.
-   - 완료 조건: Gateway가 connection별 session id를 Worker ingress frame에 주입하고, target replay actor claim-on-first-use가 stable session owner를 사용하며, route-change non-ping traffic이 client close 대신 upstream reconnect로 고정된다.
+   - 완료 조건: Gateway가 connection별 session id를 Worker ingress frame에 주입하고, route-change non-ping traffic이 client close 대신 upstream reconnect로 고정된다.
 
-2. Explicit ownership transfer
+2. [done 2026-04-26] Explicit ownership transfer
    - 목표: target replay의 claim-on-first-use fallback을 source가 전달한 session ownership manifest로 대체한다.
    - 완료 조건: `HandoverReplay`가 actor별 owner session을 포함하고, target Worker가 replay 적용 시 owner map까지 즉시 구성한다.
+   - 검증: core relay frame roundtrip, target replay owner transfer/unit test, source→target commit replay test.
 
 3. AOI precision upgrade
    - 목표: 현재 셀 경계 기반 edge margin을 거리/가시성 기반으로 확장한다.

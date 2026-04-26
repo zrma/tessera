@@ -10,7 +10,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tessera_core::{
     ActorState, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope, HandoverReplayMove,
-    MAX_FRAME_LEN, Position, ServerMsg, Tick, WorkerRelayMsg, encode_frame, try_decode_frame,
+    HandoverReplayOwner, MAX_FRAME_LEN, Position, ServerMsg, Tick, WorkerRelayMsg, encode_frame,
+    try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -667,6 +668,32 @@ impl SharedState {
             .unwrap_or_default()
     }
 
+    async fn handover_owner_manifest(
+        &self,
+        cell: CellId,
+        actors: &[ActorState],
+    ) -> Vec<HandoverReplayOwner> {
+        let owners = self.owners.lock().await;
+        let Some(cell_owners) = owners.get(&cell) else {
+            return Vec::new();
+        };
+
+        let mut manifest = actors
+            .iter()
+            .filter_map(|actor| {
+                cell_owners
+                    .get(&actor.id)
+                    .copied()
+                    .map(|owner_session| HandoverReplayOwner {
+                        actor: actor.id,
+                        owner_session,
+                    })
+            })
+            .collect::<Vec<_>>();
+        manifest.sort_by_key(|owner| owner.actor.0);
+        manifest
+    }
+
     async fn drop_buffered_moves_for_client(&self, client_id: u64) {
         let mut buffers = self.buffered_moves.lock().await;
         for queue in buffers.values_mut() {
@@ -680,6 +707,7 @@ impl SharedState {
         operation_id: String,
         cell: CellId,
         actors: Vec<ActorState>,
+        owners: Vec<HandoverReplayOwner>,
         moves: Vec<HandoverReplayMove>,
         owned_cells: &HashSet<CellId>,
     ) -> HandoverReplayApplyOutcome {
@@ -705,6 +733,19 @@ impl SharedState {
             }
         }
 
+        let mut owner_manifest = HashMap::new();
+        for owner in owners {
+            if !positions.contains_key(&owner.actor) {
+                return HandoverReplayApplyOutcome::Rejected("owner_for_missing_replay_actor");
+            }
+            if owner_manifest
+                .insert(owner.actor, owner.owner_session)
+                .is_some()
+            {
+                return HandoverReplayApplyOutcome::Rejected("duplicate_replay_owner");
+            }
+        }
+
         for moved in &moves {
             if !delta_is_finite(moved.dx, moved.dy) {
                 return HandoverReplayApplyOutcome::Rejected("invalid_replay_delta");
@@ -719,6 +760,19 @@ impl SharedState {
             }
             pos.x = new_x;
             pos.y = new_y;
+        }
+
+        if !owner_manifest.is_empty() {
+            let owners = self.owners.lock().await;
+            if let Some(cell_owners) = owners.get(&cell) {
+                for (actor, owner_session) in &owner_manifest {
+                    if let Some(existing) = cell_owners.get(actor)
+                        && existing != owner_session
+                    {
+                        return HandoverReplayApplyOutcome::Rejected("replay_owner_conflict");
+                    }
+                }
+            }
         }
 
         {
@@ -743,13 +797,16 @@ impl SharedState {
         }
 
         {
-            let owners = self.owners.lock().await;
+            let mut owners = self.owners.lock().await;
+            let cell_owners = owners.entry(cell).or_default();
+            for (actor, owner_session) in &owner_manifest {
+                cell_owners.insert(*actor, *owner_session);
+            }
             let mut claims = self.handover_replay_claims.lock().await;
             for actor in &final_actors {
-                if !owners
-                    .get(&cell)
-                    .is_some_and(|cell_owners| cell_owners.contains_key(&actor.id))
-                {
+                if owner_manifest.contains_key(&actor.id) {
+                    claims.remove(&(cell, actor.id));
+                } else if !cell_owners.contains_key(&actor.id) {
                     claims.insert((cell, actor.id));
                 }
             }
@@ -2050,6 +2107,7 @@ async fn replay_handover_to_target(
     policy: HandoverCellPolicy,
 ) {
     let actors = state.actor_snapshot(cell).await;
+    let owners = state.handover_owner_manifest(cell, &actors).await;
     let buffered_moves = state.drain_buffered_moves(cell).await;
     let mut replay_moves = Vec::with_capacity(buffered_moves.len());
     let mut replay_failures = Vec::with_capacity(buffered_moves.len());
@@ -2122,12 +2180,14 @@ async fn replay_handover_to_target(
     }
 
     let move_count = replay_moves.len();
+    let owner_count = owners.len();
     match send_handover_replay_with_retry(
         state,
         &route,
         policy.operation_id.as_str(),
         cell,
         actors,
+        owners,
         replay_moves,
     )
     .await
@@ -2139,6 +2199,7 @@ async fn replay_handover_to_target(
                 operation_id = %policy.operation_id,
                 target_worker_id = %policy.target_worker_id,
                 moves = move_count,
+                owners = owner_count,
                 expired,
                 response_closed,
                 "sent handover replay to target worker"
@@ -2151,6 +2212,7 @@ async fn replay_handover_to_target(
                 operation_id = %policy.operation_id,
                 target_worker_id = %policy.target_worker_id,
                 moves = move_count,
+                owners = owner_count,
                 expired,
                 response_closed,
                 error = ?e,
@@ -2184,12 +2246,20 @@ async fn send_handover_replay_with_retry(
     operation_id: &str,
     cell: CellId,
     actors: Vec<ActorState>,
+    owners: Vec<HandoverReplayOwner>,
     moves: Vec<HandoverReplayMove>,
 ) -> Result<()> {
     let mut last_error = None;
     for attempt in 1..=HANDOVER_REPLAY_SEND_RETRY_MAX {
-        match send_handover_replay_once(route, operation_id, cell, actors.clone(), moves.clone())
-            .await
+        match send_handover_replay_once(
+            route,
+            operation_id,
+            cell,
+            actors.clone(),
+            owners.clone(),
+            moves.clone(),
+        )
+        .await
         {
             Ok(()) => {
                 state
@@ -2215,6 +2285,7 @@ async fn send_handover_replay_once(
     operation_id: &str,
     cell: CellId,
     actors: Vec<ActorState>,
+    owners: Vec<HandoverReplayOwner>,
     moves: Vec<HandoverReplayMove>,
 ) -> Result<()> {
     let mut stream = TcpStream::connect(route.addr.as_str())
@@ -2228,6 +2299,7 @@ async fn send_handover_replay_once(
             operation_id: operation_id.to_string(),
             cell,
             actors,
+            owners,
             moves,
         },
     };
@@ -3694,11 +3766,19 @@ async fn handle_worker_relay_inner(
                 operation_id,
                 cell,
                 actors,
+                owners,
                 moves,
             } => {
                 let owned_guard = owned_cells.read().await;
                 match state
-                    .apply_handover_replay(operation_id.clone(), cell, actors, moves, &owned_guard)
+                    .apply_handover_replay(
+                        operation_id.clone(),
+                        cell,
+                        actors,
+                        owners,
+                        moves,
+                        &owned_guard,
+                    )
                     .await
                 {
                     HandoverReplayApplyOutcome::Applied => {
@@ -5181,6 +5261,7 @@ mod tests {
                     id: actor,
                     pos: Position { x: 1.0, y: 2.0 },
                 }],
+                vec![],
                 vec![HandoverReplayMove {
                     actor,
                     dx: 3.0,
@@ -5200,6 +5281,7 @@ mod tests {
                     id: actor,
                     pos: Position { x: 9.0, y: 9.0 },
                 }],
+                vec![],
                 vec![HandoverReplayMove {
                     actor,
                     dx: 9.0,
@@ -5245,6 +5327,94 @@ mod tests {
         assert_eq!(state.owner_for(&cell, &actor).await, Some(session_owner_id));
 
         let replayed_move = rx.try_recv().expect("post-handover move response");
+        match replayed_move.2 {
+            ServerMsg::Delta { moved, .. } => {
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, actor);
+                assert_eq!(moved[0].pos, Position { x: 5.0, y: 7.0 });
+            }
+            other => panic!("expected delta response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handover_replay_transfers_actor_owner_session() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(7);
+        let owner_session = 500;
+        let owned_cells = HashSet::from([cell]);
+
+        let outcome = state
+            .apply_handover_replay(
+                "op-owner".to_string(),
+                cell,
+                vec![ActorState {
+                    id: actor,
+                    pos: Position { x: 1.0, y: 2.0 },
+                }],
+                vec![HandoverReplayOwner {
+                    actor,
+                    owner_session,
+                }],
+                vec![HandoverReplayMove {
+                    actor,
+                    dx: 3.0,
+                    dy: 4.0,
+                    epoch: 11,
+                }],
+                &owned_cells,
+            )
+            .await;
+        assert_eq!(outcome, HandoverReplayApplyOutcome::Applied);
+        assert_eq!(state.owner_for(&cell, &actor).await, Some(owner_session));
+
+        let (tx, mut rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(91, tx, &disconnect_tx);
+        let denied = apply_client_move(
+            &state,
+            &owned_cells,
+            &subscriber.tx,
+            &subscriber,
+            None,
+            subscriber.client_id,
+            owner_session + 1,
+            "127.0.0.1:9999".parse().unwrap(),
+            cell,
+            actor,
+            1.0,
+            1.0,
+            12,
+        )
+        .await;
+        assert_eq!(denied, MoveApplyOutcome::Rejected);
+
+        let rejected = rx.try_recv().expect("ownership rejection");
+        match rejected.2 {
+            ServerMsg::Error { code, .. } => assert_eq!(code, "actor_owned_by_other"),
+            other => panic!("expected ownership error, got {other:?}"),
+        }
+
+        let accepted = apply_client_move(
+            &state,
+            &owned_cells,
+            &subscriber.tx,
+            &subscriber,
+            None,
+            subscriber.client_id,
+            owner_session,
+            "127.0.0.1:9999".parse().unwrap(),
+            cell,
+            actor,
+            1.0,
+            1.0,
+            13,
+        )
+        .await;
+        assert_eq!(accepted, MoveApplyOutcome::Applied);
+
+        let replayed_move = rx.try_recv().expect("owner-preserved move response");
         match replayed_move.2 {
             ServerMsg::Delta { moved, .. } => {
                 assert_eq!(moved.len(), 1);
@@ -5373,6 +5543,7 @@ mod tests {
         })
         .await
         .expect("target replay applied");
+        assert_eq!(target_state.owner_for(&cell, &actor).await, Some(client_id));
         server.await.expect("target server task");
         assert!(source_state.drain_buffered_moves(cell).await.is_empty());
         assert!(!source_state.actors.lock().await.contains_key(&cell));

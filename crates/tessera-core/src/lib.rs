@@ -73,6 +73,12 @@ pub struct HandoverReplayMove {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HandoverReplayOwner {
+    pub actor: EntityId,
+    pub owner_session: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Ping { ts: u64 },
@@ -129,6 +135,8 @@ pub enum WorkerRelayMsg {
         operation_id: String,
         cell: CellId,
         actors: Vec<ActorState>,
+        #[serde(default)]
+        owners: Vec<HandoverReplayOwner>,
         moves: Vec<HandoverReplayMove>,
     },
 }
@@ -320,6 +328,10 @@ mod tests {
                 actors: vec![ActorState {
                     id: EntityId(7),
                     pos: Position::new(1.0, 2.0),
+                }],
+                owners: vec![HandoverReplayOwner {
+                    actor: EntityId(7),
+                    owner_session: 42,
                 }],
                 moves: vec![HandoverReplayMove {
                     actor: EntityId(7),
