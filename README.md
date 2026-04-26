@@ -109,6 +109,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Worker 간 ghost relay의 장기 scrape/tracing assertions와 비-Ping request latency 계측 고도화
 - Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로만 제공되며, production target별 manifests는 아직 미구현
 - 리밸런싱 자동화, 동적 분할(V1/V2) 구현은 아직 미구현 (`docs/dynamic-split-merge.md`에 설계 노트)
+- P3 runtime hardening 실행 계획은 `docs/todo-p3-runtime-hardening.md`에 둔다.
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`

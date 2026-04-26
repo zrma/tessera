@@ -75,3 +75,9 @@ Last reviewed: 2026-04-26
 - [done 2026-04-26] Container/Kubernetes packaging sample: multi-binary runtime image, Compose smoke, non-production Kubernetes sample, packaging docs를 추가했다.
 - [done 2026-04-26] Gateway Ping/Pong latency histogram: request/round-trip latency bucket format을 정하고 Gateway metrics와 metrics smoke에 추가했다.
 - 비-Ping request latency 계측은 protocol-level request id가 생긴 뒤 일반화한다.
+
+## P3
+
+- 실행 계획: `docs/todo-p3-runtime-hardening.md`
+- 바로 진행 가능: `cargo xt dev metrics-smoke`가 실제 Ping/Pong latency histogram 증가까지 확인하도록 강화한다.
+- 에스컬레이션 필요: 비-Ping request latency correlation, production Kubernetes manifests, runtime split/merge activation.
