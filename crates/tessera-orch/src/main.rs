@@ -3,13 +3,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_core::CellId;
 use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorServer};
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, AssignmentQuery, AssignmentSnapshot,
-    ListAssignmentsRequest, WatchAssignmentsRequest, WorkerRegistration,
+    GetMetricsRequest, HealthCheckRequest, ListAssignmentsRequest, OrchestratorHealth,
+    OrchestratorMetrics, WatchAssignmentsRequest, WorkerHealth, WorkerRegistration,
 };
 use tokio::sync::{RwLock, watch};
 use tokio_stream::Stream;
@@ -261,11 +265,22 @@ struct WorkerRuntime {
     last_seen: SystemTime,
 }
 
+#[derive(Debug, Default)]
+struct OrchestratorMetricsCounters {
+    registration_attempts: AtomicU64,
+    unknown_worker_registrations: AtomicU64,
+    assignment_snapshot_requests: AtomicU64,
+    listing_requests: AtomicU64,
+    watch_streams_started: AtomicU64,
+    listing_updates: AtomicU64,
+}
+
 #[derive(Clone)]
 struct OrchestratorService {
     config: Arc<Config>,
     runtime: Arc<RwLock<HashMap<String, WorkerRuntime>>>,
     listing_tx: watch::Sender<AssignmentListing>,
+    metrics: Arc<OrchestratorMetricsCounters>,
 }
 
 impl OrchestratorService {
@@ -277,6 +292,7 @@ impl OrchestratorService {
             config,
             runtime: Arc::new(RwLock::new(HashMap::new())),
             listing_tx,
+            metrics: Arc::new(OrchestratorMetricsCounters::default()),
         }
     }
 
@@ -302,11 +318,92 @@ impl OrchestratorService {
         }
         // `send_replace` updates the stored value even when there are no receivers yet.
         let _ = self.listing_tx.send_replace(listing);
+        self.metrics.listing_updates.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]
     fn push_listing_for_test(&self, listing: AssignmentListing) {
         let _ = self.listing_tx.send(listing);
+    }
+
+    async fn worker_health(&self) -> Vec<WorkerHealth> {
+        let runtime = self.runtime.read().await;
+        let mut worker_ids: Vec<&String> = self.config.workers.keys().collect();
+        worker_ids.sort();
+
+        worker_ids
+            .into_iter()
+            .map(|worker_id| {
+                let configured = self
+                    .config
+                    .workers
+                    .get(worker_id)
+                    .expect("worker id from config keys");
+                let runtime = runtime.get(worker_id.as_str());
+                let runtime_addr = runtime.map(|rt| rt.addr.clone()).unwrap_or_default();
+                WorkerHealth {
+                    worker_id: worker_id.clone(),
+                    configured_addr: configured.addr.clone(),
+                    runtime_addr: runtime_addr.clone(),
+                    registered: runtime.is_some(),
+                    assigned_cells: configured.cells.len() as u64,
+                    last_seen_unix_secs: runtime
+                        .map(|rt| unix_timestamp_secs(rt.last_seen))
+                        .unwrap_or_default(),
+                    addr_matches_config: runtime_addr.is_empty() || runtime_addr == configured.addr,
+                }
+            })
+            .collect()
+    }
+
+    async fn health_snapshot(&self) -> OrchestratorHealth {
+        let workers = self.worker_health().await;
+        let configured_workers = workers.len() as u64;
+        let registered_workers = workers.iter().filter(|w| w.registered).count() as u64;
+        let assigned_cells = workers.iter().map(|w| w.assigned_cells).sum();
+        let addr_mismatch_workers = workers
+            .iter()
+            .filter(|w| w.registered && !w.addr_matches_config)
+            .count();
+        let status = if registered_workers == configured_workers && addr_mismatch_workers == 0 {
+            "SERVING"
+        } else {
+            "DEGRADED"
+        };
+
+        OrchestratorHealth {
+            status: status.to_string(),
+            configured_workers,
+            registered_workers,
+            assigned_cells,
+            workers,
+        }
+    }
+
+    async fn metrics_snapshot(&self) -> OrchestratorMetrics {
+        let workers = self.worker_health().await;
+        OrchestratorMetrics {
+            configured_workers: workers.len() as u64,
+            registered_workers: workers.iter().filter(|w| w.registered).count() as u64,
+            assigned_cells: workers.iter().map(|w| w.assigned_cells).sum(),
+            empty_workers: workers.iter().filter(|w| w.assigned_cells == 0).count() as u64,
+            addr_mismatch_workers: workers
+                .iter()
+                .filter(|w| w.registered && !w.addr_matches_config)
+                .count() as u64,
+            registration_attempts: self.metrics.registration_attempts.load(Ordering::Relaxed),
+            unknown_worker_registrations: self
+                .metrics
+                .unknown_worker_registrations
+                .load(Ordering::Relaxed),
+            assignment_snapshot_requests: self
+                .metrics
+                .assignment_snapshot_requests
+                .load(Ordering::Relaxed),
+            listing_requests: self.metrics.listing_requests.load(Ordering::Relaxed),
+            watch_streams_started: self.metrics.watch_streams_started.load(Ordering::Relaxed),
+            listing_updates: self.metrics.listing_updates.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -319,6 +416,9 @@ impl Orchestrator for OrchestratorService {
         &self,
         request: Request<WorkerRegistration>,
     ) -> Result<Response<AssignmentSnapshot>, Status> {
+        self.metrics
+            .registration_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let req = request.into_inner();
         let worker_id = req.worker_id.trim();
         if worker_id.is_empty() {
@@ -345,6 +445,9 @@ impl Orchestrator for OrchestratorService {
                 addr,
                 "worker registered but not defined in config"
             );
+            self.metrics
+                .unknown_worker_registrations
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(Response::new(snapshot));
         };
 
@@ -398,6 +501,9 @@ impl Orchestrator for OrchestratorService {
         if worker_id.is_empty() {
             return Err(Status::invalid_argument("worker_id must not be empty"));
         }
+        self.metrics
+            .assignment_snapshot_requests
+            .fetch_add(1, Ordering::Relaxed);
 
         {
             let mut guard = self.runtime.write().await;
@@ -426,6 +532,9 @@ impl Orchestrator for OrchestratorService {
         &self,
         _request: Request<ListAssignmentsRequest>,
     ) -> Result<Response<AssignmentListing>, Status> {
+        self.metrics
+            .listing_requests
+            .fetch_add(1, Ordering::Relaxed);
         let listing = self.listing().await;
         Ok(Response::new(listing))
     }
@@ -434,9 +543,26 @@ impl Orchestrator for OrchestratorService {
         &self,
         _request: Request<WatchAssignmentsRequest>,
     ) -> Result<Response<Self::WatchAssignmentsStream>, Status> {
+        self.metrics
+            .watch_streams_started
+            .fetch_add(1, Ordering::Relaxed);
         let rx = self.listing_tx.subscribe();
         let stream = WatchStream::new(rx).map(Ok);
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn get_health(
+        &self,
+        _request: Request<HealthCheckRequest>,
+    ) -> Result<Response<OrchestratorHealth>, Status> {
+        Ok(Response::new(self.health_snapshot().await))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<GetMetricsRequest>,
+    ) -> Result<Response<OrchestratorMetrics>, Status> {
+        Ok(Response::new(self.metrics_snapshot().await))
     }
 }
 
@@ -469,6 +595,12 @@ async fn resolve_socket_addr(raw: &str) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow!("no socket address resolved for {raw}"))
+}
+
+fn unix_timestamp_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -983,5 +1115,108 @@ mod tests {
             .expect("stream closed unexpectedly")
             .expect("second listing");
         assert_eq!(second, updated);
+    }
+
+    #[tokio::test]
+    async fn health_reports_registration_state() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+
+        let health = service
+            .get_health(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("get health")
+            .into_inner();
+        assert_eq!(health.status, "DEGRADED");
+        assert_eq!(health.configured_workers, 1);
+        assert_eq!(health.registered_workers, 0);
+        assert_eq!(health.assigned_cells, 1);
+        assert_eq!(health.workers.len(), 1);
+        assert!(!health.workers[0].registered);
+
+        service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-a".into(),
+                addr: "10.0.0.1:5001".into(),
+            }))
+            .await
+            .expect("register worker");
+
+        let health = service
+            .get_health(Request::new(HealthCheckRequest {}))
+            .await
+            .expect("get health")
+            .into_inner();
+        assert_eq!(health.status, "SERVING");
+        assert_eq!(health.registered_workers, 1);
+        assert_eq!(health.workers[0].runtime_addr, "10.0.0.1:5001");
+        assert!(health.workers[0].addr_matches_config);
+        assert!(health.workers[0].last_seen_unix_secs > 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_requests_and_runtime_state() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0), CellId::grid(0, 1, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+
+        let _ = service
+            .get_assignments(Request::new(AssignmentQuery {
+                worker_id: "worker-a".into(),
+            }))
+            .await
+            .expect("get assignments");
+        let _ = service
+            .list_assignments(Request::new(ListAssignmentsRequest {}))
+            .await
+            .expect("list assignments");
+        let _ = service
+            .watch_assignments(Request::new(WatchAssignmentsRequest {}))
+            .await
+            .expect("watch assignments");
+        let _ = service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-a".into(),
+                addr: "10.0.0.9:5001".into(),
+            }))
+            .await
+            .expect("register worker");
+        let _ = service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-unknown".into(),
+                addr: "10.0.0.8:5001".into(),
+            }))
+            .await
+            .expect("register unknown worker");
+
+        let metrics = service
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("get metrics")
+            .into_inner();
+        assert_eq!(metrics.configured_workers, 1);
+        assert_eq!(metrics.registered_workers, 1);
+        assert_eq!(metrics.assigned_cells, 2);
+        assert_eq!(metrics.empty_workers, 0);
+        assert_eq!(metrics.addr_mismatch_workers, 1);
+        assert_eq!(metrics.registration_attempts, 2);
+        assert_eq!(metrics.unknown_worker_registrations, 1);
+        assert_eq!(metrics.assignment_snapshot_requests, 1);
+        assert_eq!(metrics.listing_requests, 1);
+        assert_eq!(metrics.watch_streams_started, 1);
+        assert_eq!(metrics.listing_updates, 1);
     }
 }

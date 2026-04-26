@@ -37,10 +37,46 @@ message AssignmentListing {
 
 message ListAssignmentsRequest {}
 message WatchAssignmentsRequest {}
+message HealthCheckRequest {}
+message GetMetricsRequest {}
+
+message WorkerHealth {
+  string worker_id = 1;
+  string configured_addr = 2;
+  string runtime_addr = 3;
+  bool registered = 4;
+  uint64 assigned_cells = 5;
+  uint64 last_seen_unix_secs = 6;
+  bool addr_matches_config = 7;
+}
+
+message OrchestratorHealth {
+  string status = 1;
+  uint64 configured_workers = 2;
+  uint64 registered_workers = 3;
+  uint64 assigned_cells = 4;
+  repeated WorkerHealth workers = 5;
+}
+
+message OrchestratorMetrics {
+  uint64 configured_workers = 1;
+  uint64 registered_workers = 2;
+  uint64 assigned_cells = 3;
+  uint64 empty_workers = 4;
+  uint64 addr_mismatch_workers = 5;
+  uint64 registration_attempts = 6;
+  uint64 unknown_worker_registrations = 7;
+  uint64 assignment_snapshot_requests = 8;
+  uint64 listing_requests = 9;
+  uint64 watch_streams_started = 10;
+  uint64 listing_updates = 11;
+}
 
 service Orchestrator {
   rpc RegisterWorker(WorkerRegistration) returns (AssignmentSnapshot);
   rpc GetAssignments(AssignmentQuery) returns (AssignmentSnapshot);
   rpc ListAssignments(ListAssignmentsRequest) returns (AssignmentListing);
   rpc WatchAssignments(WatchAssignmentsRequest) returns (stream AssignmentListing);
+  rpc GetHealth(HealthCheckRequest) returns (OrchestratorHealth);
+  rpc GetMetrics(GetMetricsRequest) returns (OrchestratorMetrics);
 }
