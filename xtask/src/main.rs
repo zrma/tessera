@@ -1,12 +1,15 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[derive(Parser)]
 #[command(name = "xtask", version, about = "tessera workspace helper")]
@@ -22,7 +25,7 @@ enum Cmd {
     Fmt,
     Clippy,
     Check,
-    /// Dev helpers: up/down worker+gateway
+    /// Dev helpers: up/down worker+gateway, optionally with orchestrator
     Dev {
         #[command(subcommand)]
         sub: DevSub,
@@ -46,10 +49,10 @@ enum DevSub {
         #[arg(long, default_value_t = false)]
         with_orch: bool,
     },
-    /// Tail logs in .dev/logs (gateway/worker/all)
+    /// Tail logs in .dev/logs (gateway/worker/orch/all)
     Logs {
-        /// Target to tail: gateway|worker|all
-        #[arg(long, value_parser = ["gateway","worker","all"], default_value = "all")]
+        /// Target to tail: gateway|worker|orch|all
+        #[arg(long, value_parser = ["gateway","worker","orch","all"], default_value = "all")]
         target: String,
         /// Follow (like tail -f)
         #[arg(long, default_value_t = false)]
@@ -185,10 +188,7 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
 
     let startup = (|| -> Result<()> {
         if with_orch {
-            let orch_log = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(logs.join("orch.log"))?;
+            let orch_log = open_dev_log(&logs, "orch")?;
             let mut ocmd = Command::new(&orchestrator_bin);
             ocmd.current_dir(&root).env("RUST_LOG", &rust_log);
             if let Some(cfg) = orch_config.as_ref() {
@@ -199,6 +199,7 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
                 };
                 ocmd.env("TESSERA_ORCH_CONFIG", cfg_path);
             }
+            detach_background_process(&mut ocmd);
             let mut child = ocmd
                 .stdout(orch_log.try_clone()?)
                 .stderr(orch_log)
@@ -208,15 +209,13 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
             orch_child = Some(child);
         }
 
-        let worker_log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(logs.join("worker.log"))?;
+        let worker_log = open_dev_log(&logs, "worker")?;
         let mut wcmd = Command::new(&worker_bin);
-        let mut child = wcmd
-            .current_dir(&root)
+        wcmd.current_dir(&root)
             .env("RUST_LOG", &rust_log)
-            .env("TESSERA_WORKER_ADDR", &worker_addr)
+            .env("TESSERA_WORKER_ADDR", &worker_addr);
+        detach_background_process(&mut wcmd);
+        let mut child = wcmd
             .stdout(worker_log.try_clone()?)
             .stderr(worker_log)
             .spawn()?;
@@ -224,16 +223,14 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
         fs::write(&wk_pid, format!("{}\n", child.id()))?;
         worker_child = Some(child);
 
-        let gateway_log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(logs.join("gateway.log"))?;
+        let gateway_log = open_dev_log(&logs, "gateway")?;
         let mut gcmd = Command::new(&gateway_bin);
-        let mut child = gcmd
-            .current_dir(&root)
+        gcmd.current_dir(&root)
             .env("RUST_LOG", &rust_log)
             .env("TESSERA_GW_ADDR", &gateway_addr)
-            .env("TESSERA_WORKER_ADDR", &worker_addr)
+            .env("TESSERA_WORKER_ADDR", &worker_addr);
+        detach_background_process(&mut gcmd);
+        let mut child = gcmd
             .stdout(gateway_log.try_clone()?)
             .stderr(gateway_log)
             .spawn()?;
@@ -271,6 +268,35 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn open_dev_log(logs: &Path, service: &str) -> Result<std::fs::File> {
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join(format!("{service}.log")))?;
+    writeln!(
+        log,
+        "\n--- dev up service={service} unix_ts={} ---",
+        unix_timestamp_secs()
+    )?;
+    log.flush()?;
+    Ok(log)
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn detach_background_process(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        // Keep dev services alive after the `cargo xt dev up` process exits.
+        cmd.process_group(0);
+    }
 }
 
 fn readiness_addr(raw: &str) -> Result<SocketAddr> {
@@ -383,10 +409,12 @@ fn dev_logs(target: &str, follow: bool, lines: Option<usize>) -> Result<()> {
     let (_dev, logs, _pids) = dev_dirs();
     let gw = logs.join("gateway.log");
     let wk = logs.join("worker.log");
+    let orch = logs.join("orch.log");
 
     // Ensure files exist so tail -f works even before first write
     let _ = OpenOptions::new().create(true).append(true).open(&gw);
     let _ = OpenOptions::new().create(true).append(true).open(&wk);
+    let _ = OpenOptions::new().create(true).append(true).open(&orch);
 
     let mut args: Vec<String> = Vec::new();
     if let Some(n) = lines {
@@ -400,9 +428,11 @@ fn dev_logs(target: &str, follow: bool, lines: Option<usize>) -> Result<()> {
     match target {
         "gateway" => args.push(gw.to_string_lossy().into_owned()),
         "worker" => args.push(wk.to_string_lossy().into_owned()),
+        "orch" => args.push(orch.to_string_lossy().into_owned()),
         _ => {
             args.push(wk.to_string_lossy().into_owned());
             args.push(gw.to_string_lossy().into_owned());
+            args.push(orch.to_string_lossy().into_owned());
         }
     }
 
