@@ -11,8 +11,9 @@ Gateway Ping/Pong latency histogram.
 
 The next milestone should prefer narrow runtime hardening slices before larger
 V1/V2 rebalancing work. No immediate user escalation is required for local
-smoke/test hardening. Escalate before production manifests, protocol-wide request
-correlation changes, or automatic split/merge policy activation.
+smoke/test hardening or inactive planner modeling. Escalate before production
+manifests, protocol-wide request correlation changes, or automatic split/merge
+policy activation.
 
 ## P3.1 Metrics smoke exercises latency path
 
@@ -92,3 +93,34 @@ Deferred:
 - Runtime split/merge activation still requires explicit approval.
 - Merge planning, multi-depth parent/child semantics, and real metrics ingestion
   remain future slices.
+
+## P3.5 Merge planner skeleton
+
+Goal: extend the inactive split/merge planner so it can rank safe merge
+candidates for complete sibling sets without publishing assignment changes.
+
+Status: planned.
+
+Implementation slice:
+
+1. Add merge-specific low-water thresholds and sustained low-pressure windows to
+   the Orchestrator-local planner config and metrics model.
+2. Emit inactive `Merge` plans only when a complete sibling set is cold, old
+   enough, out of cooldown, and has no active handover.
+3. Charge merge plans against the existing churn budget by handover operations
+   and moved cells.
+4. Keep planner output disconnected from assignment listing/watch.
+
+Completion conditions:
+
+- Deterministic tests cover complete sibling validation, low-water hysteresis,
+  budget rejection, active-plan overlap rejection, and listing non-interference.
+- `docs/dynamic-split-merge.md` verification notes list merge candidate
+  validation as covered by the inactive skeleton.
+- `cargo xt`, `cargo test`, and the local runtime smoke pass.
+
+Deferred:
+
+- Runtime merge activation, target worker selection, real rolling metrics
+  ingestion, and multi-depth child encoding beyond the current `CellId.depth/sub`
+  shape still require a later explicit runtime slice.

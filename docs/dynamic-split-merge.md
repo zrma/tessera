@@ -118,7 +118,8 @@ handover commit at a time per cell family.
 Before runtime implementation, keep or extend tests for:
 
 - Split candidate ranking and hysteresis. (initial inactive skeleton covered)
-- Merge candidate validation for complete sibling sets.
+- Merge candidate validation for complete sibling sets. (planned inactive
+  skeleton)
 - Churn budget rejection. (initial inactive skeleton covered)
 - No overlapping active plans for the same cell family. (initial inactive
   skeleton covered for exact CellId families)
