@@ -392,6 +392,193 @@ fn handover_statuses(handovers: &HashMap<CellId, HandoverRuntime>) -> Vec<Handov
         .collect()
 }
 
+#[allow(dead_code)]
+mod split_merge_planner {
+    use super::CellId;
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SplitMergePlanKind {
+        Split,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SplitMergePlannerConfig {
+        pub high_actor_count: u64,
+        pub high_move_queue_pressure: u64,
+        pub high_tick_stage_micros: u64,
+        pub high_relay_fanout: u64,
+        pub high_handover_failures: u64,
+        pub min_split_pressure_signals: u8,
+        pub required_split_windows: u32,
+        pub min_cell_age_secs: u64,
+        pub max_active_plans_per_world: usize,
+        pub max_handover_ops_per_interval: usize,
+        pub max_cells_moved_per_interval: usize,
+    }
+
+    impl Default for SplitMergePlannerConfig {
+        fn default() -> Self {
+            Self {
+                high_actor_count: 100,
+                high_move_queue_pressure: 64,
+                high_tick_stage_micros: 20_000,
+                high_relay_fanout: 64,
+                high_handover_failures: 1,
+                min_split_pressure_signals: 2,
+                required_split_windows: 3,
+                min_cell_age_secs: 60,
+                max_active_plans_per_world: 1,
+                max_handover_ops_per_interval: 1,
+                max_cells_moved_per_interval: 1,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(super) struct SplitMergeMetricsSnapshot {
+        pub cells: Vec<SplitMergeCellMetrics>,
+        pub active_plans: Vec<SplitMergeActivePlan>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SplitMergeCellMetrics {
+        pub cell: CellId,
+        pub actor_count: u64,
+        pub move_queue_pressure: u64,
+        pub tick_stage_micros: u64,
+        pub relay_fanout: u64,
+        pub handover_failures: u64,
+        pub high_pressure_windows: u32,
+        pub cell_age_secs: u64,
+        pub cooldown_remaining_secs: u64,
+        pub active_handover: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SplitMergeActivePlan {
+        pub kind: SplitMergePlanKind,
+        pub cell: CellId,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SplitMergePlan {
+        pub kind: SplitMergePlanKind,
+        pub cell: CellId,
+        pub pressure_signals: u8,
+        pub score: u64,
+        pub required_handover_ops: usize,
+        pub cells_moved: usize,
+    }
+
+    pub(super) fn plan_split_merge(
+        snapshot: &SplitMergeMetricsSnapshot,
+        config: &SplitMergePlannerConfig,
+    ) -> Vec<SplitMergePlan> {
+        if config.max_active_plans_per_world == 0
+            || config.max_handover_ops_per_interval == 0
+            || config.max_cells_moved_per_interval == 0
+        {
+            return Vec::new();
+        }
+
+        let mut active_plans_by_world: HashMap<u32, usize> = HashMap::new();
+        let mut blocked_families = HashSet::new();
+        for active in &snapshot.active_plans {
+            *active_plans_by_world.entry(active.cell.world).or_default() += 1;
+            blocked_families.insert(cell_family_key(&active.cell));
+        }
+
+        let mut candidates = snapshot
+            .cells
+            .iter()
+            .filter(|cell| !blocked_families.contains(&cell_family_key(&cell.cell)))
+            .filter(|cell| cell.cooldown_remaining_secs == 0)
+            .filter(|cell| !cell.active_handover)
+            .filter(|cell| cell.cell_age_secs >= config.min_cell_age_secs)
+            .filter(|cell| cell.high_pressure_windows >= config.required_split_windows)
+            .filter_map(|cell| {
+                let pressure_signals = split_pressure_signals(cell, config);
+                (pressure_signals >= config.min_split_pressure_signals).then(|| SplitMergePlan {
+                    kind: SplitMergePlanKind::Split,
+                    cell: cell.cell,
+                    pressure_signals,
+                    score: split_pressure_score(cell, pressure_signals),
+                    required_handover_ops: 1,
+                    cells_moved: 1,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| cell_family_key(&left.cell).cmp(&cell_family_key(&right.cell)))
+        });
+
+        let mut planned_by_world: HashMap<u32, usize> = HashMap::new();
+        let mut remaining_handover_ops = config.max_handover_ops_per_interval;
+        let mut remaining_cells_moved = config.max_cells_moved_per_interval;
+        let mut plans = Vec::new();
+
+        for candidate in candidates {
+            let active_in_world = active_plans_by_world
+                .get(&candidate.cell.world)
+                .copied()
+                .unwrap_or_default();
+            let planned_in_world = planned_by_world
+                .get(&candidate.cell.world)
+                .copied()
+                .unwrap_or_default();
+            if active_in_world + planned_in_world >= config.max_active_plans_per_world {
+                continue;
+            }
+            if candidate.required_handover_ops > remaining_handover_ops
+                || candidate.cells_moved > remaining_cells_moved
+            {
+                continue;
+            }
+
+            remaining_handover_ops -= candidate.required_handover_ops;
+            remaining_cells_moved -= candidate.cells_moved;
+            *planned_by_world.entry(candidate.cell.world).or_default() += 1;
+            plans.push(candidate);
+        }
+
+        plans
+    }
+
+    fn split_pressure_signals(
+        cell: &SplitMergeCellMetrics,
+        config: &SplitMergePlannerConfig,
+    ) -> u8 {
+        [
+            cell.actor_count >= config.high_actor_count,
+            cell.move_queue_pressure >= config.high_move_queue_pressure,
+            cell.tick_stage_micros >= config.high_tick_stage_micros,
+            cell.relay_fanout >= config.high_relay_fanout,
+            cell.handover_failures >= config.high_handover_failures,
+        ]
+        .into_iter()
+        .filter(|signal| *signal)
+        .count() as u8
+    }
+
+    fn split_pressure_score(cell: &SplitMergeCellMetrics, pressure_signals: u8) -> u64 {
+        u64::from(pressure_signals) * 1_000_000
+            + cell.actor_count * 10_000
+            + cell.move_queue_pressure * 1_000
+            + cell.relay_fanout * 100
+            + cell.tick_stage_micros / 1_000
+            + cell.handover_failures * 10
+    }
+
+    fn cell_family_key(cell: &CellId) -> (u32, i32, i32, u8, u8) {
+        (cell.world, cell.cx, cell.cy, cell.depth, cell.sub)
+    }
+}
+
 #[derive(Debug, Default)]
 struct OrchestratorMetricsCounters {
     registration_attempts: AtomicU64,
@@ -1248,6 +1435,10 @@ fn unix_timestamp_secs(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::split_merge_planner::{
+        SplitMergeActivePlan, SplitMergeCellMetrics, SplitMergeMetricsSnapshot, SplitMergePlanKind,
+        SplitMergePlannerConfig, plan_split_merge,
+    };
     use super::*;
     use tokio_stream::StreamExt;
     use tonic::Request;
@@ -1279,6 +1470,169 @@ mod tests {
             target_worker_id: "worker-b".to_string(),
             command: command as i32,
         }
+    }
+
+    fn split_metrics(cell: CellId) -> SplitMergeCellMetrics {
+        SplitMergeCellMetrics {
+            cell,
+            actor_count: 0,
+            move_queue_pressure: 0,
+            tick_stage_micros: 0,
+            relay_fanout: 0,
+            handover_failures: 0,
+            high_pressure_windows: 3,
+            cell_age_secs: 60,
+            cooldown_remaining_secs: 0,
+            active_handover: false,
+        }
+    }
+
+    #[test]
+    fn split_merge_planner_ranks_candidates_with_hysteresis() {
+        let config = SplitMergePlannerConfig {
+            max_active_plans_per_world: 2,
+            max_handover_ops_per_interval: 2,
+            max_cells_moved_per_interval: 2,
+            ..SplitMergePlannerConfig::default()
+        };
+        let mut lower_score = split_metrics(CellId::grid(0, 0, 0));
+        lower_score.actor_count = 120;
+        lower_score.move_queue_pressure = 64;
+        let mut higher_score = split_metrics(CellId::grid(0, 1, 0));
+        higher_score.actor_count = 200;
+        higher_score.move_queue_pressure = 64;
+        higher_score.relay_fanout = 64;
+        let mut too_few_windows = split_metrics(CellId::grid(0, 2, 0));
+        too_few_windows.actor_count = 200;
+        too_few_windows.move_queue_pressure = 64;
+        too_few_windows.high_pressure_windows = 2;
+        let mut cooling_down = split_metrics(CellId::grid(0, 3, 0));
+        cooling_down.actor_count = 200;
+        cooling_down.move_queue_pressure = 64;
+        cooling_down.cooldown_remaining_secs = 30;
+        let mut handover_active = split_metrics(CellId::grid(0, 4, 0));
+        handover_active.actor_count = 200;
+        handover_active.move_queue_pressure = 64;
+        handover_active.active_handover = true;
+
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![
+                    lower_score,
+                    too_few_windows,
+                    higher_score,
+                    cooling_down,
+                    handover_active,
+                ],
+                active_plans: Vec::new(),
+            },
+            &config,
+        );
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].cell, CellId::grid(0, 1, 0));
+        assert_eq!(plans[0].pressure_signals, 3);
+        assert_eq!(plans[1].cell, CellId::grid(0, 0, 0));
+        assert_eq!(plans[1].pressure_signals, 2);
+    }
+
+    #[test]
+    fn split_merge_planner_enforces_churn_budget() {
+        let config = SplitMergePlannerConfig {
+            max_active_plans_per_world: 3,
+            max_handover_ops_per_interval: 1,
+            max_cells_moved_per_interval: 1,
+            ..SplitMergePlannerConfig::default()
+        };
+        let mut first = split_metrics(CellId::grid(0, 0, 0));
+        first.actor_count = 150;
+        first.move_queue_pressure = 64;
+        let mut second = split_metrics(CellId::grid(0, 1, 0));
+        second.actor_count = 220;
+        second.move_queue_pressure = 80;
+
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![first, second],
+                active_plans: Vec::new(),
+            },
+            &config,
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].cell, CellId::grid(0, 1, 0));
+    }
+
+    #[test]
+    fn split_merge_planner_blocks_overlapping_active_plans() {
+        let config = SplitMergePlannerConfig {
+            max_active_plans_per_world: 2,
+            max_handover_ops_per_interval: 2,
+            max_cells_moved_per_interval: 2,
+            ..SplitMergePlannerConfig::default()
+        };
+        let mut blocked = split_metrics(CellId::grid(0, 0, 0));
+        blocked.actor_count = 250;
+        blocked.move_queue_pressure = 100;
+        let mut allowed = split_metrics(CellId::grid(0, 1, 0));
+        allowed.actor_count = 120;
+        allowed.move_queue_pressure = 64;
+
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![blocked, allowed],
+                active_plans: vec![SplitMergeActivePlan {
+                    kind: SplitMergePlanKind::Split,
+                    cell: CellId::grid(0, 0, 0),
+                }],
+            },
+            &config,
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].cell, CellId::grid(0, 1, 0));
+
+        let world_budget = SplitMergePlannerConfig {
+            max_active_plans_per_world: 1,
+            max_handover_ops_per_interval: 2,
+            max_cells_moved_per_interval: 2,
+            ..SplitMergePlannerConfig::default()
+        };
+        let mut candidate = split_metrics(CellId::grid(0, 2, 0));
+        candidate.actor_count = 120;
+        candidate.move_queue_pressure = 64;
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![candidate],
+                active_plans: vec![SplitMergeActivePlan {
+                    kind: SplitMergePlanKind::Split,
+                    cell: CellId::grid(0, 0, 0),
+                }],
+            },
+            &world_budget,
+        );
+        assert!(plans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn split_merge_planner_is_not_connected_to_assignment_listing() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        let before = service.listing().await;
+        let mut candidate = split_metrics(CellId::grid(0, 0, 0));
+        candidate.actor_count = 120;
+        candidate.move_queue_pressure = 64;
+
+        let plans = plan_split_merge(
+            &SplitMergeMetricsSnapshot {
+                cells: vec![candidate],
+                active_plans: Vec::new(),
+            },
+            &SplitMergePlannerConfig::default(),
+        );
+        let after = service.listing().await;
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(before, after);
     }
 
     #[test]
