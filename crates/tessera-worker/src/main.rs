@@ -9,8 +9,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tessera_core::{
-    ActorState, CellId, ClientMsg, EntityId, Envelope, HandoverReplayMove, MAX_FRAME_LEN, Position,
-    ServerMsg, Tick, WorkerRelayMsg, encode_frame, try_decode_frame,
+    ActorState, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope, HandoverReplayMove,
+    MAX_FRAME_LEN, Position, ServerMsg, Tick, WorkerRelayMsg, encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -158,6 +158,7 @@ struct BufferedMove {
     connection_epoch: Arc<AtomicU32>,
     peer: SocketAddr,
     client_id: u64,
+    owner_id: u64,
     actor: EntityId,
     dx: f32,
     dy: f32,
@@ -1978,6 +1979,7 @@ async fn flush_buffered_moves_for_cells(
                 &buffered.subscriber,
                 Some(buffered.connection_epoch.as_ref()),
                 buffered.client_id,
+                buffered.owner_id,
                 buffered.peer,
                 cell,
                 buffered.actor,
@@ -3260,9 +3262,9 @@ async fn read_frame_bytes_or_disconnect(
     Ok(Some(buf))
 }
 
-fn decode_client_frame_from_bytes(frame: &BytesMut) -> Result<Envelope<ClientMsg>> {
+fn decode_client_frame_from_bytes(frame: &BytesMut) -> Result<ClientEnvelope> {
     let mut buf = frame.clone();
-    match try_decode_frame::<Envelope<ClientMsg>>(&mut buf) {
+    match try_decode_frame::<ClientEnvelope>(&mut buf) {
         Ok(Some(env)) => Ok(env),
         Ok(None) => Err(anyhow!("incomplete client frame")),
         Err(e) => Err(e.into()),
@@ -3774,6 +3776,7 @@ async fn apply_client_move(
     subscriber: &CellSubscriber,
     epoch_tracker: Option<&AtomicU32>,
     client_id: u64,
+    owner_id: u64,
     peer: SocketAddr,
     cell: CellId,
     actor: EntityId,
@@ -3805,7 +3808,7 @@ async fn apply_client_move(
     }
 
     match state.owner_for(&cell, &actor).await {
-        Some(owner) if owner == client_id => {}
+        Some(owner) if owner == owner_id => {}
         Some(owner) => {
             warn!(
                 target: "worker",
@@ -3814,7 +3817,8 @@ async fn apply_client_move(
                 actor = actor.0,
                 owner,
                 client_id,
-                "move rejected: actor owned by different client"
+                owner_id,
+                "move rejected: actor owned by different session"
             );
             return if enqueue_error(
                 tx,
@@ -3832,7 +3836,7 @@ async fn apply_client_move(
         }
         None => {
             if state
-                .claim_replayed_actor_owner(cell, actor, client_id)
+                .claim_replayed_actor_owner(cell, actor, owner_id)
                 .await
             {
                 info!(
@@ -3841,6 +3845,7 @@ async fn apply_client_move(
                     cell = ?cell,
                     actor = actor.0,
                     client_id,
+                    owner_id,
                     "claimed handover replayed actor for post-handover move"
                 );
             } else {
@@ -4024,11 +4029,12 @@ async fn handle_upstream_inner(
     tx: Sender<OutboundMsg>,
     mut rx: Receiver<OutboundMsg>,
     spawn_writer: bool,
-    mut first_env: Option<Envelope<ClientMsg>>,
+    mut first_env: Option<ClientEnvelope>,
 ) -> Result<()> {
     let epoch = Arc::new(AtomicU32::new(0));
     let writer_epoch = Arc::clone(&epoch);
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut owner_id_for_connection = client_id;
     let mut owned_actors: HashSet<(CellId, EntityId)> = HashSet::new();
     let mut subscribed_cells: HashSet<CellId> = HashSet::new();
     let (disconnect_tx, mut disconnect_rx) = watch::channel(());
@@ -4087,6 +4093,8 @@ async fn handle_upstream_inner(
             }
         };
         let cell = env_in.cell;
+        let owner_id = env_in.session.unwrap_or(client_id);
+        owner_id_for_connection = owner_id;
         // 할당 갱신과 메시지 처리가 엇갈리면 해제된 셀에 상태가 다시 생길 수 있어,
         // 처리 중에는 소유 셀 읽기 락을 유지해 레이스를 막는다.
         let owned_guard = owned_cells.read().await;
@@ -4159,7 +4167,7 @@ async fn handle_upstream_inner(
                     }
                     continue;
                 }
-                let claim = state.claim_owner(cell, actor, client_id).await;
+                let claim = state.claim_owner(cell, actor, owner_id).await;
                 if let ClaimOutcome::Denied(existing) = claim {
                     warn!(
                         target: "worker",
@@ -4167,7 +4175,8 @@ async fn handle_upstream_inner(
                         cell = ?cell,
                         actor = actor.0,
                         existing_owner = existing,
-                        "join rejected: actor owned by different client"
+                        owner_id,
+                        "join rejected: actor owned by different session"
                     );
                     if enqueue_error(
                         &tx,
@@ -4208,7 +4217,7 @@ async fn handle_upstream_inner(
                             claim,
                             ClaimOutcome::GrantedNew | ClaimOutcome::GrantedReplayed
                         ) {
-                            state.release_owner(cell, actor, client_id).await;
+                            state.release_owner(cell, actor, owner_id).await;
                         }
                         warn!(
                             target: "worker",
@@ -4300,6 +4309,7 @@ async fn handle_upstream_inner(
                         connection_epoch: Arc::clone(&epoch),
                         peer,
                         client_id,
+                        owner_id,
                         actor,
                         dx,
                         dy,
@@ -4339,6 +4349,7 @@ async fn handle_upstream_inner(
                     &subscriber,
                     Some(epoch.as_ref()),
                     client_id,
+                    owner_id,
                     peer,
                     cell,
                     actor,
@@ -4360,7 +4371,7 @@ async fn handle_upstream_inner(
     state.sync_remote_peer_sessions().await;
     state
         .remove_owned_actors(
-            client_id,
+            owner_id_for_connection,
             &owned_actors,
             Some(epoch.load(Ordering::Relaxed)),
         )
@@ -5028,6 +5039,7 @@ mod tests {
                     connection_epoch: Arc::clone(&connection_epoch),
                     peer: "127.0.0.1:9999".parse().unwrap(),
                     client_id,
+                    owner_id: client_id,
                     actor,
                     dx: 3.0,
                     dy: 4.0,
@@ -5212,6 +5224,7 @@ mod tests {
         let (tx, mut rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
         let (disconnect_tx, _disconnect_rx) = watch::channel(());
         let subscriber = test_subscriber(91, tx, &disconnect_tx);
+        let session_owner_id = 500;
         let outcome = apply_client_move(
             &state,
             &owned_cells,
@@ -5219,6 +5232,7 @@ mod tests {
             &subscriber,
             None,
             subscriber.client_id,
+            session_owner_id,
             "127.0.0.1:9999".parse().unwrap(),
             cell,
             actor,
@@ -5228,7 +5242,7 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, MoveApplyOutcome::Applied);
-        assert_eq!(state.owner_for(&cell, &actor).await, Some(91));
+        assert_eq!(state.owner_for(&cell, &actor).await, Some(session_owner_id));
 
         let replayed_move = rx.try_recv().expect("post-handover move response");
         match replayed_move.2 {
@@ -5303,6 +5317,7 @@ mod tests {
                     connection_epoch: Arc::new(AtomicU32::new(10)),
                     peer: "127.0.0.1:9999".parse().unwrap(),
                     client_id,
+                    owner_id: client_id,
                     actor,
                     dx: 3.0,
                     dy: 4.0,

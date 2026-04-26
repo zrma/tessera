@@ -142,6 +142,28 @@ pub struct Envelope<T> {
     pub payload: T,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientEnvelope {
+    pub cell: CellId,
+    pub seq: u64,
+    pub epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u64>,
+    pub payload: ClientMsg,
+}
+
+impl From<Envelope<ClientMsg>> for ClientEnvelope {
+    fn from(env: Envelope<ClientMsg>) -> Self {
+        Self {
+            cell: env.cell,
+            seq: env.seq,
+            epoch: env.epoch,
+            session: None,
+            payload: env.payload,
+        }
+    }
+}
+
 // ---------- Length-prefixed framing (JSON payload, u32 BE length) ----------
 
 /// 최대 프레임 길이(페이로드 기준). 네트워크 입력(신뢰할 수 없는 데이터)을 다룰 때
@@ -213,6 +235,41 @@ mod tests {
         let decoded: ClientMsg = try_decode_frame(&mut buf).expect("decode").expect("frame");
         assert_eq!(msg, decoded);
         // buffer should be drained
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn client_envelope_accepts_missing_session() {
+        let env = Envelope {
+            cell: CellId::grid(0, 1, 2),
+            seq: 7,
+            epoch: 9,
+            payload: ClientMsg::Ping { ts: 123 },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: ClientEnvelope = try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(decoded.cell, env.cell);
+        assert_eq!(decoded.seq, env.seq);
+        assert_eq!(decoded.epoch, env.epoch);
+        assert_eq!(decoded.session, None);
+        assert_eq!(decoded.payload, env.payload);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn client_envelope_roundtrip_session() {
+        let env = ClientEnvelope {
+            cell: CellId::grid(0, 1, 2),
+            seq: 7,
+            epoch: 9,
+            session: Some(42),
+            payload: ClientMsg::Ping { ts: 123 },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: ClientEnvelope = try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(decoded, env);
         assert_eq!(buf.len(), 0);
     }
 
