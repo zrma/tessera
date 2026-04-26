@@ -1585,6 +1585,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
         let listing_updated = AssignmentListing {
             workers: vec![AssignmentBundle {
@@ -1598,6 +1599,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
 
         let stream = iter(vec![
@@ -1641,6 +1643,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
         apply_listing_update(&routing, listing_updated)
             .await
@@ -1678,6 +1681,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
 
         let routes = routes_from_listing(&listing).expect("parse listing");
@@ -1701,6 +1705,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
 
         let err = routes_from_listing(&listing).expect_err("should reject empty addr");
@@ -1721,6 +1726,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
 
         let err = routes_from_listing(&listing).expect_err("should reject missing port");
@@ -1741,6 +1747,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
 
         let err = routes_from_listing(&listing).expect_err("should reject zero port");
@@ -1774,6 +1781,7 @@ mod tests {
                     }],
                 },
             ],
+            handovers: vec![],
         };
 
         let err = routes_from_listing(&listing).expect_err("should reject duplicates");
@@ -1903,6 +1911,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
 
         let start_version = routing.version.load(Ordering::Relaxed);
@@ -2045,6 +2054,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
         apply_listing_update(&routing, listing_updated)
             .await
@@ -2159,6 +2169,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
         apply_listing_update(&routing, listing_updated)
             .await
@@ -2356,6 +2367,7 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
         apply_listing_update(&routing, listing_updated)
             .await
@@ -2782,10 +2794,14 @@ mod tests {
                     sub: 0,
                 }],
             }],
+            handovers: vec![],
         };
         let stream = iter(vec![
             Ok(listing_initial.clone()),
-            Ok(AssignmentListing { workers: vec![] }),
+            Ok(AssignmentListing {
+                workers: vec![],
+                handovers: vec![],
+            }),
         ]);
         apply_listing_stream(routing.clone(), stream)
             .await

@@ -1,21 +1,21 @@
 use anyhow::{Context, Result, anyhow};
 use bytes::BytesMut;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, AtomicU64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tessera_core::{
     ActorState, CellId, ClientMsg, EntityId, Envelope, MAX_FRAME_LEN, Position, ServerMsg, Tick,
     WorkerRelayMsg, encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
-    Assignment, AssignmentListing, ListAssignmentsRequest, WatchAssignmentsRequest,
-    WorkerRegistration,
+    Assignment, AssignmentListing, HandoverClientMovePolicy, HandoverState, ListAssignmentsRequest,
+    WatchAssignmentsRequest, WorkerRegistration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -34,6 +34,8 @@ static NEXT_RELAY_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_AOI_RADIUS_CELLS: i32 = 1;
 const DEFAULT_AOI_CELL_SPAN_UNITS: f32 = 32.0;
+const DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY: usize = 128;
+const DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS: u64 = 2_000;
 
 #[derive(Debug, Default)]
 struct WorkerMetricsCounters {
@@ -82,6 +84,8 @@ type OwnedActors = HashSet<(CellId, EntityId)>;
 type PeerRoutes = HashMap<CellId, PeerRoute>;
 type RemoteInterestMap = HashMap<u64, HashMap<CellId, PeerRoute>>;
 type RemotePeerSessionMap = HashMap<String, RemotePeerSessionHandle>;
+type HandoverPolicyMap = HashMap<CellId, HandoverCellPolicy>;
+type BufferedMoveQueues = HashMap<CellId, VecDeque<BufferedMove>>;
 
 #[derive(Clone)]
 struct CellSubscriber {
@@ -134,6 +138,28 @@ struct RemotePeerSessionHandle {
     desired_tx: watch::Sender<RemotePeerDesired>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandoverCellPolicy {
+    operation_id: String,
+    source_worker_id: String,
+    target_worker_id: String,
+    state: HandoverState,
+    client_move_policy: HandoverClientMovePolicy,
+}
+
+#[derive(Clone)]
+struct BufferedMove {
+    subscriber: CellSubscriber,
+    connection_epoch: Arc<AtomicU32>,
+    peer: SocketAddr,
+    client_id: u64,
+    actor: EntityId,
+    dx: f32,
+    dy: f32,
+    epoch: u32,
+    buffered_at: Instant,
+}
+
 struct SharedState {
     actors: Mutex<HashMap<CellId, HashMap<EntityId, Position>>>,
     remote_actor_cache: Mutex<RemoteActorCache>,
@@ -145,10 +171,14 @@ struct SharedState {
     peer_routes: RwLock<PeerRoutes>,
     remote_interests: Mutex<RemoteInterestMap>,
     remote_peer_sessions: Mutex<RemotePeerSessionMap>,
+    handover_policies: RwLock<HandoverPolicyMap>,
+    buffered_moves: Mutex<BufferedMoveQueues>,
     metrics: Arc<WorkerMetricsCounters>,
     aoi_radius_cells: i32,
     aoi_cell_span_units: f32,
     aoi_edge_margin_units: Option<f32>,
+    handover_move_buffer_capacity: usize,
+    handover_move_buffer_ttl: Duration,
 }
 
 impl SharedState {
@@ -156,6 +186,22 @@ impl SharedState {
         aoi_radius_cells: i32,
         aoi_cell_span_units: f32,
         aoi_edge_margin_units: Option<f32>,
+    ) -> Self {
+        Self::with_runtime_config(
+            aoi_radius_cells,
+            aoi_cell_span_units,
+            aoi_edge_margin_units,
+            DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY,
+            Duration::from_millis(DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS),
+        )
+    }
+
+    fn with_runtime_config(
+        aoi_radius_cells: i32,
+        aoi_cell_span_units: f32,
+        aoi_edge_margin_units: Option<f32>,
+        handover_move_buffer_capacity: usize,
+        handover_move_buffer_ttl: Duration,
     ) -> Self {
         Self {
             actors: Mutex::new(HashMap::new()),
@@ -168,10 +214,14 @@ impl SharedState {
             peer_routes: RwLock::new(HashMap::new()),
             remote_interests: Mutex::new(HashMap::new()),
             remote_peer_sessions: Mutex::new(HashMap::new()),
+            handover_policies: RwLock::new(HashMap::new()),
+            buffered_moves: Mutex::new(HashMap::new()),
             metrics: Arc::new(WorkerMetricsCounters::default()),
             aoi_radius_cells,
             aoi_cell_span_units,
             aoi_edge_margin_units,
+            handover_move_buffer_capacity,
+            handover_move_buffer_ttl,
         }
     }
 
@@ -461,6 +511,14 @@ impl SharedState {
         }
     }
 
+    async fn client_root_actors(&self, client_id: u64) -> OwnedActors {
+        let sessions = self.client_sessions.lock().await;
+        sessions
+            .get(&client_id)
+            .map(|session| session.root_actors.clone())
+            .unwrap_or_default()
+    }
+
     async fn prune_client_roots(&self, removed_cells: &HashSet<CellId>) {
         if removed_cells.is_empty() {
             return;
@@ -521,6 +579,58 @@ impl SharedState {
         }
         *peer_routes = routes;
         true
+    }
+
+    async fn update_handover_policies(
+        &self,
+        policies: HandoverPolicyMap,
+    ) -> (bool, HashSet<CellId>) {
+        let mut guard = self.handover_policies.write().await;
+        let changed = *guard != policies;
+        let released = guard
+            .keys()
+            .filter(|cell| !policies.contains_key(cell))
+            .copied()
+            .collect::<HashSet<_>>();
+        *guard = policies;
+        (changed, released)
+    }
+
+    async fn should_buffer_move(&self, cell: &CellId) -> Option<HandoverCellPolicy> {
+        let guard = self.handover_policies.read().await;
+        guard
+            .get(cell)
+            .filter(|policy| {
+                policy.client_move_policy == HandoverClientMovePolicy::RejectDuringFreeze
+                    && matches!(policy.state, HandoverState::Frozen | HandoverState::Diffing)
+            })
+            .cloned()
+    }
+
+    async fn buffer_client_move(&self, cell: CellId, buffered: BufferedMove) -> Result<(), ()> {
+        let mut buffers = self.buffered_moves.lock().await;
+        let queue = buffers.entry(cell).or_default();
+        if queue.len() >= self.handover_move_buffer_capacity {
+            return Err(());
+        }
+        queue.push_back(buffered);
+        Ok(())
+    }
+
+    async fn drain_buffered_moves(&self, cell: CellId) -> Vec<BufferedMove> {
+        let mut buffers = self.buffered_moves.lock().await;
+        buffers
+            .remove(&cell)
+            .map(|queue| queue.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    async fn drop_buffered_moves_for_client(&self, client_id: u64) {
+        let mut buffers = self.buffered_moves.lock().await;
+        for queue in buffers.values_mut() {
+            queue.retain(|buffered| buffered.client_id != client_id);
+        }
+        buffers.retain(|_, queue| !queue.is_empty());
     }
 
     async fn sync_remote_interests(
@@ -1170,6 +1280,10 @@ async fn main() -> Result<()> {
     let aoi_cell_span_units = load_aoi_cell_span_units().context("load worker AOI cell span")?;
     let aoi_edge_margin_units =
         load_aoi_edge_margin_units().context("load worker AOI edge margin")?;
+    let handover_move_buffer_capacity = load_handover_move_buffer_capacity()
+        .context("load worker handover move buffer capacity")?;
+    let handover_move_buffer_ttl =
+        load_handover_move_buffer_ttl().context("load worker handover move buffer TTL")?;
 
     let (assignments, used_fallback) = load_assignments(&worker_id, addr, &advertise_addr, || {
         fetch_assignments(&worker_id, &advertise_addr)
@@ -1186,10 +1300,12 @@ async fn main() -> Result<()> {
         assignments.iter().copied().collect::<HashSet<_>>(),
     ));
 
-    let state = Arc::new(SharedState::with_aoi_config(
+    let state = Arc::new(SharedState::with_runtime_config(
         aoi_radius_cells,
         aoi_cell_span_units,
         aoi_edge_margin_units,
+        handover_move_buffer_capacity,
+        handover_move_buffer_ttl,
     ));
     if let Some(listener) = load_metrics_listener().await? {
         let metrics_state = Arc::clone(&state);
@@ -1428,11 +1544,21 @@ async fn apply_peer_routes_update(
     listing: AssignmentListing,
 ) -> Result<bool> {
     let routes = peer_routes_from_listing(&listing, worker_id)?;
+    let policies = handover_policies_from_listing(&listing, worker_id)?;
     let route_count = routes.len();
-    let changed = state.update_peer_routes(routes).await;
-    if changed {
-        let owned_snapshot = owned_cells.read().await.clone();
-        state.resync_client_interests(&owned_snapshot).await;
+    let routes_changed = state.update_peer_routes(routes).await;
+    let (policies_changed, released_cells) = state.update_handover_policies(policies).await;
+    let owned_snapshot = if routes_changed || !released_cells.is_empty() {
+        Some(owned_cells.read().await.clone())
+    } else {
+        None
+    };
+
+    if routes_changed {
+        let owned_snapshot = owned_snapshot
+            .as_ref()
+            .expect("owned snapshot for route update");
+        state.resync_client_interests(owned_snapshot).await;
         if route_count == 0 {
             warn!(
                 target: "worker",
@@ -1448,7 +1574,14 @@ async fn apply_peer_routes_update(
             );
         }
     }
-    Ok(changed)
+    if !released_cells.is_empty() {
+        let owned_snapshot = owned_snapshot
+            .as_ref()
+            .expect("owned snapshot for released handover cells");
+        flush_buffered_moves_for_cells(state, owned_snapshot, released_cells).await;
+    }
+
+    Ok(routes_changed || policies_changed)
 }
 
 fn peer_routes_from_listing(
@@ -1484,6 +1617,143 @@ fn peer_routes_from_listing(
         }
     }
     Ok(routes)
+}
+
+fn handover_policies_from_listing(
+    listing: &AssignmentListing,
+    self_worker_id: &str,
+) -> Result<HandoverPolicyMap> {
+    let mut policies = HashMap::new();
+    for status in &listing.handovers {
+        if status.source_worker_id != self_worker_id {
+            continue;
+        }
+
+        let Some(assignment) = status.cell.as_ref() else {
+            return Err(anyhow!(
+                "handover status {} is missing cell assignment",
+                status.operation_id
+            ));
+        };
+        let cell = assignment_to_cell_ref(assignment)?;
+        let state = HandoverState::try_from(status.state).unwrap_or(HandoverState::Unspecified);
+        let client_move_policy = HandoverClientMovePolicy::try_from(status.client_move_policy)
+            .unwrap_or(HandoverClientMovePolicy::Unspecified);
+
+        if client_move_policy != HandoverClientMovePolicy::RejectDuringFreeze
+            || !matches!(state, HandoverState::Frozen | HandoverState::Diffing)
+        {
+            continue;
+        }
+
+        let prev = policies.insert(
+            cell,
+            HandoverCellPolicy {
+                operation_id: status.operation_id.clone(),
+                source_worker_id: status.source_worker_id.clone(),
+                target_worker_id: status.target_worker_id.clone(),
+                state,
+                client_move_policy,
+            },
+        );
+        if prev.is_some() {
+            return Err(anyhow!(
+                "duplicate handover move policy for {:?} in listing",
+                cell
+            ));
+        }
+    }
+    Ok(policies)
+}
+
+async fn flush_buffered_moves_for_cells(
+    state: &Arc<SharedState>,
+    owned_cells: &HashSet<CellId>,
+    cells: HashSet<CellId>,
+) {
+    let mut cells = cells.into_iter().collect::<Vec<_>>();
+    cells.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+
+    for cell in cells {
+        let buffered_moves = state.drain_buffered_moves(cell).await;
+        if buffered_moves.is_empty() {
+            continue;
+        }
+
+        let total = buffered_moves.len();
+        let mut applied = 0_usize;
+        let mut rejected = 0_usize;
+        let mut expired = 0_usize;
+        let mut response_closed = 0_usize;
+        let mut cell_not_owned = 0_usize;
+
+        for buffered in buffered_moves {
+            if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
+                expired += 1;
+                if enqueue_error(
+                    &buffered.subscriber.tx,
+                    cell,
+                    buffered.epoch,
+                    "handover_move_expired",
+                    "move rejected: handover move buffer entry expired",
+                )
+                .is_err()
+                {
+                    response_closed += 1;
+                }
+                continue;
+            }
+
+            if !owned_cells.contains(&cell) {
+                cell_not_owned += 1;
+                if enqueue_error(
+                    &buffered.subscriber.tx,
+                    cell,
+                    buffered.epoch,
+                    "handover_cell_not_owned",
+                    "move rejected: cell is no longer owned by this worker",
+                )
+                .is_err()
+                {
+                    response_closed += 1;
+                }
+                continue;
+            }
+
+            match apply_client_move(
+                state,
+                owned_cells,
+                &buffered.subscriber.tx,
+                &buffered.subscriber,
+                Some(buffered.connection_epoch.as_ref()),
+                buffered.client_id,
+                buffered.peer,
+                cell,
+                buffered.actor,
+                buffered.dx,
+                buffered.dy,
+                buffered.epoch,
+            )
+            .await
+            {
+                MoveApplyOutcome::Applied => applied += 1,
+                MoveApplyOutcome::Rejected => rejected += 1,
+                MoveApplyOutcome::ResponseClosed => response_closed += 1,
+            }
+        }
+
+        info!(
+            target: "worker",
+            cell = ?cell,
+            total,
+            applied,
+            rejected,
+            expired,
+            cell_not_owned,
+            response_closed,
+            "flushed handover move buffer"
+        );
+    }
 }
 
 fn orchestrator_endpoint() -> String {
@@ -1935,6 +2205,16 @@ fn load_aoi_edge_margin_units() -> Result<Option<f32>> {
     parse_aoi_edge_margin_units(raw.as_deref())
 }
 
+fn load_handover_move_buffer_capacity() -> Result<usize> {
+    let raw = std::env::var("TESSERA_WORKER_HANDOVER_MOVE_BUFFER_CAPACITY").ok();
+    parse_handover_move_buffer_capacity(raw.as_deref())
+}
+
+fn load_handover_move_buffer_ttl() -> Result<Duration> {
+    let raw = std::env::var("TESSERA_WORKER_HANDOVER_MOVE_BUFFER_TTL_MS").ok();
+    parse_handover_move_buffer_ttl(raw.as_deref())
+}
+
 fn parse_aoi_radius_cells(raw: Option<&str>) -> Result<i32> {
     let Some(raw) = raw else {
         return Ok(DEFAULT_AOI_RADIUS_CELLS);
@@ -1993,6 +2273,42 @@ fn parse_aoi_edge_margin_units(raw: Option<&str>) -> Result<Option<f32>> {
         return Err(anyhow!("AOI edge margin must be >= 0"));
     }
     Ok(Some(margin))
+}
+
+fn parse_handover_move_buffer_capacity(raw: Option<&str>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY);
+    }
+
+    let capacity = trimmed
+        .parse::<usize>()
+        .with_context(|| format!("invalid handover move buffer capacity `{trimmed}`"))?;
+    if capacity == 0 {
+        return Err(anyhow!("handover move buffer capacity must be > 0"));
+    }
+    Ok(capacity)
+}
+
+fn parse_handover_move_buffer_ttl(raw: Option<&str>) -> Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(Duration::from_millis(DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Duration::from_millis(DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS));
+    }
+
+    let ttl_ms = trimmed
+        .parse::<u64>()
+        .with_context(|| format!("invalid handover move buffer TTL `{trimmed}`"))?;
+    if ttl_ms == 0 {
+        return Err(anyhow!("handover move buffer TTL must be > 0"));
+    }
+    Ok(Duration::from_millis(ttl_ms))
 }
 
 async fn retry_assignments_until_registered<F, Fut>(
@@ -2903,6 +3219,247 @@ async fn handle_worker_relay_inner(
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveApplyOutcome {
+    Applied,
+    Rejected,
+    ResponseClosed,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_client_move(
+    state: &Arc<SharedState>,
+    owned_cells: &HashSet<CellId>,
+    tx: &Sender<OutboundMsg>,
+    subscriber: &CellSubscriber,
+    epoch_tracker: Option<&AtomicU32>,
+    client_id: u64,
+    peer: SocketAddr,
+    cell: CellId,
+    actor: EntityId,
+    dx: f32,
+    dy: f32,
+    epoch: u32,
+) -> MoveApplyOutcome {
+    if !delta_is_finite(dx, dy) {
+        warn!(
+            target: "worker",
+            %peer,
+            cell = ?cell,
+            actor = actor.0,
+            "move rejected: non-finite delta"
+        );
+        return if enqueue_error(
+            tx,
+            cell,
+            epoch,
+            "invalid_delta",
+            "move rejected: invalid delta",
+        )
+        .is_err()
+        {
+            MoveApplyOutcome::ResponseClosed
+        } else {
+            MoveApplyOutcome::Rejected
+        };
+    }
+
+    match state.owner_for(&cell, &actor).await {
+        Some(owner) if owner == client_id => {}
+        Some(owner) => {
+            warn!(
+                target: "worker",
+                %peer,
+                cell = ?cell,
+                actor = actor.0,
+                owner,
+                client_id,
+                "move rejected: actor owned by different client"
+            );
+            return if enqueue_error(
+                tx,
+                cell,
+                epoch,
+                "actor_owned_by_other",
+                "move rejected: actor owned by another client",
+            )
+            .is_err()
+            {
+                MoveApplyOutcome::ResponseClosed
+            } else {
+                MoveApplyOutcome::Rejected
+            };
+        }
+        None => {
+            warn!(
+                target: "worker",
+                %peer,
+                cell = ?cell,
+                actor = actor.0,
+                "move rejected: actor not joined"
+            );
+            return if enqueue_error(
+                tx,
+                cell,
+                epoch,
+                "actor_not_joined",
+                "move rejected: actor not joined",
+            )
+            .is_err()
+            {
+                MoveApplyOutcome::ResponseClosed
+            } else {
+                MoveApplyOutcome::Rejected
+            };
+        }
+    }
+
+    let moved = {
+        let mut actors = state.actors.lock().await;
+        let cell_actors = match actors.get_mut(&cell) {
+            Some(map) => map,
+            None => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    cell = ?cell,
+                    actor = actor.0,
+                    "move rejected: cell has no actors"
+                );
+                return if enqueue_error(
+                    tx,
+                    cell,
+                    epoch,
+                    "actor_not_joined",
+                    "move rejected: actor not joined",
+                )
+                .is_err()
+                {
+                    MoveApplyOutcome::ResponseClosed
+                } else {
+                    MoveApplyOutcome::Rejected
+                };
+            }
+        };
+        let entry = match cell_actors.get_mut(&actor) {
+            Some(pos) => pos,
+            None => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    cell = ?cell,
+                    actor = actor.0,
+                    "move rejected: actor not found in cell"
+                );
+                return if enqueue_error(
+                    tx,
+                    cell,
+                    epoch,
+                    "actor_not_joined",
+                    "move rejected: actor not joined",
+                )
+                .is_err()
+                {
+                    MoveApplyOutcome::ResponseClosed
+                } else {
+                    MoveApplyOutcome::Rejected
+                };
+            }
+        };
+        let new_x = entry.x + dx;
+        let new_y = entry.y + dy;
+        if !(new_x.is_finite() && new_y.is_finite()) {
+            warn!(
+                target: "worker",
+                %peer,
+                cell = ?cell,
+                actor = actor.0,
+                "move rejected: position overflow"
+            );
+            return if enqueue_error(
+                tx,
+                cell,
+                epoch,
+                "position_overflow",
+                "move rejected: position overflow",
+            )
+            .is_err()
+            {
+                MoveApplyOutcome::ResponseClosed
+            } else {
+                MoveApplyOutcome::Rejected
+            };
+        }
+        entry.x = new_x;
+        entry.y = new_y;
+        ActorState {
+            id: actor,
+            pos: *entry,
+        }
+    };
+
+    if let Some(epoch_tracker) = epoch_tracker {
+        epoch_tracker.store(epoch, Ordering::Relaxed);
+    }
+    state.touch_client_epoch(subscriber, epoch).await;
+
+    let delta = ServerMsg::Delta {
+        cell,
+        moved: vec![moved],
+    };
+    if tx.try_send((cell, Some(epoch), delta)).is_err() {
+        warn!(
+            target: "worker",
+            %peer,
+            "client response channel closed; closing connection"
+        );
+        state
+            .enqueue_move_broadcast(cell, actor, client_id, epoch)
+            .await;
+        return MoveApplyOutcome::ResponseClosed;
+    }
+
+    state
+        .enqueue_move_broadcast(cell, actor, client_id, epoch)
+        .await;
+
+    let root_actors = state.client_root_actors(client_id).await;
+    let owned_actor_positions = state.actor_positions(&root_actors).await;
+    let desired_targets = desired_aoi_targets_for_positions(
+        &owned_actor_positions,
+        state.aoi_radius_cells,
+        state.aoi_cell_span_units,
+        state.aoi_edge_margin_units,
+    );
+    let desired_cells = desired_targets
+        .intersection(owned_cells)
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut subscribed_cells = state.client_subscribed_cells(client_id).await;
+    if sync_interest_cells(
+        state.as_ref(),
+        subscriber,
+        &mut subscribed_cells,
+        &desired_cells,
+        epoch,
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            target: "worker",
+            %peer,
+            "client response channel closed while syncing AOI after move"
+        );
+        return MoveApplyOutcome::ResponseClosed;
+    }
+    let _ = state
+        .sync_remote_interests(subscriber, client_id, &desired_targets, owned_cells, epoch)
+        .await;
+
+    MoveApplyOutcome::Applied
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_upstream_inner(
     mut reader: OwnedReadHalf,
@@ -3168,253 +3725,69 @@ async fn handle_upstream_inner(
                     .await;
             }
             ClientMsg::Move { actor, dx, dy } => {
-                if !delta_is_finite(dx, dy) {
-                    warn!(
-                        target: "worker",
-                        %peer,
-                        cell = ?cell,
-                        actor = actor.0,
-                        "move rejected: non-finite delta"
-                    );
-                    if enqueue_error(
-                        &tx,
-                        cell,
-                        env_in.epoch,
-                        "invalid_delta",
-                        "move rejected: invalid delta",
-                    )
-                    .is_err()
-                    {
+                if let Some(policy) = state.should_buffer_move(&cell).await {
+                    let buffered = BufferedMove {
+                        subscriber: subscriber.clone(),
+                        connection_epoch: Arc::clone(&epoch),
+                        peer,
+                        client_id,
+                        actor,
+                        dx,
+                        dy,
+                        epoch: env_in.epoch,
+                        buffered_at: Instant::now(),
+                    };
+                    if state.buffer_client_move(cell, buffered).await.is_err() {
                         warn!(
                             target: "worker",
                             %peer,
-                            "client response channel closed; closing connection"
+                            cell = ?cell,
+                            actor = actor.0,
+                            operation_id = %policy.operation_id,
+                            source_worker_id = %policy.source_worker_id,
+                            target_worker_id = %policy.target_worker_id,
+                            "handover move buffer full; rejecting move"
                         );
-                        break Ok(());
+                        if enqueue_error(
+                            &tx,
+                            cell,
+                            env_in.epoch,
+                            "handover_move_buffer_full",
+                            "move rejected: handover move buffer is full",
+                        )
+                        .is_err()
+                        {
+                            break Ok(());
+                        }
                     }
                     continue;
                 }
-                match state.owner_for(&cell, &actor).await {
-                    Some(owner) if owner == client_id => {}
-                    Some(owner) => {
-                        warn!(
-                            target: "worker",
-                            %peer,
-                            cell = ?cell,
-                            actor = actor.0,
-                            owner,
-                            client_id,
-                            "move rejected: actor owned by different client"
-                        );
-                        if enqueue_error(
-                            &tx,
-                            cell,
-                            env_in.epoch,
-                            "actor_owned_by_other",
-                            "move rejected: actor owned by another client",
-                        )
-                        .is_err()
-                        {
-                            warn!(
-                                target: "worker",
-                                %peer,
-                                "client response channel closed; closing connection"
-                            );
-                            break Ok(());
-                        }
-                        continue;
-                    }
-                    None => {
-                        warn!(
-                            target: "worker",
-                            %peer,
-                            cell = ?cell,
-                            actor = actor.0,
-                            "move rejected: actor not joined"
-                        );
-                        if enqueue_error(
-                            &tx,
-                            cell,
-                            env_in.epoch,
-                            "actor_not_joined",
-                            "move rejected: actor not joined",
-                        )
-                        .is_err()
-                        {
-                            warn!(
-                                target: "worker",
-                                %peer,
-                                "client response channel closed; closing connection"
-                            );
-                            break Ok(());
-                        }
-                        continue;
-                    }
-                }
 
-                let moved = {
-                    let mut actors = state.actors.lock().await;
-                    let cell_actors = match actors.get_mut(&cell) {
-                        Some(map) => map,
-                        None => {
-                            warn!(
-                                target: "worker",
-                                %peer,
-                                cell = ?cell,
-                                actor = actor.0,
-                                "move rejected: cell has no actors"
-                            );
-                            if enqueue_error(
-                                &tx,
-                                cell,
-                                env_in.epoch,
-                                "actor_not_joined",
-                                "move rejected: actor not joined",
-                            )
-                            .is_err()
-                            {
-                                warn!(
-                                    target: "worker",
-                                    %peer,
-                                    "client response channel closed; closing connection"
-                                );
-                                break Ok(());
-                            }
-                            continue;
-                        }
-                    };
-                    let entry = match cell_actors.get_mut(&actor) {
-                        Some(pos) => pos,
-                        None => {
-                            warn!(
-                                target: "worker",
-                                %peer,
-                                cell = ?cell,
-                                actor = actor.0,
-                                "move rejected: actor not found in cell"
-                            );
-                            if enqueue_error(
-                                &tx,
-                                cell,
-                                env_in.epoch,
-                                "actor_not_joined",
-                                "move rejected: actor not joined",
-                            )
-                            .is_err()
-                            {
-                                warn!(
-                                    target: "worker",
-                                    %peer,
-                                    "client response channel closed; closing connection"
-                                );
-                                break Ok(());
-                            }
-                            continue;
-                        }
-                    };
-                    let new_x = entry.x + dx;
-                    let new_y = entry.y + dy;
-                    if !(new_x.is_finite() && new_y.is_finite()) {
-                        warn!(
-                            target: "worker",
-                            %peer,
-                            cell = ?cell,
-                            actor = actor.0,
-                            "move rejected: position overflow"
-                        );
-                        if enqueue_error(
-                            &tx,
-                            cell,
-                            env_in.epoch,
-                            "position_overflow",
-                            "move rejected: position overflow",
-                        )
-                        .is_err()
-                        {
-                            warn!(
-                                target: "worker",
-                                %peer,
-                                "client response channel closed; closing connection"
-                            );
-                            break Ok(());
-                        }
-                        continue;
-                    }
-                    entry.x = new_x;
-                    entry.y = new_y;
-                    ActorState {
-                        id: actor,
-                        pos: *entry,
-                    }
-                };
-
-                epoch.store(env_in.epoch, Ordering::Relaxed);
-
-                let delta = ServerMsg::Delta {
-                    cell,
-                    moved: vec![moved.clone()],
-                };
-                let mut outbound_failed = false;
-                if tx
-                    .try_send((cell, Some(env_in.epoch), delta.clone()))
-                    .is_err()
-                {
-                    warn!(
-                        target: "worker",
-                        %peer,
-                        "client response channel closed; closing connection"
-                    );
-                    outbound_failed = true;
-                }
-                state
-                    .enqueue_move_broadcast(cell, actor, client_id, env_in.epoch)
-                    .await;
-                if outbound_failed {
-                    break Ok(());
-                }
-                state.touch_client_epoch(&subscriber, env_in.epoch).await;
-                let owned_actor_positions = state.actor_positions(&owned_actors).await;
-                let desired_targets = desired_aoi_targets_for_positions(
-                    &owned_actor_positions,
-                    state.aoi_radius_cells,
-                    state.aoi_cell_span_units,
-                    state.aoi_edge_margin_units,
-                );
-                let desired_cells = desired_targets
-                    .intersection(&owned_guard)
-                    .copied()
-                    .collect::<HashSet<_>>();
-                if sync_interest_cells(
-                    state.as_ref(),
+                match apply_client_move(
+                    &state,
+                    &owned_guard,
+                    &tx,
                     &subscriber,
-                    &mut subscribed_cells,
-                    &desired_cells,
+                    Some(epoch.as_ref()),
+                    client_id,
+                    peer,
+                    cell,
+                    actor,
+                    dx,
+                    dy,
                     env_in.epoch,
                 )
                 .await
-                .is_err()
                 {
-                    warn!(
-                        target: "worker",
-                        %peer,
-                        "client response channel closed while syncing AOI after move"
-                    );
-                    break Ok(());
+                    MoveApplyOutcome::ResponseClosed => break Ok(()),
+                    MoveApplyOutcome::Applied | MoveApplyOutcome::Rejected => {}
                 }
-                let _ = state
-                    .sync_remote_interests(
-                        &subscriber,
-                        client_id,
-                        &desired_targets,
-                        &owned_guard,
-                        env_in.epoch,
-                    )
-                    .await;
             }
         }
     };
 
     state.remove_client_subscriptions(client_id).await;
+    state.drop_buffered_moves_for_client(client_id).await;
     state.sync_remote_peer_sessions().await;
     state
         .remove_owned_actors(
@@ -3735,6 +4108,7 @@ mod tests {
                     }],
                 },
             ],
+            handovers: vec![],
         };
 
         let routes = peer_routes_from_listing(&listing, "worker-a").expect("peer routes");
@@ -3776,10 +4150,71 @@ mod tests {
                     }],
                 },
             ],
+            handovers: vec![],
         };
 
         let err = peer_routes_from_listing(&listing, "worker-a").expect_err("duplicate route");
         assert!(err.to_string().contains("duplicate remote route"));
+    }
+
+    #[test]
+    fn handover_policies_from_listing_tracks_source_freeze_and_diff() {
+        let cell = CellId::grid(0, 0, 0);
+        let listing = AssignmentListing {
+            workers: vec![],
+            handovers: vec![
+                tessera_proto::orch::v1::HandoverStatus {
+                    operation_id: "op-freeze".into(),
+                    cell: Some(Assignment {
+                        world: cell.world,
+                        cx: cell.cx,
+                        cy: cell.cy,
+                        depth: cell.depth.into(),
+                        sub: cell.sub.into(),
+                    }),
+                    source_worker_id: "worker-a".into(),
+                    target_worker_id: "worker-b".into(),
+                    state: HandoverState::Frozen as i32,
+                    client_move_policy: HandoverClientMovePolicy::RejectDuringFreeze as i32,
+                },
+                tessera_proto::orch::v1::HandoverStatus {
+                    operation_id: "op-other-source".into(),
+                    cell: Some(Assignment {
+                        world: 0,
+                        cx: 1,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }),
+                    source_worker_id: "worker-c".into(),
+                    target_worker_id: "worker-a".into(),
+                    state: HandoverState::Diffing as i32,
+                    client_move_policy: HandoverClientMovePolicy::RejectDuringFreeze as i32,
+                },
+                tessera_proto::orch::v1::HandoverStatus {
+                    operation_id: "op-precopy".into(),
+                    cell: Some(Assignment {
+                        world: 0,
+                        cx: 2,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }),
+                    source_worker_id: "worker-a".into(),
+                    target_worker_id: "worker-b".into(),
+                    state: HandoverState::PreCopying as i32,
+                    client_move_policy: HandoverClientMovePolicy::Allow as i32,
+                },
+            ],
+        };
+
+        let policies =
+            handover_policies_from_listing(&listing, "worker-a").expect("handover policies");
+        assert_eq!(policies.len(), 1);
+        let policy = policies.get(&cell).expect("source cell policy");
+        assert_eq!(policy.operation_id, "op-freeze");
+        assert_eq!(policy.target_worker_id, "worker-b");
+        assert_eq!(policy.state, HandoverState::Frozen);
     }
 
     #[tokio::test]
@@ -3873,6 +4308,7 @@ mod tests {
                     }],
                 },
             ],
+            handovers: vec![],
         };
 
         apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
@@ -3883,6 +4319,108 @@ mod tests {
             state.remote_interest_cells(watcher.client_id).await,
             HashSet::from([remote])
         );
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_replays_buffered_moves_after_handover_release() {
+        let state = Arc::new(SharedState::with_runtime_config(
+            0,
+            DEFAULT_AOI_CELL_SPAN_UNITS,
+            None,
+            4,
+            Duration::from_secs(1),
+        ));
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(7);
+        let client_id = 77;
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+
+        assert_eq!(
+            state.claim_owner(cell, actor, client_id).await,
+            ClaimOutcome::GrantedNew
+        );
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(actor, Position { x: 1.0, y: 2.0 });
+        }
+
+        let (tx, mut rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(client_id, tx, &disconnect_tx);
+        let connection_epoch = Arc::new(AtomicU32::new(10));
+        state.subscribe(cell, &subscriber).await;
+        state.upsert_client_root(&subscriber, cell, actor, 10).await;
+        state
+            .update_handover_policies(HashMap::from([(
+                cell,
+                HandoverCellPolicy {
+                    operation_id: "op-1".into(),
+                    source_worker_id: "worker-a".into(),
+                    target_worker_id: "worker-b".into(),
+                    state: HandoverState::Frozen,
+                    client_move_policy: HandoverClientMovePolicy::RejectDuringFreeze,
+                },
+            )]))
+            .await;
+        state
+            .buffer_client_move(
+                cell,
+                BufferedMove {
+                    subscriber: subscriber.clone(),
+                    connection_epoch: Arc::clone(&connection_epoch),
+                    peer: "127.0.0.1:9999".parse().unwrap(),
+                    client_id,
+                    actor,
+                    dx: 3.0,
+                    dy: 4.0,
+                    epoch: 11,
+                    buffered_at: Instant::now(),
+                },
+            )
+            .await
+            .expect("buffer move");
+
+        let listing = AssignmentListing {
+            workers: vec![tessera_proto::orch::v1::AssignmentBundle {
+                worker_id: "worker-a".into(),
+                addr: "127.0.0.1:5001".into(),
+                cells: vec![Assignment {
+                    world: 0,
+                    cx: 0,
+                    cy: 0,
+                    depth: 0,
+                    sub: 0,
+                }],
+            }],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+                .await
+                .expect("apply listing")
+        );
+
+        let replay = rx.try_recv().expect("buffered move should replay");
+        assert_eq!(replay.0, cell);
+        assert_eq!(replay.1, Some(11));
+        match replay.2 {
+            ServerMsg::Delta {
+                cell: delta_cell,
+                moved,
+            } => {
+                assert_eq!(delta_cell, cell);
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, actor);
+                assert_eq!(moved[0].pos, Position { x: 4.0, y: 6.0 });
+            }
+            other => panic!("expected delta replay, got {other:?}"),
+        }
+        assert!(state.drain_buffered_moves(cell).await.is_empty());
+        assert_eq!(connection_epoch.load(Ordering::Relaxed), 11);
     }
 
     #[tokio::test]
