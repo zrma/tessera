@@ -1,38 +1,40 @@
-# Tessera development Dockerfile
-# - Builds the Rust workspace
-# - Runs tessera-worker and tessera-gateway together for local dev
+# syntax=docker/dockerfile:1
 
-FROM rust:1-bookworm
+# Tessera sample runtime image.
+# Builds all workspace binaries once, then ships a small runtime layer that can
+# run gateway, worker, orchestrator, client, or simulator by overriding CMD.
 
-# System deps commonly needed for Rust dev and future gRPC usage
+FROM rust:1.89-bookworm AS builder
+
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-     ca-certificates curl git pkg-config build-essential \
-     protobuf-compiler \
+     ca-certificates pkg-config build-essential protobuf-compiler \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy workspace
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY proto ./proto
+COPY crates ./crates
+COPY xtask ./xtask
 
-# Prime build cache (optional during image build)
-RUN cargo build --workspace --locked || true
+RUN cargo build --workspace --bins --release --locked
 
-# Default env for in-container networking and logs
-ENV TESSERA_GW_ADDR=0.0.0.0:4000 \
-    TESSERA_WORKER_ADDR=0.0.0.0:5001 \
-    RUST_LOG=info \
-    CARGO_TERM_COLOR=always
+FROM debian:bookworm-slim AS runtime
 
-EXPOSE 4000 5001
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
 
-# Run both services and keep the container in foreground
-CMD ["bash", "-lc", "\
-set -euo pipefail; \
-cargo build --workspace; \
-cargo run -p tessera-worker & \
-cargo run -p tessera-gateway & \
-wait -n \
-"]
+COPY --from=builder /app/target/release/tessera-client /usr/local/bin/tessera-client
+COPY --from=builder /app/target/release/tessera-gateway /usr/local/bin/tessera-gateway
+COPY --from=builder /app/target/release/tessera-orch /usr/local/bin/tessera-orch
+COPY --from=builder /app/target/release/tessera-sim /usr/local/bin/tessera-sim
+COPY --from=builder /app/target/release/tessera-worker /usr/local/bin/tessera-worker
 
+ENV RUST_LOG=info
+
+EXPOSE 4000 4100 5001 5100 6000 6100
+
+USER 65532:65532
+CMD ["tessera-gateway"]
