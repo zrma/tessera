@@ -635,6 +635,7 @@ fn dev_metrics_smoke() -> Result<()> {
                 "tessera_gateway_routes",
                 "tessera_gateway_accepted_connections_total",
                 "tessera_gateway_upstream_connect_attempts_total",
+                "tessera_gateway_ping_roundtrip_seconds_count",
                 "tessera_gateway_client_closes_no_route_total",
             ],
         )?;

@@ -101,12 +101,12 @@ Cell-based world orchestration for real-time servers in Rust.
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 per-cell tick flush batch에서 처리하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화한다. AOI는 cell radius, edge margin, visibility radius, max-cell cap으로 제한할 수 있으며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 fanout을 재사용하고 opt-in `/metrics`로 relay fanout/backpressure/reconnect 카운터를 노출
-- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Gateway는 route availability 기반 `/ready`와 reconnect/close-reason counters를 노출
+- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Gateway는 route availability 기반 `/ready`, reconnect/close-reason counters, Ping/Pong round-trip latency histogram을 노출
 - Handover runtime baseline: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하고, Orchestrator `ListAssignments`/`WatchAssignments`가 active handover status를 내려주며, source Worker는 `Freeze`/`Diff` 중 bounded buffer에 client move를 보관한다. `Abort`처럼 source가 계속 cell을 소유하면 buffered move를 FIFO로 로컬 replay하고, `Commit`은 target Worker 등록과 bounded retry budget을 확인한 뒤 assignment를 target으로 전환한다. source Worker는 commit release 시 actor snapshot, actor별 owner session manifest, buffered move를 target Worker에 `HandoverReplay` relay payload로 넘기며, target은 replay를 idempotent하게 적용하고 owner map을 즉시 구성한다.
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Worker 간 ghost relay의 장기 scrape/tracing assertions와 Gateway latency histogram 고도화
+- Worker 간 ghost relay의 장기 scrape/tracing assertions와 비-Ping request latency 계측 고도화
 - Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로만 제공되며, production target별 manifests는 아직 미구현
 - 리밸런싱 자동화, 동적 분할(V1/V2) 구현은 아직 미구현 (`docs/dynamic-split-merge.md`에 설계 노트)
 
@@ -131,7 +131,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - `docs/quality.md`는 자율 수행 계약, feedback loop, crate boundary policy의 repo-local 기준 문서다.
 - `cargo xt harness`는 README/AGENTS/docs/CI discoverability와 내부 크레이트 의존 방향을 검사한다.
 - 현재 기계적 crate boundary: `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, `tessera-gateway`/`tessera-worker`/`tessera-orch`는 `tessera-core`와 `tessera-proto`만 공유 의존성으로 사용하며 서로 직접 의존하지 않는다.
-- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready` 응답을 확인한다.
+- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready` 응답을 확인한다. Gateway metrics에는 `tessera_gateway_ping_roundtrip_seconds` histogram이 포함된다.
 - `docs/packaging.md`와 `deploy/`는 Docker/Compose/Kubernetes packaging sample을 제공한다. 실제 클러스터용 manifest는 target convention을 확인한 뒤 별도 작업으로 추가한다.
 - CI는 push/PR에서 `cargo xt`, `cargo test`, `cargo xt dev up --with-orch` + `cargo run -p tessera-client -- ping --ts 123` 스모크를 실행한다.
 

@@ -109,4 +109,28 @@ Original recommendation:
 
 ## Suggested Order
 
-1. Gateway latency histogram after the Prometheus histogram format is chosen.
+All currently listed P2 slices are complete as of 2026-04-26.
+
+## P2.4 Gateway latency histogram
+
+Goal: expose a concrete latency histogram from the Gateway metrics endpoint
+without inventing a broader correlation protocol.
+
+Status: done 2026-04-26.
+
+Implemented slice:
+
+1. Gateway tracks client Ping to upstream Pong round-trip latency.
+2. Prometheus output uses a conventional histogram family:
+   `tessera_gateway_ping_roundtrip_seconds_bucket`,
+   `tessera_gateway_ping_roundtrip_seconds_sum`, and
+   `tessera_gateway_ping_roundtrip_seconds_count`.
+3. Bucket boundaries are fixed at 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms,
+   500ms, 1s, 2.5s, and 5s.
+4. `cargo xt dev metrics-smoke` asserts the histogram family exists.
+
+Deferred:
+
+- Non-Ping request latency remains deferred until the protocol carries an
+  explicit request id or response correlation key. Snapshot/Delta frames may
+  also be broadcast traffic, so FIFO matching would overcount unrelated pushes.

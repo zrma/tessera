@@ -73,4 +73,5 @@ Last reviewed: 2026-04-26
 - [done 2026-04-26] Long-lived quality loop: metrics scrape assertion을 별도 `cargo xt dev metrics-smoke`로 추가했다.
 - [done 2026-04-26] Gateway readiness/reconnect 관측: Gateway metrics listener에 `/ready`를 추가하고, route availability, upstream connect attempts, route-change reconnects, close reason counters를 Prometheus와 log field로 정리했다.
 - [done 2026-04-26] Container/Kubernetes packaging sample: multi-binary runtime image, Compose smoke, non-production Kubernetes sample, packaging docs를 추가했다.
-- Gateway latency histogram: request/round-trip latency bucket format을 정한 뒤 Gateway metrics에 추가한다.
+- [done 2026-04-26] Gateway Ping/Pong latency histogram: request/round-trip latency bucket format을 정하고 Gateway metrics와 metrics smoke에 추가했다.
+- 비-Ping request latency 계측은 protocol-level request id가 생긴 뒤 일반화한다.
