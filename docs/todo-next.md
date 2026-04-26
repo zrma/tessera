@@ -57,9 +57,10 @@ Last reviewed: 2026-04-26
    - 완료 조건: centered/edge/distant actor cases가 deterministic test로 고정되고, AOI 폭주 방지 cap이 문서화된다.
    - 검증: `TESSERA_WORKER_AOI_VISIBILITY_RADIUS_UNITS`, `TESSERA_WORKER_AOI_MAX_CELLS`, 거리 기반 centered/edge/corner/distant/cap test.
 
-4. Multi-cell tick pipeline
+4. [done 2026-04-26] Multi-cell tick pipeline
    - 목표: Worker 내부의 셀별 tick, broadcast flush, relay fanout 단계를 더 명시적인 pipeline으로 나눈다.
    - 완료 조건: 기존 client/ghost behavior test가 유지되고, per-cell stage를 개별적으로 테스트할 수 있다.
+   - 검증: ordered per-cell flush batch unit test, 기존 queued move/ghost relay tests, `cargo xt`, `cargo test`, runtime smoke.
 
 5. Dynamic split/merge design note
    - 목표: quadtree split/merge 조건, hysteresis, assignment churn 제한을 문서로 고정한다.
