@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -63,6 +63,8 @@ enum DevSub {
         #[arg(long)]
         lines: Option<usize>,
     },
+    /// Start dev stack with metrics enabled and assert /metrics responses
+    MetricsSmoke,
 }
 
 fn main() -> Result<()> {
@@ -89,6 +91,7 @@ fn main() -> Result<()> {
                 follow,
                 lines,
             } => dev_logs(&target, follow, lines)?,
+            DevSub::MetricsSmoke => dev_metrics_smoke()?,
         },
     }
     Ok(())
@@ -323,7 +326,22 @@ fn dev_dirs() -> (PathBuf, PathBuf, PathBuf) {
     (dev, logs, pids)
 }
 
+#[derive(Debug, Clone, Default)]
+struct DevLaunchOptions {
+    gateway_metrics_addr: Option<String>,
+    worker_metrics_addr: Option<String>,
+    orch_metrics_addr: Option<String>,
+}
+
 fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
+    dev_up_inner(with_orch, orch_config, DevLaunchOptions::default())
+}
+
+fn dev_up_inner(
+    with_orch: bool,
+    orch_config: Option<PathBuf>,
+    options: DevLaunchOptions,
+) -> Result<()> {
     let root = workspace_root();
     let (_dev, logs, pids) = dev_dirs();
     fs::create_dir_all(&logs)?;
@@ -382,6 +400,9 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
                 };
                 ocmd.env("TESSERA_ORCH_CONFIG", cfg_path);
             }
+            if let Some(addr) = options.orch_metrics_addr.as_ref() {
+                ocmd.env("TESSERA_ORCH_METRICS_ADDR", addr);
+            }
             detach_background_process(&mut ocmd);
             let mut child = ocmd
                 .stdout(orch_log.try_clone()?)
@@ -397,6 +418,9 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
         wcmd.current_dir(&root)
             .env("RUST_LOG", &rust_log)
             .env("TESSERA_WORKER_ADDR", &worker_addr);
+        if let Some(addr) = options.worker_metrics_addr.as_ref() {
+            wcmd.env("TESSERA_WORKER_METRICS_ADDR", addr);
+        }
         detach_background_process(&mut wcmd);
         let mut child = wcmd
             .stdout(worker_log.try_clone()?)
@@ -412,6 +436,9 @@ fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
             .env("RUST_LOG", &rust_log)
             .env("TESSERA_GW_ADDR", &gateway_addr)
             .env("TESSERA_WORKER_ADDR", &worker_addr);
+        if let Some(addr) = options.gateway_metrics_addr.as_ref() {
+            gcmd.env("TESSERA_GW_METRICS_ADDR", addr);
+        }
         detach_background_process(&mut gcmd);
         let mut child = gcmd
             .stdout(gateway_log.try_clone()?)
@@ -588,6 +615,113 @@ fn dev_down(with_orch: bool) -> Result<()> {
     Ok(())
 }
 
+fn dev_metrics_smoke() -> Result<()> {
+    let gateway_metrics_addr = "127.0.0.1:4100";
+    let worker_metrics_addr = "127.0.0.1:5100";
+    let orch_metrics_addr = "127.0.0.1:6100";
+    let options = DevLaunchOptions {
+        gateway_metrics_addr: Some(gateway_metrics_addr.to_string()),
+        worker_metrics_addr: Some(worker_metrics_addr.to_string()),
+        orch_metrics_addr: Some(orch_metrics_addr.to_string()),
+    };
+
+    dev_up_inner(true, None, options)?;
+    let smoke_result = (|| -> Result<()> {
+        assert_metrics_endpoint(
+            "gateway",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_accepted_connections_total",
+            ],
+        )?;
+        assert_metrics_endpoint(
+            "worker",
+            worker_metrics_addr,
+            &[
+                "tessera_worker_client_subscribers",
+                "tessera_worker_accepted_connections_total",
+            ],
+        )?;
+        assert_metrics_endpoint(
+            "orchestrator",
+            orch_metrics_addr,
+            &[
+                "tessera_orch_configured_workers",
+                "tessera_orch_registration_attempts_total",
+            ],
+        )?;
+        Ok(())
+    })();
+    let down_result = dev_down(true);
+
+    smoke_result?;
+    down_result?;
+    println!("metrics smoke: gateway, worker, and orchestrator /metrics are valid");
+    Ok(())
+}
+
+fn assert_metrics_endpoint(service: &str, raw_addr: &str, required_metrics: &[&str]) -> Result<()> {
+    let addr = readiness_addr(raw_addr)?;
+    let response = http_get(addr, "/metrics")?;
+    assert_prometheus_response(service, &response, required_metrics)
+}
+
+fn http_get(addr: SocketAddr, path: &str) -> Result<String> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn assert_prometheus_response(
+    service: &str,
+    response: &str,
+    required_metrics: &[&str],
+) -> Result<()> {
+    if !response.starts_with("HTTP/1.1 200 OK") {
+        bail!("{service} metrics smoke failed: expected HTTP 200 response");
+    }
+    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+        bail!("{service} metrics smoke failed: missing HTTP body separator");
+    };
+    for required in required_metrics {
+        if !body.contains(required) {
+            bail!("{service} metrics smoke failed: missing metric `{required}`");
+        }
+    }
+    let mut samples = 0_usize;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else {
+            bail!("{service} metrics smoke failed: metric `{name}` has no value");
+        };
+        value.parse::<f64>().map_err(|err| {
+            anyhow::anyhow!(
+                "{service} metrics smoke failed: metric `{name}` has invalid value `{value}`: {err}"
+            )
+        })?;
+        samples += 1;
+    }
+    if samples == 0 {
+        bail!("{service} metrics smoke failed: no metric samples found");
+    }
+    Ok(())
+}
+
 fn dev_logs(target: &str, follow: bool, lines: Option<usize>) -> Result<()> {
     let (_dev, logs, _pids) = dev_dirs();
     let gw = logs.join("gateway.log");
@@ -659,6 +793,22 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("parse socket addr")
         );
+    }
+
+    #[test]
+    fn prometheus_response_requires_metric_samples() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\n# TYPE demo gauge\ndemo 1\n";
+        assert_prometheus_response("demo", response, &["demo"]).expect("valid metrics");
+
+        let missing = "HTTP/1.1 200 OK\r\n\r\n# TYPE other gauge\nother 1\n";
+        let err = assert_prometheus_response("demo", missing, &["demo"])
+            .expect_err("missing required metric should fail");
+        assert!(err.to_string().contains("missing metric"));
+
+        let invalid = "HTTP/1.1 200 OK\r\n\r\n# TYPE demo gauge\ndemo nope\n";
+        let err = assert_prometheus_response("demo", invalid, &["demo"])
+            .expect_err("invalid metric value should fail");
+        assert!(err.to_string().contains("invalid value"));
     }
 
     #[test]
