@@ -122,10 +122,30 @@ enum ClaimOutcome {
     Denied(u64),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct PendingMoveBroadcast {
     exclude_client_id: u64,
     epoch: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TickMoveEvent {
+    actor: ActorState,
+    exclude_client_id: u64,
+    epoch: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TickCellFlush {
+    cell: CellId,
+    moved: Vec<TickMoveEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TickPipelineBatch {
+    queued_cells: usize,
+    queued_moves: usize,
+    cell_flushes: Vec<TickCellFlush>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3011,41 +3031,71 @@ async fn retry_assignments_until_registered<F, Fut>(
     }
 }
 
-async fn on_tick(tick: Tick, state: &SharedState) {
+fn cell_sort_key(cell: CellId) -> (u32, i32, i32, u8, u8) {
+    (cell.world, cell.cy, cell.cx, cell.depth, cell.sub)
+}
+
+fn build_tick_cell_flushes(
+    pending: PendingMoveQueues,
+    actors: &HashMap<CellId, HashMap<EntityId, Position>>,
+) -> Vec<TickCellFlush> {
+    let mut cells = pending.into_iter().collect::<Vec<_>>();
+    cells.sort_by_key(|(cell, _)| cell_sort_key(*cell));
+
+    let mut flushes = Vec::new();
+    for (cell, queued) in cells {
+        let Some(cell_actors) = actors.get(&cell) else {
+            continue;
+        };
+        let mut moved = queued
+            .into_iter()
+            .filter_map(|(actor_id, event)| {
+                cell_actors.get(&actor_id).map(|pos| TickMoveEvent {
+                    actor: ActorState {
+                        id: actor_id,
+                        pos: *pos,
+                    },
+                    exclude_client_id: event.exclude_client_id,
+                    epoch: event.epoch,
+                })
+            })
+            .collect::<Vec<_>>();
+        if moved.is_empty() {
+            continue;
+        }
+        moved.sort_by_key(|event| event.actor.id.0);
+        flushes.push(TickCellFlush { cell, moved });
+    }
+    flushes
+}
+
+async fn prepare_tick_pipeline(state: &SharedState) -> TickPipelineBatch {
     let pending = state.drain_move_broadcasts().await;
     let queued_cells = pending.len();
     let queued_moves = pending.values().map(HashMap::len).sum::<usize>();
 
-    for (cell, queued) in pending {
-        let queued_events = {
-            let actors = state.actors.lock().await;
-            let Some(cell_actors) = actors.get(&cell) else {
-                continue;
-            };
-            queued
-                .into_iter()
-                .filter_map(|(actor_id, event)| {
-                    cell_actors.get(&actor_id).map(|pos| {
-                        (
-                            ActorState {
-                                id: actor_id,
-                                pos: *pos,
-                            },
-                            event,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
+    let cell_flushes = {
+        let actors = state.actors.lock().await;
+        build_tick_cell_flushes(pending, &actors)
+    };
 
-        for (actor, event) in queued_events {
-            let relay_actor = actor.clone();
+    TickPipelineBatch {
+        queued_cells,
+        queued_moves,
+        cell_flushes,
+    }
+}
+
+async fn flush_tick_pipeline(state: &SharedState, batch: &TickPipelineBatch) {
+    for flush in &batch.cell_flushes {
+        for event in &flush.moved {
+            let relay_actor = event.actor.clone();
             state
                 .broadcast(
-                    cell,
+                    flush.cell,
                     ServerMsg::Delta {
-                        cell,
-                        moved: vec![actor],
+                        cell: flush.cell,
+                        moved: vec![event.actor.clone()],
                     },
                     Some(event.exclude_client_id),
                     Some(event.epoch),
@@ -3053,9 +3103,9 @@ async fn on_tick(tick: Tick, state: &SharedState) {
                 .await;
             state
                 .broadcast_relay(
-                    cell,
+                    flush.cell,
                     WorkerRelayMsg::Delta {
-                        cell,
+                        cell: flush.cell,
                         moved: vec![relay_actor],
                     },
                     Some(event.epoch),
@@ -3063,13 +3113,18 @@ async fn on_tick(tick: Tick, state: &SharedState) {
                 .await;
         }
     }
+}
+
+async fn on_tick(tick: Tick, state: &SharedState) {
+    let batch = prepare_tick_pipeline(state).await;
+    flush_tick_pipeline(state, &batch).await;
 
     if tick.0 % 30 == 0 {
         info!(
             target: "worker",
             tick = tick.0,
-            queued_cells,
-            queued_moves,
+            queued_cells = batch.queued_cells,
+            queued_moves = batch.queued_moves,
             "tick heartbeat"
         );
     }
@@ -8123,6 +8178,86 @@ mod tests {
 
         let subs = state.subscribers.lock().await;
         assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn tick_pipeline_builds_ordered_per_cell_flushes() {
+        let cell_a = CellId::grid(0, 0, 0);
+        let cell_b = CellId::grid(0, 1, 0);
+        let missing = EntityId(99);
+        let actor_a = EntityId(1);
+        let actor_b = EntityId(2);
+
+        let pending = HashMap::from([
+            (
+                cell_b,
+                HashMap::from([
+                    (
+                        actor_b,
+                        PendingMoveBroadcast {
+                            exclude_client_id: 20,
+                            epoch: 22,
+                        },
+                    ),
+                    (
+                        missing,
+                        PendingMoveBroadcast {
+                            exclude_client_id: 99,
+                            epoch: 99,
+                        },
+                    ),
+                ]),
+            ),
+            (
+                cell_a,
+                HashMap::from([(
+                    actor_a,
+                    PendingMoveBroadcast {
+                        exclude_client_id: 10,
+                        epoch: 11,
+                    },
+                )]),
+            ),
+        ]);
+        let actors = HashMap::from([
+            (
+                cell_a,
+                HashMap::from([(actor_a, Position { x: 1.0, y: 2.0 })]),
+            ),
+            (
+                cell_b,
+                HashMap::from([(actor_b, Position { x: 3.0, y: 4.0 })]),
+            ),
+        ]);
+
+        let flushes = build_tick_cell_flushes(pending, &actors);
+        assert_eq!(
+            flushes,
+            vec![
+                TickCellFlush {
+                    cell: cell_a,
+                    moved: vec![TickMoveEvent {
+                        actor: ActorState {
+                            id: actor_a,
+                            pos: Position { x: 1.0, y: 2.0 },
+                        },
+                        exclude_client_id: 10,
+                        epoch: 11,
+                    }],
+                },
+                TickCellFlush {
+                    cell: cell_b,
+                    moved: vec![TickMoveEvent {
+                        actor: ActorState {
+                            id: actor_b,
+                            pos: Position { x: 3.0, y: 4.0 },
+                        },
+                        exclude_client_id: 20,
+                        epoch: 22,
+                    }],
+                },
+            ]
+        );
     }
 
     #[tokio::test]
