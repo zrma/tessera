@@ -86,11 +86,11 @@ Cell-based world orchestration for real-time servers in Rust.
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 중복 연결을 줄임
-- Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments` gRPC 엔드포인트 제공
+- Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics` gRPC 엔드포인트 제공
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Orchestrator 메트릭 집계/헬스 체크 및 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`)
+- Orchestrator 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`) 및 Prometheus exporter
 - Worker AOI/ghost를 셀 경계 기반에서 더 정밀한 거리/가시성 기반으로 고도화하고, 다셀 틱 파이프라인을 구조화
 - Worker 간 ghost relay의 backpressure/헬스/재연결 관측성을 메트릭으로 노출
 - Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
