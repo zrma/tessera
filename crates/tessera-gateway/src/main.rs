@@ -23,6 +23,38 @@ const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
 const MAX_PENDING_PINGS: usize = 32;
 
+#[derive(Debug, Default)]
+struct GatewayMetricsCounters {
+    accepted_connections: AtomicU64,
+    upstream_connects: AtomicU64,
+    upstream_connect_failures: AtomicU64,
+    upstream_route_changes: AtomicU64,
+    upstream_reconnect_attempts: AtomicU64,
+    upstream_closed: AtomicU64,
+    upstream_read_errors: AtomicU64,
+    upstream_write_errors: AtomicU64,
+    invalid_client_frames: AtomicU64,
+    no_route_lookup_failures: AtomicU64,
+    pending_ping_replays: AtomicU64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GatewayMetricsSnapshot {
+    routes: u64,
+    routing_version: u64,
+    accepted_connections: u64,
+    upstream_connects: u64,
+    upstream_connect_failures: u64,
+    upstream_route_changes: u64,
+    upstream_reconnect_attempts: u64,
+    upstream_closed: u64,
+    upstream_read_errors: u64,
+    upstream_write_errors: u64,
+    invalid_client_frames: u64,
+    no_route_lookup_failures: u64,
+    pending_ping_replays: u64,
+}
+
 #[derive(Clone, Debug)]
 struct PendingPing {
     cell: CellId,
@@ -43,6 +75,7 @@ struct WorkerRoute {
 struct RoutingTable {
     routes: Arc<RwLock<HashMap<CellKey, WorkerRoute>>>,
     version: Arc<AtomicU64>,
+    metrics: Arc<GatewayMetricsCounters>,
 }
 
 impl RoutingTable {
@@ -50,6 +83,7 @@ impl RoutingTable {
         Self {
             routes: Arc::new(RwLock::new(initial)),
             version: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(GatewayMetricsCounters::default()),
         }
     }
 
@@ -60,6 +94,33 @@ impl RoutingTable {
 
     async fn len(&self) -> usize {
         self.routes.read().await.len()
+    }
+
+    async fn metrics_snapshot(&self) -> GatewayMetricsSnapshot {
+        GatewayMetricsSnapshot {
+            routes: self.len().await as u64,
+            routing_version: self.version.load(Ordering::Relaxed),
+            accepted_connections: self.metrics.accepted_connections.load(Ordering::Relaxed),
+            upstream_connects: self.metrics.upstream_connects.load(Ordering::Relaxed),
+            upstream_connect_failures: self
+                .metrics
+                .upstream_connect_failures
+                .load(Ordering::Relaxed),
+            upstream_route_changes: self.metrics.upstream_route_changes.load(Ordering::Relaxed),
+            upstream_reconnect_attempts: self
+                .metrics
+                .upstream_reconnect_attempts
+                .load(Ordering::Relaxed),
+            upstream_closed: self.metrics.upstream_closed.load(Ordering::Relaxed),
+            upstream_read_errors: self.metrics.upstream_read_errors.load(Ordering::Relaxed),
+            upstream_write_errors: self.metrics.upstream_write_errors.load(Ordering::Relaxed),
+            invalid_client_frames: self.metrics.invalid_client_frames.load(Ordering::Relaxed),
+            no_route_lookup_failures: self
+                .metrics
+                .no_route_lookup_failures
+                .load(Ordering::Relaxed),
+            pending_ping_replays: self.metrics.pending_ping_replays.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -75,6 +136,18 @@ async fn main() -> Result<()> {
 
     let initial_routes = load_initial_routes().await?;
     let table = RoutingTable::new(initial_routes);
+    if let Some(listener) = load_metrics_listener().await? {
+        let metrics_table = table.clone();
+        let metrics_addr = listener
+            .local_addr()
+            .context("read gateway prometheus metrics listener addr")?;
+        info!(target: "gateway", %metrics_addr, "tessera-gateway prometheus metrics listening");
+        tokio::spawn(async move {
+            if let Err(e) = serve_prometheus_metrics(listener, metrics_table).await {
+                error!(target: "gateway", error = ?e, "prometheus metrics exporter exited with error");
+            }
+        });
+    }
     {
         let routing = table.clone();
         tokio::spawn(async move {
@@ -97,6 +170,10 @@ async fn main() -> Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let routing = table.clone();
+        routing
+            .metrics
+            .accepted_connections
+            .fetch_add(1, Ordering::Relaxed);
         info!(target: "gateway", %peer, "accepted");
         tokio::spawn(async move {
             if let Err(e) = handle_conn(socket, peer, routing).await {
@@ -128,6 +205,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                 match read {
                     Ok(0) => {
                         let Some(mut conn) = upstream.take() else { continue };
+                        routing
+                            .metrics
+                            .upstream_closed
+                            .fetch_add(1, Ordering::Relaxed);
                         if conn.has_non_ping_traffic {
                             warn!(
                                 target: "gateway",
@@ -159,6 +240,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                         loop {
                             attempt += 1;
                             let Some(route) = routing.lookup(&cell).await else {
+                                routing
+                                    .metrics
+                                    .no_route_lookup_failures
+                                    .fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     target: "gateway",
                                     %peer,
@@ -174,7 +259,18 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
                                 continue;
                             };
-                            if let Err(e) = ensure_upstream(&mut upstream, route.clone(), peer).await {
+                            routing
+                                .metrics
+                                .upstream_reconnect_attempts
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Err(e) = ensure_upstream(
+                                &mut upstream,
+                                route.clone(),
+                                peer,
+                                routing.metrics.as_ref(),
+                            )
+                            .await
+                            {
                                 warn!(
                                     target: "gateway",
                                     %peer,
@@ -238,6 +334,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         }
                                     }
                                     if let Err(e) = client_writer.write_all(&frame).await {
+                                        routing
+                                            .metrics
+                                            .upstream_write_errors
+                                            .fetch_add(1, Ordering::Relaxed);
                                         warn!(
                                             target: "gateway",
                                             %peer,
@@ -250,6 +350,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 }
                                 Ok(None) => break,
                                 Err(e) => {
+                                    routing
+                                        .metrics
+                                        .invalid_client_frames
+                                        .fetch_add(1, Ordering::Relaxed);
                                     warn!(
                                         target: "gateway",
                                         %peer,
@@ -264,6 +368,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                     }
                     Err(e) => {
                         let Some(mut conn) = upstream.take() else { continue };
+                        routing
+                            .metrics
+                            .upstream_read_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         if conn.has_non_ping_traffic {
                             warn!(
                                 target: "gateway",
@@ -297,6 +405,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                         loop {
                             attempt += 1;
                             let Some(route) = routing.lookup(&cell).await else {
+                                routing
+                                    .metrics
+                                    .no_route_lookup_failures
+                                    .fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     target: "gateway",
                                     %peer,
@@ -312,7 +424,18 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 time::sleep(Duration::from_millis(UPSTREAM_RETRY_BACKOFF_MS)).await;
                                 continue;
                             };
-                            if let Err(e) = ensure_upstream(&mut upstream, route.clone(), peer).await {
+                            routing
+                                .metrics
+                                .upstream_reconnect_attempts
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Err(e) = ensure_upstream(
+                                &mut upstream,
+                                route.clone(),
+                                peer,
+                                routing.metrics.as_ref(),
+                            )
+                            .await
+                            {
                                 warn!(
                                     target: "gateway",
                                     %peer,
@@ -372,6 +495,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 Ok(Some(frame)) => frame.freeze(),
                                 Ok(None) => break,
                                 Err(e) => {
+                                    routing
+                                        .metrics
+                                        .invalid_client_frames
+                                        .fetch_add(1, Ordering::Relaxed);
                                     warn!(
                                         target: "gateway",
                                         %peer,
@@ -386,6 +513,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             let env_in: Envelope<ClientMsg> = match serde_json::from_slice(payload) {
                                 Ok(env_in) => env_in,
                                 Err(e) => {
+                                    routing
+                                        .metrics
+                                        .invalid_client_frames
+                                        .fetch_add(1, Ordering::Relaxed);
                                     warn!(
                                         target: "gateway",
                                         %peer,
@@ -406,6 +537,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             loop {
                                 attempt += 1;
                                 let Some(route) = routing.lookup(&cell).await else {
+                                    routing
+                                        .metrics
+                                        .no_route_lookup_failures
+                                        .fetch_add(1, Ordering::Relaxed);
                                     warn!(
                                         target: "gateway",
                                         %peer,
@@ -470,7 +605,13 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 }
 
                                 let connected_new =
-                                    match ensure_upstream(&mut upstream, route.clone(), peer).await
+                                    match ensure_upstream(
+                                        &mut upstream,
+                                        route.clone(),
+                                        peer,
+                                        routing.metrics.as_ref(),
+                                    )
+                                    .await
                                     {
                                         Ok(changed) => changed,
                                         Err(e) => {
@@ -523,6 +664,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
 
                                 let conn = upstream.as_mut().expect("upstream to be established");
                                 if let Err(e) = conn.writer.write_all(&frame).await {
+                                    routing
+                                        .metrics
+                                        .upstream_write_errors
+                                        .fetch_add(1, Ordering::Relaxed);
                                     let has_non_ping_traffic =
                                         ping_ts.is_none() || conn.has_non_ping_traffic;
                                     warn!(
@@ -604,10 +749,14 @@ async fn ensure_upstream(
     upstream: &mut Option<UpstreamConn>,
     target_worker: WorkerRoute,
     peer: SocketAddr,
+    metrics: &GatewayMetricsCounters,
 ) -> Result<bool> {
     let needs_new = match upstream {
         Some(conn) if conn.route.addr == target_worker.addr => false,
         Some(conn) => {
+            metrics
+                .upstream_route_changes
+                .fetch_add(1, Ordering::Relaxed);
             info!(
                 target: "gateway",
                 %peer,
@@ -622,7 +771,7 @@ async fn ensure_upstream(
     };
 
     if needs_new {
-        let new_conn = connect_upstream(target_worker.clone(), peer).await?;
+        let new_conn = connect_upstream(target_worker.clone(), peer, metrics).await?;
         if upstream.replace(new_conn).is_some() {
             // old connection already closed above
         }
@@ -632,8 +781,23 @@ async fn ensure_upstream(
     Ok(false)
 }
 
-async fn connect_upstream(target_worker: WorkerRoute, peer: SocketAddr) -> Result<UpstreamConn> {
-    let stream = TcpStream::connect(target_worker.addr.as_str()).await?;
+async fn connect_upstream(
+    target_worker: WorkerRoute,
+    peer: SocketAddr,
+    metrics: &GatewayMetricsCounters,
+) -> Result<UpstreamConn> {
+    let stream = match TcpStream::connect(target_worker.addr.as_str()).await {
+        Ok(stream) => {
+            metrics.upstream_connects.fetch_add(1, Ordering::Relaxed);
+            stream
+        }
+        Err(e) => {
+            metrics
+                .upstream_connect_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e.into());
+        }
+    };
     info!(
         target: "gateway",
         %peer,
@@ -667,6 +831,10 @@ async fn replay_pending_pings(
             .write_all(ping.frame.as_ref())
             .await
             .with_context(|| format!("replay ping cell={:?} ts={}", ping.cell, ping.ts))?;
+        routing
+            .metrics
+            .pending_ping_replays
+            .fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -821,6 +989,226 @@ async fn resolve_socket_addr(raw: &str) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no socket address resolved for {raw}"))
+}
+
+async fn load_metrics_listener() -> Result<Option<TcpListener>> {
+    let Ok(raw) = std::env::var("TESSERA_GW_METRICS_ADDR") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+
+    let addr = resolve_socket_addr(trimmed)
+        .await
+        .with_context(|| format!("resolve TESSERA_GW_METRICS_ADDR={trimmed}"))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind gateway prometheus metrics listener at {addr}"))?;
+    Ok(Some(listener))
+}
+
+async fn serve_prometheus_metrics(listener: TcpListener, routing: RoutingTable) -> Result<()> {
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("accept gateway prometheus metrics connection")?;
+        let routing = routing.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_prometheus_metrics_request(stream, routing).await {
+                tracing::debug!(
+                    target: "gateway",
+                    peer = %peer,
+                    error = ?e,
+                    "prometheus metrics request failed"
+                );
+            }
+        });
+    }
+}
+
+async fn handle_prometheus_metrics_request(
+    mut stream: TcpStream,
+    routing: RoutingTable,
+) -> Result<()> {
+    let mut buf = [0_u8; 1024];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .context("read gateway prometheus metrics request")?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+
+    if method == "GET" && path == "/metrics" {
+        let snapshot = routing.metrics_snapshot().await;
+        let body = format_gateway_prometheus_metrics(&snapshot);
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            &body,
+        )
+        .await?;
+    } else {
+        write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n",
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write gateway prometheus metrics response")?;
+    stream
+        .shutdown()
+        .await
+        .context("shutdown gateway prometheus metrics response")?;
+    Ok(())
+}
+
+fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String {
+    let mut out = String::new();
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_gateway_routes",
+        "Cell routes currently loaded by the gateway.",
+        metrics.routes,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_gateway_routing_version",
+        "Gateway routing table version.",
+        metrics.routing_version,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_accepted_connections_total",
+        "Client connections accepted by the gateway.",
+        metrics.accepted_connections,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_connects_total",
+        "Successful upstream worker connections opened by the gateway.",
+        metrics.upstream_connects,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_connect_failures_total",
+        "Failed upstream worker connection attempts.",
+        metrics.upstream_connect_failures,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_route_changes_total",
+        "Upstream worker connection swaps caused by routing changes.",
+        metrics.upstream_route_changes,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_reconnect_attempts_total",
+        "Reconnect attempts after an upstream connection closes or fails.",
+        metrics.upstream_reconnect_attempts,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_closed_total",
+        "Upstream worker connections that closed cleanly.",
+        metrics.upstream_closed,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_read_errors_total",
+        "Upstream worker read errors observed by the gateway.",
+        metrics.upstream_read_errors,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_upstream_write_errors_total",
+        "Gateway write errors while forwarding frames.",
+        metrics.upstream_write_errors,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_invalid_client_frames_total",
+        "Invalid client frames that caused connection closure.",
+        metrics.invalid_client_frames,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_no_route_lookup_failures_total",
+        "Route lookups that found no worker for a requested cell.",
+        metrics.no_route_lookup_failures,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_pending_ping_replays_total",
+        "Pending ping frames replayed after upstream reconnect.",
+        metrics.pending_ping_replays,
+    );
+    out
+}
+
+fn push_prometheus_metric(out: &mut String, metric_type: &str, name: &str, help: &str, value: u64) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(metric_type);
+    out.push('\n');
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
 }
 
 async fn load_initial_routes() -> Result<HashMap<CellKey, WorkerRoute>> {
@@ -1137,6 +1525,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn gateway_prometheus_metrics_text_uses_snapshot_values() {
+        let metrics = GatewayMetricsSnapshot {
+            routes: 2,
+            routing_version: 3,
+            accepted_connections: 5,
+            upstream_connects: 7,
+            upstream_connect_failures: 11,
+            upstream_route_changes: 13,
+            upstream_reconnect_attempts: 17,
+            upstream_closed: 19,
+            upstream_read_errors: 23,
+            upstream_write_errors: 29,
+            invalid_client_frames: 31,
+            no_route_lookup_failures: 37,
+            pending_ping_replays: 41,
+        };
+
+        let text = format_gateway_prometheus_metrics(&metrics);
+        assert!(text.contains("# TYPE tessera_gateway_routes gauge\n"));
+        assert!(text.contains("tessera_gateway_routes 2\n"));
+        assert!(text.contains("# TYPE tessera_gateway_upstream_connects_total counter\n"));
+        assert!(text.contains("tessera_gateway_upstream_connect_failures_total 11\n"));
+        assert!(text.contains("tessera_gateway_pending_ping_replays_total 41\n"));
     }
 
     #[test]
