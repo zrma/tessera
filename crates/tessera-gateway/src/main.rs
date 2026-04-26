@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tessera_core::{
     CellId, ClientEnvelope, ClientMsg, Envelope, MAX_FRAME_LEN, ServerMsg, encode_frame,
 };
@@ -24,6 +24,14 @@ use tracing::{debug, error, info, warn};
 const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
 const MAX_PENDING_PINGS: usize = 32;
+const GATEWAY_PING_RTT_BUCKETS_MICROS: [u64; 11] = [
+    1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
+    5_000_000,
+];
+const GATEWAY_PING_RTT_BUCKET_LABELS: [&str; 11] = [
+    "0.001", "0.005", "0.010", "0.025", "0.050", "0.100", "0.250", "0.500", "1.000", "2.500",
+    "5.000",
+];
 static NEXT_GATEWAY_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
@@ -45,6 +53,56 @@ struct GatewayMetricsCounters {
     client_closes_upstream_retry_exhausted: AtomicU64,
     client_closes_pending_ping_route_change: AtomicU64,
     client_closes_ambiguous_upstream: AtomicU64,
+    ping_roundtrip_latency: GatewayLatencyHistogram,
+}
+
+#[derive(Debug)]
+struct GatewayLatencyHistogram {
+    buckets: [AtomicU64; GATEWAY_PING_RTT_BUCKETS_MICROS.len() + 1],
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Default for GatewayLatencyHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::default()),
+            sum_micros: AtomicU64::default(),
+            count: AtomicU64::default(),
+        }
+    }
+}
+
+impl GatewayLatencyHistogram {
+    fn observe(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = GATEWAY_PING_RTT_BUCKETS_MICROS
+            .iter()
+            .position(|boundary| micros <= *boundary)
+            .unwrap_or(GATEWAY_PING_RTT_BUCKETS_MICROS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> GatewayLatencySnapshot {
+        GatewayLatencySnapshot {
+            buckets: self
+                .buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .collect(),
+            sum_micros: self.sum_micros.load(Ordering::Relaxed),
+            count: self.count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GatewayLatencySnapshot {
+    buckets: Vec<u64>,
+    sum_micros: u64,
+    count: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +127,7 @@ struct GatewayMetricsSnapshot {
     client_closes_upstream_retry_exhausted: u64,
     client_closes_pending_ping_route_change: u64,
     client_closes_ambiguous_upstream: u64,
+    ping_roundtrip_latency: GatewayLatencySnapshot,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -102,6 +161,7 @@ struct PendingPing {
     cell: CellId,
     ts: u64,
     frame: Bytes,
+    sent_at: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -185,6 +245,7 @@ impl RoutingTable {
                 .metrics
                 .client_closes_ambiguous_upstream
                 .load(Ordering::Relaxed),
+            ping_roundtrip_latency: self.metrics.ping_roundtrip_latency.snapshot(),
         }
     }
 
@@ -417,12 +478,16 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         if let Ok(env_out) =
                                             serde_json::from_slice::<Envelope<ServerMsg>>(payload)
                                             && let ServerMsg::Pong { ts } = env_out.payload
-                                        {
-                                            acknowledge_pending_ping(
+                                            && let Some(sent_at) = acknowledge_pending_ping(
                                                 &mut pending_pings,
                                                 env_out.cell,
                                                 ts,
-                                            );
+                                            )
+                                        {
+                                            routing
+                                                .metrics
+                                                .ping_roundtrip_latency
+                                                .observe(sent_at.elapsed());
                                         }
                                     }
                                     if let Err(e) = client_writer.write_all(&frame).await {
@@ -640,6 +705,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 ClientMsg::Ping { ts } => Some(ts),
                                 _ => None,
                             };
+                            let ping_sent_at = ping_ts.map(|_| Instant::now());
                             env_in.session = Some(session_id);
                             let frame = encode_frame(&env_in);
                             last_cell = Some(cell);
@@ -843,6 +909,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         cell,
                                         ts,
                                         frame: frame.clone(),
+                                        sent_at: ping_sent_at.expect("ping timestamp"),
                                     });
                                 } else {
                                     conn.has_non_ping_traffic = true;
@@ -1021,13 +1088,18 @@ async fn pending_pings_conflict_with_route(
     false
 }
 
-fn acknowledge_pending_ping(pending_pings: &mut VecDeque<PendingPing>, cell: CellId, ts: u64) {
+fn acknowledge_pending_ping(
+    pending_pings: &mut VecDeque<PendingPing>,
+    cell: CellId,
+    ts: u64,
+) -> Option<Instant> {
     if let Some(index) = pending_pings
         .iter()
         .position(|pending| pending.cell == cell && pending.ts == ts)
     {
-        pending_pings.remove(index);
+        return pending_pings.remove(index).map(|pending| pending.sent_at);
     }
+    None
 }
 
 fn push_pending_ping(pending_pings: &mut VecDeque<PendingPing>, ping: PendingPing) {
@@ -1415,6 +1487,12 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
         "Client connections closed when upstream state could not be retried without risking dropped replies.",
         metrics.client_closes_ambiguous_upstream,
     );
+    push_prometheus_histogram(
+        &mut out,
+        "tessera_gateway_ping_roundtrip_seconds",
+        "Gateway-observed client Ping to upstream Pong round-trip latency.",
+        &metrics.ping_roundtrip_latency,
+    );
     out
 }
 
@@ -1440,6 +1518,50 @@ fn push_prometheus_metric(out: &mut String, metric_type: &str, name: &str, help:
     out.push_str(name);
     out.push(' ');
     out.push_str(&value.to_string());
+    out.push('\n');
+}
+
+fn push_prometheus_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    histogram: &GatewayLatencySnapshot,
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push_str(" histogram\n");
+
+    let mut cumulative = 0_u64;
+    for (idx, label) in GATEWAY_PING_RTT_BUCKET_LABELS.iter().enumerate() {
+        cumulative += histogram.buckets.get(idx).copied().unwrap_or(0);
+        out.push_str(name);
+        out.push_str("_bucket{le=\"");
+        out.push_str(label);
+        out.push_str("\"} ");
+        out.push_str(&cumulative.to_string());
+        out.push('\n');
+    }
+    cumulative += histogram
+        .buckets
+        .get(GATEWAY_PING_RTT_BUCKET_LABELS.len())
+        .copied()
+        .unwrap_or(0);
+    out.push_str(name);
+    out.push_str("_bucket{le=\"+Inf\"} ");
+    out.push_str(&cumulative.to_string());
+    out.push('\n');
+    out.push_str(name);
+    out.push_str("_sum ");
+    out.push_str(&format!("{:.6}", histogram.sum_micros as f64 / 1_000_000.0));
+    out.push('\n');
+    out.push_str(name);
+    out.push_str("_count ");
+    out.push_str(&histogram.count.to_string());
     out.push('\n');
 }
 
@@ -1782,6 +1904,11 @@ mod tests {
             client_closes_upstream_retry_exhausted: 47,
             client_closes_pending_ping_route_change: 53,
             client_closes_ambiguous_upstream: 59,
+            ping_roundtrip_latency: GatewayLatencySnapshot {
+                buckets: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                sum_micros: 1_250_000,
+                count: 78,
+            },
         };
 
         let text = format_gateway_prometheus_metrics(&metrics);
@@ -1800,6 +1927,25 @@ mod tests {
             text.contains("tessera_gateway_client_closes_pending_ping_route_change_total 53\n")
         );
         assert!(text.contains("tessera_gateway_client_closes_ambiguous_upstream_total 59\n"));
+        assert!(text.contains("# TYPE tessera_gateway_ping_roundtrip_seconds histogram\n"));
+        assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_bucket{le=\"0.001\"} 1\n"));
+        assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_bucket{le=\"0.005\"} 3\n"));
+        assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_bucket{le=\"+Inf\"} 78\n"));
+        assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_sum 1.250000\n"));
+        assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_count 78\n"));
+    }
+
+    #[test]
+    fn gateway_ping_roundtrip_histogram_records_exact_buckets() {
+        let histogram = GatewayLatencyHistogram::default();
+        histogram.observe(Duration::from_micros(2_000));
+        histogram.observe(Duration::from_micros(6_000_000));
+
+        let snapshot = histogram.snapshot();
+        assert_eq!(snapshot.buckets[1], 1);
+        assert_eq!(snapshot.buckets[GATEWAY_PING_RTT_BUCKETS_MICROS.len()], 1);
+        assert_eq!(snapshot.sum_micros, 6_002_000);
+        assert_eq!(snapshot.count, 2);
     }
 
     #[test]
@@ -3138,16 +3284,23 @@ mod tests {
     fn acknowledge_pending_ping_only_removes_one_duplicate() {
         let cell = CellId::grid(0, 0, 0);
         let frame = Bytes::from_static(b"ping");
+        let sent_at = Instant::now();
         let mut pending = VecDeque::from([
             PendingPing {
                 cell,
                 ts: 7,
                 frame: frame.clone(),
+                sent_at,
             },
-            PendingPing { cell, ts: 7, frame },
+            PendingPing {
+                cell,
+                ts: 7,
+                frame,
+                sent_at,
+            },
         ]);
 
-        acknowledge_pending_ping(&mut pending, cell, 7);
+        assert!(acknowledge_pending_ping(&mut pending, cell, 7).is_some());
 
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].cell, cell);
