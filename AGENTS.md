@@ -6,6 +6,12 @@
 - 작업 전 `README.md`의 Status/Design Overview/Run Locally를 확인.
 - 이 문서(AGENTS.md)에서 명령/지침/금지사항을 확인.
 
+## 자율 수행 원칙
+- 기본값은 자율 진행이다. 요청이 목표와 제약을 충분히 주면, 추가 확인 없이 repo의 기존 패턴을 읽고 합리적인 가정으로 구현/검증/문서화까지 진행한다.
+- 사용자를 호출하는 경우는 결과가 크게 달라지는 요구사항 공백, 되돌리기 어려운 파괴적 작업, published history rewrite, 명시되지 않은 원격 bookmark 이동, 외부 비용/운영 리스크가 있는 작업, secret/credential 취급처럼 실제 위험이 있는 경우로 제한한다.
+- 진행 중 발견한 작은 불확실성은 작업을 멈추지 말고 코드/문서/최종 보고에 가정과 검증 결과를 남긴다.
+- 중간 보고는 짧게 현재 작업과 발견 사실 중심으로 하고, 최종 보고는 변경 파일·검증 명령·남은 리스크를 포함한다.
+
 ## 현재 범위 (요약)
 - V0 구현: 고정 그리드 셀, Gateway↔Worker TCP 파이프라인, Orchestrator `ListAssignments` 스냅샷 + `WatchAssignments` 스트림 + 주기적 재조회(`TESSERA_GW_REFRESH_SECS`).
 - 주요 크레이트: `tessera-gateway`, `tessera-worker`, `tessera-orch`, 공용 타입 `tessera-core`, 테스트 클라이언트 `tessera-client`, 자동화 `xtask`.
@@ -14,6 +20,7 @@
 - 빠른 기동: `cargo xt dev up` (worker+gateway), Orchestrator까지: `cargo xt dev up --with-orch [--orch-config path]`.
 - 종료: `cargo xt dev down` / `cargo xt dev down --with-orch`.
 - 로그: `.dev/logs/{worker,gateway,orch}.log`; PID는 `.dev/pids/`. 기동 후 `tail -f`로 정상 시작 여부 확인.
+- 로그 helper: `cargo xt dev logs --target all --follow` 또는 `--target gateway|worker|orch`.
 - 개별 실행 예: `cargo run -p tessera-orch`, `cargo run -p tessera-gateway`, `cargo run -p tessera-worker`, `cargo run -p tessera-client -- ...`.
 
 ## 기본 환경 변수
@@ -29,9 +36,16 @@
 - Do: README의 ✅(구현) / 🚧(계획) 구분을 지키고, 아키텍처 변화 시 Design Overview 갱신.
 - Do: 단일 파일 수정은 `apply_patch` 우선, 검색은 `rg`/`rg --files` 우선.
 - Do: 최소 `cargo fmt`, 관련 `cargo test`; 필요 시 `cargo check --workspace`. dev 헬퍼는 `cargo xt`/`cargo xt dev ...` 활용하고, 작업 마무리 시에는 `cargo xt`와 `cargo test`를 반드시 돌려 결과를 확인한다.
+- Do: 런타임/네트워크/dev helper를 바꾸면 `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, `cargo xt dev down --with-orch` 스모크를 추가로 확인한다.
 - Do: 커밋 메시지 `type: summary`(예: `feat: refresh gateway routing`). JJ는 `jj commit -m "..."`; 북마크 이동은 지시가 있을 때만(`jj bookmark set main -r <rev>`).
 - Don’t: 기존 변경을 덮어쓰거나 파괴적 명령(`git reset --hard`, 무단 삭제 등) 실행 금지.
 - Don’t: 계획을 구현된 것처럼 문서화하지 말 것.
+
+## 완료 조건
+- 코드 변경: `cargo xt`와 `cargo test`가 통과해야 한다. 실패하거나 비용이 너무 크면 이유와 가장 가까운 대체 검증을 남긴다.
+- 런타임 변경: dev stack이 실제로 살아 있고 테스트 클라이언트가 gateway에 연결되는지 확인한다.
+- 문서 변경: README/AGENTS의 구현/계획/명령이 현재 동작과 어긋나지 않는지 확인한다.
+- VCS 정리: `jj status`와 `jj diff`로 변경 범위를 확인하고, 사용자가 push까지 요청한 경우 `jj git fetch` 후 지정 bookmark를 push한다.
 
 ## 소통/결정 기록
 - 혼자 토이 프로젝트 기준: 결정/메모는 README(Design Overview) 또는 AGENTS에 간단히 남기면 충분. 필요 시 ADR 추가.

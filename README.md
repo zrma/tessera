@@ -23,6 +23,7 @@ Cell-based world orchestration for real-time servers in Rust.
 ## Quick Start
 - 빌드: `cargo build`
 - 검증: `cargo xt` (fmt → clippy → check)
+- 전체 테스트: `cargo test`
 - 실행 예시:
   - `cargo run -p tessera-gateway`
   - `cargo run -p tessera-worker`
@@ -34,8 +35,12 @@ Cell-based world orchestration for real-time servers in Rust.
   - Orchestrator까지 포함: `cargo xt dev up --with-orch [--orch-config .dev/orch-config.json]`
   - 내리기: `cargo xt dev down`
   - Orchestrator 종료: `cargo xt dev down --with-orch`
-  - 로그: `.dev/logs/{worker,gateway}.log`
-- 로그 보기: `cargo xt dev logs --target all --follow` (또는 `--target gateway|worker`, `--lines 200`)
+  - 로그: `.dev/logs/{worker,gateway,orch}.log`
+- 로그 보기: `cargo xt dev logs --target all --follow` (또는 `--target gateway|worker|orch`, `--lines 200`)
+- 로컬 스모크:
+  - `cargo xt dev up --with-orch`
+  - `cargo run -p tessera-client -- ping --ts 123`
+  - `cargo xt dev down --with-orch`
 - 환경변수(옵션):
   - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
   - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
@@ -112,5 +117,6 @@ Cell-based world orchestration for real-time servers in Rust.
 ## Contributing & Workflow
 - 기본 브랜치 `main`; 커밋 메시지 포맷은 `type: summary`(예: `feat: refresh gateway routing`), 한 커밋에 명확한 변경 세트만 담습니다.
 - 코드 변경 시 문서/테스트를 함께 갱신하고, README의 ✅(구현)/🚧(계획) 구분을 유지합니다.
-- 제출 전 `cargo fmt`, 관련 `cargo test`, 필요 시 `cargo check --workspace`를 실행합니다.
+- 제출 전 `cargo xt`와 `cargo test`를 실행합니다. 런타임/네트워크/dev helper 변경은 Run Locally의 로컬 스모크까지 확인합니다.
+- 자동화 에이전트는 목표와 제약이 충분하면 자율적으로 구현/검증/문서화를 진행하고, 파괴적 작업·published history rewrite·명시되지 않은 원격 bookmark 이동·외부 운영/비용 리스크처럼 되돌리기 어려운 경우에만 사용자 확인을 요청합니다.
 - 추가 지침과 에이전트 컨텍스트는 `AGENTS.md`를 참고하세요.
