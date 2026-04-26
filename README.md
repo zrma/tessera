@@ -45,14 +45,17 @@ Cell-based world orchestration for real-time servers in Rust.
 - 환경변수(옵션):
   - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
   - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
+  - `TESSERA_GW_METRICS_ADDR` 기본 unset (설정 시 Gateway가 `GET /metrics` Prometheus text endpoint를 함께 노출, 예: `127.0.0.1:4100`)
   - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
   - `TESSERA_WORKER_ADVERTISE_ADDR` 기본 `TESSERA_WORKER_ADDR` (오케스트레이터에 등록할 워커 주소, `TESSERA_WORKER_ADDR`가 `0.0.0.0`/`::`인 경우 반드시 지정)
   - `TESSERA_WORKER_ID` 기본 `worker-local`
   - `TESSERA_WORKER_REFRESH_SECS` 기본 `5`초(Orchestrator 연결 실패 시 워커가 할당 재등록을 재시도하는 주기)
+  - `TESSERA_WORKER_METRICS_ADDR` 기본 unset (설정 시 Worker가 `GET /metrics` Prometheus text endpoint를 함께 노출, 예: `127.0.0.1:5100`)
   - `TESSERA_WORKER_AOI_RADIUS_CELLS` 기본 `1` (현재 셀 기준 AOI ghost로 구독할 인접 셀 반경, `1`이면 3x3)
   - `TESSERA_WORKER_AOI_CELL_SPAN_UNITS` 기본 `32` (경계 기반 AOI에서 사용할 셀 로컬 좌표 범위)
   - `TESSERA_WORKER_AOI_EDGE_MARGIN_UNITS` 기본 unset (설정 시 root actor가 셀 경계에 가까울 때만 해당 방향 ghost 셀을 구독, 좌표계는 `0..TESSERA_WORKER_AOI_CELL_SPAN_UNITS`)
   - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
+  - `TESSERA_ORCH_METRICS_ADDR` 기본 unset (설정 시 Orchestrator가 `GET /metrics` Prometheus text endpoint를 함께 노출, 예: `127.0.0.1:6100`)
   - `RUST_LOG` 기본 `info`
 - 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADVERTISE_ADDR`(설정 시) 또는 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
 - 오케스트레이터 실행: `cargo run -p tessera-orch` (기본 `TESSERA_ORCH_ADDR=127.0.0.1:6000`)
@@ -86,24 +89,29 @@ Cell-based world orchestration for real-time servers in Rust.
 - Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
-- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 중복 연결을 줄임
-- Orchestrator: `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics` gRPC 엔드포인트 제공
+- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 중복 연결을 줄이고 opt-in `/metrics`로 relay fanout/backpressure/reconnect 카운터를 노출
+- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter 제공
+- Handover skeleton: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하며, 현재 slice에서는 freeze/diff 중 client move를 reject하는 정책과 commit failure 시 source route 유지+abort 정책을 문서화한다. 실제 라우팅 전환과 move buffering/retry는 다음 slice로 분리
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Orchestrator 리밸런싱 명령(`PreCopy/Freeze/Diff/Commit`) 및 Prometheus exporter
+- Handover runtime enforcement: freeze 상태를 Worker/Gateway 경로에 연결하고, 다음 slice에서 client move buffering/retry로 handover 순간의 client-visible error를 완화
 - Worker AOI/ghost를 셀 경계 기반에서 더 정밀한 거리/가시성 기반으로 고도화하고, 다셀 틱 파이프라인을 구조화
-- Worker 간 ghost relay의 backpressure/헬스/재연결 관측성을 메트릭으로 노출
-- Prometheus 지표, 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
+- Worker 간 ghost relay의 장기 scrape/tracing assertions와 health policy 고도화
+- 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
 - 멱등·역전 처리의 기반으로 `seq/epoch` 사용(현재 워커는 응답 `seq` 증가)
 - 클라 옵션: `--world --cx --cy --epoch`로 Envelope 기본값 설정
+- Handover control-plane: `SubmitHandoverCommand`는 `PreCopy`, `Freeze`, `Diff`, `Commit`, `Abort`를 순서 검증하며, 자세한 정책은 `docs/handover.md`에 둔다.
 
 ## Troubleshooting
 - 포트 점유: `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`를 변경하거나 점유 프로세스 종료
 - 로그 확인: `cargo xt dev logs --target all --follow`
+- Orchestrator metrics 확인: `TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch` 후 `curl http://127.0.0.1:6100/metrics`
+- Gateway metrics 확인: `TESSERA_GW_METRICS_ADDR=127.0.0.1:4100 cargo run -p tessera-gateway` 후 `curl http://127.0.0.1:4100/metrics`
+- Worker metrics 확인: `TESSERA_WORKER_METRICS_ADDR=127.0.0.1:5100 cargo run -p tessera-worker` 후 `curl http://127.0.0.1:5100/metrics`
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
 - 게이트웨이 라우팅/업스트림 실패가 반복되면 클라이언트 연결을 종료하므로, 클라는 재접속이 필요할 수 있음
 

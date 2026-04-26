@@ -32,5 +32,5 @@ This document is the repo-local quality map for agents. It keeps the expected au
 
 ## Known gaps
 
-- There is no custom metrics or tracing assertion loop yet.
+- Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, but long-running scrape/tracing assertions are not covered yet.
 - There is no long-lived execution-plan index yet; use README or AGENTS for small decisions and add `docs/` notes when a task spans multiple changes.

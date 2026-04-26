@@ -40,6 +40,53 @@ message WatchAssignmentsRequest {}
 message HealthCheckRequest {}
 message GetMetricsRequest {}
 
+enum HandoverCommand {
+  HANDOVER_COMMAND_UNSPECIFIED = 0;
+  HANDOVER_COMMAND_PRE_COPY = 1;
+  HANDOVER_COMMAND_FREEZE = 2;
+  HANDOVER_COMMAND_DIFF = 3;
+  HANDOVER_COMMAND_COMMIT = 4;
+  HANDOVER_COMMAND_ABORT = 5;
+}
+
+enum HandoverState {
+  HANDOVER_STATE_UNSPECIFIED = 0;
+  HANDOVER_STATE_IDLE = 1;
+  HANDOVER_STATE_PRE_COPYING = 2;
+  HANDOVER_STATE_FROZEN = 3;
+  HANDOVER_STATE_DIFFING = 4;
+  HANDOVER_STATE_COMMITTED = 5;
+  HANDOVER_STATE_ABORTED = 6;
+}
+
+enum HandoverClientMovePolicy {
+  HANDOVER_CLIENT_MOVE_POLICY_UNSPECIFIED = 0;
+  HANDOVER_CLIENT_MOVE_POLICY_ALLOW = 1;
+  HANDOVER_CLIENT_MOVE_POLICY_REJECT_DURING_FREEZE = 2;
+}
+
+enum HandoverFailurePolicy {
+  HANDOVER_FAILURE_POLICY_UNSPECIFIED = 0;
+  HANDOVER_FAILURE_POLICY_KEEP_SOURCE_AND_ABORT = 1;
+}
+
+message HandoverCommandRequest {
+  string operation_id = 1;
+  Assignment cell = 2;
+  string source_worker_id = 3;
+  string target_worker_id = 4;
+  HandoverCommand command = 5;
+}
+
+message HandoverCommandResponse {
+  bool accepted = 1;
+  HandoverState state = 2;
+  string reason = 3;
+  HandoverClientMovePolicy client_move_policy = 4;
+  HandoverFailurePolicy failure_policy = 5;
+  bool assignments_changed = 6;
+}
+
 message WorkerHealth {
   string worker_id = 1;
   string configured_addr = 2;
@@ -79,4 +126,5 @@ service Orchestrator {
   rpc WatchAssignments(WatchAssignmentsRequest) returns (stream AssignmentListing);
   rpc GetHealth(HealthCheckRequest) returns (OrchestratorHealth);
   rpc GetMetrics(GetMetricsRequest) returns (OrchestratorMetrics);
+  rpc SubmitHandoverCommand(HandoverCommandRequest) returns (HandoverCommandResponse);
 }

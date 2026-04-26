@@ -34,6 +34,43 @@ static NEXT_RELAY_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_AOI_RADIUS_CELLS: i32 = 1;
 const DEFAULT_AOI_CELL_SPAN_UNITS: f32 = 32.0;
+
+#[derive(Debug, Default)]
+struct WorkerMetricsCounters {
+    accepted_connections: AtomicU64,
+    client_connections: AtomicU64,
+    relay_connections: AtomicU64,
+    relay_subscribe_requests: AtomicU64,
+    relay_unsubscribe_requests: AtomicU64,
+    relay_outbound_drops: AtomicU64,
+    relay_forward_drops: AtomicU64,
+    remote_relay_connects: AtomicU64,
+    remote_relay_connect_failures: AtomicU64,
+    remote_relay_frames_sent: AtomicU64,
+    remote_relay_frames_received: AtomicU64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkerMetricsSnapshot {
+    client_subscribers: u64,
+    relay_subscribers: u64,
+    remote_interest_clients: u64,
+    remote_interest_cells: u64,
+    remote_peer_sessions: u64,
+    remote_actor_cache_cells: u64,
+    accepted_connections: u64,
+    client_connections: u64,
+    relay_connections: u64,
+    relay_subscribe_requests: u64,
+    relay_unsubscribe_requests: u64,
+    relay_outbound_drops: u64,
+    relay_forward_drops: u64,
+    remote_relay_connects: u64,
+    remote_relay_connect_failures: u64,
+    remote_relay_frames_sent: u64,
+    remote_relay_frames_received: u64,
+}
+
 type OutboundMsg = (CellId, Option<u32>, ServerMsg);
 type RelayOutboundMsg = (CellId, Option<u32>, WorkerRelayMsg);
 type CellSubscribers = HashMap<CellId, Vec<CellSubscriber>>;
@@ -108,6 +145,7 @@ struct SharedState {
     peer_routes: RwLock<PeerRoutes>,
     remote_interests: Mutex<RemoteInterestMap>,
     remote_peer_sessions: Mutex<RemotePeerSessionMap>,
+    metrics: Arc<WorkerMetricsCounters>,
     aoi_radius_cells: i32,
     aoi_cell_span_units: f32,
     aoi_edge_margin_units: Option<f32>,
@@ -130,6 +168,7 @@ impl SharedState {
             peer_routes: RwLock::new(HashMap::new()),
             remote_interests: Mutex::new(HashMap::new()),
             remote_peer_sessions: Mutex::new(HashMap::new()),
+            metrics: Arc::new(WorkerMetricsCounters::default()),
             aoi_radius_cells,
             aoi_cell_span_units,
             aoi_edge_margin_units,
@@ -733,6 +772,9 @@ impl SharedState {
                 match subscriber.tx.try_send((cell, epoch_override, msg.clone())) {
                     Ok(()) => true,
                     Err(TrySendError::Full(_)) => {
+                        self.metrics
+                            .relay_outbound_drops
+                            .fetch_add(1, Ordering::Relaxed);
                         warn!(
                             target: "worker",
                             cell = ?cell,
@@ -858,6 +900,9 @@ impl SharedState {
             {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
+                    self.metrics
+                        .relay_forward_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         target: "worker",
                         client_id = subscriber.client_id,
@@ -1045,6 +1090,61 @@ impl SharedState {
             .and_then(|cell_map| cell_map.get(actor))
             .copied()
     }
+
+    async fn metrics_snapshot(&self) -> WorkerMetricsSnapshot {
+        let client_subscribers = {
+            let subscribers = self.subscribers.lock().await;
+            subscribers.values().map(Vec::len).sum::<usize>() as u64
+        };
+        let relay_subscribers = {
+            let relay_subscribers = self.relay_subscribers.lock().await;
+            relay_subscribers.values().map(Vec::len).sum::<usize>() as u64
+        };
+        let (remote_interest_clients, remote_interest_cells) = {
+            let remote_interests = self.remote_interests.lock().await;
+            (
+                remote_interests.len() as u64,
+                remote_interests.values().map(HashMap::len).sum::<usize>() as u64,
+            )
+        };
+        let remote_peer_sessions = self.remote_peer_sessions.lock().await.len() as u64;
+        let remote_actor_cache_cells = self.remote_actor_cache.lock().await.len() as u64;
+
+        WorkerMetricsSnapshot {
+            client_subscribers,
+            relay_subscribers,
+            remote_interest_clients,
+            remote_interest_cells,
+            remote_peer_sessions,
+            remote_actor_cache_cells,
+            accepted_connections: self.metrics.accepted_connections.load(Ordering::Relaxed),
+            client_connections: self.metrics.client_connections.load(Ordering::Relaxed),
+            relay_connections: self.metrics.relay_connections.load(Ordering::Relaxed),
+            relay_subscribe_requests: self
+                .metrics
+                .relay_subscribe_requests
+                .load(Ordering::Relaxed),
+            relay_unsubscribe_requests: self
+                .metrics
+                .relay_unsubscribe_requests
+                .load(Ordering::Relaxed),
+            relay_outbound_drops: self.metrics.relay_outbound_drops.load(Ordering::Relaxed),
+            relay_forward_drops: self.metrics.relay_forward_drops.load(Ordering::Relaxed),
+            remote_relay_connects: self.metrics.remote_relay_connects.load(Ordering::Relaxed),
+            remote_relay_connect_failures: self
+                .metrics
+                .remote_relay_connect_failures
+                .load(Ordering::Relaxed),
+            remote_relay_frames_sent: self
+                .metrics
+                .remote_relay_frames_sent
+                .load(Ordering::Relaxed),
+            remote_relay_frames_received: self
+                .metrics
+                .remote_relay_frames_received
+                .load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Default for SharedState {
@@ -1091,6 +1191,18 @@ async fn main() -> Result<()> {
         aoi_cell_span_units,
         aoi_edge_margin_units,
     ));
+    if let Some(listener) = load_metrics_listener().await? {
+        let metrics_state = Arc::clone(&state);
+        let metrics_addr = listener
+            .local_addr()
+            .context("read worker prometheus metrics listener addr")?;
+        info!(target: "worker", %metrics_addr, "tessera-worker prometheus metrics listening");
+        tokio::spawn(async move {
+            if let Err(e) = serve_prometheus_metrics(listener, metrics_state).await {
+                error!(target: "worker", error = ?e, "prometheus metrics exporter exited with error");
+            }
+        });
+    }
     match fetch_assignment_listing().await {
         Ok(listing) => {
             if let Err(e) =
@@ -1474,6 +1586,254 @@ async fn resolve_socket_addr(raw: &str) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow!("no socket address resolved for {raw}"))
+}
+
+async fn load_metrics_listener() -> Result<Option<TcpListener>> {
+    let Ok(raw) = std::env::var("TESSERA_WORKER_METRICS_ADDR") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+
+    let addr = resolve_socket_addr(trimmed)
+        .await
+        .with_context(|| format!("resolve TESSERA_WORKER_METRICS_ADDR={trimmed}"))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind worker prometheus metrics listener at {addr}"))?;
+    Ok(Some(listener))
+}
+
+async fn serve_prometheus_metrics(listener: TcpListener, state: Arc<SharedState>) -> Result<()> {
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("accept worker prometheus metrics connection")?;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = handle_prometheus_metrics_request(stream, state).await {
+                tracing::debug!(
+                    target: "worker",
+                    peer = %peer,
+                    error = ?e,
+                    "prometheus metrics request failed"
+                );
+            }
+        });
+    }
+}
+
+async fn handle_prometheus_metrics_request(
+    mut stream: TcpStream,
+    state: Arc<SharedState>,
+) -> Result<()> {
+    let mut buf = [0_u8; 1024];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .context("read worker prometheus metrics request")?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+
+    if method == "GET" && path == "/metrics" {
+        let snapshot = state.metrics_snapshot().await;
+        let body = format_worker_prometheus_metrics(&snapshot);
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            &body,
+        )
+        .await?;
+    } else {
+        write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n",
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write worker prometheus metrics response")?;
+    stream
+        .shutdown()
+        .await
+        .context("shutdown worker prometheus metrics response")?;
+    Ok(())
+}
+
+fn format_worker_prometheus_metrics(metrics: &WorkerMetricsSnapshot) -> String {
+    let mut out = String::new();
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_client_subscribers",
+        "Current local client subscriber fanout across worker cells.",
+        metrics.client_subscribers,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_relay_subscribers",
+        "Current inbound relay subscriber fanout across worker cells.",
+        metrics.relay_subscribers,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_remote_interest_clients",
+        "Clients with at least one remote AOI interest.",
+        metrics.remote_interest_clients,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_remote_interest_cells",
+        "Remote AOI interest cells tracked across clients.",
+        metrics.remote_interest_cells,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_remote_peer_sessions",
+        "Shared outbound remote relay sessions currently tracked.",
+        metrics.remote_peer_sessions,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_remote_actor_cache_cells",
+        "Remote cells currently represented in the actor cache.",
+        metrics.remote_actor_cache_cells,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_accepted_connections_total",
+        "Connections accepted by the worker listener.",
+        metrics.accepted_connections,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_client_connections_total",
+        "Accepted connections decoded as gateway/client traffic.",
+        metrics.client_connections,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_relay_connections_total",
+        "Accepted connections decoded as worker relay traffic.",
+        metrics.relay_connections,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_relay_subscribe_requests_total",
+        "Inbound worker relay subscribe requests.",
+        metrics.relay_subscribe_requests,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_relay_unsubscribe_requests_total",
+        "Inbound worker relay unsubscribe requests.",
+        metrics.relay_unsubscribe_requests,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_relay_outbound_drops_total",
+        "Relay subscriber sends dropped due to full outbound channels.",
+        metrics.relay_outbound_drops,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_relay_forward_drops_total",
+        "Remote relay forwards dropped due to full client channels.",
+        metrics.relay_forward_drops,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_remote_relay_connects_total",
+        "Successful outbound shared remote relay connections.",
+        metrics.remote_relay_connects,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_remote_relay_connect_failures_total",
+        "Failed outbound shared remote relay connection attempts.",
+        metrics.remote_relay_connect_failures,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_remote_relay_frames_sent_total",
+        "Worker relay frames sent to remote peers.",
+        metrics.remote_relay_frames_sent,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_worker_remote_relay_frames_received_total",
+        "Worker relay frames received from remote peers.",
+        metrics.remote_relay_frames_received,
+    );
+    out
+}
+
+fn push_prometheus_metric(out: &mut String, metric_type: &str, name: &str, help: &str, value: u64) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(metric_type);
+    out.push('\n');
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
 }
 
 fn resolve_advertise_addr_inner(bind_addr: SocketAddr, raw: Option<&str>) -> Result<String> {
@@ -2126,6 +2486,10 @@ async fn run_server(
     info!(target: "worker", %addr, "listening upstream");
     loop {
         let (sock, peer) = listener.accept().await?;
+        state
+            .metrics
+            .accepted_connections
+            .fetch_add(1, Ordering::Relaxed);
         info!(target: "worker", %peer, "upstream accepted");
         let st = state.clone();
         let owned = owned_cells.clone();
@@ -2150,6 +2514,10 @@ async fn handle_incoming(
     };
 
     if let Ok(first_env) = decode_client_frame_from_bytes(&first_frame) {
+        state
+            .metrics
+            .client_connections
+            .fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel::<OutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
         return handle_upstream_inner(
             reader,
@@ -2166,6 +2534,10 @@ async fn handle_incoming(
     }
 
     if let Ok(first_env) = decode_worker_relay_frame_from_bytes(&first_frame) {
+        state
+            .metrics
+            .relay_connections
+            .fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel::<RelayOutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
         return handle_worker_relay_inner(
             reader,
@@ -2258,6 +2630,10 @@ async fn remote_peer_session_loop(
 
         match TcpStream::connect(route.addr.as_str()).await {
             Ok(stream) => {
+                state
+                    .metrics
+                    .remote_relay_connects
+                    .fetch_add(1, Ordering::Relaxed);
                 info!(
                     target: "worker",
                     peer_worker = route.worker_id.as_str(),
@@ -2284,6 +2660,10 @@ async fn remote_peer_session_loop(
                 }
             }
             Err(e) => {
+                state
+                    .metrics
+                    .remote_relay_connect_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     target: "worker",
                     peer_worker = route.worker_id.as_str(),
@@ -2315,6 +2695,7 @@ async fn run_remote_peer_session(
 ) -> Result<()> {
     let (mut reader, writer) = stream.into_split();
     let (tx, mut rx) = channel::<RelayOutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
+    let metrics = Arc::clone(&state.metrics);
 
     let writer_task = tokio::spawn(async move {
         let mut seq_out: u64 = 0;
@@ -2331,6 +2712,9 @@ async fn run_remote_peer_session(
             if let Err(e) = writer.write_all(&frame).await {
                 return Err(anyhow!(e).context("write remote relay frame"));
             }
+            metrics
+                .remote_relay_frames_sent
+                .fetch_add(1, Ordering::Relaxed);
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -2350,6 +2734,10 @@ async fn run_remote_peer_session(
                 if !subscribed_cells.contains(&env_in.cell) {
                     continue;
                 }
+                state
+                    .metrics
+                    .remote_relay_frames_received
+                    .fetch_add(1, Ordering::Relaxed);
                 state.broadcast_remote_relay(env_in).await;
             }
             changed = desired_rx.changed() => {
@@ -2455,6 +2843,10 @@ async fn handle_worker_relay_inner(
 
         match env_in.payload {
             WorkerRelayMsg::Subscribe { cells } => {
+                state
+                    .metrics
+                    .relay_subscribe_requests
+                    .fetch_add(1, Ordering::Relaxed);
                 let owned_guard = owned_cells.read().await;
                 let mut desired_cells = subscribed_cells.clone();
                 for cell in cells {
@@ -2483,6 +2875,10 @@ async fn handle_worker_relay_inner(
                 }
             }
             WorkerRelayMsg::Unsubscribe { cells } => {
+                state
+                    .metrics
+                    .relay_unsubscribe_requests
+                    .fetch_add(1, Ordering::Relaxed);
                 let removed = cells.into_iter().collect::<HashSet<_>>();
                 state
                     .remove_relay_subscriptions_for_cells(connection_id, &removed)
@@ -3084,6 +3480,36 @@ mod tests {
                 let _ = task.await;
             }
         })
+    }
+
+    #[test]
+    fn worker_prometheus_metrics_text_uses_snapshot_values() {
+        let metrics = WorkerMetricsSnapshot {
+            client_subscribers: 2,
+            relay_subscribers: 3,
+            remote_interest_clients: 5,
+            remote_interest_cells: 7,
+            remote_peer_sessions: 11,
+            remote_actor_cache_cells: 13,
+            accepted_connections: 17,
+            client_connections: 19,
+            relay_connections: 23,
+            relay_subscribe_requests: 29,
+            relay_unsubscribe_requests: 31,
+            relay_outbound_drops: 37,
+            relay_forward_drops: 41,
+            remote_relay_connects: 43,
+            remote_relay_connect_failures: 47,
+            remote_relay_frames_sent: 53,
+            remote_relay_frames_received: 59,
+        };
+
+        let text = format_worker_prometheus_metrics(&metrics);
+        assert!(text.contains("# TYPE tessera_worker_relay_subscribers gauge\n"));
+        assert!(text.contains("tessera_worker_relay_subscribers 3\n"));
+        assert!(text.contains("# TYPE tessera_worker_remote_relay_connects_total counter\n"));
+        assert!(text.contains("tessera_worker_relay_forward_drops_total 41\n"));
+        assert!(text.contains("tessera_worker_remote_relay_frames_received_total 59\n"));
     }
 
     #[test]

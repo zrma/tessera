@@ -12,9 +12,13 @@ use tessera_core::CellId;
 use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorServer};
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, AssignmentQuery, AssignmentSnapshot,
-    GetMetricsRequest, HealthCheckRequest, ListAssignmentsRequest, OrchestratorHealth,
-    OrchestratorMetrics, WatchAssignmentsRequest, WorkerHealth, WorkerRegistration,
+    GetMetricsRequest, HandoverClientMovePolicy, HandoverCommand, HandoverCommandRequest,
+    HandoverCommandResponse, HandoverFailurePolicy, HandoverState, HealthCheckRequest,
+    ListAssignmentsRequest, OrchestratorHealth, OrchestratorMetrics, WatchAssignmentsRequest,
+    WorkerHealth, WorkerRegistration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, watch};
 use tokio_stream::Stream;
 use tokio_stream::{StreamExt, wrappers::WatchStream};
@@ -33,13 +37,34 @@ async fn main() -> Result<()> {
         .with_context(|| format!("resolve TESSERA_ORCH_ADDR={addr_raw}"))?;
 
     let service = OrchestratorService::new(config);
+    let metrics_listener = load_metrics_listener().await?;
     info!(target: "orch", %listen_addr, "tessera-orch listening");
 
-    if let Err(e) = Server::builder()
-        .add_service(OrchestratorServer::new(service))
-        .serve(listen_addr)
-        .await
-    {
+    let grpc_server = Server::builder()
+        .add_service(OrchestratorServer::new(service.clone()))
+        .serve(listen_addr);
+
+    if let Some(listener) = metrics_listener {
+        let metrics_addr = listener
+            .local_addr()
+            .context("read prometheus metrics listener addr")?;
+        info!(target: "orch", %metrics_addr, "tessera-orch prometheus metrics listening");
+
+        tokio::select! {
+            grpc_result = grpc_server => {
+                if let Err(e) = grpc_result {
+                    error!(target: "orch", error = ?e, "server exited with error");
+                    return Err(e.into());
+                }
+            }
+            metrics_result = serve_prometheus_metrics(listener, service) => {
+                if let Err(e) = metrics_result {
+                    error!(target: "orch", error = ?e, "prometheus metrics exporter exited with error");
+                    return Err(e);
+                }
+            }
+        }
+    } else if let Err(e) = grpc_server.await {
         error!(target: "orch", error = ?e, "server exited with error");
         return Err(e.into());
     }
@@ -77,6 +102,16 @@ impl Config {
 
     fn assignments_for(&self, worker_id: &str) -> Option<&[CellId]> {
         self.worker(worker_id).map(|w| w.cells.as_slice())
+    }
+
+    fn owner_for_cell(&self, cell: &CellId) -> Option<&str> {
+        self.workers.iter().find_map(|(worker_id, worker)| {
+            worker
+                .cells
+                .iter()
+                .any(|assigned| assigned == cell)
+                .then_some(worker_id.as_str())
+        })
     }
 }
 
@@ -265,6 +300,14 @@ struct WorkerRuntime {
     last_seen: SystemTime,
 }
 
+#[derive(Debug, Clone)]
+struct HandoverRuntime {
+    operation_id: String,
+    source_worker_id: String,
+    target_worker_id: String,
+    state: HandoverState,
+}
+
 #[derive(Debug, Default)]
 struct OrchestratorMetricsCounters {
     registration_attempts: AtomicU64,
@@ -279,6 +322,7 @@ struct OrchestratorMetricsCounters {
 struct OrchestratorService {
     config: Arc<Config>,
     runtime: Arc<RwLock<HashMap<String, WorkerRuntime>>>,
+    handovers: Arc<RwLock<HashMap<CellId, HandoverRuntime>>>,
     listing_tx: watch::Sender<AssignmentListing>,
     metrics: Arc<OrchestratorMetricsCounters>,
 }
@@ -291,6 +335,7 @@ impl OrchestratorService {
         Self {
             config,
             runtime: Arc::new(RwLock::new(HashMap::new())),
+            handovers: Arc::new(RwLock::new(HashMap::new())),
             listing_tx,
             metrics: Arc::new(OrchestratorMetricsCounters::default()),
         }
@@ -404,6 +449,198 @@ impl OrchestratorService {
             watch_streams_started: self.metrics.watch_streams_started.load(Ordering::Relaxed),
             listing_updates: self.metrics.listing_updates.load(Ordering::Relaxed),
         }
+    }
+
+    async fn apply_handover_command(
+        &self,
+        request: HandoverCommandRequest,
+    ) -> Result<HandoverCommandResponse, Status> {
+        let parsed =
+            ParsedHandoverCommand::try_from_request(request).map_err(Status::invalid_argument)?;
+        if self.config.worker(&parsed.source_worker_id).is_none() {
+            return Ok(handover_response(
+                false,
+                HandoverState::Idle,
+                format!("unknown source_worker_id={}", parsed.source_worker_id),
+            ));
+        }
+        if self.config.worker(&parsed.target_worker_id).is_none() {
+            return Ok(handover_response(
+                false,
+                HandoverState::Idle,
+                format!("unknown target_worker_id={}", parsed.target_worker_id),
+            ));
+        }
+        match self.config.owner_for_cell(&parsed.cell) {
+            Some(owner) if owner == parsed.source_worker_id => {}
+            Some(owner) => {
+                return Ok(handover_response(
+                    false,
+                    HandoverState::Idle,
+                    format!(
+                        "source_worker_id={} does not own cell; current_owner={}",
+                        parsed.source_worker_id, owner
+                    ),
+                ));
+            }
+            None => {
+                return Ok(handover_response(
+                    false,
+                    HandoverState::Idle,
+                    "cell is not assigned to any configured worker",
+                ));
+            }
+        }
+        let mut handovers = self.handovers.write().await;
+        let current = handovers.get(&parsed.cell).cloned();
+
+        if parsed.command == HandoverCommand::PreCopy {
+            if let Some(active) = current {
+                return Ok(handover_response(
+                    false,
+                    active.state,
+                    format!(
+                        "handover already active for cell with operation_id={}",
+                        active.operation_id
+                    ),
+                ));
+            }
+            handovers.insert(
+                parsed.cell,
+                HandoverRuntime {
+                    operation_id: parsed.operation_id,
+                    source_worker_id: parsed.source_worker_id,
+                    target_worker_id: parsed.target_worker_id,
+                    state: HandoverState::PreCopying,
+                },
+            );
+            return Ok(handover_response(
+                true,
+                HandoverState::PreCopying,
+                "pre-copy accepted; assignments unchanged",
+            ));
+        }
+
+        let Some(active) = current else {
+            return Ok(handover_response(
+                false,
+                HandoverState::Idle,
+                "handover must start with PreCopy",
+            ));
+        };
+
+        if active.operation_id != parsed.operation_id
+            || active.source_worker_id != parsed.source_worker_id
+            || active.target_worker_id != parsed.target_worker_id
+        {
+            return Ok(handover_response(
+                false,
+                active.state,
+                "handover command does not match the active operation",
+            ));
+        }
+
+        let next_state = match (active.state, parsed.command) {
+            (HandoverState::PreCopying, HandoverCommand::Freeze) => HandoverState::Frozen,
+            (HandoverState::Frozen, HandoverCommand::Diff) => HandoverState::Diffing,
+            (HandoverState::Diffing, HandoverCommand::Commit) => HandoverState::Committed,
+            (_, HandoverCommand::Abort) => HandoverState::Aborted,
+            _ => {
+                return Ok(handover_response(
+                    false,
+                    active.state,
+                    format!(
+                        "invalid handover transition from {:?} with {:?}",
+                        active.state, parsed.command
+                    ),
+                ));
+            }
+        };
+
+        if matches!(
+            next_state,
+            HandoverState::Committed | HandoverState::Aborted
+        ) {
+            handovers.remove(&parsed.cell);
+        } else if let Some(active) = handovers.get_mut(&parsed.cell) {
+            active.state = next_state;
+        }
+
+        Ok(handover_response(
+            true,
+            next_state,
+            "handover command accepted; assignments unchanged",
+        ))
+    }
+}
+
+struct ParsedHandoverCommand {
+    operation_id: String,
+    cell: CellId,
+    source_worker_id: String,
+    target_worker_id: String,
+    command: HandoverCommand,
+}
+
+impl ParsedHandoverCommand {
+    fn try_from_request(request: HandoverCommandRequest) -> Result<Self, String> {
+        let operation_id = request.operation_id.trim();
+        if operation_id.is_empty() {
+            return Err("operation_id must not be empty".to_string());
+        }
+        let Some(cell_assignment) = request.cell.as_ref() else {
+            return Err("cell must be set".to_string());
+        };
+        let cell = assignment_to_cell_ref(cell_assignment).map_err(|e| e.to_string())?;
+
+        let source_worker_id = request.source_worker_id.trim();
+        if source_worker_id.is_empty() {
+            return Err("source_worker_id must not be empty".to_string());
+        }
+        let target_worker_id = request.target_worker_id.trim();
+        if target_worker_id.is_empty() {
+            return Err("target_worker_id must not be empty".to_string());
+        }
+        if source_worker_id == target_worker_id {
+            return Err("source_worker_id and target_worker_id must differ".to_string());
+        }
+
+        let command =
+            HandoverCommand::try_from(request.command).unwrap_or(HandoverCommand::Unspecified);
+        if command == HandoverCommand::Unspecified {
+            return Err("handover command must be set".to_string());
+        }
+        Ok(Self {
+            operation_id: operation_id.to_string(),
+            cell,
+            source_worker_id: source_worker_id.to_string(),
+            target_worker_id: target_worker_id.to_string(),
+            command,
+        })
+    }
+}
+
+fn handover_response(
+    accepted: bool,
+    state: HandoverState,
+    reason: impl Into<String>,
+) -> HandoverCommandResponse {
+    HandoverCommandResponse {
+        accepted,
+        state: state as i32,
+        reason: reason.into(),
+        client_move_policy: client_move_policy_for(state) as i32,
+        failure_policy: HandoverFailurePolicy::KeepSourceAndAbort as i32,
+        assignments_changed: false,
+    }
+}
+
+fn client_move_policy_for(state: HandoverState) -> HandoverClientMovePolicy {
+    match state {
+        HandoverState::Frozen | HandoverState::Diffing => {
+            HandoverClientMovePolicy::RejectDuringFreeze
+        }
+        _ => HandoverClientMovePolicy::Allow,
     }
 }
 
@@ -564,6 +801,14 @@ impl Orchestrator for OrchestratorService {
     ) -> Result<Response<OrchestratorMetrics>, Status> {
         Ok(Response::new(self.metrics_snapshot().await))
     }
+
+    async fn submit_handover_command(
+        &self,
+        request: Request<HandoverCommandRequest>,
+    ) -> Result<Response<HandoverCommandResponse>, Status> {
+        let response = self.apply_handover_command(request.into_inner()).await?;
+        Ok(Response::new(response))
+    }
 }
 
 fn cell_to_assignment(cell: &CellId) -> Assignment {
@@ -574,6 +819,20 @@ fn cell_to_assignment(cell: &CellId) -> Assignment {
         depth: cell.depth as u32,
         sub: cell.sub as u32,
     }
+}
+
+fn assignment_to_cell_ref(assignment: &Assignment) -> Result<CellId> {
+    let depth = u8::try_from(assignment.depth)
+        .map_err(|_| anyhow!("assignment depth {} out of range", assignment.depth))?;
+    let sub = u8::try_from(assignment.sub)
+        .map_err(|_| anyhow!("assignment sub {} out of range", assignment.sub))?;
+    Ok(CellId {
+        world: assignment.world,
+        cx: assignment.cx,
+        cy: assignment.cy,
+        depth,
+        sub,
+    })
 }
 
 fn init_tracing() {
@@ -597,6 +856,215 @@ async fn resolve_socket_addr(raw: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("no socket address resolved for {raw}"))
 }
 
+async fn load_metrics_listener() -> Result<Option<TcpListener>> {
+    let Ok(raw) = std::env::var("TESSERA_ORCH_METRICS_ADDR") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+
+    let addr = resolve_socket_addr(trimmed)
+        .await
+        .with_context(|| format!("resolve TESSERA_ORCH_METRICS_ADDR={trimmed}"))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind prometheus metrics listener at {addr}"))?;
+    Ok(Some(listener))
+}
+
+async fn serve_prometheus_metrics(
+    listener: TcpListener,
+    service: OrchestratorService,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("accept prometheus metrics connection")?;
+        let service = service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_prometheus_metrics_request(stream, service).await {
+                tracing::debug!(
+                    target: "orch",
+                    peer = %peer,
+                    error = ?e,
+                    "prometheus metrics request failed"
+                );
+            }
+        });
+    }
+}
+
+async fn handle_prometheus_metrics_request(
+    mut stream: TcpStream,
+    service: OrchestratorService,
+) -> Result<()> {
+    let mut buf = [0_u8; 1024];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .context("read prometheus metrics request")?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let request = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+
+    if method == "GET" && path == "/metrics" {
+        let snapshot = service.metrics_snapshot().await;
+        let body = format_prometheus_metrics(&snapshot);
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            &body,
+        )
+        .await?;
+    } else {
+        write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n",
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("write prometheus metrics response")?;
+    stream
+        .shutdown()
+        .await
+        .context("shutdown prometheus metrics response")?;
+    Ok(())
+}
+
+fn format_prometheus_metrics(metrics: &OrchestratorMetrics) -> String {
+    let mut out = String::new();
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_orch_configured_workers",
+        "Configured workers in the orchestrator assignment map.",
+        metrics.configured_workers,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_orch_registered_workers",
+        "Workers that have registered with the orchestrator.",
+        metrics.registered_workers,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_orch_assigned_cells",
+        "Cells currently assigned by orchestrator config.",
+        metrics.assigned_cells,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_orch_empty_workers",
+        "Configured workers with no assigned cells.",
+        metrics.empty_workers,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "gauge",
+        "tessera_orch_addr_mismatch_workers",
+        "Registered workers whose runtime address differs from config.",
+        metrics.addr_mismatch_workers,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_orch_registration_attempts_total",
+        "Worker registration attempts observed by the orchestrator.",
+        metrics.registration_attempts,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_orch_unknown_worker_registrations_total",
+        "Registration attempts from workers absent from orchestrator config.",
+        metrics.unknown_worker_registrations,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_orch_assignment_snapshot_requests_total",
+        "GetAssignments requests served by the orchestrator.",
+        metrics.assignment_snapshot_requests,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_orch_listing_requests_total",
+        "ListAssignments requests served by the orchestrator.",
+        metrics.listing_requests,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_orch_watch_streams_started_total",
+        "WatchAssignments streams started by the orchestrator.",
+        metrics.watch_streams_started,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_orch_listing_updates_total",
+        "Assignment listing updates published to watchers.",
+        metrics.listing_updates,
+    );
+    out
+}
+
+fn push_prometheus_metric(out: &mut String, metric_type: &str, name: &str, help: &str, value: u64) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(metric_type);
+    out.push('\n');
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');
+}
+
 fn unix_timestamp_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -608,6 +1076,35 @@ mod tests {
     use super::*;
     use tokio_stream::StreamExt;
     use tonic::Request;
+
+    fn two_worker_handover_config() -> Config {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        workers.insert(
+            "worker-b".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.2:5001".to_string(),
+                cells: Vec::new(),
+            },
+        );
+        Config { workers }
+    }
+
+    fn handover_request(command: HandoverCommand) -> HandoverCommandRequest {
+        HandoverCommandRequest {
+            operation_id: "handover-1".to_string(),
+            cell: Some(cell_to_assignment(&CellId::grid(0, 0, 0))),
+            source_worker_id: "worker-a".to_string(),
+            target_worker_id: "worker-b".to_string(),
+            command: command as i32,
+        }
+    }
 
     #[test]
     fn parse_config_single_worker() {
@@ -1218,5 +1715,242 @@ mod tests {
         assert_eq!(metrics.listing_requests, 1);
         assert_eq!(metrics.watch_streams_started, 1);
         assert_eq!(metrics.listing_updates, 1);
+    }
+
+    #[tokio::test]
+    async fn handover_commands_follow_safe_skeleton_sequence() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+
+        let pre_copy = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::PreCopy)))
+            .await
+            .expect("submit pre-copy")
+            .into_inner();
+        assert!(pre_copy.accepted);
+        assert_eq!(pre_copy.state, HandoverState::PreCopying as i32);
+        assert_eq!(
+            pre_copy.client_move_policy,
+            HandoverClientMovePolicy::Allow as i32
+        );
+        assert_eq!(
+            pre_copy.failure_policy,
+            HandoverFailurePolicy::KeepSourceAndAbort as i32
+        );
+        assert!(!pre_copy.assignments_changed);
+
+        let freeze = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Freeze)))
+            .await
+            .expect("submit freeze")
+            .into_inner();
+        assert!(freeze.accepted);
+        assert_eq!(freeze.state, HandoverState::Frozen as i32);
+        assert_eq!(
+            freeze.client_move_policy,
+            HandoverClientMovePolicy::RejectDuringFreeze as i32
+        );
+        assert!(!freeze.assignments_changed);
+
+        let diff = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Diff)))
+            .await
+            .expect("submit diff")
+            .into_inner();
+        assert!(diff.accepted);
+        assert_eq!(diff.state, HandoverState::Diffing as i32);
+        assert_eq!(
+            diff.client_move_policy,
+            HandoverClientMovePolicy::RejectDuringFreeze as i32
+        );
+        assert!(!diff.assignments_changed);
+
+        let commit = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Commit)))
+            .await
+            .expect("submit commit")
+            .into_inner();
+        assert!(commit.accepted);
+        assert_eq!(commit.state, HandoverState::Committed as i32);
+        assert_eq!(
+            commit.client_move_policy,
+            HandoverClientMovePolicy::Allow as i32
+        );
+        assert!(!commit.assignments_changed);
+
+        let listing = service
+            .list_assignments(Request::new(ListAssignmentsRequest {}))
+            .await
+            .expect("list assignments")
+            .into_inner();
+        let source = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-a")
+            .expect("source worker listing");
+        assert_eq!(source.cells.len(), 1);
+        let target = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-b")
+            .expect("target worker listing");
+        assert!(target.cells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handover_rejects_out_of_order_command() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+
+        let rejected = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Diff)))
+            .await
+            .expect("submit diff")
+            .into_inner();
+
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.state, HandoverState::Idle as i32);
+        assert!(rejected.reason.contains("PreCopy"));
+        assert!(!rejected.assignments_changed);
+    }
+
+    #[tokio::test]
+    async fn handover_rejects_source_that_does_not_own_cell() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        let mut req = handover_request(HandoverCommand::PreCopy);
+        req.source_worker_id = "worker-b".to_string();
+        req.target_worker_id = "worker-a".to_string();
+
+        let rejected = service
+            .submit_handover_command(Request::new(req))
+            .await
+            .expect("submit pre-copy")
+            .into_inner();
+
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.state, HandoverState::Idle as i32);
+        assert!(rejected.reason.contains("current_owner=worker-a"));
+        assert!(!rejected.assignments_changed);
+    }
+
+    #[tokio::test]
+    async fn handover_rejects_mismatched_active_operation() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::PreCopy)))
+            .await
+            .expect("submit pre-copy");
+
+        let mut req = handover_request(HandoverCommand::Freeze);
+        req.operation_id = "handover-2".to_string();
+        let rejected = service
+            .submit_handover_command(Request::new(req))
+            .await
+            .expect("submit mismatched freeze")
+            .into_inner();
+
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.state, HandoverState::PreCopying as i32);
+        assert!(rejected.reason.contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn handover_abort_clears_active_operation() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::PreCopy)))
+            .await
+            .expect("submit pre-copy");
+
+        let aborted = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Abort)))
+            .await
+            .expect("submit abort")
+            .into_inner();
+        assert!(aborted.accepted);
+        assert_eq!(aborted.state, HandoverState::Aborted as i32);
+        assert!(!aborted.assignments_changed);
+
+        let mut next = handover_request(HandoverCommand::PreCopy);
+        next.operation_id = "handover-2".to_string();
+        let accepted = service
+            .submit_handover_command(Request::new(next))
+            .await
+            .expect("submit next pre-copy")
+            .into_inner();
+        assert!(accepted.accepted);
+        assert_eq!(accepted.state, HandoverState::PreCopying as i32);
+    }
+
+    #[test]
+    fn prometheus_metrics_text_uses_snapshot_values() {
+        let metrics = OrchestratorMetrics {
+            configured_workers: 2,
+            registered_workers: 1,
+            assigned_cells: 8,
+            empty_workers: 0,
+            addr_mismatch_workers: 1,
+            registration_attempts: 3,
+            unknown_worker_registrations: 1,
+            assignment_snapshot_requests: 5,
+            listing_requests: 7,
+            watch_streams_started: 11,
+            listing_updates: 13,
+        };
+
+        let text = format_prometheus_metrics(&metrics);
+        assert!(text.contains("# TYPE tessera_orch_configured_workers gauge\n"));
+        assert!(text.contains("tessera_orch_configured_workers 2\n"));
+        assert!(text.contains("# TYPE tessera_orch_registration_attempts_total counter\n"));
+        assert!(text.contains("tessera_orch_registration_attempts_total 3\n"));
+        assert!(text.contains("tessera_orch_listing_updates_total 13\n"));
+    }
+
+    #[tokio::test]
+    async fn prometheus_metrics_http_serves_current_snapshot() {
+        let mut workers = HashMap::new();
+        workers.insert(
+            "worker-a".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.1:5001".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            },
+        );
+        let service = OrchestratorService::new(Config { workers });
+        service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-a".into(),
+                addr: "10.0.0.1:5001".into(),
+            }))
+            .await
+            .expect("register worker");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metrics listener");
+        let addr = listener.local_addr().expect("metrics listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept metrics request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle metrics request");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect metrics");
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write metrics request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read metrics response");
+        server.await.expect("metrics server task");
+
+        let response = String::from_utf8(response).expect("utf8 metrics response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+        assert!(response.contains("tessera_orch_registered_workers 1\n"));
+        assert!(response.contains("tessera_orch_registration_attempts_total 1\n"));
     }
 }
