@@ -62,9 +62,10 @@ Last reviewed: 2026-04-26
    - 완료 조건: 기존 client/ghost behavior test가 유지되고, per-cell stage를 개별적으로 테스트할 수 있다.
    - 검증: ordered per-cell flush batch unit test, 기존 queued move/ghost relay tests, `cargo xt`, `cargo test`, runtime smoke.
 
-5. Dynamic split/merge design note
+5. [done 2026-04-26] Dynamic split/merge design note
    - 목표: quadtree split/merge 조건, hysteresis, assignment churn 제한을 문서로 고정한다.
    - 완료 조건: README의 V2 동적 분할 목표와 일치하는 `docs/` 설계 노트가 생기고, 구현 전제와 non-goals가 분리된다.
+   - 검증: `docs/dynamic-split-merge.md`, README Planned/Upcoming 링크, `cargo xt`.
 
 ## P2
 

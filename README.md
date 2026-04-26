@@ -100,7 +100,7 @@ Cell-based world orchestration for real-time servers in Rust.
 
 ### 🚧 Planned / Upcoming
 - Worker 간 ghost relay의 장기 scrape/tracing assertions와 health policy 고도화
-- 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
+- 리밸런싱 자동화, 동적 분할(V1/V2) 구현은 아직 미구현 (`docs/dynamic-split-merge.md`에 설계 노트)
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
