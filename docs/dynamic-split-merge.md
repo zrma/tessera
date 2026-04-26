@@ -5,8 +5,11 @@ Last reviewed: 2026-04-26
 ## Scope
 
 This note fixes the V2 direction for quadtree-style cell split/merge. It is a
-design contract only; runtime split/merge, automatic rebalancing, and multi-depth
-assignment changes are not implemented yet.
+design contract only. The Orchestrator now has an inactive split planner
+skeleton with deterministic ranking, hysteresis/cooldown, churn-budget, and
+overlap tests, but runtime split/merge, automatic rebalancing, merge planning,
+real metrics ingestion, and multi-depth assignment changes are not implemented
+yet.
 
 The design assumes the existing V0/V1 foundations stay intact:
 
@@ -112,12 +115,13 @@ handover commit at a time per cell family.
 
 ## Verification Plan
 
-Before runtime implementation, add tests for:
+Before runtime implementation, keep or extend tests for:
 
-- Split candidate ranking and hysteresis.
+- Split candidate ranking and hysteresis. (initial inactive skeleton covered)
 - Merge candidate validation for complete sibling sets.
-- Churn budget rejection.
-- No overlapping active plans for the same cell family.
+- Churn budget rejection. (initial inactive skeleton covered)
+- No overlapping active plans for the same cell family. (initial inactive
+  skeleton covered for exact CellId families)
 - Assignment listing shape before and after a simulated split/merge.
 
 Runtime implementation should additionally run the existing full gate:

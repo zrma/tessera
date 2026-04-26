@@ -71,10 +71,9 @@ Open decisions:
 Goal: begin V2 dynamic split/merge safely with deterministic planner tests before
 runtime ownership changes.
 
-Escalation recommended before runtime activation, but pure planner tests can be
-implemented locally once thresholds are accepted.
+Status: done 2026-04-26 for the inactive planner skeleton.
 
-Recommended first slice:
+Implemented first slice:
 
 1. Add an Orchestrator-local planner model that ranks split candidates from a
    metrics snapshot.
@@ -87,3 +86,9 @@ Completion conditions:
 - `docs/dynamic-split-merge.md` invariants remain true.
 - No assignment listing/watch behavior changes until a later explicit runtime
   slice.
+
+Deferred:
+
+- Runtime split/merge activation still requires explicit approval.
+- Merge planning, multi-depth parent/child semantics, and real metrics ingestion
+  remain future slices.
