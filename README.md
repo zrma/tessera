@@ -93,11 +93,11 @@ Cell-based world orchestration for real-time servers in Rust.
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 틱 큐에서 flush하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 중복 연결을 줄이고 opt-in `/metrics`로 relay fanout/backpressure/reconnect 카운터를 노출
 - Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter 제공
-- Handover runtime baseline: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하고, Orchestrator `ListAssignments`/`WatchAssignments`가 active handover status를 내려주며, source Worker는 `Freeze`/`Diff` 중 bounded buffer에 client move를 보관했다가 handover status가 해제되면 FIFO로 replay한다. `Commit`은 target Worker 등록을 확인한 뒤 assignment를 target으로 전환해 Gateway route switch와 Worker owned-cell 갱신을 listing/watch 경로로 전파한다. target-side replay와 automatic commit retry는 다음 slice로 분리
+- Handover runtime baseline: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하고, Orchestrator `ListAssignments`/`WatchAssignments`가 active handover status를 내려주며, source Worker는 `Freeze`/`Diff` 중 bounded buffer에 client move를 보관한다. `Abort`처럼 source가 계속 cell을 소유하면 buffered move를 FIFO로 로컬 replay하고, `Commit`은 target Worker 등록과 bounded retry budget을 확인한 뒤 assignment를 target으로 전환한다. source Worker는 commit release 시 actor snapshot과 buffered move를 target Worker에 `HandoverReplay` relay payload로 넘기며, target은 replay를 idempotent하게 적용하고 replayed actor를 첫 post-handover client session이 claim할 수 있게 한다.
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Handover target-side replay and retry: source buffered move를 target Worker에 넘기는 replay 경로와 commit retry/abort 정책을 runtime 경로에 연결
+- Stable session handover: Gateway route change 뒤 client socket/actor ownership을 명시적 session identity로 보존하고, 현재의 claim-on-first-use replay fallback을 대체
 - Worker AOI/ghost를 셀 경계 기반에서 더 정밀한 거리/가시성 기반으로 고도화하고, 다셀 틱 파이프라인을 구조화
 - Worker 간 ghost relay의 장기 scrape/tracing assertions와 health policy 고도화
 - 리밸런싱 자동화, 동적 분할(V1/V2) 등은 아직 미구현
@@ -106,7 +106,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
 - 멱등·역전 처리의 기반으로 `seq/epoch` 사용(현재 워커는 응답 `seq` 증가)
 - 클라 옵션: `--world --cx --cy --epoch`로 Envelope 기본값 설정
-- Handover control-plane: `SubmitHandoverCommand`는 `PreCopy`, `Freeze`, `Diff`, `Commit`, `Abort`를 순서 검증하고, `Commit`은 registered target Worker로 assignment를 전환하며, `ListAssignments`/`WatchAssignments`는 active handover status와 최신 assignment를 함께 전달한다. 자세한 정책은 `docs/handover.md`에 둔다.
+- Handover control-plane: `SubmitHandoverCommand`는 `PreCopy`, `Freeze`, `Diff`, `Commit`, `Abort`를 순서 검증하고, `Commit`은 registered target Worker로 assignment를 전환하며, `ListAssignments`/`WatchAssignments`는 active handover status와 최신 assignment를 함께 전달한다. Commit 전 target 미등록은 bounded retry budget 안에서 `Diffing`을 유지하고, budget 소진 시 assignment transfer 전에 abort한다. 자세한 정책은 `docs/handover.md`에 둔다.
 
 ## Troubleshooting
 - 포트 점유: `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`를 변경하거나 점유 프로세스 종료

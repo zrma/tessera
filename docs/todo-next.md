@@ -35,7 +35,7 @@ Last reviewed: 2026-04-26
    - 완료 조건: target Worker가 등록되지 않은 commit은 retryable reject로 남고, 등록된 target으로 commit하면 Orchestrator assignment가 이동하며, source Worker는 더 이상 이전 cell을 소유한 것으로 처리하지 않는다.
    - 주의: 이번 slice는 route/ownership 전환까지이며 source buffered move의 target-side replay는 아직 없다. commit 이후 source buffer drain은 `handover_cell_not_owned` error path를 유지한다.
 
-6. [next] Handover target-side replay and commit retry
+6. [done 2026-04-26] Handover target-side replay and commit retry
    - 목표: source buffered move를 target Worker에 넘기는 replay 경로와 commit retry/abort 정책을 runtime 경로에 연결한다.
    - 작업 계획: `docs/todo-handover-replay.md`에 retry budget, replay payload, target apply, stable session 후속 작업을 분리했다.
    - 완료 조건: target replay ordering, retry budget/timeout, abort-before-assignment-transfer tests가 고정된다.
@@ -43,15 +43,19 @@ Last reviewed: 2026-04-26
 
 ## P1
 
-1. AOI precision upgrade
+1. Stable session handover
+   - 목표: Gateway route change 뒤 client socket/actor ownership을 명시적 session identity로 보존한다.
+   - 완료 조건: target replay actor claim-on-first-use를 stable session claim으로 대체하고, route-change close path의 비-ping traffic 정책을 다시 테스트로 고정한다.
+
+2. AOI precision upgrade
    - 목표: 현재 셀 경계 기반 edge margin을 거리/가시성 기반으로 확장한다.
    - 완료 조건: centered/edge/distant actor cases가 deterministic test로 고정되고, AOI 폭주 방지 cap이 문서화된다.
 
-2. Multi-cell tick pipeline
+3. Multi-cell tick pipeline
    - 목표: Worker 내부의 셀별 tick, broadcast flush, relay fanout 단계를 더 명시적인 pipeline으로 나눈다.
    - 완료 조건: 기존 client/ghost behavior test가 유지되고, per-cell stage를 개별적으로 테스트할 수 있다.
 
-3. Dynamic split/merge design note
+4. Dynamic split/merge design note
    - 목표: quadtree split/merge 조건, hysteresis, assignment churn 제한을 문서로 고정한다.
    - 완료 조건: README의 V2 동적 분할 목표와 일치하는 `docs/` 설계 노트가 생기고, 구현 전제와 non-goals가 분리된다.
 

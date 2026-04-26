@@ -9,8 +9,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tessera_core::{
-    ActorState, CellId, ClientMsg, EntityId, Envelope, MAX_FRAME_LEN, Position, ServerMsg, Tick,
-    WorkerRelayMsg, encode_frame, try_decode_frame,
+    ActorState, CellId, ClientMsg, EntityId, Envelope, HandoverReplayMove, MAX_FRAME_LEN, Position,
+    ServerMsg, Tick, WorkerRelayMsg, encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -36,6 +36,8 @@ const DEFAULT_AOI_RADIUS_CELLS: i32 = 1;
 const DEFAULT_AOI_CELL_SPAN_UNITS: f32 = 32.0;
 const DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY: usize = 128;
 const DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS: u64 = 2_000;
+const HANDOVER_REPLAY_SEND_RETRY_MAX: usize = 3;
+const HANDOVER_REPLAY_SEND_RETRY_BACKOFF_MS: u64 = 100;
 
 #[derive(Debug, Default)]
 struct WorkerMetricsCounters {
@@ -86,6 +88,8 @@ type RemoteInterestMap = HashMap<u64, HashMap<CellId, PeerRoute>>;
 type RemotePeerSessionMap = HashMap<String, RemotePeerSessionHandle>;
 type HandoverPolicyMap = HashMap<CellId, HandoverCellPolicy>;
 type BufferedMoveQueues = HashMap<CellId, VecDeque<BufferedMove>>;
+type HandoverReplayClaims = HashSet<(CellId, EntityId)>;
+type AppliedHandoverReplays = HashSet<String>;
 
 #[derive(Clone)]
 struct CellSubscriber {
@@ -111,6 +115,7 @@ struct ClientSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaimOutcome {
     GrantedNew,
+    GrantedReplayed,
     GrantedExisting,
     Denied(u64),
 }
@@ -173,6 +178,8 @@ struct SharedState {
     remote_peer_sessions: Mutex<RemotePeerSessionMap>,
     handover_policies: RwLock<HandoverPolicyMap>,
     buffered_moves: Mutex<BufferedMoveQueues>,
+    handover_replay_claims: Mutex<HandoverReplayClaims>,
+    applied_handover_replays: Mutex<AppliedHandoverReplays>,
     metrics: Arc<WorkerMetricsCounters>,
     aoi_radius_cells: i32,
     aoi_cell_span_units: f32,
@@ -216,6 +223,8 @@ impl SharedState {
             remote_peer_sessions: Mutex::new(HashMap::new()),
             handover_policies: RwLock::new(HashMap::new()),
             buffered_moves: Mutex::new(HashMap::new()),
+            handover_replay_claims: Mutex::new(HashSet::new()),
+            applied_handover_replays: Mutex::new(HashSet::new()),
             metrics: Arc::new(WorkerMetricsCounters::default()),
             aoi_radius_cells,
             aoi_cell_span_units,
@@ -249,6 +258,7 @@ impl SharedState {
         pos: Position,
         subscriber: &CellSubscriber,
         epoch: u32,
+        preserve_existing_actor: bool,
     ) -> Result<bool, ()> {
         let mut actors = self.actors.lock().await;
         let mut subs = self.subscribers.lock().await;
@@ -259,7 +269,14 @@ impl SharedState {
             let mut found = false;
             for (id, existing) in cell_actors {
                 if *id == actor {
-                    entries.push(ActorState { id: *id, pos });
+                    entries.push(ActorState {
+                        id: *id,
+                        pos: if preserve_existing_actor {
+                            *existing
+                        } else {
+                            pos
+                        },
+                    });
                     found = true;
                 } else {
                     entries.push(ActorState {
@@ -292,7 +309,11 @@ impl SharedState {
         }
 
         let cell_actors = actors.entry(cell).or_default();
-        let inserted_new = cell_actors.insert(actor, pos).is_none();
+        let inserted_new = if preserve_existing_actor && cell_actors.contains_key(&actor) {
+            false
+        } else {
+            cell_actors.insert(actor, pos).is_none()
+        };
 
         let entry = subs.entry(cell).or_default();
         if !entry
@@ -572,6 +593,21 @@ impl SharedState {
             .collect::<Vec<_>>()
     }
 
+    async fn actor_snapshot(&self, cell: CellId) -> Vec<ActorState> {
+        let actors = self.actors.lock().await;
+        let mut snapshot = actors
+            .get(&cell)
+            .map(|cell_actors| {
+                cell_actors
+                    .iter()
+                    .map(|(id, pos)| ActorState { id: *id, pos: *pos })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        snapshot.sort_by_key(|actor| actor.id.0);
+        snapshot
+    }
+
     async fn update_peer_routes(&self, routes: PeerRoutes) -> bool {
         let mut peer_routes = self.peer_routes.write().await;
         if *peer_routes == routes {
@@ -581,17 +617,22 @@ impl SharedState {
         true
     }
 
+    async fn peer_route_for(&self, cell: CellId) -> Option<PeerRoute> {
+        let peer_routes = self.peer_routes.read().await;
+        peer_routes.get(&cell).cloned()
+    }
+
     async fn update_handover_policies(
         &self,
         policies: HandoverPolicyMap,
-    ) -> (bool, HashSet<CellId>) {
+    ) -> (bool, Vec<(CellId, HandoverCellPolicy)>) {
         let mut guard = self.handover_policies.write().await;
         let changed = *guard != policies;
         let released = guard
-            .keys()
-            .filter(|cell| !policies.contains_key(cell))
-            .copied()
-            .collect::<HashSet<_>>();
+            .iter()
+            .filter(|(cell, _)| !policies.contains_key(cell))
+            .map(|(cell, policy)| (*cell, policy.clone()))
+            .collect::<Vec<_>>();
         *guard = policies;
         (changed, released)
     }
@@ -631,6 +672,112 @@ impl SharedState {
             queue.retain(|buffered| buffered.client_id != client_id);
         }
         buffers.retain(|_, queue| !queue.is_empty());
+    }
+
+    async fn apply_handover_replay(
+        &self,
+        operation_id: String,
+        cell: CellId,
+        actors: Vec<ActorState>,
+        moves: Vec<HandoverReplayMove>,
+        owned_cells: &HashSet<CellId>,
+    ) -> HandoverReplayApplyOutcome {
+        if !owned_cells.contains(&cell) {
+            return HandoverReplayApplyOutcome::Rejected("target_cell_not_owned");
+        }
+
+        let replay_key = handover_replay_key(&operation_id, cell);
+        {
+            let applied = self.applied_handover_replays.lock().await;
+            if applied.contains(&replay_key) {
+                return HandoverReplayApplyOutcome::Duplicate;
+            }
+        }
+
+        let mut positions = HashMap::new();
+        for actor in actors {
+            if !position_is_finite(&actor.pos) {
+                return HandoverReplayApplyOutcome::Rejected("invalid_replay_position");
+            }
+            if positions.insert(actor.id, actor.pos).is_some() {
+                return HandoverReplayApplyOutcome::Rejected("duplicate_replay_actor");
+            }
+        }
+
+        for moved in &moves {
+            if !delta_is_finite(moved.dx, moved.dy) {
+                return HandoverReplayApplyOutcome::Rejected("invalid_replay_delta");
+            }
+            let Some(pos) = positions.get_mut(&moved.actor) else {
+                return HandoverReplayApplyOutcome::Rejected("missing_replay_actor");
+            };
+            let new_x = pos.x + moved.dx;
+            let new_y = pos.y + moved.dy;
+            if !(new_x.is_finite() && new_y.is_finite()) {
+                return HandoverReplayApplyOutcome::Rejected("replay_position_overflow");
+            }
+            pos.x = new_x;
+            pos.y = new_y;
+        }
+
+        {
+            let mut applied = self.applied_handover_replays.lock().await;
+            if !applied.insert(replay_key) {
+                return HandoverReplayApplyOutcome::Duplicate;
+            }
+        }
+
+        let mut final_actors = positions
+            .iter()
+            .map(|(id, pos)| ActorState { id: *id, pos: *pos })
+            .collect::<Vec<_>>();
+        final_actors.sort_by_key(|actor| actor.id.0);
+
+        {
+            let mut actor_map = self.actors.lock().await;
+            let cell_actors = actor_map.entry(cell).or_default();
+            for actor in &final_actors {
+                cell_actors.insert(actor.id, actor.pos);
+            }
+        }
+
+        {
+            let owners = self.owners.lock().await;
+            let mut claims = self.handover_replay_claims.lock().await;
+            for actor in &final_actors {
+                if !owners
+                    .get(&cell)
+                    .is_some_and(|cell_owners| cell_owners.contains_key(&actor.id))
+                {
+                    claims.insert((cell, actor.id));
+                }
+            }
+        }
+
+        if !final_actors.is_empty() {
+            let epoch = moves.iter().map(|moved| moved.epoch).max();
+            self.broadcast(
+                cell,
+                ServerMsg::Delta {
+                    cell,
+                    moved: final_actors.clone(),
+                },
+                None,
+                epoch,
+            )
+            .await;
+            self.broadcast_relay(
+                cell,
+                WorkerRelayMsg::Delta {
+                    cell,
+                    moved: final_actors,
+                },
+                epoch,
+            )
+            .await;
+        }
+
+        HandoverReplayApplyOutcome::Applied
     }
 
     async fn sync_remote_interests(
@@ -988,7 +1135,9 @@ impl SharedState {
                     cache.remove(cell);
                 }
             }
-            WorkerRelayMsg::Subscribe { .. } | WorkerRelayMsg::Unsubscribe { .. } => {}
+            WorkerRelayMsg::Subscribe { .. }
+            | WorkerRelayMsg::Unsubscribe { .. }
+            | WorkerRelayMsg::HandoverReplay { .. } => {}
         }
     }
 
@@ -999,7 +1148,9 @@ impl SharedState {
             WorkerRelayMsg::Snapshot { cell, actors } => ServerMsg::Snapshot { cell, actors },
             WorkerRelayMsg::Delta { cell, moved } => ServerMsg::Delta { cell, moved },
             WorkerRelayMsg::Despawn { cell, actors } => ServerMsg::Despawn { cell, actors },
-            WorkerRelayMsg::Subscribe { .. } | WorkerRelayMsg::Unsubscribe { .. } => return,
+            WorkerRelayMsg::Subscribe { .. }
+            | WorkerRelayMsg::Unsubscribe { .. }
+            | WorkerRelayMsg::HandoverReplay { .. } => return,
         };
 
         let subscribers = self.remote_interest_subscribers(env_in.cell).await;
@@ -1170,6 +1321,10 @@ impl SharedState {
             let mut pending = self.pending_moves.lock().await;
             pending.retain(|cell, _| !cells.contains(cell));
         }
+        {
+            let mut claims = self.handover_replay_claims.lock().await;
+            claims.retain(|(cell, _)| !cells.contains(cell));
+        }
         let mut subs = self.subscribers.lock().await;
         subs.retain(|cell, _| !cells.contains(cell));
         drop(subs);
@@ -1185,12 +1340,53 @@ impl SharedState {
         let entry = owners.entry(cell).or_default();
         match entry.get(&actor).copied() {
             None => {
+                let replayed = {
+                    let mut claims = self.handover_replay_claims.lock().await;
+                    claims.remove(&(cell, actor))
+                };
                 entry.insert(actor, client_id);
-                ClaimOutcome::GrantedNew
+                if replayed {
+                    ClaimOutcome::GrantedReplayed
+                } else {
+                    ClaimOutcome::GrantedNew
+                }
             }
             Some(existing) if existing == client_id => ClaimOutcome::GrantedExisting,
             Some(existing) => ClaimOutcome::Denied(existing),
         }
+    }
+
+    async fn claim_replayed_actor_owner(
+        &self,
+        cell: CellId,
+        actor: EntityId,
+        client_id: u64,
+    ) -> bool {
+        {
+            let actors = self.actors.lock().await;
+            if !actors
+                .get(&cell)
+                .is_some_and(|cell_actors| cell_actors.contains_key(&actor))
+            {
+                return false;
+            }
+        }
+
+        let mut owners = self.owners.lock().await;
+        if owners
+            .get(&cell)
+            .is_some_and(|cell_owners| cell_owners.contains_key(&actor))
+        {
+            return false;
+        }
+
+        let mut claims = self.handover_replay_claims.lock().await;
+        if !claims.remove(&(cell, actor)) {
+            return false;
+        }
+
+        owners.entry(cell).or_default().insert(actor, client_id);
+        true
     }
 
     async fn owner_for(&self, cell: &CellId, actor: &EntityId) -> Option<u64> {
@@ -1561,19 +1757,27 @@ async fn apply_peer_routes_update(
         (changed, removed)
     };
     let routes_changed = state.update_peer_routes(routes).await;
-    let (policies_changed, released_cells) = state.update_handover_policies(policies).await;
+    let (policies_changed, released_policies) = state.update_handover_policies(policies).await;
 
     let removed_owned_count = removed_owned_cells.len();
-    if !removed_owned_cells.is_empty() {
-        state.drop_cells(&removed_owned_cells).await;
-        state.sync_remote_peer_sessions().await;
-    }
-
-    let owned_snapshot = if routes_changed || owned_changed || !released_cells.is_empty() {
+    let needs_release_handling = !released_policies.is_empty();
+    let owned_snapshot = if routes_changed || owned_changed || needs_release_handling {
         Some(owned_cells.read().await.clone())
     } else {
         None
     };
+
+    if needs_release_handling {
+        let owned_snapshot = owned_snapshot
+            .as_ref()
+            .expect("owned snapshot for released handover cells");
+        handle_released_handover_buffers(state, owned_snapshot, released_policies).await;
+    }
+
+    if !removed_owned_cells.is_empty() {
+        state.drop_cells(&removed_owned_cells).await;
+        state.sync_remote_peer_sessions().await;
+    }
 
     if routes_changed || owned_changed {
         let owned_snapshot = owned_snapshot
@@ -1603,12 +1807,6 @@ async fn apply_peer_routes_update(
                 "peer route table updated from orchestrator listing"
             );
         }
-    }
-    if !released_cells.is_empty() {
-        let owned_snapshot = owned_snapshot
-            .as_ref()
-            .expect("owned snapshot for released handover cells");
-        flush_buffered_moves_for_cells(state, owned_snapshot, released_cells).await;
     }
 
     Ok(routes_changed || policies_changed || owned_changed)
@@ -1807,6 +2005,240 @@ async fn flush_buffered_moves_for_cells(
             "flushed handover move buffer"
         );
     }
+}
+
+async fn handle_released_handover_buffers(
+    state: &Arc<SharedState>,
+    owned_cells: &HashSet<CellId>,
+    released: Vec<(CellId, HandoverCellPolicy)>,
+) {
+    let mut local_replay = HashSet::new();
+    let mut target_replay = Vec::new();
+    for (cell, policy) in released {
+        if owned_cells.contains(&cell) {
+            local_replay.insert(cell);
+        } else {
+            target_replay.push((cell, policy));
+        }
+    }
+
+    if !local_replay.is_empty() {
+        flush_buffered_moves_for_cells(state, owned_cells, local_replay).await;
+    }
+
+    target_replay.sort_by_key(|(cell, policy)| {
+        (
+            cell.world,
+            cell.cy,
+            cell.cx,
+            cell.depth,
+            cell.sub,
+            policy.operation_id.clone(),
+        )
+    });
+
+    for (cell, policy) in target_replay {
+        replay_handover_to_target(state, cell, policy).await;
+    }
+}
+
+async fn replay_handover_to_target(
+    state: &Arc<SharedState>,
+    cell: CellId,
+    policy: HandoverCellPolicy,
+) {
+    let actors = state.actor_snapshot(cell).await;
+    let buffered_moves = state.drain_buffered_moves(cell).await;
+    let mut replay_moves = Vec::with_capacity(buffered_moves.len());
+    let mut replay_failures = Vec::with_capacity(buffered_moves.len());
+    let mut expired = 0_usize;
+    let mut response_closed = 0_usize;
+
+    for buffered in buffered_moves {
+        if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
+            expired += 1;
+            if enqueue_error(
+                &buffered.subscriber.tx,
+                cell,
+                buffered.epoch,
+                "handover_move_expired",
+                "move rejected: handover move buffer entry expired",
+            )
+            .is_err()
+            {
+                response_closed += 1;
+            }
+            continue;
+        }
+
+        let replay = HandoverReplayMove {
+            actor: buffered.actor,
+            dx: buffered.dx,
+            dy: buffered.dy,
+            epoch: buffered.epoch,
+        };
+        replay_failures.push((buffered.subscriber.clone(), buffered.epoch));
+        replay_moves.push(replay);
+    }
+
+    if actors.is_empty() && replay_moves.is_empty() {
+        info!(
+            target: "worker",
+            cell = ?cell,
+            operation_id = %policy.operation_id,
+            expired,
+            response_closed,
+            "released handover had no target replay payload"
+        );
+        return;
+    }
+
+    let Some(route) = state.peer_route_for(cell).await else {
+        warn!(
+            target: "worker",
+            cell = ?cell,
+            operation_id = %policy.operation_id,
+            target_worker_id = %policy.target_worker_id,
+            "missing target route for handover replay"
+        );
+        reject_replay_moves_unavailable(cell, &replay_failures, "handover_replay_no_route").await;
+        return;
+    };
+
+    if route.worker_id != policy.target_worker_id {
+        warn!(
+            target: "worker",
+            cell = ?cell,
+            operation_id = %policy.operation_id,
+            expected_target_worker_id = %policy.target_worker_id,
+            route_worker_id = %route.worker_id,
+            "target route does not match released handover policy"
+        );
+        reject_replay_moves_unavailable(cell, &replay_failures, "handover_replay_stale_route")
+            .await;
+        return;
+    }
+
+    let move_count = replay_moves.len();
+    match send_handover_replay_with_retry(
+        state,
+        &route,
+        policy.operation_id.as_str(),
+        cell,
+        actors,
+        replay_moves,
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(
+                target: "worker",
+                cell = ?cell,
+                operation_id = %policy.operation_id,
+                target_worker_id = %policy.target_worker_id,
+                moves = move_count,
+                expired,
+                response_closed,
+                "sent handover replay to target worker"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "worker",
+                cell = ?cell,
+                operation_id = %policy.operation_id,
+                target_worker_id = %policy.target_worker_id,
+                moves = move_count,
+                expired,
+                response_closed,
+                error = ?e,
+                "failed to send handover replay to target worker"
+            );
+            reject_replay_moves_unavailable(cell, &replay_failures, "handover_replay_send_failed")
+                .await;
+        }
+    }
+}
+
+async fn reject_replay_moves_unavailable(
+    cell: CellId,
+    moves: &[(CellSubscriber, u32)],
+    code: &str,
+) {
+    for (subscriber, epoch) in moves {
+        let _ = enqueue_error(
+            &subscriber.tx,
+            cell,
+            *epoch,
+            code,
+            "move rejected: handover replay target unavailable",
+        );
+    }
+}
+
+async fn send_handover_replay_with_retry(
+    state: &Arc<SharedState>,
+    route: &PeerRoute,
+    operation_id: &str,
+    cell: CellId,
+    actors: Vec<ActorState>,
+    moves: Vec<HandoverReplayMove>,
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 1..=HANDOVER_REPLAY_SEND_RETRY_MAX {
+        match send_handover_replay_once(route, operation_id, cell, actors.clone(), moves.clone())
+            .await
+        {
+            Ok(()) => {
+                state
+                    .metrics
+                    .remote_relay_frames_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            Err(e) => {
+                last_error = Some(e);
+                if attempt < HANDOVER_REPLAY_SEND_RETRY_MAX {
+                    time::sleep(Duration::from_millis(HANDOVER_REPLAY_SEND_RETRY_BACKOFF_MS)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("handover replay send failed")))
+}
+
+async fn send_handover_replay_once(
+    route: &PeerRoute,
+    operation_id: &str,
+    cell: CellId,
+    actors: Vec<ActorState>,
+    moves: Vec<HandoverReplayMove>,
+) -> Result<()> {
+    let mut stream = TcpStream::connect(route.addr.as_str())
+        .await
+        .with_context(|| format!("connect handover replay target {}", route.addr))?;
+    let env_out = Envelope {
+        cell,
+        seq: 0,
+        epoch: moves.iter().map(|moved| moved.epoch).max().unwrap_or(0),
+        payload: WorkerRelayMsg::HandoverReplay {
+            operation_id: operation_id.to_string(),
+            cell,
+            actors,
+            moves,
+        },
+    };
+    let frame = encode_frame(&env_out);
+    stream
+        .write_all(&frame)
+        .await
+        .context("write handover replay frame")?;
+    stream
+        .shutdown()
+        .await
+        .context("shutdown handover replay stream")?;
+    Ok(())
 }
 
 fn orchestrator_endpoint() -> String {
@@ -3256,6 +3688,47 @@ async fn handle_worker_relay_inner(
                     subscribed_cells.remove(&cell);
                 }
             }
+            WorkerRelayMsg::HandoverReplay {
+                operation_id,
+                cell,
+                actors,
+                moves,
+            } => {
+                let owned_guard = owned_cells.read().await;
+                match state
+                    .apply_handover_replay(operation_id.clone(), cell, actors, moves, &owned_guard)
+                    .await
+                {
+                    HandoverReplayApplyOutcome::Applied => {
+                        info!(
+                            target: "worker",
+                            %peer,
+                            operation_id = %operation_id,
+                            cell = ?cell,
+                            "applied handover replay from peer"
+                        );
+                    }
+                    HandoverReplayApplyOutcome::Duplicate => {
+                        info!(
+                            target: "worker",
+                            %peer,
+                            operation_id = %operation_id,
+                            cell = ?cell,
+                            "ignored duplicate handover replay from peer"
+                        );
+                    }
+                    HandoverReplayApplyOutcome::Rejected(reason) => {
+                        warn!(
+                            target: "worker",
+                            %peer,
+                            operation_id = %operation_id,
+                            cell = ?cell,
+                            reason,
+                            "rejected handover replay from peer"
+                        );
+                    }
+                }
+            }
             WorkerRelayMsg::Snapshot { .. }
             | WorkerRelayMsg::Delta { .. }
             | WorkerRelayMsg::Despawn { .. } => {
@@ -3277,6 +3750,20 @@ enum MoveApplyOutcome {
     Applied,
     Rejected,
     ResponseClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoverReplayApplyOutcome {
+    Applied,
+    Duplicate,
+    Rejected(&'static str),
+}
+
+fn handover_replay_key(operation_id: &str, cell: CellId) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        operation_id, cell.world, cell.cx, cell.cy, cell.depth, cell.sub
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3344,26 +3831,40 @@ async fn apply_client_move(
             };
         }
         None => {
-            warn!(
-                target: "worker",
-                %peer,
-                cell = ?cell,
-                actor = actor.0,
-                "move rejected: actor not joined"
-            );
-            return if enqueue_error(
-                tx,
-                cell,
-                epoch,
-                "actor_not_joined",
-                "move rejected: actor not joined",
-            )
-            .is_err()
+            if state
+                .claim_replayed_actor_owner(cell, actor, client_id)
+                .await
             {
-                MoveApplyOutcome::ResponseClosed
+                info!(
+                    target: "worker",
+                    %peer,
+                    cell = ?cell,
+                    actor = actor.0,
+                    client_id,
+                    "claimed handover replayed actor for post-handover move"
+                );
             } else {
-                MoveApplyOutcome::Rejected
-            };
+                warn!(
+                    target: "worker",
+                    %peer,
+                    cell = ?cell,
+                    actor = actor.0,
+                    "move rejected: actor not joined"
+                );
+                return if enqueue_error(
+                    tx,
+                    cell,
+                    epoch,
+                    "actor_not_joined",
+                    "move rejected: actor not joined",
+                )
+                .is_err()
+                {
+                    MoveApplyOutcome::ResponseClosed
+                } else {
+                    MoveApplyOutcome::Rejected
+                };
+            }
         }
     }
 
@@ -3691,12 +4192,22 @@ async fn handle_upstream_inner(
 
                 // 스냅샷 처리 중 델타 누락을 막기 위해 구독을 같은 락 구간에서 갱신한다.
                 let inserted_new = match state
-                    .snapshot_and_subscribe(cell, actor, pos, &subscriber, env_in.epoch)
+                    .snapshot_and_subscribe(
+                        cell,
+                        actor,
+                        pos,
+                        &subscriber,
+                        env_in.epoch,
+                        matches!(claim, ClaimOutcome::GrantedReplayed),
+                    )
                     .await
                 {
                     Ok(inserted_new) => inserted_new,
                     Err(()) => {
-                        if matches!(claim, ClaimOutcome::GrantedNew) {
+                        if matches!(
+                            claim,
+                            ClaimOutcome::GrantedNew | ClaimOutcome::GrantedReplayed
+                        ) {
                             state.release_owner(cell, actor, client_id).await;
                         }
                         warn!(
@@ -3707,7 +4218,12 @@ async fn handle_upstream_inner(
                         break Ok(());
                     }
                 };
-                if inserted_new || matches!(claim, ClaimOutcome::GrantedNew) {
+                if inserted_new
+                    || matches!(
+                        claim,
+                        ClaimOutcome::GrantedNew | ClaimOutcome::GrantedReplayed
+                    )
+                {
                     owned_actors.insert((cell, actor));
                 }
                 subscribed_cells.insert(cell);
@@ -4636,6 +5152,215 @@ mod tests {
                 .and_then(|cell_map| cell_map.get(&actor))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn handover_replay_applies_moves_idempotently_and_claims_actor() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(7);
+        let owned_cells = HashSet::from([cell]);
+
+        let outcome = state
+            .apply_handover_replay(
+                "op-claim".to_string(),
+                cell,
+                vec![ActorState {
+                    id: actor,
+                    pos: Position { x: 1.0, y: 2.0 },
+                }],
+                vec![HandoverReplayMove {
+                    actor,
+                    dx: 3.0,
+                    dy: 4.0,
+                    epoch: 11,
+                }],
+                &owned_cells,
+            )
+            .await;
+        assert_eq!(outcome, HandoverReplayApplyOutcome::Applied);
+
+        let duplicate = state
+            .apply_handover_replay(
+                "op-claim".to_string(),
+                cell,
+                vec![ActorState {
+                    id: actor,
+                    pos: Position { x: 9.0, y: 9.0 },
+                }],
+                vec![HandoverReplayMove {
+                    actor,
+                    dx: 9.0,
+                    dy: 9.0,
+                    epoch: 12,
+                }],
+                &owned_cells,
+            )
+            .await;
+        assert_eq!(duplicate, HandoverReplayApplyOutcome::Duplicate);
+
+        {
+            let actors = state.actors.lock().await;
+            let pos = actors
+                .get(&cell)
+                .and_then(|cell_actors| cell_actors.get(&actor))
+                .copied()
+                .expect("replayed actor");
+            assert_eq!(pos, Position { x: 4.0, y: 6.0 });
+        }
+
+        let (tx, mut rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(91, tx, &disconnect_tx);
+        let outcome = apply_client_move(
+            &state,
+            &owned_cells,
+            &subscriber.tx,
+            &subscriber,
+            None,
+            subscriber.client_id,
+            "127.0.0.1:9999".parse().unwrap(),
+            cell,
+            actor,
+            1.0,
+            1.0,
+            13,
+        )
+        .await;
+        assert_eq!(outcome, MoveApplyOutcome::Applied);
+        assert_eq!(state.owner_for(&cell, &actor).await, Some(91));
+
+        let replayed_move = rx.try_recv().expect("post-handover move response");
+        match replayed_move.2 {
+            ServerMsg::Delta { moved, .. } => {
+                assert_eq!(moved.len(), 1);
+                assert_eq!(moved[0].id, actor);
+                assert_eq!(moved[0].pos, Position { x: 5.0, y: 7.0 });
+            }
+            other => panic!("expected delta response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_sends_handover_replay_to_target_after_commit() {
+        let source_state = Arc::new(SharedState::with_runtime_config(
+            0,
+            DEFAULT_AOI_CELL_SPAN_UNITS,
+            None,
+            4,
+            Duration::from_secs(1),
+        ));
+        let target_state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(8);
+        let client_id = 88;
+        let source_owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+        let target_owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target worker listener");
+        let target_addr = listener.local_addr().expect("target listener addr");
+        let server = spawn_incoming_test_server(
+            listener,
+            Arc::clone(&target_state),
+            Arc::clone(&target_owned_cells),
+            1,
+        );
+
+        assert_eq!(
+            source_state.claim_owner(cell, actor, client_id).await,
+            ClaimOutcome::GrantedNew
+        );
+        {
+            let mut actors = source_state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(actor, Position { x: 1.0, y: 2.0 });
+        }
+
+        let (tx, _rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(client_id, tx, &disconnect_tx);
+        source_state
+            .update_handover_policies(HashMap::from([(
+                cell,
+                HandoverCellPolicy {
+                    operation_id: "op-target".into(),
+                    source_worker_id: "worker-a".into(),
+                    target_worker_id: "worker-b".into(),
+                    state: HandoverState::Diffing,
+                    client_move_policy: HandoverClientMovePolicy::RejectDuringFreeze,
+                },
+            )]))
+            .await;
+        source_state
+            .buffer_client_move(
+                cell,
+                BufferedMove {
+                    subscriber,
+                    connection_epoch: Arc::new(AtomicU32::new(10)),
+                    peer: "127.0.0.1:9999".parse().unwrap(),
+                    client_id,
+                    actor,
+                    dx: 3.0,
+                    dy: 4.0,
+                    epoch: 11,
+                    buffered_at: Instant::now(),
+                },
+            )
+            .await
+            .expect("buffer source move");
+
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-a".into(),
+                    addr: "127.0.0.1:5001".into(),
+                    cells: vec![],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: target_addr.to_string(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&source_state, &source_owned_cells, "worker-a", listing)
+                .await
+                .expect("apply committed listing")
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let pos = {
+                    let actors = target_state.actors.lock().await;
+                    actors
+                        .get(&cell)
+                        .and_then(|cell_actors| cell_actors.get(&actor))
+                        .copied()
+                };
+                if pos == Some(Position { x: 4.0, y: 6.0 }) {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("target replay applied");
+        server.await.expect("target server task");
+        assert!(source_state.drain_buffered_moves(cell).await.is_empty());
+        assert!(!source_state.actors.lock().await.contains_key(&cell));
     }
 
     #[tokio::test]
@@ -6887,7 +7612,7 @@ mod tests {
         let state_clone = Arc::clone(&state);
         let join_handle = tokio::spawn(async move {
             state_clone
-                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0)
+                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0, false)
                 .await
                 .expect("snapshot");
         });

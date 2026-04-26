@@ -33,14 +33,14 @@ source-side buffered moves are not transferred to the target Worker.
    - Verify registered-target success, retryable unregistered target, and
      exhausted-budget abort.
 
-2. [next] Worker replay payload and source send path
+2. [done 2026-04-26] Worker replay payload and source send path
    - Add a worker-to-worker relay payload for `HandoverReplay`.
    - When a source Worker sees a freeze/diff policy released and no longer owns
      the cell, drain its buffered moves, capture the cell actor snapshot, and
      send replay to the target route with bounded send retry.
    - Preserve FIFO order and TTL/overflow behavior for source buffered moves.
 
-3. [next] Target replay apply path
+3. [done 2026-04-26] Target replay apply path
    - Accept `HandoverReplay` only when the target Worker owns the cell.
    - Apply base actor state plus buffered deltas in order, mark replayed actors
      as claimable by the next client session, and broadcast resulting deltas to
