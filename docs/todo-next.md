@@ -69,6 +69,7 @@ Last reviewed: 2026-04-26
 
 ## P2
 
+- 실행 계획: `docs/todo-p2-observability-packaging.md`
 - Long-lived quality loop: metrics scrape/tracing assertion을 `cargo xt harness` 또는 별도 smoke로 넣을지 결정한다.
 - Gateway latency/readiness 관측: request latency histogram, readiness endpoint, reconnect-required close reason을 metric/log field로 정리한다.
 - Container/Kubernetes packaging: Prometheus scrape annotation, readiness/liveness endpoint, config mount 예시를 추가한다.
