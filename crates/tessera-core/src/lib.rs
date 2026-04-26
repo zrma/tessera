@@ -65,6 +65,14 @@ pub struct ActorState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HandoverReplayMove {
+    pub actor: EntityId,
+    pub dx: f32,
+    pub dy: f32,
+    pub epoch: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     Ping { ts: u64 },
@@ -116,6 +124,12 @@ pub enum WorkerRelayMsg {
     Despawn {
         cell: CellId,
         actors: Vec<EntityId>,
+    },
+    HandoverReplay {
+        operation_id: String,
+        cell: CellId,
+        actors: Vec<ActorState>,
+        moves: Vec<HandoverReplayMove>,
     },
 }
 
@@ -226,6 +240,36 @@ mod tests {
             epoch: 9,
             payload: WorkerRelayMsg::Subscribe {
                 cells: vec![CellId::grid(0, 1, 0), CellId::grid(0, 2, 0)],
+            },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<WorkerRelayMsg> =
+            try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(env, decoded);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn frame_roundtrip_handover_replay() {
+        let cell = CellId::grid(0, 1, 0);
+        let env = Envelope {
+            cell,
+            seq: 4,
+            epoch: 12,
+            payload: WorkerRelayMsg::HandoverReplay {
+                operation_id: "handover-1".to_string(),
+                cell,
+                actors: vec![ActorState {
+                    id: EntityId(7),
+                    pos: Position::new(1.0, 2.0),
+                }],
+                moves: vec![HandoverReplayMove {
+                    actor: EntityId(7),
+                    dx: 3.0,
+                    dy: 4.0,
+                    epoch: 13,
+                }],
             },
         };
         let b = encode_frame(&env);
