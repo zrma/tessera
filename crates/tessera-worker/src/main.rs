@@ -35,6 +35,7 @@ static NEXT_RELAY_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_AOI_RADIUS_CELLS: i32 = 1;
 const DEFAULT_AOI_CELL_SPAN_UNITS: f32 = 32.0;
+const DEFAULT_AOI_MAX_CELLS: usize = 64;
 const DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY: usize = 128;
 const DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS: u64 = 2_000;
 const HANDOVER_REPLAY_SEND_RETRY_MAX: usize = 3;
@@ -186,6 +187,8 @@ struct SharedState {
     aoi_radius_cells: i32,
     aoi_cell_span_units: f32,
     aoi_edge_margin_units: Option<f32>,
+    aoi_visibility_radius_units: Option<f32>,
+    aoi_max_cells: usize,
     handover_move_buffer_capacity: usize,
     handover_move_buffer_ttl: Duration,
 }
@@ -196,10 +199,28 @@ impl SharedState {
         aoi_cell_span_units: f32,
         aoi_edge_margin_units: Option<f32>,
     ) -> Self {
+        Self::with_aoi_precision_config(
+            aoi_radius_cells,
+            aoi_cell_span_units,
+            aoi_edge_margin_units,
+            None,
+            DEFAULT_AOI_MAX_CELLS,
+        )
+    }
+
+    fn with_aoi_precision_config(
+        aoi_radius_cells: i32,
+        aoi_cell_span_units: f32,
+        aoi_edge_margin_units: Option<f32>,
+        aoi_visibility_radius_units: Option<f32>,
+        aoi_max_cells: usize,
+    ) -> Self {
         Self::with_runtime_config(
             aoi_radius_cells,
             aoi_cell_span_units,
             aoi_edge_margin_units,
+            aoi_visibility_radius_units,
+            aoi_max_cells,
             DEFAULT_HANDOVER_MOVE_BUFFER_CAPACITY,
             Duration::from_millis(DEFAULT_HANDOVER_MOVE_BUFFER_TTL_MS),
         )
@@ -209,6 +230,8 @@ impl SharedState {
         aoi_radius_cells: i32,
         aoi_cell_span_units: f32,
         aoi_edge_margin_units: Option<f32>,
+        aoi_visibility_radius_units: Option<f32>,
+        aoi_max_cells: usize,
         handover_move_buffer_capacity: usize,
         handover_move_buffer_ttl: Duration,
     ) -> Self {
@@ -231,6 +254,8 @@ impl SharedState {
             aoi_radius_cells,
             aoi_cell_span_units,
             aoi_edge_margin_units,
+            aoi_visibility_radius_units,
+            aoi_max_cells,
             handover_move_buffer_capacity,
             handover_move_buffer_ttl,
         }
@@ -1038,6 +1063,8 @@ impl SharedState {
                 self.aoi_radius_cells,
                 self.aoi_cell_span_units,
                 self.aoi_edge_margin_units,
+                self.aoi_visibility_radius_units,
+                self.aoi_max_cells,
             );
             let desired_cells = desired_targets
                 .intersection(owned_cells)
@@ -1534,6 +1561,9 @@ async fn main() -> Result<()> {
     let aoi_cell_span_units = load_aoi_cell_span_units().context("load worker AOI cell span")?;
     let aoi_edge_margin_units =
         load_aoi_edge_margin_units().context("load worker AOI edge margin")?;
+    let aoi_visibility_radius_units =
+        load_aoi_visibility_radius_units().context("load worker AOI visibility radius")?;
+    let aoi_max_cells = load_aoi_max_cells().context("load worker AOI max cells")?;
     let handover_move_buffer_capacity = load_handover_move_buffer_capacity()
         .context("load worker handover move buffer capacity")?;
     let handover_move_buffer_ttl =
@@ -1558,6 +1588,8 @@ async fn main() -> Result<()> {
         aoi_radius_cells,
         aoi_cell_span_units,
         aoi_edge_margin_units,
+        aoi_visibility_radius_units,
+        aoi_max_cells,
         handover_move_buffer_capacity,
         handover_move_buffer_ttl,
     ));
@@ -2764,6 +2796,16 @@ fn load_aoi_edge_margin_units() -> Result<Option<f32>> {
     parse_aoi_edge_margin_units(raw.as_deref())
 }
 
+fn load_aoi_visibility_radius_units() -> Result<Option<f32>> {
+    let raw = std::env::var("TESSERA_WORKER_AOI_VISIBILITY_RADIUS_UNITS").ok();
+    parse_aoi_visibility_radius_units(raw.as_deref())
+}
+
+fn load_aoi_max_cells() -> Result<usize> {
+    let raw = std::env::var("TESSERA_WORKER_AOI_MAX_CELLS").ok();
+    parse_aoi_max_cells(raw.as_deref())
+}
+
 fn load_handover_move_buffer_capacity() -> Result<usize> {
     let raw = std::env::var("TESSERA_WORKER_HANDOVER_MOVE_BUFFER_CAPACITY").ok();
     parse_handover_move_buffer_capacity(raw.as_deref())
@@ -2832,6 +2874,45 @@ fn parse_aoi_edge_margin_units(raw: Option<&str>) -> Result<Option<f32>> {
         return Err(anyhow!("AOI edge margin must be >= 0"));
     }
     Ok(Some(margin))
+}
+
+fn parse_aoi_visibility_radius_units(raw: Option<&str>) -> Result<Option<f32>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let radius = trimmed
+        .parse::<f32>()
+        .with_context(|| format!("invalid AOI visibility radius `{trimmed}`"))?;
+    if !radius.is_finite() {
+        return Err(anyhow!("AOI visibility radius must be finite"));
+    }
+    if radius < 0.0 {
+        return Err(anyhow!("AOI visibility radius must be >= 0"));
+    }
+    Ok(Some(radius))
+}
+
+fn parse_aoi_max_cells(raw: Option<&str>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_AOI_MAX_CELLS);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_AOI_MAX_CELLS);
+    }
+
+    let max_cells = trimmed
+        .parse::<usize>()
+        .with_context(|| format!("invalid AOI max cells `{trimmed}`"))?;
+    if max_cells == 0 {
+        return Err(anyhow!("AOI max cells must be > 0"));
+    }
+    Ok(max_cells)
 }
 
 fn parse_handover_move_buffer_capacity(raw: Option<&str>) -> Result<usize> {
@@ -3002,20 +3083,70 @@ fn delta_is_finite(dx: f32, dy: f32) -> bool {
     dx.is_finite() && dy.is_finite()
 }
 
-fn aoi_cells_for(cell: CellId, radius_cells: i32) -> Vec<CellId> {
-    let mut visible = Vec::with_capacity(((radius_cells * 2 + 1).pow(2)) as usize);
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AoiCandidate {
+    cell: CellId,
+    distance_sq: f32,
+    ordinal: usize,
+}
+
+fn candidate_cell(cell: CellId, dx: i32, dy: i32) -> CellId {
+    CellId {
+        world: cell.world,
+        cx: cell.cx + dx,
+        cy: cell.cy + dy,
+        depth: cell.depth,
+        sub: cell.sub,
+    }
+}
+
+fn axis_distance_to_interval(value: f32, min: f32, max: f32) -> f32 {
+    if value < min {
+        min - value
+    } else if value > max {
+        value - max
+    } else {
+        0.0
+    }
+}
+
+fn distance_sq_to_cell_rect(pos: Position, dx: i32, dy: i32, cell_span_units: f32) -> f32 {
+    let min_x = dx as f32 * cell_span_units;
+    let max_x = min_x + cell_span_units;
+    let min_y = dy as f32 * cell_span_units;
+    let max_y = min_y + cell_span_units;
+    let distance_x = axis_distance_to_interval(pos.x, min_x, max_x);
+    let distance_y = axis_distance_to_interval(pos.y, min_y, max_y);
+    distance_x.mul_add(distance_x, distance_y * distance_y)
+}
+
+fn sort_and_cap_aoi_candidates(mut candidates: Vec<AoiCandidate>, max_cells: usize) -> Vec<CellId> {
+    candidates.sort_by(|left, right| {
+        left.distance_sq
+            .total_cmp(&right.distance_sq)
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    candidates
+        .into_iter()
+        .take(max_cells)
+        .map(|candidate| candidate.cell)
+        .collect()
+}
+
+fn aoi_cells_for(cell: CellId, radius_cells: i32, max_cells: usize) -> Vec<CellId> {
+    let mut candidates = Vec::with_capacity(((radius_cells * 2 + 1).pow(2)) as usize);
+    let mut ordinal = 0_usize;
     for dy in -radius_cells..=radius_cells {
         for dx in -radius_cells..=radius_cells {
-            visible.push(CellId {
-                world: cell.world,
-                cx: cell.cx + dx,
-                cy: cell.cy + dy,
-                depth: cell.depth,
-                sub: cell.sub,
+            candidates.push(AoiCandidate {
+                cell: candidate_cell(cell, dx, dy),
+                distance_sq: (dx * dx + dy * dy) as f32,
+                ordinal,
             });
+            ordinal += 1;
         }
     }
-    visible
+    sort_and_cap_aoi_candidates(candidates, max_cells)
 }
 
 fn aoi_cells_for_position(
@@ -3024,37 +3155,53 @@ fn aoi_cells_for_position(
     radius_cells: i32,
     cell_span_units: f32,
     edge_margin_units: Option<f32>,
+    visibility_radius_units: Option<f32>,
+    max_cells: usize,
 ) -> Vec<CellId> {
-    let Some(edge_margin_units) = edge_margin_units else {
-        return aoi_cells_for(cell, radius_cells);
-    };
-    // 현재 프로토콜의 위치는 셀 로컬 좌표로 보고 `0..cell_span_units` 경계를 기준으로
-    // 인접 방향 셀 구독 여부를 결정한다.
-    let edge_margin_units = edge_margin_units.min(cell_span_units);
-    let west = pos.x <= edge_margin_units;
-    let east = pos.x >= cell_span_units - edge_margin_units;
-    let south = pos.y <= edge_margin_units;
-    let north = pos.y >= cell_span_units - edge_margin_units;
+    if edge_margin_units.is_none() && visibility_radius_units.is_none() {
+        return aoi_cells_for(cell, radius_cells, max_cells);
+    }
 
-    let mut visible = Vec::with_capacity(((radius_cells * 2 + 1).pow(2)) as usize);
+    let visibility_radius_sq = visibility_radius_units.map(|radius| radius * radius);
+    let edge_visibility = edge_margin_units.map(|margin| {
+        let edge_margin_units = margin.min(cell_span_units);
+        (
+            pos.x <= edge_margin_units,
+            pos.x >= cell_span_units - edge_margin_units,
+            pos.y <= edge_margin_units,
+            pos.y >= cell_span_units - edge_margin_units,
+        )
+    });
+
+    let mut candidates = Vec::with_capacity(((radius_cells * 2 + 1).pow(2)) as usize);
+    let mut ordinal = 0_usize;
     for dy in -radius_cells..=radius_cells {
-        if (dy < 0 && !south) || (dy > 0 && !north) {
-            continue;
-        }
         for dx in -radius_cells..=radius_cells {
-            if (dx < 0 && !west) || (dx > 0 && !east) {
-                continue;
+            let distance_sq = distance_sq_to_cell_rect(pos, dx, dy, cell_span_units);
+            let include = if dx == 0 && dy == 0 {
+                true
+            } else if let Some(visibility_radius_sq) = visibility_radius_sq {
+                distance_sq <= visibility_radius_sq
+            } else if let Some((west, east, south, north)) = edge_visibility {
+                !((dx < 0 && !west)
+                    || (dx > 0 && !east)
+                    || (dy < 0 && !south)
+                    || (dy > 0 && !north))
+            } else {
+                true
+            };
+
+            if include {
+                candidates.push(AoiCandidate {
+                    cell: candidate_cell(cell, dx, dy),
+                    distance_sq,
+                    ordinal,
+                });
             }
-            visible.push(CellId {
-                world: cell.world,
-                cx: cell.cx + dx,
-                cy: cell.cy + dy,
-                depth: cell.depth,
-                sub: cell.sub,
-            });
+            ordinal += 1;
         }
     }
-    visible
+    sort_and_cap_aoi_candidates(candidates, max_cells)
 }
 
 #[cfg(test)]
@@ -3064,6 +3211,8 @@ fn desired_aoi_cells_for_positions(
     radius_cells: i32,
     cell_span_units: f32,
     edge_margin_units: Option<f32>,
+    visibility_radius_units: Option<f32>,
+    max_cells: usize,
 ) -> HashSet<CellId> {
     let mut desired = HashSet::new();
     for (cell, pos) in root_positions {
@@ -3073,6 +3222,8 @@ fn desired_aoi_cells_for_positions(
             radius_cells,
             cell_span_units,
             edge_margin_units,
+            visibility_radius_units,
+            max_cells,
         ) {
             if owned_cells.contains(&visible) {
                 desired.insert(visible);
@@ -3087,6 +3238,8 @@ fn desired_aoi_targets_for_positions(
     radius_cells: i32,
     cell_span_units: f32,
     edge_margin_units: Option<f32>,
+    visibility_radius_units: Option<f32>,
+    max_cells: usize,
 ) -> HashSet<CellId> {
     let mut desired = HashSet::new();
     for (cell, pos) in root_positions {
@@ -3096,6 +3249,8 @@ fn desired_aoi_targets_for_positions(
             radius_cells,
             cell_span_units,
             edge_margin_units,
+            visibility_radius_units,
+            max_cells,
         ));
     }
     desired
@@ -3109,12 +3264,35 @@ fn desired_aoi_cells(
     cell_span_units: f32,
     edge_margin_units: Option<f32>,
 ) -> HashSet<CellId> {
+    desired_aoi_cells_precise(
+        owned_actor_positions,
+        owned_cells,
+        radius_cells,
+        cell_span_units,
+        edge_margin_units,
+        None,
+        DEFAULT_AOI_MAX_CELLS,
+    )
+}
+
+#[cfg(test)]
+fn desired_aoi_cells_precise(
+    owned_actor_positions: &[(CellId, Position)],
+    owned_cells: &HashSet<CellId>,
+    radius_cells: i32,
+    cell_span_units: f32,
+    edge_margin_units: Option<f32>,
+    visibility_radius_units: Option<f32>,
+    max_cells: usize,
+) -> HashSet<CellId> {
     desired_aoi_cells_for_positions(
         owned_actor_positions,
         owned_cells,
         radius_cells,
         cell_span_units,
         edge_margin_units,
+        visibility_radius_units,
+        max_cells,
     )
 }
 
@@ -4069,6 +4247,8 @@ async fn apply_client_move(
         state.aoi_radius_cells,
         state.aoi_cell_span_units,
         state.aoi_edge_margin_units,
+        state.aoi_visibility_radius_units,
+        state.aoi_max_cells,
     );
     let desired_cells = desired_targets
         .intersection(owned_cells)
@@ -4323,6 +4503,8 @@ async fn handle_upstream_inner(
                     state.aoi_radius_cells,
                     state.aoi_cell_span_units,
                     state.aoi_edge_margin_units,
+                    state.aoi_visibility_radius_units,
+                    state.aoi_max_cells,
                 );
                 let desired_cells = desired_targets
                     .intersection(&owned_guard)
@@ -4688,6 +4870,25 @@ mod tests {
         assert_eq!(parse_aoi_edge_margin_units(Some("4")).unwrap(), Some(4.0));
         let err = parse_aoi_edge_margin_units(Some("-1")).expect_err("negative margin should fail");
         assert!(err.to_string().contains(">= 0"));
+
+        assert_eq!(parse_aoi_visibility_radius_units(None).unwrap(), None);
+        assert_eq!(parse_aoi_visibility_radius_units(Some("")).unwrap(), None);
+        assert_eq!(
+            parse_aoi_visibility_radius_units(Some("12.5")).unwrap(),
+            Some(12.5)
+        );
+        let err = parse_aoi_visibility_radius_units(Some("-1"))
+            .expect_err("negative visibility radius should fail");
+        assert!(err.to_string().contains(">= 0"));
+
+        assert_eq!(parse_aoi_max_cells(None).unwrap(), DEFAULT_AOI_MAX_CELLS);
+        assert_eq!(
+            parse_aoi_max_cells(Some("  ")).unwrap(),
+            DEFAULT_AOI_MAX_CELLS
+        );
+        assert_eq!(parse_aoi_max_cells(Some("5")).unwrap(), 5);
+        let err = parse_aoi_max_cells(Some("0")).expect_err("zero max cells should fail");
+        assert!(err.to_string().contains("> 0"));
     }
 
     #[test]
@@ -4738,6 +4939,41 @@ mod tests {
         assert_eq!(
             desired_aoi_cells(&edge, &owned_cells, 1, 32.0, Some(4.0)),
             HashSet::from([origin, east, north, northeast])
+        );
+    }
+
+    #[test]
+    fn desired_aoi_cells_respects_visibility_radius_and_cap() {
+        let origin = CellId::grid(0, 0, 0);
+        let east = CellId::grid(0, 1, 0);
+        let north = CellId::grid(0, 0, 1);
+        let northeast = CellId::grid(0, 1, 1);
+        let far_east = CellId::grid(0, 2, 0);
+        let west = CellId::grid(0, -1, 0);
+        let south = CellId::grid(0, 0, -1);
+        let owned_cells = HashSet::from([origin, east, north, northeast, far_east, west, south]);
+
+        let centered = vec![(origin, Position { x: 16.0, y: 16.0 })];
+        assert_eq!(
+            desired_aoi_cells_precise(&centered, &owned_cells, 2, 32.0, None, Some(4.0), 64),
+            HashSet::from([origin])
+        );
+
+        let edge = vec![(origin, Position { x: 30.0, y: 16.0 })];
+        assert_eq!(
+            desired_aoi_cells_precise(&edge, &owned_cells, 2, 32.0, None, Some(4.0), 64),
+            HashSet::from([origin, east])
+        );
+
+        let corner = vec![(origin, Position { x: 30.0, y: 30.0 })];
+        assert_eq!(
+            desired_aoi_cells_precise(&corner, &owned_cells, 2, 32.0, None, Some(4.0), 64),
+            HashSet::from([origin, east, north, northeast])
+        );
+
+        assert_eq!(
+            desired_aoi_cells_precise(&centered, &owned_cells, 2, 32.0, None, None, 5),
+            HashSet::from([origin, east, west, north, south])
         );
     }
 
@@ -5073,6 +5309,8 @@ mod tests {
             0,
             DEFAULT_AOI_CELL_SPAN_UNITS,
             None,
+            None,
+            DEFAULT_AOI_MAX_CELLS,
             4,
             Duration::from_secs(1),
         ));
@@ -5431,6 +5669,8 @@ mod tests {
             0,
             DEFAULT_AOI_CELL_SPAN_UNITS,
             None,
+            None,
+            DEFAULT_AOI_MAX_CELLS,
             4,
             Duration::from_secs(1),
         ));

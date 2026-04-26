@@ -52,9 +52,10 @@ Last reviewed: 2026-04-26
    - 완료 조건: `HandoverReplay`가 actor별 owner session을 포함하고, target Worker가 replay 적용 시 owner map까지 즉시 구성한다.
    - 검증: core relay frame roundtrip, target replay owner transfer/unit test, source→target commit replay test.
 
-3. AOI precision upgrade
+3. [done 2026-04-26] AOI precision upgrade
    - 목표: 현재 셀 경계 기반 edge margin을 거리/가시성 기반으로 확장한다.
    - 완료 조건: centered/edge/distant actor cases가 deterministic test로 고정되고, AOI 폭주 방지 cap이 문서화된다.
+   - 검증: `TESSERA_WORKER_AOI_VISIBILITY_RADIUS_UNITS`, `TESSERA_WORKER_AOI_MAX_CELLS`, 거리 기반 centered/edge/corner/distant/cap test.
 
 4. Multi-cell tick pipeline
    - 목표: Worker 내부의 셀별 tick, broadcast flush, relay fanout 단계를 더 명시적인 pipeline으로 나눈다.
