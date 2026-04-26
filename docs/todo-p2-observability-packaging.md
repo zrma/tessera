@@ -36,25 +36,37 @@ Completion conditions:
 - README documents the command and expected local ports.
 - `cargo xt`, `cargo test`, and the metrics smoke pass.
 
-## P2.2 Gateway latency and readiness
+## P2.2 Gateway readiness and reconnect metrics
 
 Goal: make route health and reconnect behavior visible from Gateway metrics and
 logs.
 
-Recommended slice:
+Status: done 2026-04-26.
 
-1. Add a lightweight readiness endpoint when `TESSERA_GW_METRICS_ADDR` is set.
-2. Track upstream connect attempts, connect failures, reconnect-required route
-   switches, and close reasons as counters.
-3. Add request/round-trip latency buckets only after choosing a simple histogram
-   format that matches the current hand-rolled Prometheus text exporter.
+Implemented slice:
+
+1. `GET /ready` is served by the Gateway metrics listener when
+   `TESSERA_GW_METRICS_ADDR` is set.
+2. Readiness is derived from the current routing table: at least one loaded
+   route is ready; an empty route table returns HTTP 503.
+3. Gateway Prometheus output includes `tessera_gateway_ready`, upstream connect
+   attempts, route-change reconnects, and client close reason counters.
+4. Close logs include a `close_reason` field for retry exhaustion, no route,
+   pending ping route change, and ambiguous upstream state.
+5. `cargo xt dev metrics-smoke` asserts Gateway `/ready` in addition to core
+   `/metrics` families.
 
 Completion conditions:
 
-- Readiness endpoint reports healthy only when at least one route is available
-  or fallback routing is configured.
+- Readiness endpoint reports healthy only when at least one route is available.
 - Reconnect-required close/reconnect paths have explicit metric counters.
 - Unit tests cover metrics text and readiness state.
+
+Deferred:
+
+- Request/round-trip latency buckets need a simple histogram format for the
+  current hand-rolled Prometheus exporter. Keep this as a separate P2 slice to
+  avoid mixing endpoint readiness with timing semantics.
 
 ## P2.3 Container and Kubernetes packaging
 
@@ -79,5 +91,5 @@ Completion conditions:
 
 ## Suggested Order
 
-1. P2.2 Gateway readiness and reconnect metrics.
-2. P2.3 packaging examples after readiness endpoints exist.
+1. P2.3 packaging examples after readiness endpoints exist.
+2. Gateway latency histogram after the Prometheus histogram format is chosen.
