@@ -18,14 +18,16 @@ scrape annotations should match the actual cluster.
 Goal: make observability regressions discoverable without relying on manual
 inspection.
 
-Recommended slice:
+Status: done 2026-04-26.
 
-1. Add an xtask smoke target that starts the dev stack with Orchestrator,
-   Gateway, and Worker metrics ports enabled.
-2. Scrape `/metrics` from all enabled components.
-3. Assert core metric families exist and contain parseable Prometheus text.
-4. Keep this separate from `cargo xt harness` at first, then decide whether it
-   is cheap and stable enough to include in the default `cargo xt` gate.
+Implemented slice:
+
+1. `cargo xt dev metrics-smoke` starts the dev stack with Orchestrator, Gateway,
+   and Worker metrics ports enabled.
+2. It scrapes `/metrics` from all enabled components.
+3. It asserts core metric families exist and contain parseable numeric samples.
+4. It remains separate from default `cargo xt` for now, so local and CI runtime
+   gates can opt in explicitly.
 
 Completion conditions:
 
@@ -77,6 +79,5 @@ Completion conditions:
 
 ## Suggested Order
 
-1. P2.1 metrics smoke.
-2. P2.2 Gateway readiness and reconnect metrics.
-3. P2.3 packaging examples after readiness endpoints exist.
+1. P2.2 Gateway readiness and reconnect metrics.
+2. P2.3 packaging examples after readiness endpoints exist.
