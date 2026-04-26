@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tessera_core::{CellId, ClientMsg, Envelope, MAX_FRAME_LEN, ServerMsg};
+use tessera_core::{
+    CellId, ClientEnvelope, ClientMsg, Envelope, MAX_FRAME_LEN, ServerMsg, encode_frame,
+};
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, ListAssignmentsRequest,
@@ -22,6 +24,7 @@ use tracing::{debug, error, info, warn};
 const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
 const MAX_PENDING_PINGS: usize = 32;
+static NEXT_GATEWAY_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 struct GatewayMetricsCounters {
@@ -187,6 +190,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
     let (mut client_reader, mut client_writer) = stream.into_split();
     let mut upstream: Option<UpstreamConn> = None;
     let mut last_cell: Option<CellId> = None;
+    let session_id = NEXT_GATEWAY_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     // Ping은 응답(Pong)이 있어 재전송이 비교적 안전하다. 업스트림 커넥션이 끊기면
     // 아직 Pong을 못 받은 Ping을 재전송해, close 경쟁으로 인한 유실을 완화한다.
     let mut pending_pings: VecDeque<PendingPing> = VecDeque::new();
@@ -491,7 +495,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                     }
                     Ok(_) => {
                         loop {
-                            let frame = match try_take_frame(&mut client_buf) {
+                            let raw_frame = match try_take_frame(&mut client_buf) {
                                 Ok(Some(frame)) => frame.freeze(),
                                 Ok(None) => break,
                                 Err(e) => {
@@ -509,8 +513,8 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 }
                             };
 
-                            let payload = &frame[4..];
-                            let env_in: Envelope<ClientMsg> = match serde_json::from_slice(payload) {
+                            let payload = &raw_frame[4..];
+                            let mut env_in: ClientEnvelope = match serde_json::from_slice(payload) {
                                 Ok(env_in) => env_in,
                                 Err(e) => {
                                     routing
@@ -531,6 +535,8 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 ClientMsg::Ping { ts } => Some(ts),
                                 _ => None,
                             };
+                            env_in.session = Some(session_id);
+                            let frame = encode_frame(&env_in);
                             last_cell = Some(cell);
 
                             let mut attempt = 0usize;
@@ -569,17 +575,18 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             cell = ?cell,
                                             old_worker = %current.0.worker_id,
                                             new_worker = %route.worker_id,
-                                            "route changed after non-ping traffic; closing client to avoid dropping replies"
+                                            session_id,
+                                            "route changed after non-ping traffic; reconnecting upstream with stable session"
                                         );
                                         upstream
                                             .as_mut()
                                             .expect("upstream to be established")
                                             .close()
                                             .await;
-                                        break 'conn_loop Ok(());
+                                        upstream = None;
                                     }
 
-                                    if pending_pings_conflict_with_route(
+                                    else if pending_pings_conflict_with_route(
                                         &routing,
                                         &pending_pings,
                                         &route.addr,
@@ -2090,7 +2097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_change_after_non_ping_closes_client() {
+    async fn route_change_after_non_ping_reconnects_with_stable_session() {
         let worker_a_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind worker a");
@@ -2105,10 +2112,8 @@ mod tests {
             worker_a_listener,
             a_received_tx,
         ));
-        let mut worker_b_task = tokio::spawn(run_worker_expect_no_connection(
-            worker_b_listener,
-            "worker-b",
-        ));
+        let (b_done_tx, b_done_rx) = oneshot::channel();
+        let mut worker_b_task = tokio::spawn(run_ping_worker_once(worker_b_listener, 1, b_done_tx));
 
         let mut map = HashMap::new();
         map.insert(
@@ -2181,8 +2186,17 @@ mod tests {
             epoch: 0,
             payload: ClientMsg::Ping { ts: 1 },
         };
-        let _ = client.write_all(&encode_frame(&ping)).await;
-        expect_client_close(&mut client).await;
+        client
+            .write_all(&encode_frame(&ping))
+            .await
+            .expect("send ping after route change");
+        let pong = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert_eq!(pong.payload, ServerMsg::Pong { ts: 1 });
+        timeout(Duration::from_millis(500), b_done_rx)
+            .await
+            .expect("worker b did not receive routed ping")
+            .expect("worker b done");
+        drop(client);
 
         wait_task("gateway", &mut gateway_task).await;
         wait_task("worker-a", &mut worker_a_task).await;

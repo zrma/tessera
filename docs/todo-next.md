@@ -43,19 +43,23 @@ Last reviewed: 2026-04-26
 
 ## P1
 
-1. Stable session handover
-   - 목표: Gateway route change 뒤 client socket/actor ownership을 명시적 session identity로 보존한다.
-   - 완료 조건: target replay actor claim-on-first-use를 stable session claim으로 대체하고, route-change close path의 비-ping traffic 정책을 다시 테스트로 고정한다.
+1. [done 2026-04-26] Stable session handover baseline
+   - 목표: Gateway route change 뒤 client socket/actor ownership을 stable session identity로 보존한다.
+   - 완료 조건: Gateway가 connection별 session id를 Worker ingress frame에 주입하고, target replay actor claim-on-first-use가 stable session owner를 사용하며, route-change non-ping traffic이 client close 대신 upstream reconnect로 고정된다.
 
-2. AOI precision upgrade
+2. Explicit ownership transfer
+   - 목표: target replay의 claim-on-first-use fallback을 source가 전달한 session ownership manifest로 대체한다.
+   - 완료 조건: `HandoverReplay`가 actor별 owner session을 포함하고, target Worker가 replay 적용 시 owner map까지 즉시 구성한다.
+
+3. AOI precision upgrade
    - 목표: 현재 셀 경계 기반 edge margin을 거리/가시성 기반으로 확장한다.
    - 완료 조건: centered/edge/distant actor cases가 deterministic test로 고정되고, AOI 폭주 방지 cap이 문서화된다.
 
-3. Multi-cell tick pipeline
+4. Multi-cell tick pipeline
    - 목표: Worker 내부의 셀별 tick, broadcast flush, relay fanout 단계를 더 명시적인 pipeline으로 나눈다.
    - 완료 조건: 기존 client/ghost behavior test가 유지되고, per-cell stage를 개별적으로 테스트할 수 있다.
 
-4. Dynamic split/merge design note
+5. Dynamic split/merge design note
    - 목표: quadtree split/merge 조건, hysteresis, assignment churn 제한을 문서로 고정한다.
    - 완료 조건: README의 V2 동적 분할 목표와 일치하는 `docs/` 설계 노트가 생기고, 구현 전제와 non-goals가 분리된다.
 

@@ -4,7 +4,7 @@ Last reviewed: 2026-04-26
 
 ## Scope
 
-This document describes the current handover control-plane and the first runtime enforcement slices. Target routing migration is implemented through the assignment listing path, and source buffered moves are transferred to the target Worker through a worker-to-worker replay payload.
+This document describes the current handover control-plane and the first runtime enforcement slices. Target routing migration is implemented through the assignment listing path, Gateway injects a stable session id per client connection, and source buffered moves are transferred to the target Worker through a worker-to-worker replay payload.
 
 Implemented now:
 - `SubmitHandoverCommand` gRPC command API on the Orchestrator.
@@ -14,10 +14,10 @@ Implemented now:
 - Source Worker enforcement for `Freeze`/`Diff`: client moves are placed in a bounded FIFO buffer instead of being immediately rejected, then replayed when the handover status is released.
 - `Commit` requires the target Worker to be registered, transfers the cell assignment from source to target, and publishes a listing update so Gateway routing and Worker owned-cell state follow the new owner.
 - Explicit failure policy: buffer overflow/TTL expiry returns a retryable error, unregistered targets keep the handover in `Diffing` while commit retry budget remains, exhausted commit retries abort before assignment transfer, and source Workers stop applying buffered moves after committed ownership transfer.
-- Target-side replay: after a committed assignment transfer, the source Worker sends the target Worker an idempotent `HandoverReplay` payload with the current actor snapshot and non-expired buffered moves. The target applies the replay only if it owns the cell, ignores duplicate operation/cell replays, and marks replayed actors claimable by the first post-handover client session.
+- Target-side replay: after a committed assignment transfer, the source Worker sends the target Worker an idempotent `HandoverReplay` payload with the current actor snapshot and non-expired buffered moves. The target applies the replay only if it owns the cell, ignores duplicate operation/cell replays, and marks replayed actors claimable by the first post-handover client session. When traffic flows through Gateway, that claim uses the Gateway-injected stable session id rather than the target Worker's local connection id.
 
 Not implemented in this slice:
-- Stable client/session identity across Gateway route switches.
+- Explicit source-to-target ownership manifest transfer.
 - Automatic control-plane retry loops for failed handovers.
 
 ## Current Policy
@@ -33,9 +33,9 @@ The Orchestrator response reports `assignments_changed=true` only for a successf
 
 ## Next Slice
 
-Stable session handover should be implemented separately from target replay:
-- Add a client/session identity that survives Gateway upstream reconnects.
-- Replace target claim-on-first-use with explicit transferred ownership once stable session identity exists.
-- Revisit Gateway's conservative route-change close path for non-ping traffic.
+Explicit ownership transfer should be implemented separately from target replay:
+- Include source session ownership for replayed actors in the handover payload.
+- Replace target claim-on-first-use with explicit transferred ownership.
+- Keep the current Gateway stable session id as the compatibility path for client frames that arrive immediately after route switch.
 
-Source-side buffering and target replay reduce the user-visible handover glitch for normal short freeze/diff windows, and route switch now moves the authoritative owner. They do not remove every possible error path. Long freezes, exhausted buffers, missing target routes, and unavailable replay targets still need explicit reject or abort behavior.
+Source-side buffering, target replay, and Gateway stable sessions reduce the user-visible handover glitch for normal short freeze/diff windows, and route switch now moves the authoritative owner. They do not remove every possible error path. Long freezes, exhausted buffers, missing target routes, and unavailable replay targets still need explicit reject or abort behavior.
