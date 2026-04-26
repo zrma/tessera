@@ -91,17 +91,17 @@ Completion conditions:
 Deferred:
 
 - Runtime split/merge activation still requires explicit approval.
-- Merge planning, multi-depth parent/child semantics, and real metrics ingestion
-  remain future slices.
+- Multi-depth parent/child semantics and real metrics ingestion remain future
+  slices.
 
 ## P3.5 Merge planner skeleton
 
 Goal: extend the inactive split/merge planner so it can rank safe merge
 candidates for complete sibling sets without publishing assignment changes.
 
-Status: planned.
+Status: done 2026-04-26.
 
-Implementation slice:
+Implemented slice:
 
 1. Add merge-specific low-water thresholds and sustained low-pressure windows to
    the Orchestrator-local planner config and metrics model.
