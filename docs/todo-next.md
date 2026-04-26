@@ -37,8 +37,9 @@ Last reviewed: 2026-04-26
 
 6. [next] Handover target-side replay and commit retry
    - 목표: source buffered move를 target Worker에 넘기는 replay 경로와 commit retry/abort 정책을 runtime 경로에 연결한다.
+   - 작업 계획: `docs/todo-handover-replay.md`에 retry budget, replay payload, target apply, stable session 후속 작업을 분리했다.
    - 완료 조건: target replay ordering, retry budget/timeout, abort-before-assignment-transfer tests가 고정된다.
-   - 주의: client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다.
+   - 주의: client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다. 이번 milestone은 replayed actor를 target에서 claim-on-first-use로 처리하고, stable session handover는 별도 후속으로 둔다.
 
 ## P1
 
