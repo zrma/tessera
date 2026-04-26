@@ -13,7 +13,7 @@ Implemented now:
 - `ListAssignments`/`WatchAssignments` include active handover status so runtime components can enforce the advertised policy.
 - Source Worker enforcement for `Freeze`/`Diff`: client moves are placed in a bounded FIFO buffer instead of being immediately rejected, then replayed when the handover status is released.
 - `Commit` requires the target Worker to be registered, transfers the cell assignment from source to target, and publishes a listing update so Gateway routing and Worker owned-cell state follow the new owner.
-- Explicit failure policy: buffer overflow/TTL expiry returns a retryable error, unregistered targets keep the handover in `Diffing` for caller retry, and source Workers stop applying buffered moves after committed ownership transfer.
+- Explicit failure policy: buffer overflow/TTL expiry returns a retryable error, unregistered targets keep the handover in `Diffing` while commit retry budget remains, exhausted commit retries abort before assignment transfer, and source Workers stop applying buffered moves after committed ownership transfer.
 
 Not implemented in this slice:
 - Target-side replay after a routing switch.
@@ -25,10 +25,10 @@ The safe V0 handover policy is conservative:
 - `PreCopy`: accepts a new active handover if the source worker currently owns the cell and no handover is active for that cell.
 - `Freeze`: moves the active operation to frozen state. The advertised client move policy is `REJECT_DURING_FREEZE`; source Workers interpret that as bounded buffering for client moves on the source-owned cell.
 - `Diff`: moves the active operation to diffing state. Client move policy remains `REJECT_DURING_FREEZE`; source Worker buffering remains active.
-- `Commit`: requires the target Worker to be registered, moves the cell from source to target in the Orchestrator assignment map, clears the active handover, and publishes the updated listing. Gateway keeps the client socket and reconnects upstream on the next routed frame when the cell route changes.
+- `Commit`: requires the target Worker to be registered, moves the cell from source to target in the Orchestrator assignment map, clears the active handover, and publishes the updated listing. If the target Worker is not registered, the Orchestrator keeps the handover in `Diffing` for a bounded retry budget and then aborts before assignment transfer. Gateway keeps the client socket and reconnects upstream on the next routed frame when the cell route changes.
 - `Abort`: clears the active operation without changing assignments.
 
-The Orchestrator response reports `assignments_changed=true` only for a successful `Commit` that moves the cell. `Abort` and failed commits leave assignments unchanged. Source Workers replay buffered moves when the policy is released and they still own the cell, such as on `Abort`; after a successful `Commit`, the source Worker sees the cell removed from its owned set and rejects drained buffered entries with `handover_cell_not_owned` until target-side replay exists.
+The Orchestrator response reports `assignments_changed=true` only for a successful `Commit` that moves the cell. `Abort`, retryable commit failures, and retry-budget aborts leave assignments unchanged. Source Workers replay buffered moves when the policy is released and they still own the cell, such as on `Abort`; after a successful `Commit`, the source Worker sees the cell removed from its owned set and rejects drained buffered entries with `handover_cell_not_owned` until target-side replay exists.
 
 ## Next Slice
 

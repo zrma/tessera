@@ -24,7 +24,7 @@ source-side buffered moves are not transferred to the target Worker.
 
 ## Work Items
 
-1. [next] Orchestrator commit retry budget
+1. [done 2026-04-26] Orchestrator commit retry budget
    - Add a bounded retry counter to active handovers.
    - Keep the handover in `Diffing` while the target Worker is not registered
      and retry budget remains.

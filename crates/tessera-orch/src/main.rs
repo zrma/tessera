@@ -25,6 +25,8 @@ use tokio_stream::{StreamExt, wrappers::WatchStream};
 use tonic::{Request, Response, Status, async_trait, transport::Server};
 use tracing::{error, info, warn};
 
+const HANDOVER_COMMIT_RETRY_LIMIT: u32 = 3;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -361,6 +363,7 @@ struct HandoverRuntime {
     source_worker_id: String,
     target_worker_id: String,
     state: HandoverState,
+    commit_attempts: u32,
 }
 
 fn handover_statuses(handovers: &HashMap<CellId, HandoverRuntime>) -> Vec<HandoverStatus> {
@@ -618,6 +621,7 @@ impl OrchestratorService {
                     source_worker_id: parsed.source_worker_id,
                     target_worker_id: parsed.target_worker_id,
                     state: HandoverState::PreCopying,
+                    commit_attempts: 0,
                 },
             );
             drop(handovers);
@@ -676,11 +680,33 @@ impl OrchestratorService {
                 runtime.contains_key(&parsed.target_worker_id)
             };
             if !target_registered {
+                let attempts = if let Some(active) = handovers.get_mut(&parsed.cell) {
+                    active.commit_attempts = active.commit_attempts.saturating_add(1);
+                    active.commit_attempts
+                } else {
+                    1
+                };
+
+                if attempts >= HANDOVER_COMMIT_RETRY_LIMIT {
+                    handovers.remove(&parsed.cell);
+                    drop(handovers);
+                    self.publish_listing_if_changed().await;
+                    return Ok(handover_response(
+                        false,
+                        HandoverState::Aborted,
+                        format!(
+                            "target_worker_id={} is not registered after {attempts} commit attempts; handover aborted before assignment transfer",
+                            parsed.target_worker_id
+                        ),
+                        false,
+                    ));
+                }
+
                 return Ok(handover_response(
                     false,
                     active.state,
                     format!(
-                        "target_worker_id={} is not registered; commit should retry",
+                        "target_worker_id={} is not registered; commit should retry ({attempts}/{HANDOVER_COMMIT_RETRY_LIMIT})",
                         parsed.target_worker_id
                     ),
                     false,
@@ -2022,6 +2048,70 @@ mod tests {
             .find(|worker| worker.worker_id == "worker-a")
             .expect("source worker listing");
         assert_eq!(source.cells.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handover_commit_retry_budget_aborts_before_assignment_transfer() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        for command in [
+            HandoverCommand::PreCopy,
+            HandoverCommand::Freeze,
+            HandoverCommand::Diff,
+        ] {
+            service
+                .submit_handover_command(Request::new(handover_request(command)))
+                .await
+                .expect("advance handover");
+        }
+
+        for attempt in 1..HANDOVER_COMMIT_RETRY_LIMIT {
+            let rejected = service
+                .submit_handover_command(Request::new(handover_request(HandoverCommand::Commit)))
+                .await
+                .expect("submit retryable commit")
+                .into_inner();
+            assert!(!rejected.accepted);
+            assert_eq!(rejected.state, HandoverState::Diffing as i32);
+            assert!(
+                rejected
+                    .reason
+                    .contains(&format!("commit should retry ({attempt}/"))
+            );
+            assert!(!rejected.assignments_changed);
+        }
+
+        let aborted = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Commit)))
+            .await
+            .expect("submit exhausted commit")
+            .into_inner();
+        assert!(!aborted.accepted);
+        assert_eq!(aborted.state, HandoverState::Aborted as i32);
+        assert!(
+            aborted
+                .reason
+                .contains("aborted before assignment transfer")
+        );
+        assert!(!aborted.assignments_changed);
+
+        let listing = service
+            .list_assignments(Request::new(ListAssignmentsRequest {}))
+            .await
+            .expect("list assignments")
+            .into_inner();
+        assert!(listing.handovers.is_empty());
+        let source = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-a")
+            .expect("source worker listing");
+        assert_eq!(source.cells.len(), 1);
+        let target = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-b")
+            .expect("target worker listing");
+        assert!(target.cells.is_empty());
     }
 
     #[tokio::test]
