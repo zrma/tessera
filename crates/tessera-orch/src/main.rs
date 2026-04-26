@@ -13,9 +13,9 @@ use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorSer
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, AssignmentQuery, AssignmentSnapshot,
     GetMetricsRequest, HandoverClientMovePolicy, HandoverCommand, HandoverCommandRequest,
-    HandoverCommandResponse, HandoverFailurePolicy, HandoverState, HealthCheckRequest,
-    ListAssignmentsRequest, OrchestratorHealth, OrchestratorMetrics, WatchAssignmentsRequest,
-    WorkerHealth, WorkerRegistration,
+    HandoverCommandResponse, HandoverFailurePolicy, HandoverState, HandoverStatus,
+    HealthCheckRequest, ListAssignmentsRequest, OrchestratorHealth, OrchestratorMetrics,
+    WatchAssignmentsRequest, WorkerHealth, WorkerRegistration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -118,6 +118,7 @@ impl Config {
 fn listing_with_runtime(
     config: &Config,
     runtime: &HashMap<String, WorkerRuntime>,
+    handovers: &HashMap<CellId, HandoverRuntime>,
 ) -> AssignmentListing {
     let mut bundles = Vec::new();
     let mut worker_ids: Vec<&String> = config.workers.keys().collect();
@@ -139,7 +140,10 @@ fn listing_with_runtime(
             cells,
         });
     }
-    AssignmentListing { workers: bundles }
+    AssignmentListing {
+        workers: bundles,
+        handovers: handover_statuses(handovers),
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -308,6 +312,32 @@ struct HandoverRuntime {
     state: HandoverState,
 }
 
+fn handover_statuses(handovers: &HashMap<CellId, HandoverRuntime>) -> Vec<HandoverStatus> {
+    let mut entries = handovers.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(cell, handover)| {
+        (
+            cell.world,
+            cell.cy,
+            cell.cx,
+            cell.depth,
+            cell.sub,
+            handover.operation_id.as_str(),
+        )
+    });
+
+    entries
+        .into_iter()
+        .map(|(cell, handover)| HandoverStatus {
+            operation_id: handover.operation_id.clone(),
+            cell: Some(cell_to_assignment(cell)),
+            source_worker_id: handover.source_worker_id.clone(),
+            target_worker_id: handover.target_worker_id.clone(),
+            state: handover.state as i32,
+            client_move_policy: client_move_policy_for(handover.state) as i32,
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct OrchestratorMetricsCounters {
     registration_attempts: AtomicU64,
@@ -330,7 +360,7 @@ struct OrchestratorService {
 impl OrchestratorService {
     fn new(config: Config) -> Self {
         let config = Arc::new(config);
-        let initial_listing = listing_with_runtime(&config, &HashMap::new());
+        let initial_listing = listing_with_runtime(&config, &HashMap::new(), &HashMap::new());
         let (listing_tx, _) = watch::channel(initial_listing);
         Self {
             config,
@@ -353,7 +383,8 @@ impl OrchestratorService {
 
     async fn listing(&self) -> AssignmentListing {
         let runtime = self.runtime.read().await;
-        listing_with_runtime(&self.config, &runtime)
+        let handovers = self.handovers.read().await;
+        listing_with_runtime(&self.config, &runtime, &handovers)
     }
 
     async fn publish_listing_if_changed(&self) {
@@ -514,6 +545,8 @@ impl OrchestratorService {
                     state: HandoverState::PreCopying,
                 },
             );
+            drop(handovers);
+            self.publish_listing_if_changed().await;
             return Ok(handover_response(
                 true,
                 HandoverState::PreCopying,
@@ -566,6 +599,8 @@ impl OrchestratorService {
             active.state = next_state;
         }
 
+        drop(handovers);
+        self.publish_listing_if_changed().await;
         Ok(handover_response(
             true,
             next_state,
@@ -1751,6 +1786,26 @@ mod tests {
         );
         assert!(!freeze.assignments_changed);
 
+        let frozen_listing = service
+            .list_assignments(Request::new(ListAssignmentsRequest {}))
+            .await
+            .expect("list frozen assignments")
+            .into_inner();
+        assert_eq!(frozen_listing.handovers.len(), 1);
+        let frozen_handover = &frozen_listing.handovers[0];
+        assert_eq!(frozen_handover.operation_id, "handover-1");
+        assert_eq!(frozen_handover.source_worker_id, "worker-a");
+        assert_eq!(frozen_handover.target_worker_id, "worker-b");
+        let frozen_cell = frozen_handover.cell.as_ref().expect("handover cell");
+        assert_eq!(frozen_cell.world, 0);
+        assert_eq!(frozen_cell.cx, 0);
+        assert_eq!(frozen_cell.cy, 0);
+        assert_eq!(frozen_handover.state, HandoverState::Frozen as i32);
+        assert_eq!(
+            frozen_handover.client_move_policy,
+            HandoverClientMovePolicy::RejectDuringFreeze as i32
+        );
+
         let diff = service
             .submit_handover_command(Request::new(handover_request(HandoverCommand::Diff)))
             .await
@@ -1782,6 +1837,7 @@ mod tests {
             .await
             .expect("list assignments")
             .into_inner();
+        assert!(listing.handovers.is_empty());
         let source = listing
             .workers
             .iter()

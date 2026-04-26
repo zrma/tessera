@@ -25,10 +25,15 @@ Last reviewed: 2026-04-26
    - 완료 조건: 명령 타입, validation, rejected-state tests, 문서화가 먼저 들어가고 runtime routing 전환은 다음 change로 분리한다.
    - 정책: freeze/diff 중 client move는 현재 slice에서 reject하고, commit failure는 기존 source owner/route 유지 후 abort한다.
 
-4. [next] Handover move buffering and retry
-   - 목표: freeze/diff 중 즉시 reject되는 client move를 bounded buffer에 보관하고 commit 후 target side에서 순서대로 재적용해 client-visible error를 완화한다.
-   - 완료 조건: buffer capacity/timeout/overflow 정책, commit retry/abort 정책, replay ordering tests가 고정된다.
+4. [done 2026-04-26] Handover source move buffering
+   - 목표: freeze/diff 중 즉시 reject되는 client move를 source Worker의 bounded buffer에 보관하고 handover status가 해제되면 순서대로 재적용해 client-visible error를 완화한다.
+   - 완료 조건: buffer capacity/TTL/overflow 정책, Orchestrator listing의 handover status propagation, Worker replay ordering test가 고정된다.
    - 주의: buffering은 짧은 handover window를 완화하지만, 장시간 freeze·buffer overflow·반복 commit 실패에는 여전히 reject/abort가 필요하다.
+
+5. [next] Handover route switch and commit retry
+   - 목표: target readiness 확인 후 assignment/listing을 target Worker로 전환하고, target-side replay 및 commit retry/abort 정책을 runtime 경로에 연결한다.
+   - 완료 조건: Gateway route switch, target replay ordering, retry budget/timeout, abort-on-failure tests가 고정된다.
+   - 주의: 이 단계부터 client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다.
 
 ## P1
 

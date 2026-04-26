@@ -31,10 +31,6 @@ message AssignmentBundle {
   repeated Assignment cells = 3;
 }
 
-message AssignmentListing {
-  repeated AssignmentBundle workers = 1;
-}
-
 message ListAssignmentsRequest {}
 message WatchAssignmentsRequest {}
 message HealthCheckRequest {}
@@ -85,6 +81,20 @@ message HandoverCommandResponse {
   HandoverClientMovePolicy client_move_policy = 4;
   HandoverFailurePolicy failure_policy = 5;
   bool assignments_changed = 6;
+}
+
+message HandoverStatus {
+  string operation_id = 1;
+  Assignment cell = 2;
+  string source_worker_id = 3;
+  string target_worker_id = 4;
+  HandoverState state = 5;
+  HandoverClientMovePolicy client_move_policy = 6;
+}
+
+message AssignmentListing {
+  repeated AssignmentBundle workers = 1;
+  repeated HandoverStatus handovers = 2;
 }
 
 message WorkerHealth {
