@@ -1543,29 +1543,59 @@ async fn apply_peer_routes_update(
     worker_id: &str,
     listing: AssignmentListing,
 ) -> Result<bool> {
+    let updated_owned_cells = owned_cells_from_listing(&listing, worker_id)?;
     let routes = peer_routes_from_listing(&listing, worker_id)?;
     let policies = handover_policies_from_listing(&listing, worker_id)?;
     let route_count = routes.len();
+    let updated_owned_count = updated_owned_cells.len();
+    let (owned_changed, removed_owned_cells) = {
+        let mut guard = owned_cells.write().await;
+        let removed = guard
+            .difference(&updated_owned_cells)
+            .copied()
+            .collect::<HashSet<_>>();
+        let changed = *guard != updated_owned_cells;
+        if changed {
+            *guard = updated_owned_cells;
+        }
+        (changed, removed)
+    };
     let routes_changed = state.update_peer_routes(routes).await;
     let (policies_changed, released_cells) = state.update_handover_policies(policies).await;
-    let owned_snapshot = if routes_changed || !released_cells.is_empty() {
+
+    let removed_owned_count = removed_owned_cells.len();
+    if !removed_owned_cells.is_empty() {
+        state.drop_cells(&removed_owned_cells).await;
+        state.sync_remote_peer_sessions().await;
+    }
+
+    let owned_snapshot = if routes_changed || owned_changed || !released_cells.is_empty() {
         Some(owned_cells.read().await.clone())
     } else {
         None
     };
 
-    if routes_changed {
+    if routes_changed || owned_changed {
         let owned_snapshot = owned_snapshot
             .as_ref()
-            .expect("owned snapshot for route update");
+            .expect("owned snapshot for assignment update");
         state.resync_client_interests(owned_snapshot).await;
-        if route_count == 0 {
+        if owned_changed {
+            info!(
+                target: "worker",
+                worker_id,
+                owned_cells = updated_owned_count,
+                removed_cells = removed_owned_count,
+                "owned cells updated from orchestrator listing"
+            );
+        }
+        if routes_changed && route_count == 0 {
             warn!(
                 target: "worker",
                 worker_id,
                 "peer route table updated; no remote cells available"
             );
-        } else {
+        } else if routes_changed {
             info!(
                 target: "worker",
                 worker_id,
@@ -1581,7 +1611,30 @@ async fn apply_peer_routes_update(
         flush_buffered_moves_for_cells(state, owned_snapshot, released_cells).await;
     }
 
-    Ok(routes_changed || policies_changed)
+    Ok(routes_changed || policies_changed || owned_changed)
+}
+
+fn owned_cells_from_listing(
+    listing: &AssignmentListing,
+    self_worker_id: &str,
+) -> Result<HashSet<CellId>> {
+    let mut owned = HashSet::new();
+    for bundle in &listing.workers {
+        if bundle.worker_id != self_worker_id {
+            continue;
+        }
+        for assignment in &bundle.cells {
+            let cell = assignment_to_cell_ref(assignment)?;
+            if !owned.insert(cell) {
+                return Err(anyhow!(
+                    "duplicate owned cell for {} in listing: {:?}",
+                    self_worker_id,
+                    cell
+                ));
+            }
+        }
+    }
+    Ok(owned)
 }
 
 fn peer_routes_from_listing(
@@ -4124,6 +4177,40 @@ mod tests {
     }
 
     #[test]
+    fn owned_cells_from_listing_maps_self_bundle() {
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-a".into(),
+                    addr: "127.0.0.1:5001".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 1,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+            handovers: vec![],
+        };
+
+        let owned = owned_cells_from_listing(&listing, "worker-a").expect("owned cells");
+        assert_eq!(owned, HashSet::from([CellId::grid(0, 0, 0)]));
+    }
+
+    #[test]
     fn peer_routes_from_listing_rejects_duplicate_remote_cells() {
         let listing = AssignmentListing {
             workers: vec![
@@ -4318,6 +4405,58 @@ mod tests {
         assert_eq!(
             state.remote_interest_cells(watcher.client_id).await,
             HashSet::from([remote])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_tracks_owned_cell_moves() {
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(EntityId(9), Position { x: 1.0, y: 2.0 });
+        }
+
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-a".into(),
+                    addr: "127.0.0.1:5001".into(),
+                    cells: vec![],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+            ],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+                .await
+                .expect("apply listing")
+        );
+
+        assert!(owned_cells.read().await.is_empty());
+        assert!(!state.actors.lock().await.contains_key(&cell));
+        assert_eq!(
+            state.peer_routes.read().await.get(&cell),
+            Some(&PeerRoute {
+                worker_id: "worker-b".into(),
+                addr: "127.0.0.1:5002".into(),
+            })
         );
     }
 

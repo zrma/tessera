@@ -77,6 +77,8 @@ struct Config {
     workers: HashMap<String, WorkerStatic>,
 }
 
+type AssignmentMap = HashMap<String, Vec<CellId>>;
+
 #[derive(Debug, Clone)]
 struct WorkerStatic {
     addr: String,
@@ -100,23 +102,70 @@ impl Config {
         self.workers.get(worker_id)
     }
 
-    fn assignments_for(&self, worker_id: &str) -> Option<&[CellId]> {
-        self.worker(worker_id).map(|w| w.cells.as_slice())
+    fn initial_assignments(&self) -> AssignmentMap {
+        self.workers
+            .iter()
+            .map(|(worker_id, worker)| (worker_id.clone(), worker.cells.clone()))
+            .collect()
+    }
+}
+
+fn owner_for_cell<'a>(assignments: &'a AssignmentMap, cell: &CellId) -> Option<&'a str> {
+    assignments.iter().find_map(|(worker_id, cells)| {
+        cells
+            .iter()
+            .any(|assigned| assigned == cell)
+            .then_some(worker_id.as_str())
+    })
+}
+
+fn sort_cells(cells: &mut [CellId]) {
+    cells.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+}
+
+fn transfer_cell_assignment(
+    assignments: &mut AssignmentMap,
+    cell: CellId,
+    source_worker_id: &str,
+    target_worker_id: &str,
+) -> Result<bool, String> {
+    match owner_for_cell(assignments, &cell) {
+        Some(owner) if owner == source_worker_id => {}
+        Some(owner) => {
+            return Err(format!(
+                "source_worker_id={} no longer owns cell; current_owner={}",
+                source_worker_id, owner
+            ));
+        }
+        None => return Err("cell is not assigned to any worker".to_string()),
     }
 
-    fn owner_for_cell(&self, cell: &CellId) -> Option<&str> {
-        self.workers.iter().find_map(|(worker_id, worker)| {
-            worker
-                .cells
-                .iter()
-                .any(|assigned| assigned == cell)
-                .then_some(worker_id.as_str())
-        })
+    let source_cells = assignments
+        .get_mut(source_worker_id)
+        .ok_or_else(|| format!("unknown source_worker_id={source_worker_id}"))?;
+    let source_len = source_cells.len();
+    source_cells.retain(|assigned| assigned != &cell);
+    if source_cells.len() == source_len {
+        return Err(format!(
+            "source_worker_id={} no longer owns cell",
+            source_worker_id
+        ));
     }
+
+    let target_cells = assignments
+        .get_mut(target_worker_id)
+        .ok_or_else(|| format!("unknown target_worker_id={target_worker_id}"))?;
+    if target_cells.iter().any(|assigned| assigned == &cell) {
+        return Ok(false);
+    }
+    target_cells.push(cell);
+    sort_cells(target_cells);
+    Ok(true)
 }
 
 fn listing_with_runtime(
     config: &Config,
+    assignments: &AssignmentMap,
     runtime: &HashMap<String, WorkerRuntime>,
     handovers: &HashMap<CellId, HandoverRuntime>,
 ) -> AssignmentListing {
@@ -129,8 +178,10 @@ fn listing_with_runtime(
             .get(worker_id.as_str())
             .map(|rt| rt.addr.as_str())
             .unwrap_or(worker.addr.as_str());
-        let cells = worker
-            .cells
+        let cells = assignments
+            .get(worker_id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
             .iter()
             .map(cell_to_assignment)
             .collect::<Vec<_>>();
@@ -298,7 +349,7 @@ fn validate_addr_with_port(addr: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WorkerRuntime {
     addr: String,
     last_seen: SystemTime,
@@ -351,6 +402,7 @@ struct OrchestratorMetricsCounters {
 #[derive(Clone)]
 struct OrchestratorService {
     config: Arc<Config>,
+    assignments: Arc<RwLock<AssignmentMap>>,
     runtime: Arc<RwLock<HashMap<String, WorkerRuntime>>>,
     handovers: Arc<RwLock<HashMap<CellId, HandoverRuntime>>>,
     listing_tx: watch::Sender<AssignmentListing>,
@@ -360,10 +412,17 @@ struct OrchestratorService {
 impl OrchestratorService {
     fn new(config: Config) -> Self {
         let config = Arc::new(config);
-        let initial_listing = listing_with_runtime(&config, &HashMap::new(), &HashMap::new());
+        let initial_assignments = config.initial_assignments();
+        let initial_listing = listing_with_runtime(
+            &config,
+            &initial_assignments,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         let (listing_tx, _) = watch::channel(initial_listing);
         Self {
             config,
+            assignments: Arc::new(RwLock::new(initial_assignments)),
             runtime: Arc::new(RwLock::new(HashMap::new())),
             handovers: Arc::new(RwLock::new(HashMap::new())),
             listing_tx,
@@ -371,10 +430,10 @@ impl OrchestratorService {
         }
     }
 
-    fn snapshot_for(&self, worker_id: &str) -> AssignmentSnapshot {
-        let cells = self.config.assignments_for(worker_id);
+    async fn snapshot_for(&self, worker_id: &str) -> AssignmentSnapshot {
+        let assignments = self.assignments.read().await;
         let mut entries = Vec::new();
-        if let Some(cells) = cells {
+        if let Some(cells) = assignments.get(worker_id) {
             entries.reserve(cells.len());
             entries.extend(cells.iter().map(cell_to_assignment));
         }
@@ -382,9 +441,12 @@ impl OrchestratorService {
     }
 
     async fn listing(&self) -> AssignmentListing {
-        let runtime = self.runtime.read().await;
-        let handovers = self.handovers.read().await;
-        listing_with_runtime(&self.config, &runtime, &handovers)
+        let runtime = self.runtime.read().await.clone();
+        // Handover commit mutates assignments while holding the handover lock, so read
+        // handovers first to avoid pairing old assignments with a post-commit empty status.
+        let handovers = self.handovers.read().await.clone();
+        let assignments = self.assignments.read().await.clone();
+        listing_with_runtime(&self.config, &assignments, &runtime, &handovers)
     }
 
     async fn publish_listing_if_changed(&self) {
@@ -404,6 +466,7 @@ impl OrchestratorService {
 
     async fn worker_health(&self) -> Vec<WorkerHealth> {
         let runtime = self.runtime.read().await;
+        let assignments = self.assignments.read().await;
         let mut worker_ids: Vec<&String> = self.config.workers.keys().collect();
         worker_ids.sort();
 
@@ -422,7 +485,10 @@ impl OrchestratorService {
                     configured_addr: configured.addr.clone(),
                     runtime_addr: runtime_addr.clone(),
                     registered: runtime.is_some(),
-                    assigned_cells: configured.cells.len() as u64,
+                    assigned_cells: assignments
+                        .get(worker_id.as_str())
+                        .map(Vec::len)
+                        .unwrap_or_default() as u64,
                     last_seen_unix_secs: runtime
                         .map(|rt| unix_timestamp_secs(rt.last_seen))
                         .unwrap_or_default(),
@@ -493,6 +559,7 @@ impl OrchestratorService {
                 false,
                 HandoverState::Idle,
                 format!("unknown source_worker_id={}", parsed.source_worker_id),
+                false,
             ));
         }
         if self.config.worker(&parsed.target_worker_id).is_none() {
@@ -500,9 +567,14 @@ impl OrchestratorService {
                 false,
                 HandoverState::Idle,
                 format!("unknown target_worker_id={}", parsed.target_worker_id),
+                false,
             ));
         }
-        match self.config.owner_for_cell(&parsed.cell) {
+        let current_owner = {
+            let assignments = self.assignments.read().await;
+            owner_for_cell(&assignments, &parsed.cell).map(str::to_owned)
+        };
+        match current_owner.as_deref() {
             Some(owner) if owner == parsed.source_worker_id => {}
             Some(owner) => {
                 return Ok(handover_response(
@@ -512,6 +584,7 @@ impl OrchestratorService {
                         "source_worker_id={} does not own cell; current_owner={}",
                         parsed.source_worker_id, owner
                     ),
+                    false,
                 ));
             }
             None => {
@@ -519,6 +592,7 @@ impl OrchestratorService {
                     false,
                     HandoverState::Idle,
                     "cell is not assigned to any configured worker",
+                    false,
                 ));
             }
         }
@@ -534,6 +608,7 @@ impl OrchestratorService {
                         "handover already active for cell with operation_id={}",
                         active.operation_id
                     ),
+                    false,
                 ));
             }
             handovers.insert(
@@ -551,6 +626,7 @@ impl OrchestratorService {
                 true,
                 HandoverState::PreCopying,
                 "pre-copy accepted; assignments unchanged",
+                false,
             ));
         }
 
@@ -559,6 +635,7 @@ impl OrchestratorService {
                 false,
                 HandoverState::Idle,
                 "handover must start with PreCopy",
+                false,
             ));
         };
 
@@ -570,6 +647,7 @@ impl OrchestratorService {
                 false,
                 active.state,
                 "handover command does not match the active operation",
+                false,
             ));
         }
 
@@ -586,14 +664,43 @@ impl OrchestratorService {
                         "invalid handover transition from {:?} with {:?}",
                         active.state, parsed.command
                     ),
+                    false,
                 ));
             }
         };
 
-        if matches!(
-            next_state,
-            HandoverState::Committed | HandoverState::Aborted
-        ) {
+        let mut assignments_changed = false;
+        if next_state == HandoverState::Committed {
+            let target_registered = {
+                let runtime = self.runtime.read().await;
+                runtime.contains_key(&parsed.target_worker_id)
+            };
+            if !target_registered {
+                return Ok(handover_response(
+                    false,
+                    active.state,
+                    format!(
+                        "target_worker_id={} is not registered; commit should retry",
+                        parsed.target_worker_id
+                    ),
+                    false,
+                ));
+            }
+
+            let mut assignments = self.assignments.write().await;
+            match transfer_cell_assignment(
+                &mut assignments,
+                parsed.cell,
+                &parsed.source_worker_id,
+                &parsed.target_worker_id,
+            ) {
+                Ok(changed) => assignments_changed = changed,
+                Err(reason) => {
+                    return Ok(handover_response(false, active.state, reason, false));
+                }
+            }
+            handovers.remove(&parsed.cell);
+        } else if next_state == HandoverState::Aborted {
             handovers.remove(&parsed.cell);
         } else if let Some(active) = handovers.get_mut(&parsed.cell) {
             active.state = next_state;
@@ -601,10 +708,16 @@ impl OrchestratorService {
 
         drop(handovers);
         self.publish_listing_if_changed().await;
+        let reason = match next_state {
+            HandoverState::Committed => "handover committed; assignments moved to target",
+            HandoverState::Aborted => "handover aborted; assignments unchanged",
+            _ => "handover command accepted; assignments unchanged",
+        };
         Ok(handover_response(
             true,
             next_state,
-            "handover command accepted; assignments unchanged",
+            reason,
+            assignments_changed,
         ))
     }
 }
@@ -659,6 +772,7 @@ fn handover_response(
     accepted: bool,
     state: HandoverState,
     reason: impl Into<String>,
+    assignments_changed: bool,
 ) -> HandoverCommandResponse {
     HandoverCommandResponse {
         accepted,
@@ -666,7 +780,7 @@ fn handover_response(
         reason: reason.into(),
         client_move_policy: client_move_policy_for(state) as i32,
         failure_policy: HandoverFailurePolicy::KeepSourceAndAbort as i32,
-        assignments_changed: false,
+        assignments_changed,
     }
 }
 
@@ -705,7 +819,7 @@ impl Orchestrator for OrchestratorService {
         }
 
         let planned = self.config.worker(worker_id);
-        let snapshot = self.snapshot_for(worker_id);
+        let snapshot = self.snapshot_for(worker_id).await;
         let cell_count = snapshot.cells.len();
 
         // Config is the source of truth for assignments. Unknown workers should not be stored in
@@ -796,7 +910,7 @@ impl Orchestrator for OrchestratorService {
             }
         }
 
-        let snapshot = self.snapshot_for(worker_id);
+        let snapshot = self.snapshot_for(worker_id).await;
         Ok(Response::new(snapshot))
     }
 
@@ -1159,14 +1273,15 @@ mod tests {
 
         let cfg = parse_config(json).expect("parse config");
         assert!(cfg.worker("worker-a").is_some());
-        let cells = cfg.assignments_for("worker-a").expect("cells");
+        let assignments = cfg.initial_assignments();
+        let cells = assignments.get("worker-a").expect("cells");
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].world, 1);
         assert_eq!(cells[0].cx, 2);
         assert_eq!(cells[0].cy, -3);
         assert_eq!(cells[1].depth, 1);
         assert_eq!(cells[1].sub, 2);
-        assert!(cfg.assignments_for("missing").is_none());
+        assert!(!assignments.contains_key("missing"));
     }
 
     #[test]
@@ -1819,6 +1934,14 @@ mod tests {
         );
         assert!(!diff.assignments_changed);
 
+        service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: "worker-b".into(),
+                addr: "10.0.0.2:5001".into(),
+            }))
+            .await
+            .expect("register target worker");
+
         let commit = service
             .submit_handover_command(Request::new(handover_request(HandoverCommand::Commit)))
             .await
@@ -1830,7 +1953,7 @@ mod tests {
             commit.client_move_policy,
             HandoverClientMovePolicy::Allow as i32
         );
-        assert!(!commit.assignments_changed);
+        assert!(commit.assignments_changed);
 
         let listing = service
             .list_assignments(Request::new(ListAssignmentsRequest {}))
@@ -1843,13 +1966,62 @@ mod tests {
             .iter()
             .find(|worker| worker.worker_id == "worker-a")
             .expect("source worker listing");
-        assert_eq!(source.cells.len(), 1);
+        assert!(source.cells.is_empty());
         let target = listing
             .workers
             .iter()
             .find(|worker| worker.worker_id == "worker-b")
             .expect("target worker listing");
-        assert!(target.cells.is_empty());
+        assert_eq!(target.cells.len(), 1);
+        assert_eq!(target.cells[0].cx, 0);
+
+        let target_snapshot = service
+            .get_assignments(Request::new(AssignmentQuery {
+                worker_id: "worker-b".into(),
+            }))
+            .await
+            .expect("get target assignments")
+            .into_inner();
+        assert_eq!(target_snapshot.cells.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handover_commit_waits_for_registered_target() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        for command in [
+            HandoverCommand::PreCopy,
+            HandoverCommand::Freeze,
+            HandoverCommand::Diff,
+        ] {
+            service
+                .submit_handover_command(Request::new(handover_request(command)))
+                .await
+                .expect("advance handover");
+        }
+
+        let rejected = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::Commit)))
+            .await
+            .expect("submit commit")
+            .into_inner();
+
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.state, HandoverState::Diffing as i32);
+        assert!(rejected.reason.contains("commit should retry"));
+        assert!(!rejected.assignments_changed);
+
+        let listing = service
+            .list_assignments(Request::new(ListAssignmentsRequest {}))
+            .await
+            .expect("list assignments")
+            .into_inner();
+        assert_eq!(listing.handovers.len(), 1);
+        let source = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-a")
+            .expect("source worker listing");
+        assert_eq!(source.cells.len(), 1);
     }
 
     #[tokio::test]

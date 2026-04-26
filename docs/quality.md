@@ -33,4 +33,4 @@ This document is the repo-local quality map for agents. It keeps the expected au
 ## Known gaps
 
 - Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, but long-running scrape/tracing assertions are not covered yet.
-- There is no long-lived execution-plan index yet; use README or AGENTS for small decisions and add `docs/` notes when a task spans multiple changes.
+- `docs/todo-next.md` is the current execution-plan index; keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

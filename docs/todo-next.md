@@ -30,10 +30,15 @@ Last reviewed: 2026-04-26
    - 완료 조건: buffer capacity/TTL/overflow 정책, Orchestrator listing의 handover status propagation, Worker replay ordering test가 고정된다.
    - 주의: buffering은 짧은 handover window를 완화하지만, 장시간 freeze·buffer overflow·반복 commit 실패에는 여전히 reject/abort가 필요하다.
 
-5. [next] Handover route switch and commit retry
-   - 목표: target readiness 확인 후 assignment/listing을 target Worker로 전환하고, target-side replay 및 commit retry/abort 정책을 runtime 경로에 연결한다.
-   - 완료 조건: Gateway route switch, target replay ordering, retry budget/timeout, abort-on-failure tests가 고정된다.
-   - 주의: 이 단계부터 client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다.
+5. [done 2026-04-26] Handover commit route switch
+   - 목표: target readiness 확인 후 assignment/listing을 target Worker로 전환하고, Gateway route switch와 Worker owned-cell 갱신을 기존 watch/listing 경로에 연결한다.
+   - 완료 조건: target Worker가 등록되지 않은 commit은 retryable reject로 남고, 등록된 target으로 commit하면 Orchestrator assignment가 이동하며, source Worker는 더 이상 이전 cell을 소유한 것으로 처리하지 않는다.
+   - 주의: 이번 slice는 route/ownership 전환까지이며 source buffered move의 target-side replay는 아직 없다. commit 이후 source buffer drain은 `handover_cell_not_owned` error path를 유지한다.
+
+6. [next] Handover target-side replay and commit retry
+   - 목표: source buffered move를 target Worker에 넘기는 replay 경로와 commit retry/abort 정책을 runtime 경로에 연결한다.
+   - 완료 조건: target replay ordering, retry budget/timeout, abort-before-assignment-transfer tests가 고정된다.
+   - 주의: client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다.
 
 ## P1
 
