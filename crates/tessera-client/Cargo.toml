@@ -11,4 +11,4 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 tessera-core = { path = "../tessera-core" }
-rustyline = "12"
+rustyline = "18"

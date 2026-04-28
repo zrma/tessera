@@ -9,10 +9,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_files = [orchestrator_proto];
     let include_dirs = [proto_root.clone()];
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile(&proto_files, &include_dirs)?;
+        .compile_protos(&proto_files, &include_dirs)?;
 
     println!("cargo:rerun-if-changed={}", proto_root.display());
     println!(
