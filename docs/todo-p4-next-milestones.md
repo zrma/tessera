@@ -1,13 +1,14 @@
 # Tessera P4 Next Milestones
 
-Last reviewed: 2026-04-28
+Last reviewed: 2026-04-29
 
 ## Baseline
 
 P0 through P3 are complete through handover replay ownership, stable Gateway
 sessions, AOI precision controls, per-cell tick structure, observability
 endpoints, packaging samples, split/merge planner skeletons, and fixture-backed
-dry-run preview smoke.
+dry-run preview smoke. Completed milestone details are archived in
+`docs/completed-milestones.md`.
 
 There is no uncommitted implementation work at this planning point. The next
 substantial milestones all cross a decision boundary: protocol shape, production

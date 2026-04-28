@@ -1,89 +1,12 @@
 # Tessera Next Todo
 
-Last reviewed: 2026-04-28
+Last reviewed: 2026-04-29
 
 ## Baseline
 
 - V0 범위는 고정 그리드 셀, Gateway/Worker TCP 파이프라인, Orchestrator assignment snapshot/watch, Worker AOI ghost relay까지 구현된 상태다.
-- P0/P1/P2/P3는 handover replay ownership, stable Gateway sessions, AOI precision, per-cell tick pipeline, observability/packaging sample, split/merge planner skeleton, fixture-backed dry-run preview smoke까지 완료됐다.
-- P4의 큰 작업은 protocol shape, production cluster policy, runtime assignment mutation 중 하나를 건드리므로 구현 전 사용자 판단이 필요하다.
-
-## P0
-
-1. [done 2026-04-26] Orchestrator Prometheus exporter
-   - 목표: 기존 `GetMetrics` snapshot을 Prometheus text format으로 노출한다.
-   - 완료 조건: `TESSERA_ORCH_METRICS_ADDR` 설정 시 `GET /metrics`가 `tessera_orch_*` gauge/counter를 반환하고, 기본 gRPC 경로는 기존처럼 동작한다.
-   - 검증: unit/HTTP smoke test, `cargo xt`, `cargo test`, metrics-enabled dev smoke.
-
-2. [done 2026-04-26] Worker/Gateway relay observability
-   - 목표: remote ghost relay의 연결 상태, 재연결 횟수, 구독 fanout, dropped/backpressure 이벤트를 메트릭으로 볼 수 있게 한다.
-   - 완료 조건: Worker와 Gateway가 각자 runtime-local counters와 opt-in `/metrics` endpoint를 갖고, 기존 relay/connection behavior를 유지한다.
-   - 검증: unit metrics format tests, `cargo xt`, `cargo test`, metrics-enabled dev smoke.
-
-3. [done 2026-04-26] Handover command protocol skeleton
-   - 목표: `PreCopy`, `Freeze`, `Diff`, `Commit` 명령의 proto 타입과 Orchestrator 상태 모델을 추가하되 실제 무중단 이동은 feature slice로 나눈다.
-   - 완료 조건: 명령 타입, validation, rejected-state tests, 문서화가 먼저 들어가고 runtime routing 전환은 다음 change로 분리한다.
-   - 정책: freeze/diff 중 client move는 현재 slice에서 reject하고, commit failure는 기존 source owner/route 유지 후 abort한다.
-
-4. [done 2026-04-26] Handover source move buffering
-   - 목표: freeze/diff 중 즉시 reject되는 client move를 source Worker의 bounded buffer에 보관하고 handover status가 해제되면 순서대로 재적용해 client-visible error를 완화한다.
-   - 완료 조건: buffer capacity/TTL/overflow 정책, Orchestrator listing의 handover status propagation, Worker replay ordering test가 고정된다.
-   - 주의: buffering은 짧은 handover window를 완화하지만, 장시간 freeze·buffer overflow·반복 commit 실패에는 여전히 reject/abort가 필요하다.
-
-5. [done 2026-04-26] Handover commit route switch
-   - 목표: target readiness 확인 후 assignment/listing을 target Worker로 전환하고, Gateway route switch와 Worker owned-cell 갱신을 기존 watch/listing 경로에 연결한다.
-   - 완료 조건: target Worker가 등록되지 않은 commit은 retryable reject로 남고, 등록된 target으로 commit하면 Orchestrator assignment가 이동하며, source Worker는 더 이상 이전 cell을 소유한 것으로 처리하지 않는다.
-   - 주의: 이번 slice는 route/ownership 전환까지이며 source buffered move의 target-side replay는 아직 없다. commit 이후 source buffer drain은 `handover_cell_not_owned` error path를 유지한다.
-
-6. [done 2026-04-26] Handover target-side replay and commit retry
-   - 목표: source buffered move를 target Worker에 넘기는 replay 경로와 commit retry/abort 정책을 runtime 경로에 연결한다.
-   - 작업 계획: `docs/todo-handover-replay.md`에 retry budget, replay payload, target apply, stable session 후속 작업을 분리했다.
-   - 완료 조건: target replay ordering, retry budget/timeout, abort-before-assignment-transfer tests가 고정된다.
-   - 주의: client socket 유지, source/target 중복 적용 방지, stale route 차단이 핵심 리스크다. 이후 stable session handover와 explicit owner transfer가 P1에서 별도 완료됐다.
-
-## P1
-
-1. [done 2026-04-26] Stable session handover baseline
-   - 목표: Gateway route change 뒤 client socket/actor ownership을 stable session identity로 보존한다.
-   - 완료 조건: Gateway가 connection별 session id를 Worker ingress frame에 주입하고, route-change non-ping traffic이 client close 대신 upstream reconnect로 고정된다.
-
-2. [done 2026-04-26] Explicit ownership transfer
-   - 목표: target replay의 claim-on-first-use fallback을 source가 전달한 session ownership manifest로 대체한다.
-   - 완료 조건: `HandoverReplay`가 actor별 owner session을 포함하고, target Worker가 replay 적용 시 owner map까지 즉시 구성한다.
-   - 검증: core relay frame roundtrip, target replay owner transfer/unit test, source→target commit replay test.
-
-3. [done 2026-04-26] AOI precision upgrade
-   - 목표: 현재 셀 경계 기반 edge margin을 거리/가시성 기반으로 확장한다.
-   - 완료 조건: centered/edge/distant actor cases가 deterministic test로 고정되고, AOI 폭주 방지 cap이 문서화된다.
-   - 검증: `TESSERA_WORKER_AOI_VISIBILITY_RADIUS_UNITS`, `TESSERA_WORKER_AOI_MAX_CELLS`, 거리 기반 centered/edge/corner/distant/cap test.
-
-4. [done 2026-04-26] Multi-cell tick pipeline
-   - 목표: Worker 내부의 셀별 tick, broadcast flush, relay fanout 단계를 더 명시적인 pipeline으로 나눈다.
-   - 완료 조건: 기존 client/ghost behavior test가 유지되고, per-cell stage를 개별적으로 테스트할 수 있다.
-   - 검증: ordered per-cell flush batch unit test, 기존 queued move/ghost relay tests, `cargo xt`, `cargo test`, runtime smoke.
-
-5. [done 2026-04-26] Dynamic split/merge design note
-   - 목표: quadtree split/merge 조건, hysteresis, assignment churn 제한을 문서로 고정한다.
-   - 완료 조건: README의 V2 동적 분할 목표와 일치하는 `docs/` 설계 노트가 생기고, 구현 전제와 non-goals가 분리된다.
-   - 검증: `docs/dynamic-split-merge.md`, README Planned/Upcoming 링크, `cargo xt`.
-
-## P2
-
-- 실행 계획: `docs/todo-p2-observability-packaging.md`
-- [done 2026-04-26] Long-lived quality loop: metrics scrape assertion을 별도 `cargo xt dev metrics-smoke`로 추가했다.
-- [done 2026-04-26] Gateway readiness/reconnect 관측: Gateway metrics listener에 `/ready`를 추가하고, route availability, upstream connect attempts, route-change reconnects, close reason counters를 Prometheus와 log field로 정리했다.
-- [done 2026-04-26] Container/Kubernetes packaging sample: multi-binary runtime image, Compose smoke, non-production Kubernetes sample, packaging docs를 추가했다.
-- [done 2026-04-26] Gateway Ping/Pong latency histogram: request/round-trip latency bucket format을 정하고 Gateway metrics와 metrics smoke에 추가했다.
-- 비-Ping request latency 계측은 protocol-level request id가 생긴 뒤 일반화한다.
-
-## P3
-
-- 실행 계획: `docs/todo-p3-runtime-hardening.md`
-- [done 2026-04-26] Metrics smoke latency path: `cargo xt dev metrics-smoke`가 실제 Ping/Pong latency histogram 증가까지 확인하도록 강화했다.
-- [done 2026-04-26] Split/merge planner skeleton: Orchestrator-local inactive planner와 deterministic ranking/hysteresis/budget/overlap tests를 추가했다.
-- [done 2026-04-26] Merge planner skeleton: runtime assignment 변경 없이 complete sibling set의 cold/low-water 조건과 churn budget을 deterministic planner test로 고정했다.
-- [done 2026-04-26] Split/merge dry-run preview: Orchestrator `GET /split-merge/preview`로 assignment 변경 없는 planner JSON preview를 노출했다.
-- [done 2026-04-28] Split/merge preview fixture smoke: `cargo xt dev metrics-smoke`가 hot-cell fixture로 non-empty dry-run split plan을 검증한다.
+- P0/P1/P2/P3는 handover replay ownership, stable Gateway sessions, AOI precision, per-cell tick pipeline, observability/packaging sample, split/merge planner skeleton, fixture-backed dry-run preview smoke까지 완료됐다. 완료 상세 기록은 `docs/completed-milestones.md`로 옮겼다.
+- 현재 active todo는 P4뿐이다. P4의 큰 작업은 protocol shape, production cluster policy, runtime assignment mutation 중 하나를 건드리므로 구현 전 사용자 판단이 필요하다.
 
 ## P4
 
