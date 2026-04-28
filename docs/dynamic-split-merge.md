@@ -1,15 +1,16 @@
 # Dynamic Split/Merge Design Note
 
-Last reviewed: 2026-04-26
+Last reviewed: 2026-04-28
 
 ## Scope
 
 This note fixes the V2 direction for quadtree-style cell split/merge. It is a
 design contract only. The Orchestrator now has an inactive split/merge planner
 skeleton with deterministic ranking, hysteresis/cooldown, churn-budget, complete
-sibling validation, overlap tests, and an assignment-safe dry-run preview
-endpoint, but runtime split/merge, automatic rebalancing, real metrics
-ingestion, and multi-depth assignment changes are not implemented yet.
+sibling validation, overlap tests, an assignment-safe dry-run preview endpoint,
+and a fixture-backed runtime smoke that proves the preview can emit a non-empty
+split plan. Runtime split/merge, automatic rebalancing, real metrics ingestion,
+and multi-depth assignment changes are not implemented yet.
 
 The design assumes the existing V0/V1 foundations stay intact:
 
@@ -124,7 +125,8 @@ Before runtime implementation, keep or extend tests for:
 - No overlapping active plans for the same cell family. (initial inactive
   skeleton covered for exact CellId families)
 - Assignment listing shape before and after a simulated split/merge.
-- Dry-run preview response without assignment mutation.
+- Dry-run preview response without assignment mutation, including a smoke
+  fixture that emits a non-empty split plan.
 
 Runtime implementation should additionally run the existing full gate:
 

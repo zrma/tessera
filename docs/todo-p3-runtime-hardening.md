@@ -1,6 +1,6 @@
 # Tessera P3 Runtime Hardening Todo
 
-Last reviewed: 2026-04-26
+Last reviewed: 2026-04-28
 
 ## Baseline
 
@@ -154,3 +154,31 @@ Deferred:
 
 - Runtime split/merge activation, real metrics ingestion, target worker
   selection, and production exposure policy remain separate follow-up slices.
+
+## P3.7 Split/merge preview fixture smoke
+
+Goal: make the runtime smoke prove that the Orchestrator preview endpoint can
+return an actual planner result, not only an empty dry-run response.
+
+Status: done 2026-04-28.
+
+Implemented slice:
+
+1. `cargo xt dev metrics-smoke` starts Orchestrator with
+   `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON` set to a deterministic hot-cell
+   snapshot.
+2. The smoke still asserts `mode="dry_run"` and
+   `assignments_changed=false`.
+3. The smoke now also asserts the preview source is the env snapshot and the
+   planner emits a non-empty `split` plan.
+
+Completion conditions:
+
+- Preview fixture smoke remains assignment-safe; it does not enable runtime
+  split/merge activation.
+- `cargo xt`, `cargo test`, and `cargo xt dev metrics-smoke` pass.
+
+Deferred:
+
+- Real rolling metrics ingestion, target worker selection, production exposure
+  policy, and runtime split/merge activation remain P4 decision gates.

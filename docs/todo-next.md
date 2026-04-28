@@ -1,12 +1,12 @@
 # Tessera Next Todo
 
-Last reviewed: 2026-04-26
+Last reviewed: 2026-04-28
 
 ## Baseline
 
-- 작업 시작 시점에는 Orchestrator Prometheus exporter 미완성 diff가 있었고, 이번 pass에서 이를 검증 가능한 변경으로 마무리했다.
 - V0 범위는 고정 그리드 셀, Gateway/Worker TCP 파이프라인, Orchestrator assignment snapshot/watch, Worker AOI ghost relay까지 구현된 상태다.
-- 즉시 사용자 판단이 필요한 에스컬레이션은 없다. 다만 handover 순서와 동적 분할 정책은 구현 전 의미론 결정을 다시 확인하는 편이 안전하다.
+- P0/P1/P2/P3는 handover replay ownership, stable Gateway sessions, AOI precision, per-cell tick pipeline, observability/packaging sample, split/merge planner skeleton, fixture-backed dry-run preview smoke까지 완료됐다.
+- P4의 큰 작업은 protocol shape, production cluster policy, runtime assignment mutation 중 하나를 건드리므로 구현 전 사용자 판단이 필요하다.
 
 ## P0
 
@@ -83,4 +83,9 @@ Last reviewed: 2026-04-26
 - [done 2026-04-26] Split/merge planner skeleton: Orchestrator-local inactive planner와 deterministic ranking/hysteresis/budget/overlap tests를 추가했다.
 - [done 2026-04-26] Merge planner skeleton: runtime assignment 변경 없이 complete sibling set의 cold/low-water 조건과 churn budget을 deterministic planner test로 고정했다.
 - [done 2026-04-26] Split/merge dry-run preview: Orchestrator `GET /split-merge/preview`로 assignment 변경 없는 planner JSON preview를 노출했다.
+- [done 2026-04-28] Split/merge preview fixture smoke: `cargo xt dev metrics-smoke`가 hot-cell fixture로 non-empty dry-run split plan을 검증한다.
+
+## P4
+
+- 실행 계획: `docs/todo-p4-next-milestones.md`
 - 에스컬레이션 필요: 비-Ping request latency correlation, production Kubernetes manifests, runtime split/merge activation.

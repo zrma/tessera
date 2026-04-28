@@ -43,7 +43,7 @@ Cell-based world orchestration for real-time servers in Rust.
   - `cargo run -p tessera-client -- ping --ts 123`
   - `cargo xt dev down --with-orch`
 - Metrics 스모크:
-  - `cargo xt dev metrics-smoke` (Gateway `127.0.0.1:4100`, Worker `127.0.0.1:5100`, Orchestrator `127.0.0.1:6100`의 `/metrics`, Gateway `/ready`, Orchestrator `/split-merge/preview`를 확인)
+  - `cargo xt dev metrics-smoke` (Gateway `127.0.0.1:4100`, Worker `127.0.0.1:5100`, Orchestrator `127.0.0.1:6100`의 `/metrics`, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed dry-run plan, Ping/Pong latency histogram 증가를 확인)
 - Packaging 예시:
   - 컨테이너 이미지: `docker build -t tessera:local .`
   - Compose smoke: `docker compose -f deploy/docker-compose.yml up --build`
@@ -110,8 +110,9 @@ Cell-based world orchestration for real-time servers in Rust.
 ### 🚧 Planned / Upcoming
 - Worker 간 ghost relay의 장기 scrape/tracing assertions와 비-Ping request latency 계측 고도화
 - Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로만 제공되며, production target별 manifests는 아직 미구현
-- 리밸런싱 자동화, 동적 분할(V1/V2) 런타임 구현은 아직 미구현이며, Orchestrator에는 비활성 split/merge planner skeleton만 있다 (`docs/dynamic-split-merge.md`에 설계 노트)
+- 리밸런싱 자동화, 동적 분할(V1/V2) 런타임 구현은 아직 미구현이며, Orchestrator에는 비활성 split/merge planner skeleton과 fixture-backed dry-run preview smoke만 있다 (`docs/dynamic-split-merge.md`에 설계 노트)
 - P3 runtime hardening 실행 계획은 `docs/todo-p3-runtime-hardening.md`에 둔다.
+- 다음 milestone decision gate는 `docs/todo-p4-next-milestones.md`에 둔다.
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
@@ -135,7 +136,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - `docs/quality.md`는 자율 수행 계약, feedback loop, crate boundary policy의 repo-local 기준 문서다.
 - `cargo xt harness`는 README/AGENTS/docs/CI discoverability와 내부 크레이트 의존 방향을 검사한다.
 - 현재 기계적 crate boundary: `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, `tessera-gateway`/`tessera-worker`/`tessera-orch`는 `tessera-core`와 `tessera-proto`만 공유 의존성으로 사용하며 서로 직접 의존하지 않는다.
-- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready`, Orchestrator `/split-merge/preview`, 그리고 실제 Ping/Pong 후 `tessera_gateway_ping_roundtrip_seconds` histogram 증가를 확인한다.
+- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed non-empty dry-run plan, 그리고 실제 Ping/Pong 후 `tessera_gateway_ping_roundtrip_seconds` histogram 증가를 확인한다.
 - `docs/packaging.md`와 `deploy/`는 Docker/Compose/Kubernetes packaging sample을 제공한다. 실제 클러스터용 manifest는 target convention을 확인한 뒤 별도 작업으로 추가한다.
 - CI는 push/PR에서 `cargo xt`, `cargo test`, `cargo xt dev up --with-orch` + `cargo run -p tessera-client -- ping --ts 123` 스모크를 실행한다.
 

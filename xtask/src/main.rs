@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -331,6 +331,7 @@ struct DevLaunchOptions {
     gateway_metrics_addr: Option<String>,
     worker_metrics_addr: Option<String>,
     orch_metrics_addr: Option<String>,
+    orch_split_merge_preview_json: Option<String>,
 }
 
 fn dev_up(with_orch: bool, orch_config: Option<PathBuf>) -> Result<()> {
@@ -402,6 +403,9 @@ fn dev_up_inner(
             }
             if let Some(addr) = options.orch_metrics_addr.as_ref() {
                 ocmd.env("TESSERA_ORCH_METRICS_ADDR", addr);
+            }
+            if let Some(raw) = options.orch_split_merge_preview_json.as_ref() {
+                ocmd.env("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", raw);
             }
             detach_background_process(&mut ocmd);
             let mut child = ocmd
@@ -619,10 +623,12 @@ fn dev_metrics_smoke() -> Result<()> {
     let gateway_metrics_addr = "127.0.0.1:4100";
     let worker_metrics_addr = "127.0.0.1:5100";
     let orch_metrics_addr = "127.0.0.1:6100";
+    let split_merge_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0},"actor_count":150,"move_queue_pressure":80,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-local"}]}"#;
     let options = DevLaunchOptions {
         gateway_metrics_addr: Some(gateway_metrics_addr.to_string()),
         worker_metrics_addr: Some(worker_metrics_addr.to_string()),
         orch_metrics_addr: Some(orch_metrics_addr.to_string()),
+        orch_split_merge_preview_json: Some(split_merge_preview_json.to_string()),
     };
 
     dev_up_inner(true, None, options)?;
@@ -665,7 +671,13 @@ fn dev_metrics_smoke() -> Result<()> {
             "orchestrator split/merge preview",
             orch_metrics_addr,
             "/split-merge/preview",
-            &["\"mode\": \"dry_run\"", "\"assignments_changed\": false"],
+            &[
+                "\"mode\": \"dry_run\"",
+                "\"source\": \"env:TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON\"",
+                "\"assignments_changed\": false",
+                "\"kind\": \"split\"",
+                "\"cells_moved\": 1",
+            ],
         )?;
         run_client_ping(987)?;
         let gateway_metrics = assert_metrics_endpoint_body(
@@ -724,12 +736,24 @@ fn assert_http_status_endpoint(
     expected_status: &str,
 ) -> Result<()> {
     let addr = readiness_addr(raw_addr)?;
-    let response = http_get(addr, path)?;
     let expected = format!("HTTP/1.1 {expected_status}");
-    if !response.starts_with(&expected) {
-        bail!("{service} smoke failed: expected HTTP {expected_status} response");
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        match http_get(addr, path) {
+            Ok(response) if response.starts_with(&expected) => return Ok(()),
+            Ok(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(_) => {
+                bail!("{service} smoke failed: expected HTTP {expected_status} response");
+            }
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Err(err),
+        }
     }
-    Ok(())
 }
 
 fn assert_json_endpoint_contains(
@@ -739,7 +763,25 @@ fn assert_json_endpoint_contains(
     required_fragments: &[&str],
 ) -> Result<()> {
     let addr = readiness_addr(raw_addr)?;
-    let response = http_get(addr, path)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        match assert_json_response_contains(service, http_get(addr, path), required_fragments) {
+            Ok(()) => return Ok(()),
+            Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn assert_json_response_contains(
+    service: &str,
+    response: Result<String>,
+    required_fragments: &[&str],
+) -> Result<()> {
+    let response = response?;
     if !response.starts_with("HTTP/1.1 200 OK") {
         bail!("{service} smoke failed: expected HTTP 200 response");
     }
@@ -803,9 +845,17 @@ fn http_get(addr: SocketAddr, path: &str) -> Result<String> {
         stream,
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
     )?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
+    let mut response = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == ErrorKind::ConnectionReset && !response.is_empty() => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(String::from_utf8(response)?)
 }
 
 fn assert_prometheus_response(
