@@ -10,6 +10,14 @@ This document is the repo-local quality map for agents. It keeps the expected au
 - Escalate to the user only for judgment-heavy requirement gaps, destructive operations, published history rewrite, unspecified remote bookmark movement, external cost or operations risk, and secrets or credentials.
 - Small uncertainty should not stop the task. Capture the assumption in code, docs, tests, or the final report.
 
+## OpenAI GPT-5.5 guidance
+
+- Use the `openai-docs` skill and official OpenAI developer docs before changing OpenAI model, API, prompt, or agent guidance.
+- If the task asks for the latest OpenAI baseline, treat `gpt-5.5` as the target and keep the change narrow: active model strings and directly related prompts or harness instructions only.
+- Prefer outcome-first GPT-5.5 instructions: goal, success criteria, allowed side effects, evidence or validation rules, stop/escalation conditions, and output shape.
+- Preserve existing reasoning effort, verbosity, tool definitions, structured output contracts, and Responses API state handling unless this repo exposes a safe configuration point. Record broader API or tool rewiring as a blocker.
+- Leave historical examples, fixtures, eval baselines, provider comparisons, and fallback paths unchanged unless the task explicitly includes them.
+
 ## Feedback loops
 
 - `cargo xt` is the default local gate and runs fmt, clippy with `-D warnings`, workspace check, and `cargo xt harness`.
