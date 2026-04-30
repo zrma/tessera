@@ -1,6 +1,6 @@
 # Tessera P4 Next Milestones
 
-Last reviewed: 2026-04-29
+Last reviewed: 2026-04-30
 
 ## Baseline
 
@@ -13,6 +13,23 @@ dry-run preview smoke. Completed milestone details are archived in
 There is no uncommitted implementation work at this planning point. The next
 substantial milestones all cross a decision boundary: protocol shape, production
 cluster policy, or runtime assignment mutation.
+
+## 2026-04-30 Decision Checkpoint
+
+No safe autonomous implementation slice remains before choosing a P4 branch.
+Pick one of these directions to unblock the next commit-sized milestone:
+
+1. P4.1 for local code progress: approve adding a request correlation field to
+   client/server protocol envelopes, with backward-compatible decode defaults.
+2. P4.2 for cluster rollout: provide the live GitOps target details for image,
+   namespace, Gateway exposure, Prometheus discovery, resources, and rollout
+   policy.
+3. P4.3 for runtime split/merge: approve the first activation shape, target
+   worker policy, multi-depth `CellId` semantics, and manual-vs-automatic plan
+   submission.
+
+Default recommendation remains P4.1 unless operating Tessera on the existing
+cluster is the immediate goal.
 
 ## P4.1 Non-Ping Request Latency Correlation
 
