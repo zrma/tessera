@@ -12,21 +12,18 @@ P4.2 internal GitOps manifests are committed, pushed, synced by ArgoCD, and
 runtime-smoked on the MicroK8s cluster. Completed milestone details are
 archived in `docs/completed-milestones.md`.
 
-The next substantial milestones now cross either production cluster rollout or
-runtime assignment mutation.
+The next substantial milestone crosses runtime assignment mutation.
 
 ## 2026-05-01 Decision Checkpoint
 
 P4.2 defaults were accepted for the first internal-only deployment slice, the
 cluster rollout was verified, and `v2026.05.1` was published by GitHub Actions
-and promoted through GitOps. The remaining substantial branch is:
+and promoted through GitOps. The remaining substantial branch is P4.3 runtime
+split/merge activation.
 
-1. P4.3 runtime split/merge: approve the first activation shape, target
-   worker policy, multi-depth `CellId` semantics, and manual-vs-automatic plan
-   submission.
-
-Default recommendation is keeping P4.3 gated until the assignment mutation
-semantics are explicit.
+The first P4.3 activation shape is fixed in `docs/dynamic-split-merge.md`:
+split-only, manual submission, default-off feature flag, explicit target map,
+and one-level `CellId` activation from `depth=0/sub=0` to `depth=1/sub=0..3`.
 
 ## P4.1 Non-Ping Request Latency Correlation
 
@@ -139,28 +136,59 @@ Completed image-promotion checks:
 
 ## P4.3 Runtime Split/Merge Activation
 
-Status: escalation required before implementation.
+Status: first activation shape fixed; implementation not started.
 
-Decision needed:
+Chosen first slice:
 
-- Whether the first runtime activation should support split-only, merge-only, or
-  both.
-- Target worker selection policy.
-- Multi-depth `CellId.depth/sub` semantics beyond the current shallow shape.
-- Whether runtime plans are manually submitted first or automatically emitted
-  from observed metrics.
+1. Split-only activation. Merge remains dry-run/design-only until a later
+   milestone chooses merge rollback and sibling coalescing behavior.
+2. Manual activation. Planner output can recommend candidates, but it must not
+   auto-submit runtime mutations from observed metrics.
+3. Default-off feature flag. Mutating activation should reject unless an
+   explicit manual activation flag/config is enabled.
+4. Explicit target map. The command must name targets for all four child
+   `sub` values, validate configured/registered Workers, reject missing or
+   duplicate children, and keep source-only no-op plans as dry-run output.
+5. One-level `CellId` semantics. Only `depth=0/sub=0` parents split into
+   `depth=1/sub=0..3` children with the quadrant convention recorded in
+   `docs/dynamic-split-merge.md`; nested `depth>1` activation is rejected until
+   a future encoding change.
+6. All-or-nothing publication. Staged child assignments are private until
+   replay succeeds, parent removal and child publication happen atomically, and
+   pre-publication failures abort with parent assignment unchanged.
+7. Post-publication convergence failures are surfaced with cooldown and manual
+   recovery; the first slice does not automatically merge back.
 
 Suggested implementation after approval:
 
-1. Keep assignment mutation behind an explicit runtime flag or manual command.
-2. Materialize planned target assignments without publishing them.
-3. Drive each ownership move through the existing handover state machine.
-4. Publish assignments only after successful commit/replay.
-5. Add route convergence, AOI resync, and rollback/error-path tests before
-   enabling any automatic policy.
+1. Add the manual activation command/API and feature flag.
+2. Materialize planned target child assignments without publishing them.
+3. Drive parent freeze, child replay, and owner/session transfer through the
+   existing handover/replay contracts or an explicitly equivalent split replay
+   path.
+4. Publish child assignments only after all child replay paths succeed, and
+   remove the parent assignment in the same publication step.
+5. Add target validation, depth validation, route convergence, AOI resync,
+   atomic rollback, and post-publish failure tests before enabling the flag in
+   any environment.
+
+Verification required for the implementation milestone:
+
+```sh
+cargo xt
+cargo test
+cargo xt dev up --with-orch
+cargo run -p tessera-client -- ping --ts 123
+cargo xt dev down --with-orch
+```
+
+The implementation should also extend the existing split/merge preview smoke or
+add a new activation smoke so the default-off flag, manual validation, successful
+split, and failed replay/target paths are covered by automated evidence.
 
 ## Recommendation
 
-Choose P4.3 only when runtime split/merge semantics are the immediate priority;
-it should remain gated until target worker policy and assignment mutation rules
-are explicit.
+Choose the P4.3 implementation milestone only when runtime assignment mutation
+is the immediate priority. The approved first shape is intentionally narrow:
+split-only, manual, default-off, one-level `CellId`, and no automatic merge
+rollback.
