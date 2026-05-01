@@ -2365,6 +2365,63 @@ mod tests {
         assert_eq!(route.addr, "worker-a:5001");
     }
 
+    #[tokio::test]
+    async fn split_publish_listing_replaces_parent_route_with_child_routes() {
+        let parent = CellId::grid(0, 0, 0);
+        let child_assignments = (0..4)
+            .map(|sub| Assignment {
+                world: 0,
+                cx: 0,
+                cy: 0,
+                depth: 1,
+                sub,
+            })
+            .collect::<Vec<_>>();
+        let mut initial_routes = HashMap::new();
+        initial_routes.insert(
+            CellKey(parent),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: "127.0.0.1:5001".to_string(),
+            },
+        );
+        let routing = RoutingTable::new(initial_routes);
+        let listing = AssignmentListing {
+            workers: vec![
+                AssignmentBundle {
+                    worker_id: "worker-a".to_string(),
+                    addr: "127.0.0.1:5001".to_string(),
+                    cells: Vec::new(),
+                },
+                AssignmentBundle {
+                    worker_id: "worker-b".to_string(),
+                    addr: "127.0.0.1:5002".to_string(),
+                    cells: child_assignments,
+                },
+            ],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_listing_update(&routing, listing)
+                .await
+                .expect("apply split publish listing")
+        );
+        assert!(routing.lookup(&parent).await.is_none());
+        for sub in 0..4 {
+            let child = CellId {
+                world: 0,
+                cx: 0,
+                cy: 0,
+                depth: 1,
+                sub,
+            };
+            let route = routing.lookup(&child).await.expect("child route");
+            assert_eq!(route.worker_id, "worker-b");
+            assert_eq!(route.addr, "127.0.0.1:5002");
+        }
+    }
+
     #[test]
     fn routes_from_listing_rejects_empty_addr() {
         let listing = AssignmentListing {

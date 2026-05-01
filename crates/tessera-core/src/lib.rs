@@ -78,6 +78,13 @@ pub struct HandoverReplayOwner {
     pub owner_session: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SplitReplayTarget {
+    pub cell: CellId,
+    pub target_worker_id: String,
+    pub target_addr: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
@@ -138,6 +145,32 @@ pub enum WorkerRelayMsg {
         #[serde(default)]
         owners: Vec<HandoverReplayOwner>,
         moves: Vec<HandoverReplayMove>,
+    },
+    HandoverReplayAck {
+        operation_id: String,
+        cell: CellId,
+        accepted: bool,
+        reason: String,
+    },
+    SplitReplayPrepare {
+        operation_id: String,
+        cells: Vec<CellId>,
+    },
+    SplitReplayRequest {
+        operation_id: String,
+        parent: CellId,
+        children: Vec<SplitReplayTarget>,
+    },
+    SplitReplayAbort {
+        operation_id: String,
+        cells: Vec<CellId>,
+    },
+    SplitReplayAck {
+        operation_id: String,
+        parent: CellId,
+        accepted: bool,
+        reason: String,
+        children: Vec<CellId>,
     },
 }
 
@@ -408,6 +441,57 @@ mod tests {
         let decoded: Envelope<WorkerRelayMsg> =
             try_decode_frame(&mut buf).expect("decode").expect("frame");
         assert_eq!(env, decoded);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn frame_roundtrip_split_replay_request_and_ack() {
+        let parent = CellId::grid(0, 1, 0);
+        let child = CellId {
+            world: 0,
+            cx: 1,
+            cy: 0,
+            depth: 1,
+            sub: 2,
+        };
+        let env = Envelope {
+            cell: parent,
+            seq: 5,
+            epoch: 13,
+            payload: WorkerRelayMsg::SplitReplayRequest {
+                operation_id: "split-1".to_string(),
+                parent,
+                children: vec![SplitReplayTarget {
+                    cell: child,
+                    target_worker_id: "worker-b".to_string(),
+                    target_addr: "127.0.0.1:5002".to_string(),
+                }],
+            },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<WorkerRelayMsg> =
+            try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(env, decoded);
+        assert_eq!(buf.len(), 0);
+
+        let ack = Envelope {
+            cell: parent,
+            seq: 6,
+            epoch: 13,
+            payload: WorkerRelayMsg::SplitReplayAck {
+                operation_id: "split-1".to_string(),
+                parent,
+                accepted: true,
+                reason: "split replay applied".to_string(),
+                children: vec![child],
+            },
+        };
+        let b = encode_frame(&ack);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<WorkerRelayMsg> =
+            try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(ack, decoded);
         assert_eq!(buf.len(), 0);
     }
 

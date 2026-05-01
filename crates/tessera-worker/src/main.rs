@@ -10,8 +10,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tessera_core::{
     ActorState, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope, HandoverReplayMove,
-    HandoverReplayOwner, MAX_FRAME_LEN, Position, ServerEnvelope, ServerMsg, Tick, WorkerRelayMsg,
-    encode_frame, try_decode_frame,
+    HandoverReplayOwner, MAX_FRAME_LEN, Position, ServerEnvelope, ServerMsg, SplitReplayTarget,
+    Tick, WorkerRelayMsg, encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -88,6 +88,8 @@ type PeerRoutes = HashMap<CellId, PeerRoute>;
 type RemoteInterestMap = HashMap<u64, HashMap<CellId, PeerRoute>>;
 type RemotePeerSessionMap = HashMap<String, RemotePeerSessionHandle>;
 type HandoverPolicyMap = HashMap<CellId, HandoverCellPolicy>;
+type SplitReplayPlans = HashMap<CellId, SplitReplayPlan>;
+type PreparedSplitReplays = HashSet<(String, CellId)>;
 type BufferedMoveQueues = HashMap<CellId, VecDeque<BufferedMove>>;
 type HandoverReplayClaims = HashSet<(CellId, EntityId)>;
 type AppliedHandoverReplays = HashSet<String>;
@@ -201,6 +203,12 @@ struct HandoverCellPolicy {
     client_move_policy: HandoverClientMovePolicy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitReplayPlan {
+    operation_id: String,
+    children: Vec<SplitReplayTarget>,
+}
+
 #[derive(Clone)]
 struct BufferedMove {
     subscriber: CellSubscriber,
@@ -228,6 +236,8 @@ struct SharedState {
     remote_interests: Mutex<RemoteInterestMap>,
     remote_peer_sessions: Mutex<RemotePeerSessionMap>,
     handover_policies: RwLock<HandoverPolicyMap>,
+    split_replay_plans: Mutex<SplitReplayPlans>,
+    prepared_split_replays: Mutex<PreparedSplitReplays>,
     buffered_moves: Mutex<BufferedMoveQueues>,
     handover_replay_claims: Mutex<HandoverReplayClaims>,
     applied_handover_replays: Mutex<AppliedHandoverReplays>,
@@ -295,6 +305,8 @@ impl SharedState {
             remote_interests: Mutex::new(HashMap::new()),
             remote_peer_sessions: Mutex::new(HashMap::new()),
             handover_policies: RwLock::new(HashMap::new()),
+            split_replay_plans: Mutex::new(HashMap::new()),
+            prepared_split_replays: Mutex::new(HashSet::new()),
             buffered_moves: Mutex::new(HashMap::new()),
             handover_replay_claims: Mutex::new(HashSet::new()),
             applied_handover_replays: Mutex::new(HashSet::new()),
@@ -715,15 +727,68 @@ impl SharedState {
         (changed, released)
     }
 
+    async fn prepare_split_replay(&self, operation_id: &str, cells: &[CellId]) {
+        let mut prepared = self.prepared_split_replays.lock().await;
+        for cell in cells {
+            prepared.insert((operation_id.to_string(), *cell));
+        }
+    }
+
+    async fn clear_prepared_split_replay(&self, operation_id: &str, cells: &[CellId]) {
+        let mut prepared = self.prepared_split_replays.lock().await;
+        for cell in cells {
+            prepared.remove(&(operation_id.to_string(), *cell));
+        }
+    }
+
+    async fn split_replay_prepared(&self, operation_id: &str, cell: CellId) -> bool {
+        let prepared = self.prepared_split_replays.lock().await;
+        prepared.contains(&(operation_id.to_string(), cell))
+    }
+
+    async fn register_split_replay_plan(
+        &self,
+        operation_id: String,
+        parent: CellId,
+        children: Vec<SplitReplayTarget>,
+    ) {
+        let mut plans = self.split_replay_plans.lock().await;
+        plans.insert(
+            parent,
+            SplitReplayPlan {
+                operation_id,
+                children,
+            },
+        );
+    }
+
+    async fn take_split_replay_plan(&self, parent: CellId) -> Option<SplitReplayPlan> {
+        let mut plans = self.split_replay_plans.lock().await;
+        plans.remove(&parent)
+    }
+
     async fn should_buffer_move(&self, cell: &CellId) -> Option<HandoverCellPolicy> {
         let guard = self.handover_policies.read().await;
-        guard
+        if let Some(policy) = guard
             .get(cell)
             .filter(|policy| {
                 policy.client_move_policy == HandoverClientMovePolicy::RejectDuringFreeze
                     && matches!(policy.state, HandoverState::Frozen | HandoverState::Diffing)
             })
             .cloned()
+        {
+            return Some(policy);
+        }
+        drop(guard);
+
+        let plans = self.split_replay_plans.lock().await;
+        plans.get(cell).map(|plan| HandoverCellPolicy {
+            operation_id: plan.operation_id.clone(),
+            source_worker_id: String::new(),
+            target_worker_id: "split-replay".to_string(),
+            state: HandoverState::Diffing,
+            client_move_policy: HandoverClientMovePolicy::RejectDuringFreeze,
+        })
     }
 
     async fn buffer_client_move(&self, cell: CellId, buffered: BufferedMove) -> Result<(), ()> {
@@ -787,16 +852,16 @@ impl SharedState {
         moves: Vec<HandoverReplayMove>,
         owned_cells: &HashSet<CellId>,
     ) -> HandoverReplayApplyOutcome {
-        if !owned_cells.contains(&cell) {
-            return HandoverReplayApplyOutcome::Rejected("target_cell_not_owned");
-        }
-
         let replay_key = handover_replay_key(&operation_id, cell);
         {
             let applied = self.applied_handover_replays.lock().await;
             if applied.contains(&replay_key) {
                 return HandoverReplayApplyOutcome::Duplicate;
             }
+        }
+
+        if !owned_cells.contains(&cell) && !self.split_replay_prepared(&operation_id, cell).await {
+            return HandoverReplayApplyOutcome::Rejected("target_cell_not_owned_or_staged");
         }
 
         let mut positions = HashMap::new();
@@ -1276,7 +1341,12 @@ impl SharedState {
             }
             WorkerRelayMsg::Subscribe { .. }
             | WorkerRelayMsg::Unsubscribe { .. }
-            | WorkerRelayMsg::HandoverReplay { .. } => {}
+            | WorkerRelayMsg::HandoverReplay { .. }
+            | WorkerRelayMsg::HandoverReplayAck { .. }
+            | WorkerRelayMsg::SplitReplayPrepare { .. }
+            | WorkerRelayMsg::SplitReplayRequest { .. }
+            | WorkerRelayMsg::SplitReplayAbort { .. }
+            | WorkerRelayMsg::SplitReplayAck { .. } => {}
         }
     }
 
@@ -1289,7 +1359,12 @@ impl SharedState {
             WorkerRelayMsg::Despawn { cell, actors } => ServerMsg::Despawn { cell, actors },
             WorkerRelayMsg::Subscribe { .. }
             | WorkerRelayMsg::Unsubscribe { .. }
-            | WorkerRelayMsg::HandoverReplay { .. } => return,
+            | WorkerRelayMsg::HandoverReplay { .. }
+            | WorkerRelayMsg::HandoverReplayAck { .. }
+            | WorkerRelayMsg::SplitReplayPrepare { .. }
+            | WorkerRelayMsg::SplitReplayRequest { .. }
+            | WorkerRelayMsg::SplitReplayAbort { .. }
+            | WorkerRelayMsg::SplitReplayAck { .. } => return,
         };
 
         let subscribers = self.remote_interest_subscribers(env_in.cell).await;
@@ -1464,6 +1539,16 @@ impl SharedState {
         {
             let mut claims = self.handover_replay_claims.lock().await;
             claims.retain(|(cell, _)| !cells.contains(cell));
+        }
+        {
+            let mut plans = self.split_replay_plans.lock().await;
+            for cell in cells {
+                plans.remove(cell);
+            }
+        }
+        {
+            let mut prepared = self.prepared_split_replays.lock().await;
+            prepared.retain(|(_, cell)| !cells.contains(cell));
         }
         let mut subs = self.subscribers.lock().await;
         subs.retain(|cell, _| !cells.contains(cell));
@@ -2319,6 +2404,236 @@ async fn replay_handover_to_target(
     }
 }
 
+#[derive(Debug)]
+struct SplitReplayOutcome {
+    operation_id: String,
+    accepted: bool,
+    reason: String,
+    children: Vec<CellId>,
+}
+
+struct SplitReplayBatch {
+    cell: CellId,
+    route: PeerRoute,
+    actors: Vec<ActorState>,
+    owners: Vec<HandoverReplayOwner>,
+}
+
+async fn handle_split_replay_request(
+    state: &Arc<SharedState>,
+    owned_cells: &HashSet<CellId>,
+    operation_id: String,
+    parent: CellId,
+    children: Vec<SplitReplayTarget>,
+) -> SplitReplayOutcome {
+    let child_cells = children.iter().map(|child| child.cell).collect::<Vec<_>>();
+    if !owned_cells.contains(&parent) {
+        return SplitReplayOutcome {
+            operation_id,
+            accepted: false,
+            reason: "split replay parent is not owned by this worker".to_string(),
+            children: child_cells,
+        };
+    }
+    if children.len() != 4 {
+        return SplitReplayOutcome {
+            operation_id,
+            accepted: false,
+            reason: "split replay requires four child targets".to_string(),
+            children: child_cells,
+        };
+    }
+
+    state
+        .register_split_replay_plan(operation_id.clone(), parent, children.clone())
+        .await;
+
+    let batches = match build_split_replay_batches(state, parent, &children).await {
+        Ok(batches) => batches,
+        Err(reason) => {
+            let _ = state.take_split_replay_plan(parent).await;
+            return SplitReplayOutcome {
+                operation_id,
+                accepted: false,
+                reason,
+                children: child_cells,
+            };
+        }
+    };
+
+    for batch in batches {
+        if let Err(e) = send_handover_replay_with_retry(
+            state,
+            &batch.route,
+            &operation_id,
+            batch.cell,
+            batch.actors,
+            batch.owners,
+            Vec::new(),
+        )
+        .await
+        {
+            let _ = state.take_split_replay_plan(parent).await;
+            return SplitReplayOutcome {
+                operation_id,
+                accepted: false,
+                reason: format!("split replay failed for child {:?}: {e}", batch.cell),
+                children: child_cells,
+            };
+        }
+    }
+
+    SplitReplayOutcome {
+        operation_id,
+        accepted: true,
+        reason: "split replay applied to all child targets".to_string(),
+        children: child_cells,
+    }
+}
+
+async fn build_split_replay_batches(
+    state: &Arc<SharedState>,
+    parent: CellId,
+    children: &[SplitReplayTarget],
+) -> Result<Vec<SplitReplayBatch>, String> {
+    let child_by_sub = children
+        .iter()
+        .map(|child| (child.cell.sub, child))
+        .collect::<HashMap<_, _>>();
+    let mut positions = {
+        let actors = state.actors.lock().await;
+        actors.get(&parent).cloned().unwrap_or_default()
+    };
+    let buffered_moves = state.drain_buffered_moves(parent).await;
+
+    for buffered in buffered_moves {
+        if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
+            let _ = enqueue_error(
+                &buffered.subscriber.tx,
+                parent,
+                buffered.epoch,
+                buffered.request_id,
+                "split_replay_move_expired",
+                "move rejected: split replay move buffer entry expired",
+            );
+            return Err("split replay buffered move expired before publish".to_string());
+        }
+        if !delta_is_finite(buffered.dx, buffered.dy) {
+            let _ = enqueue_error(
+                &buffered.subscriber.tx,
+                parent,
+                buffered.epoch,
+                buffered.request_id,
+                "split_replay_invalid_delta",
+                "move rejected: split replay delta is invalid",
+            );
+            return Err("split replay buffered move contains invalid delta".to_string());
+        }
+        let Some(pos) = positions.get_mut(&buffered.actor) else {
+            let _ = enqueue_error(
+                &buffered.subscriber.tx,
+                parent,
+                buffered.epoch,
+                buffered.request_id,
+                "split_replay_missing_actor",
+                "move rejected: split replay actor is missing from parent snapshot",
+            );
+            return Err("split replay buffered move references missing actor".to_string());
+        };
+        let new_x = pos.x + buffered.dx;
+        let new_y = pos.y + buffered.dy;
+        if !(new_x.is_finite() && new_y.is_finite()) {
+            let _ = enqueue_error(
+                &buffered.subscriber.tx,
+                parent,
+                buffered.epoch,
+                buffered.request_id,
+                "split_replay_position_overflow",
+                "move rejected: split replay position overflow",
+            );
+            return Err("split replay buffered move overflows actor position".to_string());
+        }
+        pos.x = new_x;
+        pos.y = new_y;
+    }
+
+    {
+        let mut actors = state.actors.lock().await;
+        if positions.is_empty() {
+            actors.remove(&parent);
+        } else {
+            actors.insert(parent, positions.clone());
+        }
+    }
+
+    let owners = state.owners.lock().await;
+    let parent_owners = owners.get(&parent).cloned().unwrap_or_default();
+    drop(owners);
+
+    let mut actors_by_child: HashMap<CellId, Vec<ActorState>> = HashMap::new();
+    let mut owners_by_child: HashMap<CellId, Vec<HandoverReplayOwner>> = HashMap::new();
+    for (actor, pos) in positions {
+        let child = split_child_for_position(parent, pos, state.aoi_cell_span_units);
+        let Some(target) = child_by_sub.get(&child.sub) else {
+            return Err(format!(
+                "split replay child sub={} is not targeted",
+                child.sub
+            ));
+        };
+        let actor_state = ActorState { id: actor, pos };
+        actors_by_child
+            .entry(target.cell)
+            .or_default()
+            .push(actor_state);
+        if let Some(owner_session) = parent_owners.get(&actor).copied() {
+            owners_by_child
+                .entry(target.cell)
+                .or_default()
+                .push(HandoverReplayOwner {
+                    actor,
+                    owner_session,
+                });
+        }
+    }
+
+    let mut batches = Vec::with_capacity(children.len());
+    for child in children {
+        let mut actors = actors_by_child.remove(&child.cell).unwrap_or_default();
+        actors.sort_by_key(|actor| actor.id.0);
+        let mut owners = owners_by_child.remove(&child.cell).unwrap_or_default();
+        owners.sort_by_key(|owner| owner.actor.0);
+        batches.push(SplitReplayBatch {
+            cell: child.cell,
+            route: PeerRoute {
+                worker_id: child.target_worker_id.clone(),
+                addr: child.target_addr.clone(),
+            },
+            actors,
+            owners,
+        });
+    }
+    Ok(batches)
+}
+
+fn split_child_for_position(parent: CellId, pos: Position, cell_span_units: f32) -> CellId {
+    let midpoint = cell_span_units / 2.0;
+    let right = pos.x >= midpoint;
+    let upper = pos.y >= midpoint;
+    let sub = match (right, upper) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (true, true) => 3,
+    };
+    CellId {
+        world: parent.world,
+        cx: parent.cx,
+        cy: parent.cy,
+        depth: 1,
+        sub,
+    }
+}
+
 async fn reject_replay_moves_unavailable(
     cell: CellId,
     moves: &[(CellSubscriber, u32, Option<u64>)],
@@ -2384,9 +2699,10 @@ async fn send_handover_replay_once(
     owners: Vec<HandoverReplayOwner>,
     moves: Vec<HandoverReplayMove>,
 ) -> Result<()> {
-    let mut stream = TcpStream::connect(route.addr.as_str())
+    let stream = TcpStream::connect(route.addr.as_str())
         .await
         .with_context(|| format!("connect handover replay target {}", route.addr))?;
+    let (mut reader, mut writer) = stream.into_split();
     let env_out = Envelope {
         cell,
         seq: 0,
@@ -2400,15 +2716,36 @@ async fn send_handover_replay_once(
         },
     };
     let frame = encode_frame(&env_out);
-    stream
+    writer
         .write_all(&frame)
         .await
         .context("write handover replay frame")?;
-    stream
+    writer
         .shutdown()
         .await
         .context("shutdown handover replay stream")?;
-    Ok(())
+    let Some(frame) = read_frame_bytes(&mut reader)
+        .await
+        .context("read handover replay ack")?
+    else {
+        return Err(anyhow!("handover replay target closed without ack"));
+    };
+    let ack = decode_worker_relay_frame_from_bytes(&frame).context("decode handover replay ack")?;
+    match ack.payload {
+        WorkerRelayMsg::HandoverReplayAck {
+            operation_id: ack_operation_id,
+            cell: ack_cell,
+            accepted,
+            reason,
+        } if ack_operation_id == operation_id && ack_cell == cell => {
+            if accepted {
+                Ok(())
+            } else {
+                Err(anyhow!("handover replay rejected by target: {reason}"))
+            }
+        }
+        other => Err(anyhow!("unexpected handover replay ack payload: {other:?}")),
+    }
 }
 
 fn orchestrator_endpoint() -> String {
@@ -4053,7 +4390,7 @@ async fn handle_worker_relay_inner(
                 moves,
             } => {
                 let owned_guard = owned_cells.read().await;
-                match state
+                let outcome = state
                     .apply_handover_replay(
                         operation_id.clone(),
                         cell,
@@ -4062,8 +4399,8 @@ async fn handle_worker_relay_inner(
                         moves,
                         &owned_guard,
                     )
-                    .await
-                {
+                    .await;
+                let (accepted, reason) = match outcome {
                     HandoverReplayApplyOutcome::Applied => {
                         info!(
                             target: "worker",
@@ -4072,6 +4409,7 @@ async fn handle_worker_relay_inner(
                             cell = ?cell,
                             "applied handover replay from peer"
                         );
+                        (true, "applied".to_string())
                     }
                     HandoverReplayApplyOutcome::Duplicate => {
                         info!(
@@ -4081,6 +4419,7 @@ async fn handle_worker_relay_inner(
                             cell = ?cell,
                             "ignored duplicate handover replay from peer"
                         );
+                        (true, "duplicate".to_string())
                     }
                     HandoverReplayApplyOutcome::Rejected(reason) => {
                         warn!(
@@ -4091,8 +4430,106 @@ async fn handle_worker_relay_inner(
                             reason,
                             "rejected handover replay from peer"
                         );
+                        (false, reason.to_string())
+                    }
+                };
+                let _ = tx.try_send((
+                    cell,
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::HandoverReplayAck {
+                        operation_id,
+                        cell,
+                        accepted,
+                        reason,
+                    },
+                ));
+            }
+            WorkerRelayMsg::SplitReplayPrepare {
+                operation_id,
+                cells,
+            } => {
+                state.prepare_split_replay(&operation_id, &cells).await;
+                let parent = cells.first().copied().unwrap_or(env_in.cell);
+                let _ = tx.try_send((
+                    parent,
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::SplitReplayAck {
+                        operation_id,
+                        parent,
+                        accepted: true,
+                        reason: "split replay prepared".to_string(),
+                        children: cells,
+                    },
+                ));
+            }
+            WorkerRelayMsg::SplitReplayRequest {
+                operation_id,
+                parent,
+                children,
+            } => {
+                let owned_guard = owned_cells.read().await.clone();
+                let outcome = handle_split_replay_request(
+                    &state,
+                    &owned_guard,
+                    operation_id,
+                    parent,
+                    children,
+                )
+                .await;
+                let _ = tx.try_send((
+                    parent,
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::SplitReplayAck {
+                        operation_id: outcome.operation_id,
+                        parent,
+                        accepted: outcome.accepted,
+                        reason: outcome.reason,
+                        children: outcome.children,
+                    },
+                ));
+            }
+            WorkerRelayMsg::SplitReplayAbort {
+                operation_id,
+                cells,
+            } => {
+                state
+                    .clear_prepared_split_replay(&operation_id, &cells)
+                    .await;
+                let owned_snapshot = owned_cells.read().await.clone();
+                let mut source_cells = HashSet::new();
+                let mut target_cells = HashSet::new();
+                for cell in &cells {
+                    if state.take_split_replay_plan(*cell).await.is_some() {
+                        source_cells.insert(*cell);
+                    } else {
+                        target_cells.insert(*cell);
                     }
                 }
+                if !source_cells.is_empty() {
+                    flush_buffered_moves_for_cells(&state, &owned_snapshot, source_cells).await;
+                }
+                if !target_cells.is_empty() {
+                    state.drop_cells(&target_cells).await;
+                }
+                let parent = cells.first().copied().unwrap_or(env_in.cell);
+                let _ = tx.try_send((
+                    parent,
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::SplitReplayAck {
+                        operation_id,
+                        parent,
+                        accepted: true,
+                        reason: "split replay aborted".to_string(),
+                        children: cells,
+                    },
+                ));
+            }
+            WorkerRelayMsg::HandoverReplayAck { .. } | WorkerRelayMsg::SplitReplayAck { .. } => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "unexpected worker relay ack from subscriber connection"
+                );
             }
             WorkerRelayMsg::Snapshot { .. }
             | WorkerRelayMsg::Delta { .. }
@@ -5434,6 +5871,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_peer_routes_update_refreshes_owned_cells_after_split_publish() {
+        let state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let children = (0..4)
+            .map(|sub| CellId {
+                world: 0,
+                cx: 0,
+                cy: 0,
+                depth: 1,
+                sub,
+            })
+            .collect::<Vec<_>>();
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([parent])));
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(parent)
+                .or_default()
+                .insert(EntityId(9), Position { x: 1.0, y: 2.0 });
+        }
+
+        let (watcher_tx, _watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(53, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(parent, &watcher).await;
+        state
+            .upsert_client_root(&watcher, parent, EntityId(9), 17)
+            .await;
+
+        let listing = AssignmentListing {
+            workers: vec![tessera_proto::orch::v1::AssignmentBundle {
+                worker_id: "worker-a".into(),
+                addr: "127.0.0.1:5001".into(),
+                cells: children
+                    .iter()
+                    .map(|cell| Assignment {
+                        world: cell.world,
+                        cx: cell.cx,
+                        cy: cell.cy,
+                        depth: cell.depth as u32,
+                        sub: cell.sub as u32,
+                    })
+                    .collect(),
+            }],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+                .await
+                .expect("apply split publish listing")
+        );
+
+        assert_eq!(
+            owned_cells.read().await.clone(),
+            children.iter().copied().collect::<HashSet<_>>()
+        );
+        assert!(!state.actors.lock().await.contains_key(&parent));
+        assert!(
+            state
+                .client_subscribed_cells(watcher.client_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            state
+                .remote_interest_cells(watcher.client_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn apply_peer_routes_update_replays_buffered_moves_after_handover_release() {
         let state = Arc::new(SharedState::with_runtime_config(
             0,
@@ -5923,6 +6433,149 @@ mod tests {
         server.await.expect("target server task");
         assert!(source_state.drain_buffered_moves(cell).await.is_empty());
         assert!(!source_state.actors.lock().await.contains_key(&cell));
+    }
+
+    #[tokio::test]
+    async fn split_replay_partitions_parent_snapshot_and_buffered_moves_to_children() {
+        let source_state = Arc::new(SharedState::with_runtime_config(
+            0,
+            DEFAULT_AOI_CELL_SPAN_UNITS,
+            None,
+            None,
+            DEFAULT_AOI_MAX_CELLS,
+            4,
+            Duration::from_secs(1),
+        ));
+        let target_state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let child0 = CellId {
+            depth: 1,
+            sub: 0,
+            ..parent
+        };
+        let child1 = CellId {
+            depth: 1,
+            sub: 1,
+            ..parent
+        };
+        let child2 = CellId {
+            depth: 1,
+            sub: 2,
+            ..parent
+        };
+        let child3 = CellId {
+            depth: 1,
+            sub: 3,
+            ..parent
+        };
+        let children = vec![child0, child1, child2, child3];
+        target_state
+            .prepare_split_replay("split-rt", &children)
+            .await;
+        let source_owned_cells = HashSet::from([parent]);
+        let target_owned_cells = Arc::new(RwLock::new(HashSet::new()));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target worker listener");
+        let target_addr = listener.local_addr().expect("target listener addr");
+        let server = spawn_incoming_test_server(
+            listener,
+            Arc::clone(&target_state),
+            Arc::clone(&target_owned_cells),
+            4,
+        );
+
+        let actor_a = EntityId(10);
+        let actor_b = EntityId(11);
+        {
+            let mut actors = source_state.actors.lock().await;
+            let parent_actors = actors.entry(parent).or_default();
+            parent_actors.insert(actor_a, Position { x: 4.0, y: 4.0 });
+            parent_actors.insert(actor_b, Position { x: 20.0, y: 20.0 });
+        }
+        assert_eq!(
+            source_state.claim_owner(parent, actor_a, 501).await,
+            ClaimOutcome::GrantedNew
+        );
+        assert_eq!(
+            source_state.claim_owner(parent, actor_b, 502).await,
+            ClaimOutcome::GrantedNew
+        );
+
+        let (tx, _rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(501, tx, &disconnect_tx);
+        source_state
+            .buffer_client_move(
+                parent,
+                BufferedMove {
+                    subscriber,
+                    connection_epoch: Arc::new(AtomicU32::new(10)),
+                    peer: "127.0.0.1:9999".parse().unwrap(),
+                    client_id: 501,
+                    owner_id: 501,
+                    actor: actor_a,
+                    dx: 20.0,
+                    dy: 0.0,
+                    epoch: 12,
+                    request_id: None,
+                    buffered_at: Instant::now(),
+                },
+            )
+            .await
+            .expect("buffer split move");
+
+        let targets = children
+            .iter()
+            .map(|cell| SplitReplayTarget {
+                cell: *cell,
+                target_worker_id: "worker-b".to_string(),
+                target_addr: target_addr.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let outcome = handle_split_replay_request(
+            &source_state,
+            &source_owned_cells,
+            "split-rt".to_string(),
+            parent,
+            targets,
+        )
+        .await;
+        assert!(outcome.accepted, "{}", outcome.reason);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let positions = {
+                    let actors = target_state.actors.lock().await;
+                    (
+                        actors
+                            .get(&child1)
+                            .and_then(|cell_actors| cell_actors.get(&actor_a))
+                            .copied(),
+                        actors
+                            .get(&child3)
+                            .and_then(|cell_actors| cell_actors.get(&actor_b))
+                            .copied(),
+                    )
+                };
+                if positions
+                    == (
+                        Some(Position { x: 24.0, y: 4.0 }),
+                        Some(Position { x: 20.0, y: 20.0 }),
+                    )
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("target split replay applied");
+        assert_eq!(target_state.owner_for(&child1, &actor_a).await, Some(501));
+        assert_eq!(target_state.owner_for(&child3, &actor_b).await, Some(502));
+        assert!(source_state.drain_buffered_moves(parent).await.is_empty());
+        server.await.expect("target server task");
     }
 
     #[tokio::test]

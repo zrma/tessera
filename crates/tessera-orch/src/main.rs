@@ -9,7 +9,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use tessera_core::CellId;
+use tessera_core::{
+    CellId, Envelope, MAX_FRAME_LEN, SplitReplayTarget, WorkerRelayMsg, encode_frame,
+};
 use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorServer};
 use tessera_proto::orch::v1::{
     Assignment, AssignmentBundle, AssignmentListing, AssignmentQuery, AssignmentSnapshot,
@@ -213,6 +215,57 @@ fn transfer_cell_assignment(
     }
     target_cells.push(cell);
     sort_cells(target_cells);
+    Ok(true)
+}
+
+fn publish_split_assignments(
+    assignments: &mut AssignmentMap,
+    parent: CellId,
+    source_worker_id: &str,
+    children: &[SplitReplayTarget],
+) -> Result<bool, String> {
+    match owner_for_cell(assignments, &parent) {
+        Some(owner) if owner == source_worker_id => {}
+        Some(owner) => {
+            return Err(format!(
+                "source_worker_id={} no longer owns split parent; current_owner={}",
+                source_worker_id, owner
+            ));
+        }
+        None => return Err("split parent is not assigned to any worker".to_string()),
+    }
+    for child in children {
+        let owners = owners_for_cell(assignments, &child.cell);
+        if !owners.is_empty() {
+            return Err(format!(
+                "split child depth={},sub={} was published before split commit for owners={}",
+                child.cell.depth,
+                child.cell.sub,
+                owners.join(",")
+            ));
+        }
+    }
+
+    let source_cells = assignments
+        .get_mut(source_worker_id)
+        .ok_or_else(|| format!("unknown source_worker_id={source_worker_id}"))?;
+    let source_len = source_cells.len();
+    source_cells.retain(|assigned| assigned != &parent);
+    if source_cells.len() == source_len {
+        return Err(format!(
+            "source_worker_id={} no longer owns split parent",
+            source_worker_id
+        ));
+    }
+
+    for child in children {
+        let target_cells = assignments
+            .get_mut(&child.target_worker_id)
+            .ok_or_else(|| format!("unknown target_worker_id={}", child.target_worker_id))?;
+        target_cells.push(child.cell);
+        sort_cells(target_cells);
+    }
+
     Ok(true)
 }
 
@@ -1195,7 +1248,6 @@ impl OrchestratorService {
                 false,
             ));
         }
-
         if target_worker_ids
             .iter()
             .all(|target_worker_id| target_worker_id == &source_worker_id)
@@ -1209,6 +1261,19 @@ impl OrchestratorService {
                 false,
             ));
         }
+        let source_runtime = match runtime.get(source_worker_id.as_str()) {
+            Some(runtime) => runtime.clone(),
+            None => {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    format!("source_worker_id={source_worker_id} is not registered"),
+                    source_worker_id,
+                    Vec::new(),
+                    false,
+                ));
+            }
+        };
 
         for target_worker_id in &target_worker_ids {
             if self.config.worker(target_worker_id).is_none() {
@@ -1317,7 +1382,7 @@ impl OrchestratorService {
         }
 
         let staged = StagedSplitActivation {
-            operation_id: parsed.operation_id,
+            operation_id: parsed.operation_id.clone(),
             parent: parsed.parent,
             source_worker_id: source_worker_id.clone(),
             children: child_cells
@@ -1330,15 +1395,120 @@ impl OrchestratorService {
                 .collect(),
         };
         let staged_children = staged.as_response_children();
+        let split_replay_targets = staged
+            .children
+            .iter()
+            .map(|child| {
+                let runtime = runtime
+                    .get(child.target_worker_id.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "target_worker_id={} is not registered",
+                            child.target_worker_id
+                        )
+                    })?;
+                Ok(SplitReplayTarget {
+                    cell: child.cell,
+                    target_worker_id: child.target_worker_id.clone(),
+                    target_addr: runtime.addr.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>();
+        let split_replay_targets = match split_replay_targets {
+            Ok(targets) => targets,
+            Err(reason) => {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    reason,
+                    source_worker_id,
+                    Vec::new(),
+                    false,
+                ));
+            }
+        };
         staged_splits.insert(staged.parent, staged);
+        drop(staged_splits);
+
+        let mut prepared_targets = Vec::new();
+        if let Err(reason) = prepare_split_replay_targets(
+            &parsed.operation_id,
+            &split_replay_targets,
+            &mut prepared_targets,
+        )
+        .await
+        {
+            self.staged_splits.write().await.remove(&parsed.parent);
+            abort_prepared_split_targets(&parsed.operation_id, &prepared_targets).await;
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Failed,
+                reason,
+                source_worker_id,
+                staged_children,
+                false,
+            ));
+        }
+
+        match request_split_replay_from_source(
+            &source_runtime.addr,
+            parsed.operation_id.as_str(),
+            parsed.parent,
+            split_replay_targets.clone(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(reason) => {
+                self.staged_splits.write().await.remove(&parsed.parent);
+                abort_prepared_split_targets(&parsed.operation_id, &prepared_targets).await;
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Failed,
+                    reason,
+                    source_worker_id,
+                    staged_children,
+                    false,
+                ));
+            }
+        }
+
+        let publish_result = {
+            let mut assignments = self.assignments.write().await;
+            publish_split_assignments(
+                &mut assignments,
+                parsed.parent,
+                &source_worker_id,
+                &split_replay_targets,
+            )
+        };
+        let assignments_changed = match publish_result {
+            Ok(changed) => changed,
+            Err(reason) => {
+                self.staged_splits.write().await.remove(&parsed.parent);
+                abort_prepared_split_targets(&parsed.operation_id, &prepared_targets).await;
+                abort_split_source(&source_runtime.addr, &parsed.operation_id, parsed.parent).await;
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Failed,
+                    reason,
+                    source_worker_id,
+                    staged_children,
+                    false,
+                ));
+            }
+        };
+
+        self.staged_splits.write().await.remove(&parsed.parent);
+        self.publish_listing_if_changed().await;
 
         Ok(split_activation_response(
             true,
-            SplitActivationState::Staged,
-            "split activation staged; child assignment publish and worker replay are deferred to the next slice",
+            SplitActivationState::Published,
+            "split activation replayed all children and published assignments atomically",
             source_worker_id,
             staged_children,
-            false,
+            assignments_changed,
         ))
     }
 
@@ -2057,6 +2227,198 @@ async fn write_http_response(
     Ok(())
 }
 
+async fn prepare_split_replay_targets(
+    operation_id: &str,
+    targets: &[SplitReplayTarget],
+    prepared_targets: &mut Vec<SplitReplayTarget>,
+) -> Result<(), String> {
+    let mut grouped: HashMap<(String, String), Vec<CellId>> = HashMap::new();
+    for target in targets {
+        grouped
+            .entry((target.target_worker_id.clone(), target.target_addr.clone()))
+            .or_default()
+            .push(target.cell);
+    }
+    let mut groups = grouped.into_iter().collect::<Vec<_>>();
+    groups.sort_by(|((worker_a, addr_a), _), ((worker_b, addr_b), _)| {
+        worker_a.cmp(worker_b).then_with(|| addr_a.cmp(addr_b))
+    });
+
+    for ((target_worker_id, target_addr), mut cells) in groups {
+        cells.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+        let ack = send_worker_relay_command(
+            &target_addr,
+            cells[0],
+            WorkerRelayMsg::SplitReplayPrepare {
+                operation_id: operation_id.to_string(),
+                cells: cells.clone(),
+            },
+        )
+        .await?;
+        match ack {
+            WorkerRelayMsg::SplitReplayAck {
+                operation_id: ack_operation_id,
+                accepted,
+                reason,
+                ..
+            } if ack_operation_id == operation_id => {
+                if !accepted {
+                    return Err(format!(
+                        "target_worker_id={target_worker_id} rejected split replay prepare: {reason}"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "target_worker_id={target_worker_id} returned unexpected split prepare ack: {other:?}"
+                ));
+            }
+        }
+        prepared_targets.extend(
+            targets
+                .iter()
+                .filter(|target| {
+                    target.target_worker_id == target_worker_id && cells.contains(&target.cell)
+                })
+                .cloned(),
+        );
+    }
+    Ok(())
+}
+
+async fn request_split_replay_from_source(
+    source_addr: &str,
+    operation_id: &str,
+    parent: CellId,
+    children: Vec<SplitReplayTarget>,
+) -> Result<(), String> {
+    let ack = send_worker_relay_command(
+        source_addr,
+        parent,
+        WorkerRelayMsg::SplitReplayRequest {
+            operation_id: operation_id.to_string(),
+            parent,
+            children,
+        },
+    )
+    .await?;
+    match ack {
+        WorkerRelayMsg::SplitReplayAck {
+            operation_id: ack_operation_id,
+            parent: ack_parent,
+            accepted,
+            reason,
+            ..
+        } if ack_operation_id == operation_id && ack_parent == parent => {
+            if accepted {
+                Ok(())
+            } else {
+                Err(format!("source worker rejected split replay: {reason}"))
+            }
+        }
+        other => Err(format!(
+            "source worker returned unexpected split replay ack: {other:?}"
+        )),
+    }
+}
+
+async fn abort_prepared_split_targets(operation_id: &str, targets: &[SplitReplayTarget]) {
+    let mut grouped: HashMap<(String, String), Vec<CellId>> = HashMap::new();
+    for target in targets {
+        grouped
+            .entry((target.target_worker_id.clone(), target.target_addr.clone()))
+            .or_default()
+            .push(target.cell);
+    }
+    for ((target_worker_id, target_addr), cells) in grouped {
+        if let Err(reason) = send_worker_relay_command(
+            &target_addr,
+            cells[0],
+            WorkerRelayMsg::SplitReplayAbort {
+                operation_id: operation_id.to_string(),
+                cells,
+            },
+        )
+        .await
+        {
+            warn!(
+                target: "orch",
+                target_worker_id,
+                reason,
+                "failed to abort prepared split replay target"
+            );
+        }
+    }
+}
+
+async fn abort_split_source(source_addr: &str, operation_id: &str, parent: CellId) {
+    if let Err(reason) = send_worker_relay_command(
+        source_addr,
+        parent,
+        WorkerRelayMsg::SplitReplayAbort {
+            operation_id: operation_id.to_string(),
+            cells: vec![parent],
+        },
+    )
+    .await
+    {
+        warn!(
+            target: "orch",
+            source_addr,
+            reason,
+            "failed to abort source split replay state"
+        );
+    }
+}
+
+async fn send_worker_relay_command(
+    addr: &str,
+    cell: CellId,
+    payload: WorkerRelayMsg,
+) -> Result<WorkerRelayMsg, String> {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|err| format!("connect worker relay {addr}: {err}"))?;
+    let env = Envelope {
+        cell,
+        seq: 0,
+        epoch: 0,
+        payload,
+    };
+    let frame = encode_frame(&env);
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(|err| format!("write worker relay command to {addr}: {err}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|err| format!("shutdown worker relay command to {addr}: {err}"))?;
+    read_worker_relay_response(&mut stream).await
+}
+
+async fn read_worker_relay_response(stream: &mut TcpStream) -> Result<WorkerRelayMsg, String> {
+    let mut len_buf = [0_u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|err| format!("read worker relay response length: {err}"))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(format!(
+            "worker relay response frame length {len} exceeds max {MAX_FRAME_LEN}"
+        ));
+    }
+    let mut payload = vec![0_u8; len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|err| format!("read worker relay response payload: {err}"))?;
+    let env: Envelope<WorkerRelayMsg> = serde_json::from_slice(&payload)
+        .map_err(|err| format!("decode worker relay response: {err}"))?;
+    Ok(env.payload)
+}
+
 fn format_prometheus_metrics(metrics: &OrchestratorMetrics) -> String {
     let mut out = String::new();
     push_prometheus_metric(
@@ -2169,6 +2531,8 @@ mod tests {
         SplitMergePlannerConfig, plan_split_merge,
     };
     use super::*;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
     use tokio_stream::StreamExt;
     use tonic::Request;
 
@@ -2234,6 +2598,109 @@ mod tests {
             }))
             .await
             .expect("register worker");
+    }
+
+    fn spawn_split_replay_ack_server(
+        listener: TcpListener,
+        accept_count: usize,
+    ) -> JoinHandle<Vec<WorkerRelayMsg>> {
+        tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..accept_count {
+                let (mut stream, _) = listener.accept().await.expect("accept split replay");
+                let mut len_buf = [0_u8; 4];
+                stream.read_exact(&mut len_buf).await.expect("read len");
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut payload = vec![0_u8; len];
+                stream.read_exact(&mut payload).await.expect("read payload");
+                let env: Envelope<WorkerRelayMsg> =
+                    serde_json::from_slice(&payload).expect("decode worker relay command");
+                let ack = match &env.payload {
+                    WorkerRelayMsg::SplitReplayPrepare {
+                        operation_id,
+                        cells,
+                    } => WorkerRelayMsg::SplitReplayAck {
+                        operation_id: operation_id.clone(),
+                        parent: cells.first().copied().unwrap_or(env.cell),
+                        accepted: true,
+                        reason: "prepared".to_string(),
+                        children: cells.clone(),
+                    },
+                    WorkerRelayMsg::SplitReplayRequest {
+                        operation_id,
+                        parent,
+                        children,
+                    } => WorkerRelayMsg::SplitReplayAck {
+                        operation_id: operation_id.clone(),
+                        parent: *parent,
+                        accepted: true,
+                        reason: "replayed".to_string(),
+                        children: children.iter().map(|child| child.cell).collect(),
+                    },
+                    WorkerRelayMsg::SplitReplayAbort {
+                        operation_id,
+                        cells,
+                    } => WorkerRelayMsg::SplitReplayAck {
+                        operation_id: operation_id.clone(),
+                        parent: cells.first().copied().unwrap_or(env.cell),
+                        accepted: true,
+                        reason: "aborted".to_string(),
+                        children: cells.clone(),
+                    },
+                    other => panic!("unexpected relay command: {other:?}"),
+                };
+                received.push(env.payload);
+                let ack_env = Envelope {
+                    cell: env.cell,
+                    seq: 0,
+                    epoch: env.epoch,
+                    payload: ack,
+                };
+                let frame = encode_frame(&ack_env);
+                stream.write_all(&frame).await.expect("write ack");
+                stream.shutdown().await.expect("shutdown ack");
+            }
+            received
+        })
+    }
+
+    fn spawn_split_replay_reject_source_server(
+        listener: TcpListener,
+    ) -> JoinHandle<WorkerRelayMsg> {
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept split replay");
+            let mut len_buf = [0_u8; 4];
+            stream.read_exact(&mut len_buf).await.expect("read len");
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0_u8; len];
+            stream.read_exact(&mut payload).await.expect("read payload");
+            let env: Envelope<WorkerRelayMsg> =
+                serde_json::from_slice(&payload).expect("decode worker relay command");
+            let (operation_id, parent) = match &env.payload {
+                WorkerRelayMsg::SplitReplayRequest {
+                    operation_id,
+                    parent,
+                    ..
+                } => (operation_id.clone(), *parent),
+                other => panic!("unexpected relay command: {other:?}"),
+            };
+            let ack_env = Envelope {
+                cell: parent,
+                seq: 0,
+                epoch: env.epoch,
+                payload: WorkerRelayMsg::SplitReplayAck {
+                    operation_id,
+                    parent,
+                    accepted: false,
+                    reason: "source replay failed".to_string(),
+                    children: Vec::new(),
+                },
+            };
+            let frame = encode_frame(&ack_env);
+            stream.write_all(&frame).await.expect("write ack");
+            stream.shutdown().await.expect("shutdown ack");
+            env.payload
+        })
     }
 
     async fn assert_split_rejected_without_assignment_change(
@@ -2623,25 +3090,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_activation_stages_child_assignments_without_publishing() {
+    async fn split_activation_publishes_child_assignments_after_replay() {
         let service = OrchestratorService::new_with_split_activation(
             two_worker_handover_config(),
             SplitActivationMode::Manual,
         );
-        register_worker_for_test(&service, "worker-b", "10.0.0.2:5001").await;
-        let before = service.listing().await;
+        let source_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind source relay");
+        let source_addr = source_listener.local_addr().expect("source addr");
+        let target_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target relay");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let source_server = spawn_split_replay_ack_server(source_listener, 1);
+        let target_server = spawn_split_replay_ack_server(target_listener, 1);
+        register_worker_for_test(&service, "worker-a", &source_addr.to_string()).await;
+        register_worker_for_test(&service, "worker-b", &target_addr.to_string()).await;
 
         let response = service
             .submit_split_activation(Request::new(valid_split_activation_request()))
             .await
             .expect("submit split activation")
             .into_inner();
-        let after = service.listing().await;
 
         assert!(response.accepted);
-        assert_eq!(response.state, SplitActivationState::Staged as i32);
+        assert_eq!(response.state, SplitActivationState::Published as i32);
         assert_eq!(response.source_worker_id, "worker-a");
-        assert!(!response.assignments_changed);
+        assert!(response.assignments_changed);
         assert_eq!(response.staged_children.len(), 4);
         for (sub, child) in response.staged_children.iter().enumerate() {
             let cell = child.cell.as_ref().expect("staged child cell");
@@ -2652,13 +3128,40 @@ mod tests {
             assert_eq!(cell.sub, sub as u32);
             assert_eq!(child.target_worker_id, "worker-b");
         }
-        assert_eq!(before, after);
+        let source_received = source_server.await.expect("source server");
+        let target_received = target_server.await.expect("target server");
+        assert!(matches!(
+            target_received.as_slice(),
+            [WorkerRelayMsg::SplitReplayPrepare { .. }]
+        ));
+        assert!(matches!(
+            source_received.as_slice(),
+            [WorkerRelayMsg::SplitReplayRequest { .. }]
+        ));
 
         let staged = service.staged_splits.read().await;
-        let staged = staged.get(&CellId::grid(0, 0, 0)).expect("staged split");
-        assert_eq!(staged.operation_id, "split-1");
-        assert_eq!(staged.source_worker_id, "worker-a");
-        assert_eq!(staged.children.len(), 4);
+        assert!(staged.is_empty());
+
+        let listing = service.listing().await;
+        let source = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-a")
+            .expect("source listing");
+        assert!(source.cells.is_empty());
+        let target = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-b")
+            .expect("target listing");
+        assert_eq!(target.cells.len(), 4);
+        assert!(
+            target
+                .cells
+                .iter()
+                .enumerate()
+                .all(|(sub, cell)| cell.depth == 1 && cell.sub == sub as u32)
+        );
 
         let target_snapshot = service
             .get_assignments(Request::new(AssignmentQuery {
@@ -2667,7 +3170,7 @@ mod tests {
             .await
             .expect("get target assignments")
             .into_inner();
-        assert!(target_snapshot.cells.is_empty());
+        assert_eq!(target_snapshot.cells.len(), 4);
     }
 
     #[tokio::test]
@@ -2725,6 +3228,7 @@ mod tests {
             two_worker_handover_config(),
             SplitActivationMode::Manual,
         );
+        register_worker_for_test(&service, "worker-a", "10.0.0.1:5001").await;
 
         assert_split_rejected_without_assignment_change(
             &service,
@@ -2748,23 +3252,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_activation_rejects_second_staged_family_without_publishing() {
+    async fn split_activation_rolls_back_when_source_replay_fails() {
         let service = OrchestratorService::new_with_split_activation(
             two_worker_handover_config(),
             SplitActivationMode::Manual,
         );
-        register_worker_for_test(&service, "worker-b", "10.0.0.2:5001").await;
+        let source_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind source relay");
+        let source_addr = source_listener.local_addr().expect("source addr");
+        let target_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target relay");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let source_server = spawn_split_replay_reject_source_server(source_listener);
+        let target_server = spawn_split_replay_ack_server(target_listener, 2);
+        register_worker_for_test(&service, "worker-a", &source_addr.to_string()).await;
+        register_worker_for_test(&service, "worker-b", &target_addr.to_string()).await;
+        let before = service.listing().await;
 
-        let staged = service
+        let failed = service
             .submit_split_activation(Request::new(valid_split_activation_request()))
             .await
             .expect("submit split activation")
             .into_inner();
-        assert!(staged.accepted);
+        assert!(!failed.accepted);
+        assert_eq!(failed.state, SplitActivationState::Failed as i32);
+        assert!(failed.reason.contains("source replay failed"));
+        assert!(!failed.assignments_changed);
 
-        let mut duplicate = valid_split_activation_request();
-        duplicate.operation_id = "split-2".to_string();
-        assert_split_rejected_without_assignment_change(&service, duplicate, "world=0").await;
+        let after = service.listing().await;
+        assert_eq!(before, after);
+        assert!(service.staged_splits.read().await.is_empty());
+        assert!(matches!(
+            source_server.await.expect("source server"),
+            WorkerRelayMsg::SplitReplayRequest { .. }
+        ));
+        let target_received = target_server.await.expect("target server");
+        assert!(matches!(
+            target_received.as_slice(),
+            [
+                WorkerRelayMsg::SplitReplayPrepare { .. },
+                WorkerRelayMsg::SplitReplayAbort { .. }
+            ]
+        ));
     }
 
     #[test]
