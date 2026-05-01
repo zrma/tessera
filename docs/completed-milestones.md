@@ -166,9 +166,9 @@ curl http://127.0.0.1:4100/ready
 curl http://127.0.0.1:6100/split-merge/preview
 ```
 
-## P4.3 Manual Split Activation Staging
+## P4.3 Manual Split Activation Replay/Publish
 
-Status: first staging slice complete as of 2026-05-02.
+Status: replay/publish slice complete as of 2026-05-02.
 
 Completed slices:
 
@@ -181,15 +181,21 @@ Completed slices:
    family handovers, published child overlap, and already staged split
    families.
 4. Materialized four private staged child assignments in Orchestrator memory
-   without publishing them through `ListAssignments` or `WatchAssignments`.
-5. Covered disabled activation, validation failures, unregistered targets, and
-   duplicate staged-family failures with assignments-unchanged tests.
+   before publishing them through `ListAssignments`/`WatchAssignments`.
+5. Prepared target Workers for child replay, asked the source Worker to
+   partition parent snapshot and buffered moves by child quadrant, and required
+   acked child replay before publication.
+6. Removed the parent assignment and published the four child assignments in one
+   Orchestrator assignment update after replay success.
+7. Covered disabled activation, validation failures, unregistered targets,
+   successful publication, and source replay failure rollback with
+   assignments-unchanged tests.
 
 Deferred from this slice:
 
-- Parent freeze, child replay, owner/session transfer, child assignment
-  publication, Gateway route convergence, Worker owned-cell refresh, AOI resync,
-  and post-publish convergence failure handling.
+- Long-running Gateway route convergence assertions, Worker refresh/AOI resync
+  smoke for a live activation fixture, automatic merge rollback, and
+  post-publish convergence failure handling.
 
 Verification used for this slice:
 
@@ -203,12 +209,12 @@ cargo xt dev down --with-orch
 
 ## Active Follow-Up
 
-Open P4 work now starts after the P4.3 staging slice:
+Open P4 work now starts after the P4.3 replay/publish slice:
 
-1. Connect staged split activation to parent freeze, child replay, and
-   assignment publication.
-2. Add route convergence, Worker refresh, AOI resync, replay failure rollback,
-   and post-publish convergence failure evidence.
+1. Add route convergence, Worker refresh, AOI resync, and post-publish failure
+   evidence to an activation smoke.
+2. Decide whether merge activation and automatic rollback should be enabled or
+   kept behind a later manual recovery milestone.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.

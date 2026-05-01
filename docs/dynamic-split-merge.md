@@ -9,9 +9,9 @@ Orchestrator now has an inactive split/merge planner skeleton with deterministic
 ranking, hysteresis/cooldown, churn-budget, complete sibling validation, overlap
 tests, an assignment-safe dry-run preview endpoint, a fixture-backed runtime
 smoke that proves the preview can emit a non-empty split plan, and a
-default-off manual split activation staging RPC. Runtime child assignment
-publication, Worker replay, automatic rebalancing, real metrics ingestion, and
-multi-depth assignment changes are not implemented yet.
+default-off manual split activation replay/publish RPC. Automatic rebalancing,
+runtime merge activation, real metrics ingestion, and multi-depth assignment
+changes are not implemented yet.
 
 P4.3's first activation shape is now fixed as a manual, feature-flagged,
 split-only runtime slice. The implementation milestone should follow this
@@ -117,10 +117,11 @@ Chosen shape:
 4. One active split operation per world and per cell family. Do not run sibling
    or nested splits concurrently with a handover touching the same parent,
    child, source Worker, or target Worker set.
-5. The first implementation slice stops at validation and private staging:
+5. The first mutating implementation remains manual and split-only:
    `SubmitSplitActivation` requires the manual feature flag, validates the
-   parent and child target map, and records staged child assignments without
-   publishing them through `ListAssignments` or `WatchAssignments`.
+   parent and child target map, prepares target Workers for child replay, asks
+   the source Worker to partition the parent snapshot and buffered moves, and
+   publishes child assignments only after all child replay paths ack success.
 
 ### Target Worker Selection
 
@@ -177,8 +178,7 @@ boundary:
    target registration, no active family handover, no published child overlap,
    and churn budget.
 2. Reserve the split operation and staged child assignments without publishing
-   them through `ListAssignments` or `WatchAssignments`. The current first
-   implementation slice stops here.
+   them through `ListAssignments` or `WatchAssignments`.
 3. Freeze the parent through the existing handover policy so source-side moves
    are bounded-buffered.
 4. Partition the source snapshot and buffered moves into the four child cells
@@ -193,10 +193,10 @@ Rollback rules:
 
 - Any validation failure leaves assignments unchanged and returns a rejected
   operation.
-- Any target registration, replay, buffer overflow, TTL, or route-prepublish
-  failure aborts before child assignments are published. The parent remains the
-  only writable assignment, staged children are discarded, and source buffered
-  moves follow the existing abort/release behavior.
+- Any target registration, replay prepare, replay ack, buffer overflow, TTL, or
+  route-prepublish failure aborts before child assignments are published. The
+  parent remains the only writable assignment, prepared child payloads are
+  aborted, and source buffered moves stay on the source-side split replay path.
 - If publication succeeds but post-publish convergence checks fail, do not
   automatically merge back in the first slice. Mark the operation failed,
   place the family in cooldown, surface the failed convergence evidence, and
@@ -249,7 +249,7 @@ Runtime implementation should additionally run the existing full gate:
 - `cargo run -p tessera-client -- ping --ts 123`
 - `cargo xt dev down --with-orch`
 
-The current P4.3 staging slice adds focused checks for:
+The current P4.3 replay/publish slice adds focused checks for:
 
 - Feature flag disabled: mutating activation is rejected and preview remains
   assignment-safe.
@@ -261,16 +261,15 @@ The current P4.3 staging slice adds focused checks for:
 - Assignment atomicity before publication: disabled activation, validation
   failures, unregistered targets, and staged-family conflicts leave the parent
   assignment published and publish no child assignment.
-- Successful staging: the response returns four private staged child assignments
-  with `assignments_changed=false`; `ListAssignments` and `WatchAssignments`
-  remain unchanged.
+- Successful replay/publish: the response returns four child assignments with
+  `assignments_changed=true`; `ListAssignments` and `WatchAssignments` publish
+  the four children and no longer publish the parent.
+- Replay failure rollback: failed source replay keeps `assignments_changed=false`,
+  leaves the parent assignment published, and aborts prepared target payloads.
 
 The next runtime slice must add focused checks for:
 
-- Replay or route-prepublish failure: parent assignment remains published and no
-  child assignment is published.
-- Successful split publication: parent assignment is removed, four child
-  assignments are published, Gateway routes converge, Worker owned-cell state
-  refreshes, and AOI subscriptions are recalculated.
+- Gateway routes converge, Worker owned-cell state refreshes, and AOI
+  subscriptions are recalculated under a dev activation smoke.
 - Post-publish failure path: failed convergence is surfaced with cooldown and
   does not trigger automatic merge rollback.

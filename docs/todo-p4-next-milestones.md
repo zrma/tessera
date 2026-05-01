@@ -12,15 +12,17 @@ P4.2 internal GitOps manifests are committed, pushed, synced by ArgoCD, and
 runtime-smoked on the MicroK8s cluster. Completed milestone details are
 archived in `docs/completed-milestones.md`.
 
-The next substantial milestone crosses from private split staging into runtime
-assignment publication and replay.
+The current P4.3 implementation has crossed from private split staging into
+manual runtime assignment publication and replay. The next substantial decision
+is post-publish convergence failure handling and whether merge activation should
+remain design-only.
 
 ## 2026-05-01 Decision Checkpoint
 
 P4.2 defaults were accepted for the first internal-only deployment slice, the
 cluster rollout was verified, and `v2026.05.1` was published by GitHub Actions
-and promoted through GitOps. P4.3 has now started with the default-off manual
-staging slice.
+and promoted through GitOps. P4.3 has now added the default-off manual
+replay/publish slice.
 
 The first P4.3 activation shape is fixed in `docs/dynamic-split-merge.md`:
 split-only, manual submission, default-off feature flag, explicit target map,
@@ -137,8 +139,8 @@ Completed image-promotion checks:
 
 ## P4.3 Runtime Split/Merge Activation
 
-Status: first default-off manual staging slice implemented; child assignment
-publish and Worker replay remain open.
+Status: default-off manual replay/publish slice implemented; post-publish
+convergence evidence and automatic merge rollback remain open.
 
 Chosen first slice:
 
@@ -161,7 +163,7 @@ Chosen first slice:
 7. Post-publication convergence failures are surfaced with cooldown and manual
    recovery; the first slice does not automatically merge back.
 
-Implemented first slice:
+Implemented slices:
 
 1. Add the manual activation command/API and feature flag.
 2. Materialize planned target child assignments without publishing them.
@@ -170,17 +172,23 @@ Implemented first slice:
    overlap, and already staged split families.
 4. Keep failed activation attempts assignment-safe with
    `assignments_changed=false` and unchanged `ListAssignments` output.
+5. Prepare target Workers for child replay before assignment publication.
+6. Ask the source Worker to freeze the parent, fold buffered moves into the
+   parent snapshot, partition actors/owners into child replay payloads, and send
+   acked replay frames to every child target.
+7. Publish the four child assignments and remove the parent assignment only
+   after all child replay paths ack success.
+8. Abort prepared target replay payloads and keep the parent assignment
+   unchanged when prepare or source replay fails.
 
 Remaining implementation:
 
-1. Drive parent freeze, child replay, and owner/session transfer through the
-   existing handover/replay contracts or an explicitly equivalent split replay
-   path.
-2. Publish child assignments only after all child replay paths succeed, and
-   remove the parent assignment in the same publication step.
-3. Add route convergence, AOI resync, atomic rollback for replay/publish
-   failures, and post-publish failure tests before enabling the flag in any
-   environment.
+1. Add stronger route convergence, Worker refresh, AOI resync, and
+   post-publish failure evidence before enabling the flag in any environment.
+2. Decide whether post-publish convergence failure should stay cooldown/manual
+   recovery or grow an automatic merge rollback path.
+3. Keep merge activation disabled until sibling coalescing and rollback
+   semantics are chosen.
 
 Verification required for the implementation milestone:
 
@@ -192,13 +200,14 @@ cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
 ```
 
-The next implementation should extend the existing split/merge preview smoke or
-add a new activation smoke so successful split publication and failed
-replay/target paths are covered by automated evidence.
+The next implementation should extend the dev smoke with a manual activation
+fixture so successful split publication, failed replay/target paths, Gateway
+route convergence, Worker refresh, and AOI resync are covered by automated
+evidence.
 
 ## Recommendation
 
-Continue P4.3 only when runtime assignment mutation is the immediate priority.
-The implemented first shape is intentionally narrow: split-only, manual,
-default-off, one-level `CellId`, private staging first, and no automatic merge
-rollback.
+Continue P4.3 only for convergence hardening or explicit merge policy work. The
+implemented shape is intentionally narrow: split-only, manual, default-off,
+one-level `CellId`, acked replay before atomic publication, and no automatic
+merge rollback.
