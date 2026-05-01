@@ -36,6 +36,38 @@ message WatchAssignmentsRequest {}
 message HealthCheckRequest {}
 message GetMetricsRequest {}
 
+message SplitChildTarget {
+  uint32 sub = 1;
+  string target_worker_id = 2;
+}
+
+message StagedSplitChildAssignment {
+  Assignment cell = 1;
+  string target_worker_id = 2;
+}
+
+message SplitActivationRequest {
+  string operation_id = 1;
+  Assignment parent = 2;
+  repeated SplitChildTarget targets = 3;
+}
+
+enum SplitActivationState {
+  SPLIT_ACTIVATION_STATE_UNSPECIFIED = 0;
+  SPLIT_ACTIVATION_STATE_DISABLED = 1;
+  SPLIT_ACTIVATION_STATE_REJECTED = 2;
+  SPLIT_ACTIVATION_STATE_STAGED = 3;
+}
+
+message SplitActivationResponse {
+  bool accepted = 1;
+  SplitActivationState state = 2;
+  string reason = 3;
+  string source_worker_id = 4;
+  repeated StagedSplitChildAssignment staged_children = 5;
+  bool assignments_changed = 6;
+}
+
 enum HandoverCommand {
   HANDOVER_COMMAND_UNSPECIFIED = 0;
   HANDOVER_COMMAND_PRE_COPY = 1;
@@ -137,4 +169,5 @@ service Orchestrator {
   rpc GetHealth(HealthCheckRequest) returns (OrchestratorHealth);
   rpc GetMetrics(GetMetricsRequest) returns (OrchestratorMetrics);
   rpc SubmitHandoverCommand(HandoverCommandRequest) returns (HandoverCommandResponse);
+  rpc SubmitSplitActivation(SplitActivationRequest) returns (SplitActivationResponse);
 }

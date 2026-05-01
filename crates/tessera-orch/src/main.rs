@@ -16,7 +16,8 @@ use tessera_proto::orch::v1::{
     GetMetricsRequest, HandoverClientMovePolicy, HandoverCommand, HandoverCommandRequest,
     HandoverCommandResponse, HandoverFailurePolicy, HandoverState, HandoverStatus,
     HealthCheckRequest, ListAssignmentsRequest, OrchestratorHealth, OrchestratorMetrics,
-    WatchAssignmentsRequest, WorkerHealth, WorkerRegistration,
+    SplitActivationRequest, SplitActivationResponse, SplitActivationState,
+    StagedSplitChildAssignment, WatchAssignmentsRequest, WorkerHealth, WorkerRegistration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,18 +29,43 @@ use tracing::{error, info, warn};
 
 const HANDOVER_COMMIT_RETRY_LIMIT: u32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitActivationMode {
+    Disabled,
+    Manual,
+}
+
+fn load_split_activation_mode() -> Result<SplitActivationMode> {
+    let Ok(raw) = std::env::var("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION") else {
+        return Ok(SplitActivationMode::Disabled);
+    };
+    let mode = raw.trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("off") || mode.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(SplitActivationMode::Disabled);
+    }
+    if mode.eq_ignore_ascii_case("manual") {
+        return Ok(SplitActivationMode::Manual);
+    }
+    Err(anyhow!(
+        "TESSERA_ORCH_SPLIT_MERGE_ACTIVATION must be unset, off, disabled, or manual"
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     let config = load_config().context("load orchestrator config")?;
+    let split_activation_mode =
+        load_split_activation_mode().context("load split/merge activation mode")?;
     let addr_raw =
         std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
     let listen_addr = resolve_socket_addr(&addr_raw)
         .await
         .with_context(|| format!("resolve TESSERA_ORCH_ADDR={addr_raw}"))?;
 
-    let service = OrchestratorService::new(config);
+    let service = OrchestratorService::new_with_split_activation(config, split_activation_mode);
     let metrics_listener = load_metrics_listener().await?;
     info!(target: "orch", %listen_addr, "tessera-orch listening");
 
@@ -122,8 +148,32 @@ fn owner_for_cell<'a>(assignments: &'a AssignmentMap, cell: &CellId) -> Option<&
     })
 }
 
+fn owners_for_cell(assignments: &AssignmentMap, cell: &CellId) -> Vec<String> {
+    let mut owners = assignments
+        .iter()
+        .filter_map(|(worker_id, cells)| {
+            cells
+                .iter()
+                .any(|assigned| assigned == cell)
+                .then_some(worker_id.clone())
+        })
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners
+}
+
 fn sort_cells(cells: &mut [CellId]) {
     cells.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+}
+
+fn split_child_cell(parent: CellId, sub: u8) -> CellId {
+    CellId {
+        world: parent.world,
+        cx: parent.cx,
+        cy: parent.cy,
+        depth: 1,
+        sub,
+    }
 }
 
 fn transfer_cell_assignment(
@@ -365,6 +415,32 @@ struct HandoverRuntime {
     target_worker_id: String,
     state: HandoverState,
     commit_attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+struct StagedSplitActivation {
+    operation_id: String,
+    parent: CellId,
+    source_worker_id: String,
+    children: Vec<StagedSplitAssignment>,
+}
+
+#[derive(Debug, Clone)]
+struct StagedSplitAssignment {
+    cell: CellId,
+    target_worker_id: String,
+}
+
+impl StagedSplitActivation {
+    fn as_response_children(&self) -> Vec<StagedSplitChildAssignment> {
+        self.children
+            .iter()
+            .map(|child| StagedSplitChildAssignment {
+                cell: Some(cell_to_assignment(&child.cell)),
+                target_worker_id: child.target_worker_id.clone(),
+            })
+            .collect()
+    }
 }
 
 fn handover_statuses(handovers: &HashMap<CellId, HandoverRuntime>) -> Vec<HandoverStatus> {
@@ -787,8 +863,10 @@ struct OrchestratorService {
     assignments: Arc<RwLock<AssignmentMap>>,
     runtime: Arc<RwLock<HashMap<String, WorkerRuntime>>>,
     handovers: Arc<RwLock<HashMap<CellId, HandoverRuntime>>>,
+    staged_splits: Arc<RwLock<HashMap<CellId, StagedSplitActivation>>>,
     listing_tx: watch::Sender<AssignmentListing>,
     metrics: Arc<OrchestratorMetricsCounters>,
+    split_activation_mode: SplitActivationMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -800,7 +878,15 @@ struct SplitMergePreviewResponse {
 }
 
 impl OrchestratorService {
+    #[cfg(test)]
     fn new(config: Config) -> Self {
+        Self::new_with_split_activation(config, SplitActivationMode::Disabled)
+    }
+
+    fn new_with_split_activation(
+        config: Config,
+        split_activation_mode: SplitActivationMode,
+    ) -> Self {
         let config = Arc::new(config);
         let initial_assignments = config.initial_assignments();
         let initial_listing = listing_with_runtime(
@@ -815,8 +901,10 @@ impl OrchestratorService {
             assignments: Arc::new(RwLock::new(initial_assignments)),
             runtime: Arc::new(RwLock::new(HashMap::new())),
             handovers: Arc::new(RwLock::new(HashMap::new())),
+            staged_splits: Arc::new(RwLock::new(HashMap::new())),
             listing_tx,
             metrics: Arc::new(OrchestratorMetricsCounters::default()),
+            split_activation_mode,
         }
     }
 
@@ -1016,6 +1104,241 @@ impl OrchestratorService {
                 cells,
                 active_plans: Vec::new(),
             },
+        ))
+    }
+
+    async fn apply_split_activation(
+        &self,
+        request: SplitActivationRequest,
+    ) -> Result<SplitActivationResponse, Status> {
+        let parsed =
+            ParsedSplitActivation::try_from_request(request).map_err(Status::invalid_argument)?;
+        if self.split_activation_mode != SplitActivationMode::Manual {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Disabled,
+                "split activation is disabled; set TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual to enable manual staging",
+                String::new(),
+                Vec::new(),
+                false,
+            ));
+        }
+
+        if parsed.parent.depth != 0 || parsed.parent.sub != 0 {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                format!(
+                    "split activation only supports depth=0/sub=0 parents; got depth={},sub={}",
+                    parsed.parent.depth, parsed.parent.sub
+                ),
+                String::new(),
+                Vec::new(),
+                false,
+            ));
+        }
+
+        let target_worker_ids = match parsed.child_target_map() {
+            Ok(target_worker_ids) => target_worker_ids,
+            Err(reason) => {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    reason,
+                    String::new(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+        };
+        let child_cells = (0..4)
+            .map(|sub| split_child_cell(parsed.parent, sub))
+            .collect::<Vec<_>>();
+
+        let assignments = self.assignments.read().await.clone();
+        let runtime = self.runtime.read().await.clone();
+        let handovers = self.handovers.read().await.clone();
+
+        let source_worker_id = match owners_for_cell(&assignments, &parsed.parent).as_slice() {
+            [owner] => owner.clone(),
+            [] => {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    "source parent cell is not assigned to any configured worker",
+                    String::new(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            owners => {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    format!(
+                        "source parent cell must have exactly one owner; current_owners={}",
+                        owners.join(",")
+                    ),
+                    String::new(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+        };
+        if self.config.worker(&source_worker_id).is_none() {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                format!("source_worker_id={source_worker_id} is not configured"),
+                source_worker_id,
+                Vec::new(),
+                false,
+            ));
+        }
+
+        if target_worker_ids
+            .iter()
+            .all(|target_worker_id| target_worker_id == &source_worker_id)
+        {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                "target map assigns all children to the source worker; keep this as a dry-run/no-op recommendation",
+                source_worker_id,
+                Vec::new(),
+                false,
+            ));
+        }
+
+        for target_worker_id in &target_worker_ids {
+            if self.config.worker(target_worker_id).is_none() {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    format!("unknown target_worker_id={target_worker_id}"),
+                    source_worker_id,
+                    Vec::new(),
+                    false,
+                ));
+            }
+            if !runtime.contains_key(target_worker_id.as_str()) {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    format!("target_worker_id={target_worker_id} is not registered"),
+                    source_worker_id,
+                    Vec::new(),
+                    false,
+                ));
+            }
+        }
+
+        for child in &child_cells {
+            let owners = owners_for_cell(&assignments, child);
+            if !owners.is_empty() {
+                return Ok(split_activation_response(
+                    false,
+                    SplitActivationState::Rejected,
+                    format!(
+                        "child cell depth={},sub={} is already published for owners={}",
+                        child.depth,
+                        child.sub,
+                        owners.join(",")
+                    ),
+                    source_worker_id,
+                    Vec::new(),
+                    false,
+                ));
+            }
+        }
+
+        if handovers
+            .keys()
+            .any(|cell| cell == &parsed.parent || child_cells.contains(cell))
+        {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                "active handover already touches the split parent or child family",
+                source_worker_id,
+                Vec::new(),
+                false,
+            ));
+        }
+
+        let mut staged_splits = self.staged_splits.write().await;
+        if staged_splits
+            .values()
+            .any(|staged| staged.operation_id == parsed.operation_id)
+        {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                format!(
+                    "split activation operation_id={} is already staged",
+                    parsed.operation_id
+                ),
+                source_worker_id,
+                Vec::new(),
+                false,
+            ));
+        }
+        if let Some(staged) = staged_splits
+            .values()
+            .find(|staged| staged.parent.world == parsed.parent.world)
+        {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                format!(
+                    "another split activation is already staged for world={} by source_worker_id={}",
+                    parsed.parent.world, staged.source_worker_id
+                ),
+                source_worker_id,
+                Vec::new(),
+                false,
+            ));
+        }
+        if staged_splits.values().any(|staged| {
+            staged.parent == parsed.parent
+                || staged
+                    .children
+                    .iter()
+                    .any(|child| child.cell == parsed.parent || child_cells.contains(&child.cell))
+        }) {
+            return Ok(split_activation_response(
+                false,
+                SplitActivationState::Rejected,
+                "another split activation already touches this cell family",
+                source_worker_id,
+                Vec::new(),
+                false,
+            ));
+        }
+
+        let staged = StagedSplitActivation {
+            operation_id: parsed.operation_id,
+            parent: parsed.parent,
+            source_worker_id: source_worker_id.clone(),
+            children: child_cells
+                .into_iter()
+                .zip(target_worker_ids)
+                .map(|(cell, target_worker_id)| StagedSplitAssignment {
+                    cell,
+                    target_worker_id,
+                })
+                .collect(),
+        };
+        let staged_children = staged.as_response_children();
+        staged_splits.insert(staged.parent, staged);
+
+        Ok(split_activation_response(
+            true,
+            SplitActivationState::Staged,
+            "split activation staged; child assignment publish and worker replay are deferred to the next slice",
+            source_worker_id,
+            staged_children,
+            false,
         ))
     }
 
@@ -1223,6 +1546,95 @@ fn parse_split_merge_preview_snapshot(
     let snapshot = serde_json::from_str(raw)
         .map_err(|err| format!("parse split/merge preview snapshot from {source}: {err}"))?;
     Ok((source.to_string(), snapshot))
+}
+
+struct ParsedSplitActivation {
+    operation_id: String,
+    parent: CellId,
+    targets: Vec<ParsedSplitChildTarget>,
+}
+
+struct ParsedSplitChildTarget {
+    sub: u32,
+    target_worker_id: String,
+}
+
+impl ParsedSplitActivation {
+    fn try_from_request(request: SplitActivationRequest) -> Result<Self, String> {
+        let operation_id = request.operation_id.trim();
+        if operation_id.is_empty() {
+            return Err("operation_id must not be empty".to_string());
+        }
+        let Some(parent_assignment) = request.parent.as_ref() else {
+            return Err("parent must be set".to_string());
+        };
+        let parent = assignment_to_cell_ref(parent_assignment).map_err(|e| e.to_string())?;
+        let targets = request
+            .targets
+            .into_iter()
+            .map(|target| ParsedSplitChildTarget {
+                sub: target.sub,
+                target_worker_id: target.target_worker_id.trim().to_string(),
+            })
+            .collect();
+        Ok(Self {
+            operation_id: operation_id.to_string(),
+            parent,
+            targets,
+        })
+    }
+
+    fn child_target_map(&self) -> Result<Vec<String>, String> {
+        let mut targets = vec![None::<String>; 4];
+        for target in &self.targets {
+            if target.sub > 3 {
+                return Err(format!(
+                    "target map child sub={} is out of range; expected 0..=3",
+                    target.sub
+                ));
+            }
+            if target.target_worker_id.is_empty() {
+                return Err(format!(
+                    "target_worker_id must not be empty for child sub={}",
+                    target.sub
+                ));
+            }
+            let slot = &mut targets[target.sub as usize];
+            if slot.is_some() {
+                return Err(format!(
+                    "target map contains duplicate child sub={}",
+                    target.sub
+                ));
+            }
+            *slot = Some(target.target_worker_id.clone());
+        }
+
+        targets
+            .into_iter()
+            .enumerate()
+            .map(|(sub, target_worker_id)| {
+                target_worker_id.ok_or_else(|| format!("target map must include child sub={sub}"))
+            })
+            .collect()
+    }
+}
+
+fn split_activation_response(
+    accepted: bool,
+    state: SplitActivationState,
+    reason: impl Into<String>,
+    source_worker_id: String,
+    staged_children: Vec<StagedSplitChildAssignment>,
+    assignments_changed: bool,
+) -> SplitActivationResponse {
+    SplitActivationResponse {
+        accepted,
+        state: state as i32,
+        reason: reason.into(),
+        source_worker_id,
+        staged_children,
+        assignments_changed,
+    }
 }
 
 struct ParsedHandoverCommand {
@@ -1459,6 +1871,14 @@ impl Orchestrator for OrchestratorService {
         request: Request<HandoverCommandRequest>,
     ) -> Result<Response<HandoverCommandResponse>, Status> {
         let response = self.apply_handover_command(request.into_inner()).await?;
+        Ok(Response::new(response))
+    }
+
+    async fn submit_split_activation(
+        &self,
+        request: Request<SplitActivationRequest>,
+    ) -> Result<Response<SplitActivationResponse>, Status> {
+        let response = self.apply_split_activation(request.into_inner()).await?;
         Ok(Response::new(response))
     }
 }
@@ -1779,6 +2199,62 @@ mod tests {
             target_worker_id: "worker-b".to_string(),
             command: command as i32,
         }
+    }
+
+    fn split_activation_request(targets: &[(u32, &str)]) -> SplitActivationRequest {
+        SplitActivationRequest {
+            operation_id: "split-1".to_string(),
+            parent: Some(cell_to_assignment(&CellId::grid(0, 0, 0))),
+            targets: targets
+                .iter()
+                .map(
+                    |(sub, target_worker_id)| tessera_proto::orch::v1::SplitChildTarget {
+                        sub: *sub,
+                        target_worker_id: (*target_worker_id).to_string(),
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn valid_split_activation_request() -> SplitActivationRequest {
+        split_activation_request(&[
+            (0, "worker-b"),
+            (1, "worker-b"),
+            (2, "worker-b"),
+            (3, "worker-b"),
+        ])
+    }
+
+    async fn register_worker_for_test(service: &OrchestratorService, worker_id: &str, addr: &str) {
+        service
+            .register_worker(Request::new(WorkerRegistration {
+                worker_id: worker_id.to_string(),
+                addr: addr.to_string(),
+            }))
+            .await
+            .expect("register worker");
+    }
+
+    async fn assert_split_rejected_without_assignment_change(
+        service: &OrchestratorService,
+        request: SplitActivationRequest,
+        reason: &str,
+    ) -> SplitActivationResponse {
+        let before = service.listing().await;
+        let response = service
+            .submit_split_activation(Request::new(request))
+            .await
+            .expect("submit split activation")
+            .into_inner();
+        let after = service.listing().await;
+
+        assert!(!response.accepted);
+        assert_eq!(response.state, SplitActivationState::Rejected as i32);
+        assert!(response.reason.contains(reason), "{}", response.reason);
+        assert!(!response.assignments_changed);
+        assert_eq!(before, after);
+        response
     }
 
     fn split_metrics(cell: CellId) -> SplitMergeCellMetrics {
@@ -2123,6 +2599,172 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(merge_plans.len(), 1);
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn split_activation_disabled_rejects_without_assignment_mutation() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        let before = service.listing().await;
+
+        let response = service
+            .submit_split_activation(Request::new(valid_split_activation_request()))
+            .await
+            .expect("submit split activation")
+            .into_inner();
+        let after = service.listing().await;
+
+        assert!(!response.accepted);
+        assert_eq!(response.state, SplitActivationState::Disabled as i32);
+        assert!(response.reason.contains("disabled"));
+        assert!(!response.assignments_changed);
+        assert!(response.staged_children.is_empty());
+        assert_eq!(before, after);
+        assert!(service.staged_splits.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn split_activation_stages_child_assignments_without_publishing() {
+        let service = OrchestratorService::new_with_split_activation(
+            two_worker_handover_config(),
+            SplitActivationMode::Manual,
+        );
+        register_worker_for_test(&service, "worker-b", "10.0.0.2:5001").await;
+        let before = service.listing().await;
+
+        let response = service
+            .submit_split_activation(Request::new(valid_split_activation_request()))
+            .await
+            .expect("submit split activation")
+            .into_inner();
+        let after = service.listing().await;
+
+        assert!(response.accepted);
+        assert_eq!(response.state, SplitActivationState::Staged as i32);
+        assert_eq!(response.source_worker_id, "worker-a");
+        assert!(!response.assignments_changed);
+        assert_eq!(response.staged_children.len(), 4);
+        for (sub, child) in response.staged_children.iter().enumerate() {
+            let cell = child.cell.as_ref().expect("staged child cell");
+            assert_eq!(cell.world, 0);
+            assert_eq!(cell.cx, 0);
+            assert_eq!(cell.cy, 0);
+            assert_eq!(cell.depth, 1);
+            assert_eq!(cell.sub, sub as u32);
+            assert_eq!(child.target_worker_id, "worker-b");
+        }
+        assert_eq!(before, after);
+
+        let staged = service.staged_splits.read().await;
+        let staged = staged.get(&CellId::grid(0, 0, 0)).expect("staged split");
+        assert_eq!(staged.operation_id, "split-1");
+        assert_eq!(staged.source_worker_id, "worker-a");
+        assert_eq!(staged.children.len(), 4);
+
+        let target_snapshot = service
+            .get_assignments(Request::new(AssignmentQuery {
+                worker_id: "worker-b".into(),
+            }))
+            .await
+            .expect("get target assignments")
+            .into_inner();
+        assert!(target_snapshot.cells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn split_activation_validates_target_map_and_depth_without_assignment_mutation() {
+        let service = OrchestratorService::new_with_split_activation(
+            two_worker_handover_config(),
+            SplitActivationMode::Manual,
+        );
+
+        assert_split_rejected_without_assignment_change(
+            &service,
+            split_activation_request(&[(0, "worker-b"), (1, "worker-b"), (2, "worker-b")]),
+            "child sub=3",
+        )
+        .await;
+        assert_split_rejected_without_assignment_change(
+            &service,
+            split_activation_request(&[
+                (0, "worker-b"),
+                (1, "worker-b"),
+                (1, "worker-b"),
+                (3, "worker-b"),
+            ]),
+            "duplicate child sub=1",
+        )
+        .await;
+
+        let mut nested_parent = valid_split_activation_request();
+        nested_parent.parent = Some(cell_to_assignment(&CellId {
+            world: 0,
+            cx: 0,
+            cy: 0,
+            depth: 1,
+            sub: 0,
+        }));
+        assert_split_rejected_without_assignment_change(&service, nested_parent, "depth=0/sub=0")
+            .await;
+
+        assert_split_rejected_without_assignment_change(
+            &service,
+            split_activation_request(&[
+                (0, "worker-a"),
+                (1, "worker-a"),
+                (2, "worker-a"),
+                (3, "worker-a"),
+            ]),
+            "dry-run/no-op",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn split_activation_requires_registered_targets_without_assignment_mutation() {
+        let service = OrchestratorService::new_with_split_activation(
+            two_worker_handover_config(),
+            SplitActivationMode::Manual,
+        );
+
+        assert_split_rejected_without_assignment_change(
+            &service,
+            valid_split_activation_request(),
+            "not registered",
+        )
+        .await;
+
+        register_worker_for_test(&service, "worker-b", "10.0.0.2:5001").await;
+        assert_split_rejected_without_assignment_change(
+            &service,
+            split_activation_request(&[
+                (0, "worker-b"),
+                (1, "worker-b"),
+                (2, "worker-b"),
+                (3, "worker-unknown"),
+            ]),
+            "unknown target_worker_id=worker-unknown",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn split_activation_rejects_second_staged_family_without_publishing() {
+        let service = OrchestratorService::new_with_split_activation(
+            two_worker_handover_config(),
+            SplitActivationMode::Manual,
+        );
+        register_worker_for_test(&service, "worker-b", "10.0.0.2:5001").await;
+
+        let staged = service
+            .submit_split_activation(Request::new(valid_split_activation_request()))
+            .await
+            .expect("submit split activation")
+            .into_inner();
+        assert!(staged.accepted);
+
+        let mut duplicate = valid_split_activation_request();
+        duplicate.operation_id = "split-2".to_string();
+        assert_split_rejected_without_assignment_change(&service, duplicate, "world=0").await;
     }
 
     #[test]

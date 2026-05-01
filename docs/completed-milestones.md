@@ -1,6 +1,6 @@
 # Tessera Completed Milestones
 
-Last reviewed: 2026-05-01
+Last reviewed: 2026-05-02
 
 This document records completed milestone plans that used to live in active
 `docs/todo-*` files. Current open work should stay in `docs/todo-next.md` and
@@ -166,12 +166,49 @@ curl http://127.0.0.1:4100/ready
 curl http://127.0.0.1:6100/split-merge/preview
 ```
 
+## P4.3 Manual Split Activation Staging
+
+Status: first staging slice complete as of 2026-05-02.
+
+Completed slices:
+
+1. Added the default-off `SubmitSplitActivation` gRPC surface and
+   `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual` feature flag.
+2. Kept the command split-only and manual; planner output still does not
+   auto-submit mutating operations.
+3. Validated the full child target map, one-level `CellId` parent semantics,
+   configured and registered target Workers, source-only no-op maps, active
+   family handovers, published child overlap, and already staged split
+   families.
+4. Materialized four private staged child assignments in Orchestrator memory
+   without publishing them through `ListAssignments` or `WatchAssignments`.
+5. Covered disabled activation, validation failures, unregistered targets, and
+   duplicate staged-family failures with assignments-unchanged tests.
+
+Deferred from this slice:
+
+- Parent freeze, child replay, owner/session transfer, child assignment
+  publication, Gateway route convergence, Worker owned-cell refresh, AOI resync,
+  and post-publish convergence failure handling.
+
+Verification used for this slice:
+
+```sh
+cargo xt
+cargo test
+cargo xt dev up --with-orch
+cargo run -p tessera-client -- ping --ts 123
+cargo xt dev down --with-orch
+```
+
 ## Active Follow-Up
 
-Open P4 work now starts after P4.2:
+Open P4 work now starts after the P4.3 staging slice:
 
-1. Runtime split/merge activation remains gated on assignment mutation
-   semantics.
+1. Connect staged split activation to parent freeze, child replay, and
+   assignment publication.
+2. Add route convergence, Worker refresh, AOI resync, replay failure rollback,
+   and post-publish convergence failure evidence.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.

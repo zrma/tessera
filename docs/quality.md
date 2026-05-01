@@ -42,5 +42,5 @@ This document is the repo-local quality map for agents. It keeps the expected au
 
 - Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, Gateway has a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram, and Join/Move request latency is covered by request-id correlation histograms. Long-running scrape/tracing assertions are not covered yet.
 - Docker/Compose/Kubernetes sample packaging exists, but production manifests are intentionally deferred until target cluster conventions are known.
-- Orchestrator has an inactive split/merge planner skeleton and dry-run preview endpoint, but runtime split/merge activation remains deferred.
+- Orchestrator has an inactive split/merge planner skeleton, dry-run preview endpoint, and a default-off manual split activation staging RPC. Actual child assignment publication, Worker replay, route convergence, and AOI resync remain deferred.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

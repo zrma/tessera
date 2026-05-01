@@ -1,6 +1,6 @@
 # Tessera P4 Next Milestones
 
-Last reviewed: 2026-05-01
+Last reviewed: 2026-05-02
 
 ## Baseline
 
@@ -12,14 +12,15 @@ P4.2 internal GitOps manifests are committed, pushed, synced by ArgoCD, and
 runtime-smoked on the MicroK8s cluster. Completed milestone details are
 archived in `docs/completed-milestones.md`.
 
-The next substantial milestone crosses runtime assignment mutation.
+The next substantial milestone crosses from private split staging into runtime
+assignment publication and replay.
 
 ## 2026-05-01 Decision Checkpoint
 
 P4.2 defaults were accepted for the first internal-only deployment slice, the
 cluster rollout was verified, and `v2026.05.1` was published by GitHub Actions
-and promoted through GitOps. The remaining substantial branch is P4.3 runtime
-split/merge activation.
+and promoted through GitOps. P4.3 has now started with the default-off manual
+staging slice.
 
 The first P4.3 activation shape is fixed in `docs/dynamic-split-merge.md`:
 split-only, manual submission, default-off feature flag, explicit target map,
@@ -136,7 +137,8 @@ Completed image-promotion checks:
 
 ## P4.3 Runtime Split/Merge Activation
 
-Status: first activation shape fixed; implementation not started.
+Status: first default-off manual staging slice implemented; child assignment
+publish and Worker replay remain open.
 
 Chosen first slice:
 
@@ -159,18 +161,26 @@ Chosen first slice:
 7. Post-publication convergence failures are surfaced with cooldown and manual
    recovery; the first slice does not automatically merge back.
 
-Suggested implementation after approval:
+Implemented first slice:
 
 1. Add the manual activation command/API and feature flag.
 2. Materialize planned target child assignments without publishing them.
-3. Drive parent freeze, child replay, and owner/session transfer through the
+3. Validate the full target map, parent depth/sub, configured and registered
+   targets, source-only no-op maps, active family handovers, published child
+   overlap, and already staged split families.
+4. Keep failed activation attempts assignment-safe with
+   `assignments_changed=false` and unchanged `ListAssignments` output.
+
+Remaining implementation:
+
+1. Drive parent freeze, child replay, and owner/session transfer through the
    existing handover/replay contracts or an explicitly equivalent split replay
    path.
-4. Publish child assignments only after all child replay paths succeed, and
+2. Publish child assignments only after all child replay paths succeed, and
    remove the parent assignment in the same publication step.
-5. Add target validation, depth validation, route convergence, AOI resync,
-   atomic rollback, and post-publish failure tests before enabling the flag in
-   any environment.
+3. Add route convergence, AOI resync, atomic rollback for replay/publish
+   failures, and post-publish failure tests before enabling the flag in any
+   environment.
 
 Verification required for the implementation milestone:
 
@@ -182,13 +192,13 @@ cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
 ```
 
-The implementation should also extend the existing split/merge preview smoke or
-add a new activation smoke so the default-off flag, manual validation, successful
-split, and failed replay/target paths are covered by automated evidence.
+The next implementation should extend the existing split/merge preview smoke or
+add a new activation smoke so successful split publication and failed
+replay/target paths are covered by automated evidence.
 
 ## Recommendation
 
-Choose the P4.3 implementation milestone only when runtime assignment mutation
-is the immediate priority. The approved first shape is intentionally narrow:
-split-only, manual, default-off, one-level `CellId`, and no automatic merge
+Continue P4.3 only when runtime assignment mutation is the immediate priority.
+The implemented first shape is intentionally narrow: split-only, manual,
+default-off, one-level `CellId`, private staging first, and no automatic merge
 rollback.

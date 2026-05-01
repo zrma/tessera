@@ -69,6 +69,7 @@ Cell-based world orchestration for real-time servers in Rust.
   - `TESSERA_ORCH_METRICS_ADDR` 기본 unset (설정 시 Orchestrator가 `GET /metrics` Prometheus text endpoint를 함께 노출, 예: `127.0.0.1:6100`)
   - `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON` 기본 unset (`GET /split-merge/preview` dry-run 입력 snapshot JSON, unset이면 현재 assignment를 zero-metric snapshot으로 preview)
   - `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH` 기본 unset (`TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`이 unset일 때 dry-run 입력 snapshot 파일 경로)
+  - `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` 기본 unset/disabled (`manual`로 설정한 경우에만 `SubmitSplitActivation` gRPC가 split-only staged activation을 받으며, 자식 assignment publish와 Worker replay는 아직 수행하지 않음)
   - `RUST_LOG` 기본 `info`
 - 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADVERTISE_ADDR`(설정 시) 또는 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
 - 오케스트레이터 실행: `cargo run -p tessera-orch` (기본 `TESSERA_ORCH_ADDR=127.0.0.1:6000`)
@@ -103,7 +104,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 per-cell tick flush batch에서 처리하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화한다. AOI는 cell radius, edge margin, visibility radius, max-cell cap으로 제한할 수 있으며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 fanout을 재사용하고 opt-in `/metrics`로 relay fanout/backpressure/reconnect 카운터를 노출
-- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Orchestrator는 assignment 변경 없는 `GET /split-merge/preview` dry-run endpoint를 제공한다. Gateway는 route availability 기반 `/ready`, reconnect/close-reason counters, Ping/Pong round-trip latency histogram, request-id로 매칭된 Join/Move round-trip latency histogram을 노출
+- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand`/`SubmitSplitActivation` gRPC 엔드포인트를 제공한다. `SubmitSplitActivation`은 default-off manual flag 뒤에서 split-only target map/depth/registration validation과 private staged child assignment 모델까지만 수행하고, active assignment publish와 Worker replay는 다음 slice로 남긴다. Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Orchestrator는 assignment 변경 없는 `GET /split-merge/preview` dry-run endpoint를 제공한다. Gateway는 route availability 기반 `/ready`, reconnect/close-reason counters, Ping/Pong round-trip latency histogram, request-id로 매칭된 Join/Move round-trip latency histogram을 노출
 - Handover runtime baseline: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하고, Orchestrator `ListAssignments`/`WatchAssignments`가 active handover status를 내려주며, source Worker는 `Freeze`/`Diff` 중 bounded buffer에 client move를 보관한다. `Abort`처럼 source가 계속 cell을 소유하면 buffered move를 FIFO로 로컬 replay하고, `Commit`은 target Worker 등록과 bounded retry budget을 확인한 뒤 assignment를 target으로 전환한다. source Worker는 commit release 시 actor snapshot, actor별 owner session manifest, buffered move를 target Worker에 `HandoverReplay` relay payload로 넘기며, target은 replay를 idempotent하게 적용하고 owner map을 즉시 구성한다.
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
@@ -111,7 +112,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Worker 간 ghost relay와 request latency의 장기 scrape/tracing assertions
 - Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로 제공되며, 첫 internal-only production GitOps manifest slice는 k8s GitOps repo에서 ArgoCD sync와 runtime smoke까지 검증됐다.
 - GitHub Actions image publish workflow는 build/push only로 `v2026.05.1` Harbor image를 발행했고, k8s GitOps repo에서 해당 tag로 promotion되어 ArgoCD sync와 runtime smoke까지 통과했다.
-- 리밸런싱 자동화, 동적 분할(V1/V2) 런타임 구현은 아직 미구현이며, Orchestrator에는 비활성 split/merge planner skeleton과 fixture-backed dry-run preview smoke만 있다. P4.3 첫 activation shape는 split-only/manual/default-off feature flag/one-level `CellId` 기준으로 `docs/dynamic-split-merge.md`에 고정되어 있고, 구현은 별도 milestone이다.
+- 리밸런싱 자동화와 자동 split/merge 런타임은 아직 미구현이다. Orchestrator에는 비활성 split/merge planner skeleton, fixture-backed dry-run preview smoke, 그리고 P4.3 첫 slice로 default-off/manual `SubmitSplitActivation` staging surface가 있다. 이 surface는 split-only target map/depth/registration validation과 private staged child assignment만 제공하며, 실제 child assignment publish와 Worker replay는 다음 milestone이다.
 - P0/P1/P2/P3/P4.1/P4.2 완료 기록은 `docs/completed-milestones.md`에 둔다.
 - 현재 milestone decision gate와 rollout follow-up은 `docs/todo-next.md`와 `docs/todo-p4-next-milestones.md`에 둔다.
 
@@ -122,6 +123,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - 멱등·역전 처리의 기반으로 `seq/epoch` 사용(현재 워커는 응답 `seq` 증가)
 - 클라 옵션: `--world --cx --cy --epoch`로 Envelope 기본값 설정
 - Handover control-plane: `SubmitHandoverCommand`는 `PreCopy`, `Freeze`, `Diff`, `Commit`, `Abort`를 순서 검증하고, `Commit`은 registered target Worker로 assignment를 전환하며, `ListAssignments`/`WatchAssignments`는 active handover status와 최신 assignment를 함께 전달한다. Commit 전 target 미등록은 bounded retry budget 안에서 `Diffing`을 유지하고, budget 소진 시 assignment transfer 전에 abort한다. Commit 후 Worker `HandoverReplay`는 actor snapshot, owner session manifest, buffered move를 target으로 넘긴다. 자세한 정책은 `docs/handover.md`에 둔다.
+- Split activation control-plane: `SubmitSplitActivation`은 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`에서만 split-only 명령을 staging한다. 요청은 `depth=0/sub=0` parent와 `sub=0..3` 전체 target map을 요구하고, source ownership, configured/registered target Worker, no-op source-only target map, active handover, 이미 published 된 child overlap, 이미 staged 된 split family를 검증한다. 성공해도 `assignments_changed=false`이며 child assignment publish와 Worker replay는 아직 수행하지 않는다.
 
 ## Troubleshooting
 - 포트 점유: `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`를 변경하거나 점유 프로세스 종료
