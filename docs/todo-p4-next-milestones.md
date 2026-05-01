@@ -8,29 +8,26 @@ P0 through P4.1 are complete through handover replay ownership, stable Gateway
 sessions, AOI precision controls, per-cell tick structure, observability
 endpoints, packaging samples, split/merge planner skeletons, and fixture-backed
 dry-run preview smoke, plus request-id-based Join/Move latency correlation.
-Completed milestone details are archived in
+P4.2 internal GitOps manifests are prepared in the k8s GitOps repo, with
+cluster sync and runtime smoke still pending. Completed milestone details are archived in
 `docs/completed-milestones.md`.
 
-There is no additional autonomous implementation slice at this planning point
-after P4.1. The next substantial milestones cross either production cluster
-policy or runtime assignment mutation.
+The next substantial milestones now cross either production cluster rollout or
+runtime assignment mutation.
 
 ## 2026-05-01 Decision Checkpoint
 
-No safe autonomous implementation slice remains before choosing the next P4
-branch.
-Pick one of these directions to unblock the next commit-sized milestone:
+P4.2 defaults were accepted for the first internal-only deployment slice.
+The remaining branches are:
 
-1. P4.2 for cluster rollout: provide the live GitOps target details for image,
-   namespace, Gateway exposure, Prometheus discovery, resources, and rollout
-   policy.
-2. P4.3 for runtime split/merge: approve the first activation shape, target
+1. P4.2 rollout verification: push the k8s GitOps commit, let ArgoCD sync, and
+   run internal Gateway/Orchestrator smoke checks.
+2. P4.3 runtime split/merge: approve the first activation shape, target
    worker policy, multi-depth `CellId` semantics, and manual-vs-automatic plan
    submission.
 
-Default recommendation is P4.2 if operating Tessera on the existing cluster is
-the immediate goal. Otherwise keep P4.3 gated until runtime split/merge
-semantics are explicitly chosen.
+Default recommendation is finishing P4.2 rollout verification before opening
+P4.3 runtime mutation.
 
 ## P4.1 Non-Ping Request Latency Correlation
 
@@ -81,23 +78,47 @@ Completed implementation:
 
 ## P4.2 Production Kubernetes Manifests
 
-Status: escalation required before implementation.
+Status: internal-only manifest slice prepared as of 2026-05-01; GitOps push,
+ArgoCD sync, and runtime smoke are still pending.
 
-Decision needed:
+Implemented first-slice defaults:
 
-- Target image registry and tag convention.
-- Namespace and label convention in the live `../k8s` GitOps repo.
-- Service exposure for Gateway TCP ingress.
-- Prometheus discovery convention.
-- Resource requests/limits, rollout policy, and PodDisruptionBudget.
+1. Published `harbor.1day1coding.com/1day1coding/tessera:ec8c42b4`.
+2. Added namespace `tessera` with restricted pod-security labels and Istio
+   revision label matching the current app namespace pattern.
+3. Added one Orchestrator, one Worker, and one Gateway, all behind ClusterIP
+   services; no public Gateway API routing for the custom
+   `4000/TCP` client protocol yet.
+4. Enabled metrics ports `6100`/`5100`/`4100`, Gateway `/ready`, and existing
+   `prometheus.io/*` annotations.
+5. Used conservative per-component requests (`cpu: 100m`, `memory: 128Mi`) and
+   `256Mi` memory limits; deferred PodDisruptionBudget while each component has
+   one replica.
 
-Suggested implementation after approval:
+k8s GitOps repo files added or updated:
 
-1. Convert `../k8s/docs/todo-tessera-deploy/` decisions into raw manifests under
-   the k8s repo's app layout.
-2. Keep the first profile internal-only unless Gateway TCP ingress is explicitly
-   selected.
-3. Validate with the k8s repo policy checks before any ArgoCD sync.
+- `k8s/apps/tessera/manifests/`
+- `k8s/common/namespaces/tessera.yaml`
+- `k8s/common/netpol/tessera.yaml`
+- `k8s/argocd/project-tessera.yaml`
+- `k8s/argocd/project-common.yaml`
+
+Verification used for manifest prep:
+
+```sh
+docker build -t harbor.1day1coding.com/1day1coding/tessera:ec8c42b4 .
+docker push harbor.1day1coding.com/1day1coding/tessera:ec8c42b4
+make validate
+```
+
+Remaining rollout checks:
+
+1. Push the k8s GitOps commit after confirming the remote bookmark move.
+2. Confirm ArgoCD Application `tessera` reaches `Synced / Healthy`.
+3. Confirm `kubectl -n tessera get pods,svc` shows all components ready.
+4. Port-forward the internal Gateway and verify `tessera-client ping --ts 123`.
+5. Port-forward Orchestrator metrics and verify `/split-merge/preview` reports
+   `assignments_changed=false`.
 
 ## P4.3 Runtime Split/Merge Activation
 
@@ -123,7 +144,7 @@ Suggested implementation after approval:
 
 ## Recommendation
 
-Choose P4.2 next if the goal is operating Tessera on the existing cluster.
-Choose P4.3 only when runtime split/merge semantics are the immediate priority;
-it should remain gated until target worker policy and assignment mutation rules
-are explicit.
+Finish P4.2 rollout verification next if the goal is operating Tessera on the
+existing cluster. Choose P4.3 only when runtime split/merge semantics are the
+immediate priority; it should remain gated until target worker policy and
+assignment mutation rules are explicit.
