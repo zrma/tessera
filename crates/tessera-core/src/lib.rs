@@ -157,6 +157,8 @@ pub struct ClientEnvelope {
     pub epoch: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
     pub payload: ClientMsg,
 }
 
@@ -167,6 +169,29 @@ impl From<Envelope<ClientMsg>> for ClientEnvelope {
             seq: env.seq,
             epoch: env.epoch,
             session: None,
+            request_id: None,
+            payload: env.payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerEnvelope {
+    pub cell: CellId,
+    pub seq: u64,
+    pub epoch: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<u64>,
+    pub payload: ServerMsg,
+}
+
+impl From<Envelope<ServerMsg>> for ServerEnvelope {
+    fn from(env: Envelope<ServerMsg>) -> Self {
+        Self {
+            cell: env.cell,
+            seq: env.seq,
+            epoch: env.epoch,
+            request_id: None,
             payload: env.payload,
         }
     }
@@ -261,6 +286,7 @@ mod tests {
         assert_eq!(decoded.seq, env.seq);
         assert_eq!(decoded.epoch, env.epoch);
         assert_eq!(decoded.session, None);
+        assert_eq!(decoded.request_id, None);
         assert_eq!(decoded.payload, env.payload);
         assert_eq!(buf.len(), 0);
     }
@@ -272,12 +298,48 @@ mod tests {
             seq: 7,
             epoch: 9,
             session: Some(42),
+            request_id: Some(99),
             payload: ClientMsg::Ping { ts: 123 },
         };
         let b = encode_frame(&env);
         let mut buf = BytesMut::from(&b[..]);
         let decoded: ClientEnvelope = try_decode_frame(&mut buf).expect("decode").expect("frame");
         assert_eq!(decoded, env);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn server_envelope_accepts_missing_request_id() {
+        let env = Envelope {
+            cell: CellId::grid(0, 1, 2),
+            seq: 7,
+            epoch: 0,
+            payload: ServerMsg::Pong { ts: 123 },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: ServerEnvelope = try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(decoded.cell, env.cell);
+        assert_eq!(decoded.seq, env.seq);
+        assert_eq!(decoded.epoch, env.epoch);
+        assert_eq!(decoded.request_id, None);
+        assert_eq!(decoded.payload, env.payload);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn server_envelope_roundtrip_request_id() {
+        let env = ServerEnvelope {
+            cell: CellId::grid(0, 1, 2),
+            seq: 7,
+            epoch: 0,
+            request_id: Some(101),
+            payload: ServerMsg::Pong { ts: 123 },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: ServerEnvelope = try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(env, decoded);
         assert_eq!(buf.len(), 0);
     }
 

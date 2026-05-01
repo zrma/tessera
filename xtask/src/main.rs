@@ -642,6 +642,7 @@ fn dev_metrics_smoke() -> Result<()> {
                 "tessera_gateway_accepted_connections_total",
                 "tessera_gateway_upstream_connect_attempts_total",
                 "tessera_gateway_ping_roundtrip_seconds_count",
+                "tessera_gateway_request_roundtrip_seconds_count",
                 "tessera_gateway_client_closes_no_route_total",
             ],
         )?;
@@ -680,15 +681,31 @@ fn dev_metrics_smoke() -> Result<()> {
             ],
         )?;
         run_client_ping(987)?;
+        run_client_demo(42)?;
         let gateway_metrics = assert_metrics_endpoint_body(
             "gateway",
             gateway_metrics_addr,
-            &["tessera_gateway_ping_roundtrip_seconds_count"],
+            &[
+                "tessera_gateway_ping_roundtrip_seconds_count",
+                "tessera_gateway_request_roundtrip_seconds_count",
+            ],
         )?;
         assert_prometheus_sample_at_least(
             "gateway",
             &gateway_metrics,
             "tessera_gateway_ping_roundtrip_seconds_count",
+            1.0,
+        )?;
+        assert_prometheus_sample_at_least(
+            "gateway",
+            &gateway_metrics,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+            1.0,
+        )?;
+        assert_prometheus_sample_at_least(
+            "gateway",
+            &gateway_metrics,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
             1.0,
         )?;
         Ok(())
@@ -698,7 +715,7 @@ fn dev_metrics_smoke() -> Result<()> {
     smoke_result?;
     down_result?;
     println!(
-        "metrics smoke: gateway, worker, orchestrator /metrics, gateway /ready, orchestrator split/merge preview, and ping latency histogram are valid"
+        "metrics smoke: gateway, worker, orchestrator /metrics, gateway /ready, orchestrator split/merge preview, and ping/non-ping latency histograms are valid"
     );
     Ok(())
 }
@@ -727,6 +744,14 @@ fn run_client_ping(ts: u64) -> Result<()> {
     let mut ping = Command::new(client);
     ping.args(["ping", "--ts", &ts.to_string()]);
     run(&mut ping)
+}
+
+fn run_client_demo(actor: u64) -> Result<()> {
+    let root = workspace_root();
+    let client = root.join("target/debug/tessera-client");
+    let mut demo = Command::new(client);
+    demo.args(["demo", "--actor", &actor.to_string()]);
+    run(&mut demo)
 }
 
 fn assert_http_status_endpoint(
