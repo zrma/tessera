@@ -17,18 +17,16 @@ runtime assignment mutation.
 
 ## 2026-05-01 Decision Checkpoint
 
-P4.2 defaults were accepted for the first internal-only deployment slice and
-the cluster rollout was verified. The remaining branches are:
+P4.2 defaults were accepted for the first internal-only deployment slice, the
+cluster rollout was verified, and `v2026.05.1` was published by GitHub Actions
+and promoted through GitOps. The remaining substantial branch is:
 
-1. Image publish follow-up: fix the GitHub Actions Harbor push credential or
-   account permission, rerun the build/push workflow, and promote the resulting
-   version tag through the k8s GitOps repo.
-2. P4.3 runtime split/merge: approve the first activation shape, target
+1. P4.3 runtime split/merge: approve the first activation shape, target
    worker policy, multi-depth `CellId` semantics, and manual-vs-automatic plan
    submission.
 
-Default recommendation is unblocking version-tag image promotion before opening
-P4.3 runtime mutation.
+Default recommendation is keeping P4.3 gated until the assignment mutation
+semantics are explicit.
 
 ## P4.1 Non-Ping Request Latency Correlation
 
@@ -118,33 +116,26 @@ curl http://127.0.0.1:4100/ready
 curl http://127.0.0.1:6100/split-merge/preview
 ```
 
-Image publish follow-up:
+Image publish and GitOps promotion:
 
 ```sh
 gh workflow run tessera.build-push.yml --ref main
 ```
 
 The workflow builds `linux/amd64` on GitHub Actions and pushes a `vYYYY.MM.N`
-tag to Harbor. After it succeeds, update the k8s GitOps manifest image tag to
-that version tag and let ArgoCD roll out the new image.
+tag to Harbor. The current promoted image tag is `v2026.05.1`.
 
-Current blocker:
+Completed image-promotion checks:
 
-- The workflow currently reaches Docker login with registry
-  `harbor.1day1coding.com`, but Harbor returns `unauthorized`. This points to
-  `HARBOR_USERNAME`/`HARBOR_PASSWORD` or that account's push permission, not the
-  GitOps pull secret.
-
-Remaining image-promotion checks:
-
-1. Rerun the GitHub Actions build/push workflow after Harbor credentials or
-   permissions are fixed.
-2. Update the k8s GitOps manifest tag to the GitHub Actions image tag.
-3. Confirm ArgoCD Application `tessera` reaches `Synced / Healthy`.
-4. Confirm `kubectl -n tessera get pods,svc` shows all components ready.
-5. Port-forward the internal Gateway and verify `tessera-client ping --ts 123`.
-6. Port-forward Orchestrator metrics and verify `/split-merge/preview` reports
-   `assignments_changed=false`.
+1. GitHub Actions run published `v2026.05.1` to Harbor.
+2. k8s GitOps manifest tag was updated to `v2026.05.1` and pushed.
+3. ArgoCD Application `tessera` reached `Synced / Healthy`.
+4. `kubectl -n tessera get pods,deploy,svc` showed all components ready on
+   `v2026.05.1`.
+5. Port-forwarded the internal Gateway and verified `tessera-client ping --ts
+   123`.
+6. Port-forwarded Orchestrator metrics and verified `/split-merge/preview`
+   reports `assignments_changed=false`.
 
 ## P4.3 Runtime Split/Merge Activation
 
@@ -170,7 +161,6 @@ Suggested implementation after approval:
 
 ## Recommendation
 
-Finish Harbor-backed version-tag image promotion next if the goal is repeatable
-release automation. Choose P4.3 only when runtime split/merge semantics are the
-immediate priority; it should remain gated until target worker policy and
-assignment mutation rules are explicit.
+Choose P4.3 only when runtime split/merge semantics are the immediate priority;
+it should remain gated until target worker policy and assignment mutation rules
+are explicit.

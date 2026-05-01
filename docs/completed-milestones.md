@@ -142,10 +142,13 @@ Completed slices:
    HTTPRoute or runtime split/merge activation was added.
 4. Published and verified the initial `ec8c42b4` runtime image as
    `linux/amd64` for the cluster node platform.
-5. Confirmed ArgoCD `tessera` reached `Synced / Healthy`, all runtime pods were
-   ready, Gateway `ping --ts 123` worked through port-forward, Gateway `/ready`
-   reported ready, and Orchestrator `/split-merge/preview` returned
-   `assignments_changed=false`.
+5. Added a build/push-only GitHub Actions image workflow, verified Harbor
+   credentials, published `v2026.05.1`, and promoted that tag through the k8s
+   GitOps repo.
+6. Confirmed ArgoCD `tessera` reached `Synced / Healthy`, all runtime pods were
+   ready on `v2026.05.1`, Gateway `ping --ts 123` worked through port-forward,
+   Gateway `/ready` reported ready, and Orchestrator `/split-merge/preview`
+   returned `assignments_changed=false`.
 
 Verification used for this slice:
 
@@ -154,6 +157,8 @@ cargo test
 cargo xt
 make validate
 docker buildx imagetools inspect harbor.1day1coding.com/1day1coding/tessera:ec8c42b4
+gh workflow run tessera.build-push.yml --ref main
+docker buildx imagetools inspect harbor.1day1coding.com/1day1coding/tessera:v2026.05.1
 kubectl -n argocd get app tessera -o wide
 kubectl -n tessera get pods,svc,externalsecret -o wide
 cargo run -p tessera-client -- ping --ts 123
@@ -165,9 +170,7 @@ curl http://127.0.0.1:6100/split-merge/preview
 
 Open P4 work now starts after P4.2:
 
-1. Harbor-backed GitHub Actions image publish is implemented but blocked on
-   Harbor push credentials or account permission.
-2. Runtime split/merge activation remains gated on assignment mutation
+1. Runtime split/merge activation remains gated on assignment mutation
    semantics.
 
 Use `docs/todo-next.md` for the current open-work index and
