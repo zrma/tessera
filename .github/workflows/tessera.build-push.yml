@@ -1,0 +1,125 @@
+name: build and push image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-tag-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git user
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Get current commit SHA
+        id: get-sha
+        run: |
+          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "sha=${CURRENT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Current commit SHA: ${CURRENT_SHA}"
+
+      - name: Check for existing version tag on this commit
+        id: check-tag
+        run: |
+          CURRENT_SHA="${{ steps.get-sha.outputs.sha }}"
+          EXISTING_TAG=$(git tag --points-at "${CURRENT_SHA}" | grep "^v" | sort -V | tail -n 1 || true)
+
+          if [ -z "${EXISTING_TAG}" ]; then
+            echo "existing_tag=false" >> "$GITHUB_OUTPUT"
+            echo "No existing version tag found for this commit."
+          else
+            echo "existing_tag=true" >> "$GITHUB_OUTPUT"
+            echo "existing_tag_name=${EXISTING_TAG}" >> "$GITHUB_OUTPUT"
+            echo "Existing version tag found for this commit: ${EXISTING_TAG}"
+          fi
+
+      - name: Get next version tag
+        id: tag-version
+        if: steps.check-tag.outputs.existing_tag == 'false'
+        run: |
+          YEAR=$(date +%Y)
+          MONTH=$(date +%m)
+          LATEST_TAG=$(git tag -l "v${YEAR}.${MONTH}.*" --sort=version:refname | tail -n 1)
+
+          if [ -z "${LATEST_TAG}" ]; then
+            NEW_VERSION="0"
+          else
+            CURRENT_VERSION=$(echo "${LATEST_TAG}" | grep -o '[0-9]*$')
+            NEW_VERSION=$((CURRENT_VERSION + 1))
+          fi
+
+          NEW_TAG="v${YEAR}.${MONTH}.${NEW_VERSION}"
+          echo "new_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "New tag will be: ${NEW_TAG}"
+
+      - name: Use existing version tag
+        id: existing-tag
+        if: steps.check-tag.outputs.existing_tag == 'true'
+        run: |
+          echo "new_tag=${{ steps.check-tag.outputs.existing_tag_name }}" >> "$GITHUB_OUTPUT"
+          echo "Using existing tag: ${{ steps.check-tag.outputs.existing_tag_name }}"
+
+      - name: Create and push version tag
+        if: steps.check-tag.outputs.existing_tag == 'false'
+        run: |
+          git tag "${{ steps.tag-version.outputs.new_tag }}"
+          git push origin "${{ steps.tag-version.outputs.new_tag }}"
+
+      - name: Set final Docker tag
+        id: final-tag
+        run: |
+          if [ "${{ steps.check-tag.outputs.existing_tag }}" = "true" ]; then
+            FINAL_TAG="${{ steps.existing-tag.outputs.new_tag }}"
+          else
+            FINAL_TAG="${{ steps.tag-version.outputs.new_tag }}"
+          fi
+
+          echo "tag=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Final Docker image tag: ${FINAL_TAG}"
+
+      - name: Normalize Harbor registry
+        id: harbor-registry
+        env:
+          RAW_REGISTRY: ${{ secrets.HARBOR_URL }}
+        run: |
+          REGISTRY="${RAW_REGISTRY#https://}"
+          REGISTRY="${REGISTRY#http://}"
+          REGISTRY="${REGISTRY%/}"
+          REGISTRY="${REGISTRY%%/*}"
+
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "Using Harbor registry host: ${REGISTRY}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.0.0
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v4.1.0
+        with:
+          registry: ${{ steps.harbor-registry.outputs.registry }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.harbor-registry.outputs.registry }}/1day1coding/tessera:${{ steps.final-tag.outputs.tag }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

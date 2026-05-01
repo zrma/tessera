@@ -32,6 +32,26 @@ docker run --rm tessera:local tessera-worker
 docker run --rm tessera:local tessera-gateway
 ```
 
+## Harbor Image Publish
+
+Production images are published by the manual `build and push image` GitHub
+Actions workflow. The workflow creates or reuses a `vYYYY.MM.N` Git tag for the
+selected commit, builds `linux/amd64`, and pushes:
+
+```text
+harbor.1day1coding.com/1day1coding/tessera:<tag>
+```
+
+Required repository secrets:
+
+- `HARBOR_URL`
+- `HARBOR_USERNAME`
+- `HARBOR_PASSWORD`
+
+`HARBOR_URL` may include `https://`; the workflow normalizes it to the registry
+host before Docker login. The workflow only builds and pushes the image. Runtime
+GitOps tag promotion stays in the k8s GitOps repo.
+
 ## Docker Compose Smoke
 
 `deploy/docker-compose.yml` runs one orchestrator, one worker, and one gateway

@@ -9,8 +9,8 @@ sessions, AOI precision controls, per-cell tick structure, observability
 endpoints, packaging samples, split/merge planner skeletons, and fixture-backed
 dry-run preview smoke, plus request-id-based Join/Move latency correlation.
 P4.2 internal GitOps manifests are prepared in the k8s GitOps repo, with
-cluster sync and runtime smoke still pending. Completed milestone details are archived in
-`docs/completed-milestones.md`.
+cluster runtime smoke still pending. Completed milestone details are archived
+in `docs/completed-milestones.md`.
 
 The next substantial milestones now cross either production cluster rollout or
 runtime assignment mutation.
@@ -78,12 +78,15 @@ Completed implementation:
 
 ## P4.2 Production Kubernetes Manifests
 
-Status: internal-only manifest slice prepared as of 2026-05-01; GitOps push,
-ArgoCD sync, and runtime smoke are still pending.
+Status: internal-only manifest slice pushed and ArgoCD synced as of
+2026-05-01; runtime smoke is blocked until the image is rebuilt for the cluster
+node platform.
 
 Implemented first-slice defaults:
 
-1. Published `harbor.1day1coding.com/1day1coding/tessera:ec8c42b4`.
+1. Bootstrapped `harbor.1day1coding.com/1day1coding/tessera:ec8c42b4` locally;
+   that image was `linux/arm64` only and could not run on the `linux/amd64`
+   MicroK8s nodes.
 2. Added namespace `tessera` with restricted pod-security labels and Istio
    revision label matching the current app namespace pattern.
 3. Added one Orchestrator, one Worker, and one Gateway, all behind ClusterIP
@@ -111,9 +114,19 @@ docker push harbor.1day1coding.com/1day1coding/tessera:ec8c42b4
 make validate
 ```
 
+Image publish follow-up:
+
+```sh
+gh workflow run tessera.build-push.yml --ref main
+```
+
+The workflow builds `linux/amd64` on GitHub Actions and pushes a `vYYYY.MM.N`
+tag to Harbor. After it succeeds, update the k8s GitOps manifest image tag to
+that version tag and let ArgoCD roll out the new image.
+
 Remaining rollout checks:
 
-1. Push the k8s GitOps commit after confirming the remote bookmark move.
+1. Update the k8s GitOps manifest tag to the GitHub Actions image tag.
 2. Confirm ArgoCD Application `tessera` reaches `Synced / Healthy`.
 3. Confirm `kubectl -n tessera get pods,svc` shows all components ready.
 4. Port-forward the internal Gateway and verify `tessera-client ping --ts 123`.
