@@ -2211,6 +2211,7 @@ async fn flush_buffered_moves_for_cells(
                 Some(buffered.connection_epoch.as_ref()),
                 buffered.client_id,
                 buffered.owner_id,
+                None,
                 buffered.peer,
                 cell,
                 buffered.actor,
@@ -3527,6 +3528,20 @@ struct AoiCandidate {
 }
 
 fn candidate_cell(cell: CellId, dx: i32, dy: i32) -> CellId {
+    if cell.depth == 1 && cell.sub < 4 {
+        let fine_x = cell.cx * 2 + i32::from(cell.sub % 2) + dx;
+        let fine_y = cell.cy * 2 + i32::from(cell.sub / 2) + dy;
+        let child_x = fine_x.rem_euclid(2);
+        let child_y = fine_y.rem_euclid(2);
+        return CellId {
+            world: cell.world,
+            cx: fine_x.div_euclid(2),
+            cy: fine_y.div_euclid(2),
+            depth: cell.depth,
+            sub: (child_y * 2 + child_x) as u8,
+        };
+    }
+
     CellId {
         world: cell.world,
         cx: cell.cx + dx,
@@ -4577,6 +4592,7 @@ async fn apply_client_move(
     epoch_tracker: Option<&AtomicU32>,
     client_id: u64,
     owner_id: u64,
+    mut owned_actors: Option<&mut HashSet<(CellId, EntityId)>>,
     peer: SocketAddr,
     cell: CellId,
     actor: EntityId,
@@ -4792,8 +4808,16 @@ async fn apply_client_move(
         .enqueue_move_broadcast(cell, actor, client_id, epoch)
         .await;
 
-    let root_actors = state.client_root_actors(client_id).await;
-    let owned_actor_positions = state.actor_positions(&root_actors).await;
+    state
+        .upsert_client_root(subscriber, cell, actor, epoch)
+        .await;
+    let owned_actor_positions = if let Some(owned_actors) = owned_actors.as_mut() {
+        owned_actors.insert((cell, actor));
+        state.actor_positions(owned_actors).await
+    } else {
+        let root_actors = state.client_root_actors(client_id).await;
+        state.actor_positions(&root_actors).await
+    };
     let desired_targets = desired_aoi_targets_for_positions(
         &owned_actor_positions,
         state.aoi_radius_cells,
@@ -5178,6 +5202,7 @@ async fn handle_upstream_inner(
                     Some(epoch.as_ref()),
                     client_id,
                     owner_id,
+                    Some(&mut owned_actors),
                     peer,
                     cell,
                     actor,
@@ -5485,6 +5510,57 @@ mod tests {
                 None,
             ),
             HashSet::from([origin, adjacent])
+        );
+    }
+
+    #[test]
+    fn desired_aoi_cells_for_depth_one_reaches_split_siblings() {
+        let child3 = CellId {
+            world: 0,
+            cx: 0,
+            cy: 0,
+            depth: 1,
+            sub: 3,
+        };
+        let child2 = CellId { sub: 2, ..child3 };
+        let child1 = CellId { sub: 1, ..child3 };
+        let child0 = CellId { sub: 0, ..child3 };
+        let east_parent_child2 = CellId {
+            cx: 1,
+            sub: 2,
+            ..child3
+        };
+        let north_parent_child1 = CellId {
+            cy: 1,
+            sub: 1,
+            ..child3
+        };
+        let owned_cells = HashSet::from([
+            child3,
+            child2,
+            child1,
+            child0,
+            east_parent_child2,
+            north_parent_child1,
+        ]);
+        let root_positions = vec![(child3, Position { x: 16.0, y: 16.0 })];
+
+        assert_eq!(
+            desired_aoi_cells(
+                &root_positions,
+                &owned_cells,
+                1,
+                DEFAULT_AOI_CELL_SPAN_UNITS,
+                None,
+            ),
+            HashSet::from([
+                child3,
+                child2,
+                child1,
+                child0,
+                east_parent_child2,
+                north_parent_child1,
+            ])
         );
     }
 
@@ -6195,6 +6271,7 @@ mod tests {
             None,
             subscriber.client_id,
             session_owner_id,
+            None,
             "127.0.0.1:9999".parse().unwrap(),
             cell,
             actor,
@@ -6261,6 +6338,7 @@ mod tests {
             None,
             subscriber.client_id,
             owner_session + 1,
+            None,
             "127.0.0.1:9999".parse().unwrap(),
             cell,
             actor,
@@ -6286,6 +6364,7 @@ mod tests {
             None,
             subscriber.client_id,
             owner_session,
+            None,
             "127.0.0.1:9999".parse().unwrap(),
             cell,
             actor,
