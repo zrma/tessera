@@ -11,11 +11,29 @@ tests, an assignment-safe dry-run preview endpoint, a fixture-backed runtime
 smoke that proves the preview can emit a non-empty split plan, and a
 default-off manual split activation replay/publish RPC. Automatic rebalancing,
 runtime merge activation, real metrics ingestion, and multi-depth assignment
-changes are not implemented yet.
+changes are not implemented yet. A local two-Worker activation smoke now proves
+successful manual split publication, Gateway child route convergence,
+source/target Worker owned-cell refresh, stable-session post-split Move, and
+remote child AOI resync. A companion failure smoke injects a post-publish target
+Worker outage, records failed child convergence without automatic rollback, and
+verifies target Worker restart recovery. A local activation soak smoke runs
+sustained child Ping/Move traffic after publish and records route convergence,
+remote AOI frames, Gateway latency histogram growth, and Gateway client close
+counters. A planner-to-operator helper converts dry-run preview output plus
+Orchestrator health/listing into mutation-free operator evidence and a manual
+submission command template. An internal MicroK8s helper now automates the
+port-forwarded plan, optional publish, and guarded target Worker scale-down/up
+failure recovery smoke, but live cluster evidence is still blocked until the
+two-Worker GitOps slice is approved and synced.
 
 P4.3's first activation shape is now fixed as a manual, feature-flagged,
 split-only runtime slice. The implementation milestone should follow this
 contract instead of widening into automatic rebalancing or merge activation.
+The local post-publish failure smoke verifies failure evidence and target Worker
+restart recovery; it does not implement automatic rollback or runtime cooldown
+enforcement. The P5 recovery policy is explicit operator recovery plus GitOps
+backout for controlled smoke rollback; runtime merge activation stays outside
+this completion boundary.
 
 The design assumes the existing V0/V1 foundations stay intact:
 
@@ -187,7 +205,8 @@ boundary:
    before publication.
 6. Atomically publish the child assignments and remove the parent assignment.
 7. Verify Gateway route convergence, Worker owned-cell refresh, and AOI resync;
-   then clear the operation and cooldown marker.
+   then clear the operation. A later automated planner policy may also clear a
+   cooldown marker here.
 
 Rollback rules:
 
@@ -198,24 +217,26 @@ Rollback rules:
   parent remains the only writable assignment, prepared child payloads are
   aborted, and source buffered moves stay on the source-side split replay path.
 - If publication succeeds but post-publish convergence checks fail, do not
-  automatically merge back in the first slice. Mark the operation failed,
-  place the family in cooldown, surface the failed convergence evidence, and
-  require an explicit operator recovery command or a later merge/rollback
-  milestone.
+  automatically merge back in the first slice. Surface the failed convergence
+  evidence and require explicit operator target restoration. For a controlled
+  smoke rollback, revert the GitOps image/topology/fixture/flag slice and wait
+  for ArgoCD `Synced / Healthy`. Cooldown marking remains policy-only until a
+  later planner/runtime milestone implements it.
 - Automatic planner retries must stay disabled. Manual retry is allowed only
-  after the failed operation is cleared and the cooldown policy permits another
-  attempt.
+  after the failed operation is cleared; if a later cooldown policy is enabled,
+  it must also permit another attempt.
 
 ## Runtime Sequence
 
 1. Observe rolling metrics and build a deterministic candidate list.
-2. Reserve a split/merge plan with an operation id and cooldown marker.
+2. Reserve a split/merge plan with an operation id and, for automated planner
+   policy, a cooldown marker.
 3. Materialize target assignments in Orchestrator memory but do not publish them
    as active ownership yet.
 4. Use `PreCopy -> Freeze -> Diff -> Commit` handover for each ownership move.
 5. Publish updated assignments through existing listing/watch paths.
 6. Monitor replay, route switch, AOI subscription counts, and retry/error rates.
-7. Clear the plan or mark it failed with cooldown.
+7. Clear the plan or mark it failed with policy-selected cooldown.
 
 ## Required Invariants
 
@@ -266,10 +287,67 @@ The current P4.3 replay/publish slice adds focused checks for:
   the four children and no longer publish the parent.
 - Replay failure rollback: failed source replay keeps `assignments_changed=false`,
   leaves the parent assignment published, and aborts prepared target payloads.
+- Local activation convergence smoke: `cargo xt dev activation-smoke` starts a
+  two-Worker dev stack, enables manual activation, publishes a split, waits for
+  Gateway `/ready` to report four routes, pings all children through the
+  source/target Workers, moves a replayed actor through a stable Gateway
+  session after the route switch, and verifies a remote child AOI resync
+  snapshot. The smoke writes the latest local evidence to
+  `.dev/reports/activation-smoke-latest.json`.
+- Local post-publish failure smoke: `cargo xt dev activation-failure-smoke`
+  publishes the same split, stops the target Worker after publication, verifies
+  only target-owned children fail convergence while assignments remain
+  published, restarts the target Worker, and verifies all child routes recover.
+  The smoke writes the latest local evidence to
+  `.dev/reports/activation-failure-smoke-latest.json`.
+- Local activation soak smoke: `cargo xt dev activation-soak [--iterations 32]
+  [--sleep-ms 10]` publishes the same split, runs repeated child Ping/Move
+  traffic, verifies route convergence remains at four child routes, observes
+  remote AOI frames, checks Gateway latency histogram growth and zero Gateway
+  client close counters, and writes evidence to
+  `.dev/reports/activation-soak-latest.json`.
+- Local activation report check: `cargo xt dev activation-report-check`
+  validates the latest local plan, success, failure/recovery, and soak reports
+  against the P5 local evidence contract and rollback policy.
+- Planner-to-operator smoke: `cargo xt dev activation-plan-smoke` starts a
+  two-Worker dev stack with a fixture-backed split preview, runs
+  `cargo xt split-activation-plan`, verifies the report is ready, verifies the
+  deterministic `worker-a`/`worker-b` target map, and confirms assignments stay
+  unchanged. The helper writes evidence to
+  `.dev/reports/split-activation-plan-latest.json`.
+- Operator activation helper: `cargo xt split-activation` submits the same
+  default-off manual RPC using an explicit `--target sub=worker-id` map and exits
+  non-zero unless the operation publishes four child assignments.
+- Internal MicroK8s activation helper: `cargo xt k8s activation-smoke` starts
+  Orchestrator/Gateway service port-forwards, writes a mutation-free plan by
+  default, requires `--allow-activation` before `SubmitSplitActivation`, and
+  requires `--with-failure --allow-scale` before scaling the target Worker down
+  and back up. `--require-target-worker` extends the read-only preflight so the
+  target Worker deployment and image must exist before the plan is trusted.
+  Successful cluster runs write
+  `.dev/reports/internal-microk8s-activation-smoke-latest.json`.
+
+### P5 rollback and recovery policy
+
+The P5 split-activation completion boundary uses
+`operator_recovery_no_automatic_merge_rollback_v1`.
+
+- Automatic rollback is disabled for this slice. A post-publish target outage
+  must be surfaced as operator evidence instead of silently merging back.
+- Runtime merge activation remains deferred outside the P5 split-activation
+  completion boundary. The merge planner can stay dry-run/design evidence until
+  a later milestone chooses sibling coalescing and rollback semantics.
+- Operator recovery is target restoration: restart or restore the failed target
+  Worker and rerun convergence checks until all child routes answer.
+- GitOps backout for a controlled smoke window is to revert the smoke slice:
+  image tag, second Worker topology, preview fixture, and manual activation
+  flag. Wait for ArgoCD `Synced / Healthy` before retrying activation.
+- `cargo xt k8s activation-report-check --require-published --require-failure`
+  requires the final cluster report to include this policy and to have an empty
+  `remaining_uncovered` list.
 
 The next runtime slice must add focused checks for:
 
-- Gateway routes converge, Worker owned-cell state refreshes, and AOI
-  subscriptions are recalculated under a dev activation smoke.
-- Post-publish failure path: failed convergence is surfaced with cooldown and
-  does not trigger automatic merge rollback.
+- Actual internal MicroK8s activation evidence after the approved two-Worker
+  GitOps smoke topology is synced, following
+  `docs/internal-microk8s-activation-smoke.md`.

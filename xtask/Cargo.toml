@@ -6,3 +6,9 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tessera-core = { path = "../crates/tessera-core" }
+tessera-proto = { path = "../crates/tessera-proto" }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tonic.workspace = true

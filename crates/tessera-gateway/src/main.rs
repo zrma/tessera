@@ -377,6 +377,20 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             .metrics
                             .upstream_closed
                             .fetch_add(1, Ordering::Relaxed);
+                        if conn.has_non_ping_traffic
+                            && pending_requests.is_empty()
+                            && pending_pings.is_empty()
+                        {
+                            warn!(
+                                target: "gateway",
+                                %peer,
+                                worker = %conn.route.worker_id,
+                                addr = %conn.route.addr,
+                                "upstream closed after completed non-ping traffic; keeping client connection open"
+                            );
+                            conn.close().await;
+                            continue;
+                        }
                         if conn.has_non_ping_traffic {
                             let close_reason = record_client_close(
                                 routing.metrics.as_ref(),
@@ -585,6 +599,21 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                             .metrics
                             .upstream_read_errors
                             .fetch_add(1, Ordering::Relaxed);
+                        if conn.has_non_ping_traffic
+                            && pending_requests.is_empty()
+                            && pending_pings.is_empty()
+                        {
+                            warn!(
+                                target: "gateway",
+                                %peer,
+                                worker = %conn.route.worker_id,
+                                addr = %conn.route.addr,
+                                error = ?e,
+                                "upstream read failed after completed non-ping traffic; keeping client connection open"
+                            );
+                            conn.close().await;
+                            continue;
+                        }
                         if conn.has_non_ping_traffic {
                             let close_reason = record_client_close(
                                 routing.metrics.as_ref(),
@@ -2042,7 +2071,7 @@ fn validate_addr_with_port(addr: &str, label: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tessera_core::{ActorState, EntityId, Envelope, Position, ServerMsg, encode_frame};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -3290,6 +3319,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_non_ping_disconnect_keeps_client_for_next_route() {
+        let worker_a_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker a");
+        let worker_a_addr = worker_a_listener.local_addr().expect("worker a addr");
+        let worker_b_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker b");
+        let worker_b_addr = worker_b_listener.local_addr().expect("worker b addr");
+
+        let (a_done_tx, a_done_rx) = oneshot::channel();
+        let mut worker_a_task = tokio::spawn(run_join_reply_then_close_worker(
+            worker_a_listener,
+            a_done_tx,
+        ));
+        let (b_done_tx, b_done_rx) = oneshot::channel();
+        let mut worker_b_task = tokio::spawn(run_ping_worker_once(worker_b_listener, 9, b_done_tx));
+
+        let cell = CellId::grid(0, 0, 0);
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(cell),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: worker_a_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        let mut gateway_task = tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                handle_conn(sock, peer, routing_clone)
+                    .await
+                    .expect("handle conn");
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+        let join = Envelope {
+            cell,
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Join {
+                actor: EntityId(1),
+                pos: Position { x: 0.0, y: 0.0 },
+            },
+        };
+        client
+            .write_all(&encode_frame(&join))
+            .await
+            .expect("send join");
+        let reply = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert!(matches!(reply.payload, ServerMsg::Snapshot { .. }));
+        timeout(Duration::from_millis(500), a_done_rx)
+            .await
+            .expect("worker a did not close")
+            .expect("worker a done");
+
+        let listing_updated = AssignmentListing {
+            workers: vec![AssignmentBundle {
+                worker_id: "worker-b".to_string(),
+                addr: worker_b_addr.to_string(),
+                cells: vec![Assignment {
+                    world: cell.world,
+                    cx: cell.cx,
+                    cy: cell.cy,
+                    depth: u32::from(cell.depth),
+                    sub: u32::from(cell.sub),
+                }],
+            }],
+            handovers: vec![],
+        };
+        apply_listing_update(&routing, listing_updated)
+            .await
+            .expect("apply listing update");
+        wait_for_upstream_closed(&routing).await;
+
+        let ping = Envelope {
+            cell,
+            seq: 1,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 9 },
+        };
+        client
+            .write_all(&encode_frame(&ping))
+            .await
+            .expect("send ping after completed upstream close");
+        let pong = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert_eq!(pong.payload, ServerMsg::Pong { ts: 9 });
+
+        let metrics = routing.metrics_snapshot().await;
+        assert!(metrics.upstream_closed >= 1);
+        assert_eq!(metrics.client_closes_ambiguous_upstream, 0);
+
+        timeout(Duration::from_millis(500), b_done_rx)
+            .await
+            .expect("worker b timeout")
+            .expect("worker b done");
+        drop(client);
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker-a", &mut worker_a_task).await;
+        wait_task("worker-b", &mut worker_b_task).await;
+    }
+
+    #[tokio::test]
     async fn upstream_disconnect_allows_reconnect() {
         let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
         let worker_addr = worker_listener.local_addr().expect("worker addr");
@@ -3814,6 +3956,38 @@ mod tests {
         let _ = done.send(request_id);
     }
 
+    async fn run_join_reply_then_close_worker(listener: TcpListener, done: oneshot::Sender<()>) {
+        let (mut socket, _peer) = listener.accept().await.expect("accept worker");
+        let env_in = read_client_envelope(&mut socket).await;
+        let request_id = env_in.request_id.expect("gateway request id");
+        assert!(env_in.session.is_some());
+        let cell = env_in.cell;
+        let actor = match env_in.payload {
+            ClientMsg::Join { actor, .. } => actor,
+            other => panic!("expected join, got {other:?}"),
+        };
+        let env_out = ServerEnvelope {
+            cell,
+            seq: 0,
+            epoch: env_in.epoch,
+            request_id: Some(request_id),
+            payload: ServerMsg::Snapshot {
+                cell,
+                actors: vec![ActorState {
+                    id: actor,
+                    pos: Position { x: 0.0, y: 0.0 },
+                }],
+            },
+        };
+        socket
+            .write_all(&encode_frame(&env_out))
+            .await
+            .expect("write join reply");
+        let _ = socket.shutdown().await;
+        drop(socket);
+        let _ = done.send(());
+    }
+
     async fn run_join_then_close_and_expect_no_reconnect(
         listener: TcpListener,
         received: oneshot::Sender<()>,
@@ -4101,6 +4275,20 @@ mod tests {
             Ok(Ok(_)) => panic!("unexpected data from gateway"),
             Ok(Err(e)) => panic!("unexpected client read error: {e:?}"),
             Err(_) => panic!("gateway did not close client connection in time"),
+        }
+    }
+
+    async fn wait_for_upstream_closed(routing: &RoutingTable) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if routing.metrics_snapshot().await.upstream_closed > 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gateway did not observe upstream close in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

@@ -13,9 +13,9 @@ runtime-smoked on the MicroK8s cluster. Completed milestone details are
 archived in `docs/completed-milestones.md`.
 
 The current P4.3 implementation has crossed from private split staging into
-manual runtime assignment publication and replay. The next substantial decision
-is post-publish convergence failure handling and whether merge activation should
-remain design-only.
+manual runtime assignment publication, replay, and a local two-Worker
+convergence smoke. The next substantial decision is post-publish convergence
+failure handling and whether merge activation should remain design-only.
 
 ## 2026-05-01 Decision Checkpoint
 
@@ -139,13 +139,24 @@ Completed image-promotion checks:
 
 ## P4.3 Runtime Split/Merge Activation
 
-Status: default-off manual replay/publish slice implemented; post-publish
-convergence evidence and automatic merge rollback remain open.
+Status: default-off manual replay/publish slice plus planner-to-operator plan
+evidence, local route convergence, remote AOI resync, post-publish target
+outage/restart recovery smoke, and local load/soak observation smoke
+implemented; P5 rollback policy is
+`operator_recovery_no_automatic_merge_rollback_v1`.
+`cargo xt k8s activation-smoke` now provides the internal MicroK8s
+port-forwarded operator helper, but the actual cluster evidence remains open
+until the approved two-Worker GitOps topology and image are synced.
+The 2026-05-02 plan-only run against the current live topology stopped before
+mutation with `no_split_candidate`, because the live preview source is
+`assignment_listing_zero_metrics` and the cluster has no controlled pressure
+fixture or real metrics candidate.
 
 Chosen first slice:
 
 1. Split-only activation. Merge remains dry-run/design-only until a later
-   milestone chooses merge rollback and sibling coalescing behavior.
+   milestone chooses sibling coalescing behavior and a separate merge activation
+   safety model.
 2. Manual activation. Planner output can recommend candidates, but it must not
    auto-submit runtime mutations from observed metrics.
 3. Default-off feature flag. Mutating activation should reject unless an
@@ -160,8 +171,10 @@ Chosen first slice:
 6. All-or-nothing publication. Staged child assignments are private until
    replay succeeds, parent removal and child publication happen atomically, and
    pre-publication failures abort with parent assignment unchanged.
-7. Post-publication convergence failures are surfaced with cooldown and manual
-   recovery; the first slice does not automatically merge back.
+7. Post-publication convergence failures are surfaced as operator evidence with
+   manual target Worker restoration. The first slice does not automatically
+   merge back or enforce runtime cooldown state; controlled-smoke rollback is a
+   GitOps backout of image/topology/fixture/flag changes.
 
 Implemented slices:
 
@@ -183,31 +196,74 @@ Implemented slices:
 
 Remaining implementation:
 
-1. Add stronger route convergence, Worker refresh, AOI resync, and
-   post-publish failure evidence before enabling the flag in any environment.
-2. Decide whether post-publish convergence failure should stay cooldown/manual
-   recovery or grow an automatic merge rollback path.
-3. Keep merge activation disabled until sibling coalescing and rollback
-   semantics are chosen.
+1. Run internal-cluster activation evidence before enabling the flag in any
+   environment beyond controlled smoke runs. The helper exists as
+   `cargo xt k8s activation-smoke`, but the cluster topology/image/flag slice is
+   not applied yet, and the smoke window also needs a controlled preview fixture
+   or real metrics candidate.
+2. Keep merge activation disabled until sibling coalescing and merge-runtime
+   safety semantics are chosen in a later milestone.
+
+Internal MicroK8s activation preflight on 2026-05-02:
+
+1. `kubectl config current-context` reported `microk8s-ts`.
+2. `kubectl -n tessera get deploy,po,svc,cm -o wide` showed
+   `tessera-orch`, `tessera-worker`, and `tessera-gateway` all ready on
+   `harbor.1day1coding.com/1day1coding/tessera:v2026.05.1`, with only one
+   Worker deployment/service.
+3. `../k8s/k8s/apps/tessera/manifests/tessera-runtime.yaml` configures only
+   `worker-a` and does not set
+   `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`.
+
+Conclusion: internal activation smoke is intentionally blocked by the current
+single-worker, preview-only GitOps slice. The next cluster slice must be
+explicitly approved because it changes runtime topology: publish an image that
+contains the activation evidence harness, add a second Worker/service and
+Orchestrator target config, enable the manual activation flag for the controlled
+smoke environment, sync ArgoCD, then run success/failure/recovery smoke through
+port-forward or an in-cluster Job. The concrete command/checklist plan lives in
+`docs/internal-microk8s-activation-smoke.md`.
 
 Verification required for the implementation milestone:
 
 ```sh
 cargo xt
 cargo test
+cargo xt dev activation-plan-smoke
+cargo xt dev activation-smoke
+cargo xt dev activation-failure-smoke
+cargo xt dev activation-soak
+cargo xt dev activation-report-check
+cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --require-target-worker
+cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --allow-activation --with-failure --allow-scale
 cargo xt dev up --with-orch
 cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
 ```
 
-The next implementation should extend the dev smoke with a manual activation
-fixture so successful split publication, failed replay/target paths, Gateway
-route convergence, Worker refresh, and AOI resync are covered by automated
-evidence.
+The current operator/dev flow has `cargo xt split-activation-plan` for
+preview-to-operator evidence without mutation, `cargo xt split-activation` for
+explicit manual submission, and `cargo xt dev activation-plan-smoke` to prove a
+preview split candidate becomes a ready operator plan while assignments remain
+unchanged. `cargo xt dev activation-smoke` covers successful split publication,
+Gateway route convergence, source/target Worker owned-cell refresh, target
+replay, stable-session post-split Move, remote AOI resync snapshot, and local
+JSON evidence. `cargo xt dev activation-failure-smoke` adds post-publish target
+outage detection, failed child convergence evidence, no-automatic-rollback
+observation, and target Worker restart recovery evidence. `cargo xt dev
+activation-soak` adds sustained child Ping/Move traffic, route convergence
+retention, remote AOI frame observation, Gateway latency histogram growth, zero
+Gateway close counters, and local JSON evidence. `cargo xt k8s
+activation-smoke` adds the guarded internal operator flow: service
+port-forward, mutation-free plan, explicit activation publish, optional target
+Worker scale-down failure detection, scale-up recovery, and cluster JSON
+evidence once the controlled topology exists.
 
 ## Recommendation
 
-Continue P4.3 only for convergence hardening or explicit merge policy work. The
-implemented shape is intentionally narrow: split-only, manual, default-off,
-one-level `CellId`, acked replay before atomic publication, and no automatic
+Continue P4.3 only for approved cluster activation evidence. The implemented
+shape is intentionally narrow: split-only, manual, default-off, one-level
+`CellId`, acked replay before atomic publication, local route
+convergence/load-soak smoke, guarded internal smoke helper, target Worker
+restoration as recovery, GitOps controlled-smoke backout, and no automatic
 merge rollback.

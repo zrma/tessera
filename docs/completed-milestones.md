@@ -168,7 +168,8 @@ curl http://127.0.0.1:6100/split-merge/preview
 
 ## P4.3 Manual Split Activation Replay/Publish
 
-Status: replay/publish slice complete as of 2026-05-02.
+Status: replay/publish and local convergence smoke slices complete as of
+2026-05-02.
 
 Completed slices:
 
@@ -190,18 +191,51 @@ Completed slices:
 7. Covered disabled activation, validation failures, unregistered targets,
    successful publication, and source replay failure rollback with
    assignments-unchanged tests.
+8. Added `cargo xt dev activation-smoke`, which starts a manual two-Worker dev
+   stack, publishes a split, verifies four Gateway child routes, pings
+   source/target-owned children, observes target relay replay metrics, moves a
+   replayed actor through a stable Gateway session after route switch, and
+   verifies a remote child AOI resync snapshot. The smoke writes
+   `.dev/reports/activation-smoke-latest.json` as local evidence.
+9. Added `cargo xt split-activation` as the operator-facing manual submission
+   helper for explicit `sub=worker-id` target maps.
+10. Added `cargo xt dev activation-failure-smoke`, which injects a
+    post-publish target Worker outage, verifies target-owned child convergence
+    fails while child assignments remain published, confirms no automatic
+    rollback, restarts the target Worker, and verifies all child routes recover.
+11. Added `cargo xt dev activation-soak`, which publishes the same split, runs
+    repeated child Ping/Move traffic, verifies child route convergence remains
+    stable, observes remote AOI frames, checks Gateway latency histogram growth
+    and zero Gateway client close counters, and writes
+    `.dev/reports/activation-soak-latest.json`.
+12. Added `cargo xt split-activation-plan` and `cargo xt dev
+    activation-plan-smoke`, which turn a dry-run preview split candidate plus
+    Orchestrator health/listing into mutation-free operator evidence, a
+    deterministic target map, preconditions, and a manual submission command
+    template at `.dev/reports/split-activation-plan-latest.json`.
+13. Added `cargo xt k8s activation-smoke`, which runs the internal MicroK8s
+    operator flow through service port-forwards. It writes a plan-only report by
+    default, requires `--allow-activation` before publishing a split, and
+    requires `--with-failure --allow-scale` before scaling the target Worker
+    down/up for failure and recovery evidence.
 
 Deferred from this slice:
 
-- Long-running Gateway route convergence assertions, Worker refresh/AOI resync
-  smoke for a live activation fixture, automatic merge rollback, and
-  post-publish convergence failure handling.
+- Runtime merge activation implementation and actual internal MicroK8s
+  activation evidence from an approved two-Worker GitOps smoke topology. The P5
+  split-activation rollback policy is operator recovery plus GitOps backout, not
+  automatic merge rollback.
 
 Verification used for this slice:
 
 ```sh
 cargo xt
 cargo test
+cargo test -p xtask
+cargo xt dev activation-plan-smoke
+cargo xt dev activation-smoke
+cargo xt dev activation-failure-smoke
+cargo xt dev activation-soak
 cargo xt dev up --with-orch
 cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
@@ -211,10 +245,10 @@ cargo xt dev down --with-orch
 
 Open P4 work now starts after the P4.3 replay/publish slice:
 
-1. Add route convergence, Worker refresh, AOI resync, and post-publish failure
-   evidence to an activation smoke.
-2. Decide whether merge activation and automatic rollback should be enabled or
-   kept behind a later manual recovery milestone.
+1. Run internal MicroK8s activation smoke after the two-Worker GitOps topology
+   and image promotion are approved and synced.
+2. Keep runtime merge activation behind a later milestone with its own sibling
+   coalescing and safety policy.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.
