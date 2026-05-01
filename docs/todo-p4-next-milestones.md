@@ -1,58 +1,83 @@
 # Tessera P4 Next Milestones
 
-Last reviewed: 2026-04-30
+Last reviewed: 2026-05-01
 
 ## Baseline
 
-P0 through P3 are complete through handover replay ownership, stable Gateway
+P0 through P4.1 are complete through handover replay ownership, stable Gateway
 sessions, AOI precision controls, per-cell tick structure, observability
 endpoints, packaging samples, split/merge planner skeletons, and fixture-backed
-dry-run preview smoke. Completed milestone details are archived in
+dry-run preview smoke, plus request-id-based Join/Move latency correlation.
+Completed milestone details are archived in
 `docs/completed-milestones.md`.
 
-There is no uncommitted implementation work at this planning point. The next
-substantial milestones all cross a decision boundary: protocol shape, production
-cluster policy, or runtime assignment mutation.
+There is no additional autonomous implementation slice at this planning point
+after P4.1. The next substantial milestones cross either production cluster
+policy or runtime assignment mutation.
 
-## 2026-04-30 Decision Checkpoint
+## 2026-05-01 Decision Checkpoint
 
-No safe autonomous implementation slice remains before choosing a P4 branch.
+No safe autonomous implementation slice remains before choosing the next P4
+branch.
 Pick one of these directions to unblock the next commit-sized milestone:
 
-1. P4.1 for local code progress: approve adding a request correlation field to
-   client/server protocol envelopes, with backward-compatible decode defaults.
-2. P4.2 for cluster rollout: provide the live GitOps target details for image,
+1. P4.2 for cluster rollout: provide the live GitOps target details for image,
    namespace, Gateway exposure, Prometheus discovery, resources, and rollout
    policy.
-3. P4.3 for runtime split/merge: approve the first activation shape, target
+2. P4.3 for runtime split/merge: approve the first activation shape, target
    worker policy, multi-depth `CellId` semantics, and manual-vs-automatic plan
    submission.
 
-Default recommendation remains P4.1 unless operating Tessera on the existing
-cluster is the immediate goal.
+Default recommendation is P4.2 if operating Tessera on the existing cluster is
+the immediate goal. Otherwise keep P4.3 gated until runtime split/merge
+semantics are explicitly chosen.
 
 ## P4.1 Non-Ping Request Latency Correlation
 
-Status: escalation required before implementation.
+Status: complete as of 2026-05-01.
 
-Decision needed:
+Decision chosen:
 
-- Add a protocol-level request id/correlation key to client/server envelopes, or
-  keep Gateway latency metrics scoped to Ping/Pong RTT until another protocol
-  change justifies the correlation field.
+- Add optional envelope-level `request_id` correlation. Gateway assigns it to
+  Join/Move requests, Workers echo it only on direct replies, and broadcast
+  traffic keeps it unset.
 
-Why it is blocked:
+Why explicit correlation was required:
 
 - Join/Move responses and broadcast Snapshot/Delta traffic currently share the
   same `ServerMsg` stream. Gateway-side FIFO matching would count unrelated
   broadcast traffic as request latency.
 
-Suggested implementation after approval:
+Decision options considered:
 
-1. Add explicit request correlation to `ClientEnvelope`/server replies.
-2. Preserve backward-compatible decode defaults for existing scripted clients.
-3. Track Gateway latency for Join/Move only when the reply correlation matches.
-4. Extend tests and `cargo xt dev metrics-smoke`.
+1. Keep Ping/Pong-only latency metrics and leave non-Ping latency deferred.
+   This avoids protocol churn, but does not advance P4.1 beyond the current
+   baseline.
+2. Infer Join/Move latency by FIFO response order at the Gateway. This is not
+   recommended because broadcast `Snapshot`/`Delta`/`Despawn` frames can arrive
+   between a request and its direct reply.
+3. Reuse existing `seq`/`epoch` as a correlation key. This is not recommended
+   because those fields currently describe stream ordering and connection epoch,
+   not a reply-echo contract.
+4. Add request ids to individual `ServerMsg` payload variants. This is possible
+   but broadens the payload surface and mixes direct-reply metadata into
+   broadcast message shapes.
+5. Add separate Join/Move acknowledgement payloads. This gives the cleanest
+   semantic split, but changes client-visible behavior more than the first P4.1
+   baseline needs.
+6. Recommended: add an optional envelope-level `request_id` that the Gateway
+   assigns to Join/Move requests and Workers echo only on direct replies. Keep
+   serde defaults/skip-when-none for backward-compatible JSON frames, and do not
+   attach request ids to broadcast traffic.
+
+Completed implementation:
+
+1. Added optional `request_id` correlation to `ClientEnvelope` and server reply
+   envelopes.
+2. Preserved backward-compatible decode defaults for existing scripted clients.
+3. Gateway tracks Join/Move latency only when the reply `request_id` matches a
+   pending request.
+4. Tests and `cargo xt dev metrics-smoke` cover the new metric path.
 
 ## P4.2 Production Kubernetes Manifests
 
@@ -98,7 +123,7 @@ Suggested implementation after approval:
 
 ## Recommendation
 
-The safest next milestone is P4.1 if the goal is local code progress, because it
-keeps deployment and assignment mutation out of scope. If the goal is operating
-Tessera on the existing cluster, choose P4.2 first. P4.3 should come last unless
-runtime split/merge semantics are the immediate priority.
+Choose P4.2 next if the goal is operating Tessera on the existing cluster.
+Choose P4.3 only when runtime split/merge semantics are the immediate priority;
+it should remain gated until target worker policy and assignment mutation rules
+are explicit.

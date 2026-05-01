@@ -43,7 +43,7 @@ Cell-based world orchestration for real-time servers in Rust.
   - `cargo run -p tessera-client -- ping --ts 123`
   - `cargo xt dev down --with-orch`
 - Metrics 스모크:
-  - `cargo xt dev metrics-smoke` (Gateway `127.0.0.1:4100`, Worker `127.0.0.1:5100`, Orchestrator `127.0.0.1:6100`의 `/metrics`, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed dry-run plan, Ping/Pong latency histogram 증가를 확인)
+  - `cargo xt dev metrics-smoke` (Gateway `127.0.0.1:4100`, Worker `127.0.0.1:5100`, Orchestrator `127.0.0.1:6100`의 `/metrics`, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed dry-run plan, Ping/Pong 및 Join/Move latency histogram 증가를 확인)
 - Packaging 예시:
   - 컨테이너 이미지: `docker build -t tessera:local .`
   - Compose smoke: `docker compose -f deploy/docker-compose.yml up --build`
@@ -103,19 +103,20 @@ Cell-based world orchestration for real-time servers in Rust.
 - Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
 - Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
 - Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 per-cell tick flush batch에서 처리하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화한다. AOI는 cell radius, edge margin, visibility radius, max-cell cap으로 제한할 수 있으며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 fanout을 재사용하고 opt-in `/metrics`로 relay fanout/backpressure/reconnect 카운터를 노출
-- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Orchestrator는 assignment 변경 없는 `GET /split-merge/preview` dry-run endpoint를 제공한다. Gateway는 route availability 기반 `/ready`, reconnect/close-reason counters, Ping/Pong round-trip latency histogram을 노출
+- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand` gRPC 엔드포인트를 제공하고, Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Orchestrator는 assignment 변경 없는 `GET /split-merge/preview` dry-run endpoint를 제공한다. Gateway는 route availability 기반 `/ready`, reconnect/close-reason counters, Ping/Pong round-trip latency histogram, request-id로 매칭된 Join/Move round-trip latency histogram을 노출
 - Handover runtime baseline: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하고, Orchestrator `ListAssignments`/`WatchAssignments`가 active handover status를 내려주며, source Worker는 `Freeze`/`Diff` 중 bounded buffer에 client move를 보관한다. `Abort`처럼 source가 계속 cell을 소유하면 buffered move를 FIFO로 로컬 replay하고, `Commit`은 target Worker 등록과 bounded retry budget을 확인한 뒤 assignment를 target으로 전환한다. source Worker는 commit release 시 actor snapshot, actor별 owner session manifest, buffered move를 target Worker에 `HandoverReplay` relay payload로 넘기며, target은 replay를 idempotent하게 적용하고 owner map을 즉시 구성한다.
 - 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
 
 ### 🚧 Planned / Upcoming
-- Worker 간 ghost relay의 장기 scrape/tracing assertions와 비-Ping request latency 계측 고도화
+- Worker 간 ghost relay와 request latency의 장기 scrape/tracing assertions
 - Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로만 제공되며, production target별 manifests는 아직 미구현
 - 리밸런싱 자동화, 동적 분할(V1/V2) 런타임 구현은 아직 미구현이며, Orchestrator에는 비활성 split/merge planner skeleton과 fixture-backed dry-run preview smoke만 있다 (`docs/dynamic-split-merge.md`에 설계 노트)
-- P0/P1/P2/P3 완료 기록은 `docs/completed-milestones.md`에 둔다.
+- P0/P1/P2/P3/P4.1 완료 기록은 `docs/completed-milestones.md`에 둔다.
 - 현재 milestone decision gate는 `docs/todo-next.md`와 `docs/todo-p4-next-milestones.md`에 둔다.
 
 ## Protocol Snapshot
 - Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
+- Request correlation: Gateway는 Join/Move `ClientEnvelope`에 optional `request_id`를 부여하고, Worker는 direct reply에만 같은 `request_id`를 echo한다. Broadcast `Snapshot`/`Delta`/`Despawn`에는 request id를 붙이지 않아 Gateway가 unrelated AOI traffic을 request latency로 세지 않는다.
 - Client ingress envelope: Gateway는 client connection별 stable `session` id를 Worker로 주입해 route switch 뒤에도 actor ownership을 이어간다. 직접 Worker로 들어오는 legacy client frame은 session 없이도 계속 허용된다.
 - 멱등·역전 처리의 기반으로 `seq/epoch` 사용(현재 워커는 응답 `seq` 증가)
 - 클라 옵션: `--world --cx --cy --epoch`로 Envelope 기본값 설정
@@ -136,7 +137,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - `docs/quality.md`는 자율 수행 계약, feedback loop, crate boundary policy의 repo-local 기준 문서다.
 - `cargo xt harness`는 README/AGENTS/docs/CI discoverability와 내부 크레이트 의존 방향을 검사한다.
 - 현재 기계적 crate boundary: `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, `tessera-gateway`/`tessera-worker`/`tessera-orch`는 `tessera-core`와 `tessera-proto`만 공유 의존성으로 사용하며 서로 직접 의존하지 않는다.
-- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed non-empty dry-run plan, 그리고 실제 Ping/Pong 후 `tessera_gateway_ping_roundtrip_seconds` histogram 증가를 확인한다.
+- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed non-empty dry-run plan, 실제 Ping/Pong 후 `tessera_gateway_ping_roundtrip_seconds` histogram 증가, 그리고 Join/Move 후 `tessera_gateway_request_roundtrip_seconds{kind="join|move"}` histogram 증가를 확인한다.
 - `docs/packaging.md`와 `deploy/`는 Docker/Compose/Kubernetes packaging sample을 제공한다. 실제 클러스터용 manifest는 target convention을 확인한 뒤 별도 작업으로 추가한다.
 - CI는 push/PR에서 `cargo xt`, `cargo test`, `cargo xt dev up --with-orch` + `cargo run -p tessera-client -- ping --ts 123` 스모크를 실행한다.
 

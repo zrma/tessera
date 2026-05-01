@@ -1,6 +1,6 @@
 # Tessera Completed Milestones
 
-Last reviewed: 2026-04-29
+Last reviewed: 2026-05-01
 
 This document records completed milestone plans that used to live in active
 `docs/todo-*` files. Current open work should stay in `docs/todo-next.md` and
@@ -75,8 +75,6 @@ Completed slices:
 
 Deferred from P2:
 
-- Non-Ping request latency remains deferred until the protocol carries an
-  explicit request id or response correlation key.
 - Production manifests remain blocked on target cluster conventions.
 
 ## P3 Runtime Hardening
@@ -102,13 +100,38 @@ P3 intentionally did not implement runtime assignment mutation, production
 exposure policy, target worker selection, or real rolling metrics ingestion.
 Those remain P4 decision gates.
 
+## P4.1 Non-Ping Request Latency Correlation
+
+Status: complete as of 2026-05-01.
+
+Completed slices:
+
+1. `ClientEnvelope` accepts optional `request_id` with serde defaults for
+   backward-compatible JSON frames.
+2. Worker client replies are encoded as `ServerEnvelope` and echo `request_id`
+   only on direct replies. Broadcast/AOI traffic keeps `request_id` unset.
+3. Gateway assigns request ids to Join/Move requests, tracks pending requests,
+   and records latency only when a server reply echoes the matching id.
+4. Gateway Prometheus metrics expose
+   `tessera_gateway_request_roundtrip_seconds{kind="join|move"}`.
+5. `cargo xt dev metrics-smoke` exercises Ping, Join, and Move through the real
+   Gateway/Worker path and asserts both Ping/Pong and Join/Move latency
+   histograms increment.
+
+Verification used for this slice:
+
+```sh
+cargo test
+cargo xt
+cargo xt dev metrics-smoke
+```
+
 ## Active Follow-Up
 
-Open work now starts at P4:
+Open P4 work now starts after P4.1:
 
-1. Non-Ping request latency correlation.
-2. Production Kubernetes manifests.
-3. Runtime split/merge activation.
+1. Production Kubernetes manifests.
+2. Runtime split/merge activation.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.

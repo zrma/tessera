@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tessera_core::{
-    CellId, ClientEnvelope, ClientMsg, Envelope, MAX_FRAME_LEN, ServerMsg, encode_frame,
+    CellId, ClientEnvelope, ClientMsg, MAX_FRAME_LEN, ServerEnvelope, ServerMsg, encode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 const UPSTREAM_RETRY_MAX: usize = 3;
 const UPSTREAM_RETRY_BACKOFF_MS: u64 = 50;
 const MAX_PENDING_PINGS: usize = 32;
+const MAX_PENDING_REQUESTS: usize = 128;
 const GATEWAY_PING_RTT_BUCKETS_MICROS: [u64; 11] = [
     1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
     5_000_000,
@@ -33,6 +34,7 @@ const GATEWAY_PING_RTT_BUCKET_LABELS: [&str; 11] = [
     "5.000",
 ];
 static NEXT_GATEWAY_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_GATEWAY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 struct GatewayMetricsCounters {
@@ -54,6 +56,8 @@ struct GatewayMetricsCounters {
     client_closes_pending_ping_route_change: AtomicU64,
     client_closes_ambiguous_upstream: AtomicU64,
     ping_roundtrip_latency: GatewayLatencyHistogram,
+    join_roundtrip_latency: GatewayLatencyHistogram,
+    move_roundtrip_latency: GatewayLatencyHistogram,
 }
 
 #[derive(Debug)]
@@ -128,6 +132,8 @@ struct GatewayMetricsSnapshot {
     client_closes_pending_ping_route_change: u64,
     client_closes_ambiguous_upstream: u64,
     ping_roundtrip_latency: GatewayLatencySnapshot,
+    join_roundtrip_latency: GatewayLatencySnapshot,
+    move_roundtrip_latency: GatewayLatencySnapshot,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -161,6 +167,29 @@ struct PendingPing {
     cell: CellId,
     ts: u64,
     frame: Bytes,
+    sent_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRequestKind {
+    Join,
+    Move,
+}
+
+impl PendingRequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Join => "join",
+            Self::Move => "move",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingRequest {
+    cell: CellId,
+    request_id: u64,
+    kind: PendingRequestKind,
     sent_at: Instant,
 }
 
@@ -246,6 +275,8 @@ impl RoutingTable {
                 .client_closes_ambiguous_upstream
                 .load(Ordering::Relaxed),
             ping_roundtrip_latency: self.metrics.ping_roundtrip_latency.snapshot(),
+            join_roundtrip_latency: self.metrics.join_roundtrip_latency.snapshot(),
+            move_roundtrip_latency: self.metrics.move_roundtrip_latency.snapshot(),
         }
     }
 
@@ -326,6 +357,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
     // Ping은 응답(Pong)이 있어 재전송이 비교적 안전하다. 업스트림 커넥션이 끊기면
     // 아직 Pong을 못 받은 Ping을 재전송해, close 경쟁으로 인한 유실을 완화한다.
     let mut pending_pings: VecDeque<PendingPing> = VecDeque::new();
+    let mut pending_requests: VecDeque<PendingRequest> = VecDeque::new();
 
     let mut client_buf = BytesMut::with_capacity(8 * 1024);
 
@@ -473,21 +505,45 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                         loop {
                             match try_take_frame(&mut conn.read_buf) {
                                 Ok(Some(frame)) => {
-                                    if !pending_pings.is_empty() {
+                                    if !pending_pings.is_empty()
+                                        || !pending_requests.is_empty()
+                                    {
                                         let payload = &frame[4..];
                                         if let Ok(env_out) =
-                                            serde_json::from_slice::<Envelope<ServerMsg>>(payload)
-                                            && let ServerMsg::Pong { ts } = env_out.payload
-                                            && let Some(sent_at) = acknowledge_pending_ping(
-                                                &mut pending_pings,
-                                                env_out.cell,
-                                                ts,
-                                            )
+                                            serde_json::from_slice::<ServerEnvelope>(payload)
                                         {
-                                            routing
-                                                .metrics
-                                                .ping_roundtrip_latency
-                                                .observe(sent_at.elapsed());
+                                            let ServerEnvelope {
+                                                cell,
+                                                request_id,
+                                                payload,
+                                                ..
+                                            } = env_out;
+                                            if let ServerMsg::Pong { ts } = payload
+                                                && let Some(sent_at) = acknowledge_pending_ping(
+                                                    &mut pending_pings,
+                                                    cell,
+                                                    ts,
+                                                )
+                                            {
+                                                routing
+                                                    .metrics
+                                                    .ping_roundtrip_latency
+                                                    .observe(sent_at.elapsed());
+                                            }
+                                            if let Some(request_id) = request_id
+                                                && let Some((kind, sent_at)) =
+                                                    acknowledge_pending_request(
+                                                        &mut pending_requests,
+                                                        cell,
+                                                        request_id,
+                                                    )
+                                            {
+                                                observe_request_latency(
+                                                    routing.metrics.as_ref(),
+                                                    kind,
+                                                    sent_at.elapsed(),
+                                                );
+                                            }
                                         }
                                     }
                                     if let Err(e) = client_writer.write_all(&frame).await {
@@ -701,12 +757,22 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 }
                             };
                             let cell = env_in.cell;
-                            let ping_ts = match env_in.payload {
-                                ClientMsg::Ping { ts } => Some(ts),
+                            let ping_ts = match &env_in.payload {
+                                ClientMsg::Ping { ts } => Some(*ts),
                                 _ => None,
                             };
                             let ping_sent_at = ping_ts.map(|_| Instant::now());
+                            let request_kind = match &env_in.payload {
+                                ClientMsg::Join { .. } => Some(PendingRequestKind::Join),
+                                ClientMsg::Move { .. } => Some(PendingRequestKind::Move),
+                                ClientMsg::Ping { .. } => None,
+                            };
+                            let request_id = request_kind.map(|_| {
+                                NEXT_GATEWAY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+                            });
+                            let request_sent_at = request_id.map(|_| Instant::now());
                             env_in.session = Some(session_id);
+                            env_in.request_id = request_id;
                             let frame = encode_frame(&env_in);
                             last_cell = Some(cell);
 
@@ -912,6 +978,19 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         sent_at: ping_sent_at.expect("ping timestamp"),
                                     });
                                 } else {
+                                    if let (Some(kind), Some(request_id), Some(sent_at)) =
+                                        (request_kind, request_id, request_sent_at)
+                                    {
+                                        push_pending_request(
+                                            &mut pending_requests,
+                                            PendingRequest {
+                                                cell,
+                                                request_id,
+                                                kind,
+                                                sent_at,
+                                            },
+                                        );
+                                    }
                                     conn.has_non_ping_traffic = true;
                                 }
                                 break;
@@ -1102,11 +1181,45 @@ fn acknowledge_pending_ping(
     None
 }
 
+fn acknowledge_pending_request(
+    pending_requests: &mut VecDeque<PendingRequest>,
+    cell: CellId,
+    request_id: u64,
+) -> Option<(PendingRequestKind, Instant)> {
+    if let Some(index) = pending_requests
+        .iter()
+        .position(|pending| pending.cell == cell && pending.request_id == request_id)
+    {
+        return pending_requests
+            .remove(index)
+            .map(|pending| (pending.kind, pending.sent_at));
+    }
+    None
+}
+
 fn push_pending_ping(pending_pings: &mut VecDeque<PendingPing>, ping: PendingPing) {
     while pending_pings.len() >= MAX_PENDING_PINGS {
         pending_pings.pop_front();
     }
     pending_pings.push_back(ping);
+}
+
+fn push_pending_request(pending_requests: &mut VecDeque<PendingRequest>, request: PendingRequest) {
+    while pending_requests.len() >= MAX_PENDING_REQUESTS {
+        pending_requests.pop_front();
+    }
+    pending_requests.push_back(request);
+}
+
+fn observe_request_latency(
+    metrics: &GatewayMetricsCounters,
+    kind: PendingRequestKind,
+    elapsed: Duration,
+) {
+    match kind {
+        PendingRequestKind::Join => metrics.join_roundtrip_latency.observe(elapsed),
+        PendingRequestKind::Move => metrics.move_roundtrip_latency.observe(elapsed),
+    }
 }
 
 fn try_take_frame(buf: &mut BytesMut) -> Result<Option<BytesMut>> {
@@ -1493,6 +1606,23 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
         "Gateway-observed client Ping to upstream Pong round-trip latency.",
         &metrics.ping_roundtrip_latency,
     );
+    push_prometheus_labeled_histogram(
+        &mut out,
+        "tessera_gateway_request_roundtrip_seconds",
+        "Gateway-observed client request to correlated upstream reply latency.",
+        &[
+            (
+                "kind",
+                PendingRequestKind::Join.as_str(),
+                &metrics.join_roundtrip_latency,
+            ),
+            (
+                "kind",
+                PendingRequestKind::Move.as_str(),
+                &metrics.move_roundtrip_latency,
+            ),
+        ],
+    );
     out
 }
 
@@ -1535,33 +1665,103 @@ fn push_prometheus_histogram(
     out.push_str("# TYPE ");
     out.push_str(name);
     out.push_str(" histogram\n");
+    push_prometheus_histogram_samples(out, name, None, histogram);
+}
 
+fn push_prometheus_labeled_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    labeled_histograms: &[(&str, &str, &GatewayLatencySnapshot)],
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push_str(" histogram\n");
+    for (label_name, label_value, histogram) in labeled_histograms {
+        push_prometheus_histogram_samples(out, name, Some((*label_name, *label_value)), histogram);
+    }
+}
+
+fn push_prometheus_histogram_samples(
+    out: &mut String,
+    name: &str,
+    label: Option<(&str, &str)>,
+    histogram: &GatewayLatencySnapshot,
+) {
     let mut cumulative = 0_u64;
-    for (idx, label) in GATEWAY_PING_RTT_BUCKET_LABELS.iter().enumerate() {
+    for (idx, label_value) in GATEWAY_PING_RTT_BUCKET_LABELS.iter().enumerate() {
         cumulative += histogram.buckets.get(idx).copied().unwrap_or(0);
-        out.push_str(name);
-        out.push_str("_bucket{le=\"");
-        out.push_str(label);
-        out.push_str("\"} ");
-        out.push_str(&cumulative.to_string());
-        out.push('\n');
+        push_prometheus_histogram_sample(
+            out,
+            &format!("{name}_bucket"),
+            label,
+            Some(label_value),
+            &cumulative.to_string(),
+        );
     }
     cumulative += histogram
         .buckets
-        .get(GATEWAY_PING_RTT_BUCKET_LABELS.len())
+        .get(GATEWAY_PING_RTT_BUCKETS_MICROS.len())
         .copied()
         .unwrap_or(0);
+    push_prometheus_histogram_sample(
+        out,
+        &format!("{name}_bucket"),
+        label,
+        Some("+Inf"),
+        &cumulative.to_string(),
+    );
+
+    push_prometheus_histogram_sample(
+        out,
+        &format!("{name}_sum"),
+        label,
+        None,
+        &format!("{:.6}", histogram.sum_micros as f64 / 1_000_000.0),
+    );
+
+    push_prometheus_histogram_sample(
+        out,
+        &format!("{name}_count"),
+        label,
+        None,
+        &histogram.count.to_string(),
+    );
+}
+
+fn push_prometheus_histogram_sample(
+    out: &mut String,
+    name: &str,
+    label: Option<(&str, &str)>,
+    le: Option<&str>,
+    value: &str,
+) {
     out.push_str(name);
-    out.push_str("_bucket{le=\"+Inf\"} ");
-    out.push_str(&cumulative.to_string());
-    out.push('\n');
-    out.push_str(name);
-    out.push_str("_sum ");
-    out.push_str(&format!("{:.6}", histogram.sum_micros as f64 / 1_000_000.0));
-    out.push('\n');
-    out.push_str(name);
-    out.push_str("_count ");
-    out.push_str(&histogram.count.to_string());
+    if label.is_some() || le.is_some() {
+        out.push('{');
+        if let Some((label_name, label_value)) = label {
+            out.push_str(label_name);
+            out.push_str("=\"");
+            out.push_str(label_value);
+            out.push('"');
+            if le.is_some() {
+                out.push(',');
+            }
+        }
+        if let Some(le) = le {
+            out.push_str("le=\"");
+            out.push_str(le);
+            out.push('"');
+        }
+        out.push('}');
+    }
+    out.push(' ');
+    out.push_str(value);
     out.push('\n');
 }
 
@@ -1843,7 +2043,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::Duration;
-    use tessera_core::{ActorState, EntityId, Position, ServerMsg, encode_frame};
+    use tessera_core::{ActorState, EntityId, Envelope, Position, ServerMsg, encode_frame};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
@@ -1909,6 +2109,16 @@ mod tests {
                 sum_micros: 1_250_000,
                 count: 78,
             },
+            join_roundtrip_latency: GatewayLatencySnapshot {
+                buckets: vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                sum_micros: 500,
+                count: 1,
+            },
+            move_roundtrip_latency: GatewayLatencySnapshot {
+                buckets: vec![0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                sum_micros: 4_000,
+                count: 2,
+            },
         };
 
         let text = format_gateway_prometheus_metrics(&metrics);
@@ -1933,6 +2143,18 @@ mod tests {
         assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_bucket{le=\"+Inf\"} 78\n"));
         assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_sum 1.250000\n"));
         assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_count 78\n"));
+        assert!(text.contains("# TYPE tessera_gateway_request_roundtrip_seconds histogram\n"));
+        assert!(text.contains(
+            "tessera_gateway_request_roundtrip_seconds_bucket{kind=\"join\",le=\"0.001\"} 1\n"
+        ));
+        assert!(
+            text.contains(
+                "tessera_gateway_request_roundtrip_seconds_sum{kind=\"join\"} 0.000500\n"
+            )
+        );
+        assert!(
+            text.contains("tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"} 2\n")
+        );
     }
 
     #[test]
@@ -2654,6 +2876,74 @@ mod tests {
         wait_task("gateway", &mut gateway_task).await;
         wait_task("worker-a", &mut worker_a_task).await;
         wait_task("worker-b", &mut worker_b_task).await;
+    }
+
+    #[tokio::test]
+    async fn join_request_id_is_correlated_into_latency_metric() {
+        let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+        let (worker_done_tx, worker_done_rx) = oneshot::channel();
+        let mut worker_task = tokio::spawn(run_join_worker_echo_request_id(
+            worker_listener,
+            worker_done_tx,
+        ));
+
+        let mut map = HashMap::new();
+        map.insert(
+            CellKey(CellId::grid(0, 0, 0)),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: worker_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(map);
+
+        let gateway_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway listener");
+        let gw_addr = gateway_listener.local_addr().expect("gateway addr");
+        let routing_clone = routing.clone();
+        let mut gateway_task = tokio::spawn(async move {
+            if let Ok((sock, peer)) = gateway_listener.accept().await {
+                handle_conn(sock, peer, routing_clone)
+                    .await
+                    .expect("handle conn");
+            }
+        });
+
+        let mut client = TcpStream::connect(gw_addr)
+            .await
+            .expect("connect to gateway");
+        let cell = CellId::grid(0, 0, 0);
+        let join = Envelope {
+            cell,
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Join {
+                actor: EntityId(1),
+                pos: Position { x: 0.0, y: 0.0 },
+            },
+        };
+        client
+            .write_all(&encode_frame(&join))
+            .await
+            .expect("send join");
+        let reply = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert!(matches!(reply.payload, ServerMsg::Snapshot { .. }));
+
+        let echoed_request_id = timeout(Duration::from_millis(500), worker_done_rx)
+            .await
+            .expect("worker did not echo request id")
+            .expect("worker done");
+        assert!(echoed_request_id > 0);
+
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.join_roundtrip_latency.count, 1);
+        assert_eq!(metrics.move_roundtrip_latency.count, 0);
+
+        drop(client);
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker", &mut worker_task).await;
     }
 
     #[tokio::test]
@@ -3437,6 +3727,36 @@ mod tests {
         }
     }
 
+    async fn run_join_worker_echo_request_id(listener: TcpListener, done: oneshot::Sender<u64>) {
+        let (mut socket, _peer) = listener.accept().await.expect("accept worker");
+        let env_in = read_client_envelope(&mut socket).await;
+        let request_id = env_in.request_id.expect("gateway request id");
+        assert!(env_in.session.is_some());
+        let cell = env_in.cell;
+        let actor = match env_in.payload {
+            ClientMsg::Join { actor, .. } => actor,
+            other => panic!("expected join, got {other:?}"),
+        };
+        let env_out = ServerEnvelope {
+            cell,
+            seq: 0,
+            epoch: env_in.epoch,
+            request_id: Some(request_id),
+            payload: ServerMsg::Snapshot {
+                cell,
+                actors: vec![ActorState {
+                    id: actor,
+                    pos: Position { x: 0.0, y: 0.0 },
+                }],
+            },
+        };
+        socket
+            .write_all(&encode_frame(&env_out))
+            .await
+            .expect("write join reply");
+        let _ = done.send(request_id);
+    }
+
     async fn run_join_then_close_and_expect_no_reconnect(
         listener: TcpListener,
         received: oneshot::Sender<()>,
@@ -3701,6 +4021,15 @@ mod tests {
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await.expect("read payload");
         serde_json::from_slice::<Envelope<ClientMsg>>(&payload).expect("decode client frame")
+    }
+
+    async fn read_client_envelope(stream: &mut TcpStream) -> ClientEnvelope {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.expect("read len");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.expect("read payload");
+        serde_json::from_slice::<ClientEnvelope>(&payload).expect("decode client envelope")
     }
 
     async fn expect_client_close(stream: &mut TcpStream) {

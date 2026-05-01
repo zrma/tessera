@@ -10,8 +10,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tessera_core::{
     ActorState, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope, HandoverReplayMove,
-    HandoverReplayOwner, MAX_FRAME_LEN, Position, ServerMsg, Tick, WorkerRelayMsg, encode_frame,
-    try_decode_frame,
+    HandoverReplayOwner, MAX_FRAME_LEN, Position, ServerEnvelope, ServerMsg, Tick, WorkerRelayMsg,
+    encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -77,7 +77,6 @@ struct WorkerMetricsSnapshot {
     remote_relay_frames_received: u64,
 }
 
-type OutboundMsg = (CellId, Option<u32>, ServerMsg);
 type RelayOutboundMsg = (CellId, Option<u32>, WorkerRelayMsg);
 type CellSubscribers = HashMap<CellId, Vec<CellSubscriber>>;
 type RelaySubscribers = HashMap<CellId, Vec<RelaySubscriber>>;
@@ -92,6 +91,34 @@ type HandoverPolicyMap = HashMap<CellId, HandoverCellPolicy>;
 type BufferedMoveQueues = HashMap<CellId, VecDeque<BufferedMove>>;
 type HandoverReplayClaims = HashSet<(CellId, EntityId)>;
 type AppliedHandoverReplays = HashSet<String>;
+
+#[derive(Debug, Clone)]
+struct OutboundMsg {
+    cell: CellId,
+    epoch_override: Option<u32>,
+    request_id: Option<u64>,
+    payload: ServerMsg,
+}
+
+impl OutboundMsg {
+    fn new(
+        cell: CellId,
+        epoch_override: Option<u32>,
+        request_id: Option<u64>,
+        payload: ServerMsg,
+    ) -> Self {
+        Self {
+            cell,
+            epoch_override,
+            request_id,
+            payload,
+        }
+    }
+
+    fn push(cell: CellId, epoch_override: Option<u32>, payload: ServerMsg) -> Self {
+        Self::new(cell, epoch_override, None, payload)
+    }
+}
 
 #[derive(Clone)]
 struct CellSubscriber {
@@ -185,6 +212,7 @@ struct BufferedMove {
     dx: f32,
     dy: f32,
     epoch: u32,
+    request_id: Option<u64>,
     buffered_at: Instant,
 }
 
@@ -298,6 +326,7 @@ impl SharedState {
         entry.push(subscriber.clone());
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn snapshot_and_subscribe(
         &self,
         cell: CellId,
@@ -305,6 +334,7 @@ impl SharedState {
         pos: Position,
         subscriber: &CellSubscriber,
         epoch: u32,
+        request_id: Option<u64>,
         preserve_existing_actor: bool,
     ) -> Result<bool, ()> {
         let mut actors = self.actors.lock().await;
@@ -342,9 +372,10 @@ impl SharedState {
 
         if subscriber
             .tx
-            .try_send((
+            .try_send(OutboundMsg::new(
                 cell,
                 Some(epoch),
+                request_id,
                 ServerMsg::Snapshot {
                     cell,
                     actors: snapshot,
@@ -404,7 +435,7 @@ impl SharedState {
 
         if subscriber
             .tx
-            .try_send((
+            .try_send(OutboundMsg::push(
                 cell,
                 Some(epoch),
                 ServerMsg::Snapshot {
@@ -1040,7 +1071,7 @@ impl SharedState {
             if snapshot.is_empty() {
                 continue;
             }
-            match subscriber.tx.try_send((
+            match subscriber.tx.try_send(OutboundMsg::push(
                 cell,
                 Some(epoch),
                 ServerMsg::Snapshot {
@@ -1131,7 +1162,10 @@ impl SharedState {
                 if exclude.is_some_and(|excluded| excluded == subscriber.client_id) {
                     return !subscriber.tx.is_closed();
                 }
-                match subscriber.tx.try_send((cell, epoch_override, msg.clone())) {
+                match subscriber
+                    .tx
+                    .try_send(OutboundMsg::push(cell, epoch_override, msg.clone()))
+                {
                     Ok(()) => true,
                     Err(TrySendError::Full(_)) => {
                         self.metrics
@@ -1260,10 +1294,11 @@ impl SharedState {
 
         let subscribers = self.remote_interest_subscribers(env_in.cell).await;
         for subscriber in subscribers {
-            match subscriber
-                .tx
-                .try_send((env_in.cell, Some(env_in.epoch), msg.clone()))
-            {
+            match subscriber.tx.try_send(OutboundMsg::push(
+                env_in.cell,
+                Some(env_in.epoch),
+                msg.clone(),
+            )) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     self.metrics
@@ -2055,6 +2090,7 @@ async fn flush_buffered_moves_for_cells(
                     &buffered.subscriber.tx,
                     cell,
                     buffered.epoch,
+                    buffered.request_id,
                     "handover_move_expired",
                     "move rejected: handover move buffer entry expired",
                 )
@@ -2071,6 +2107,7 @@ async fn flush_buffered_moves_for_cells(
                     &buffered.subscriber.tx,
                     cell,
                     buffered.epoch,
+                    buffered.request_id,
                     "handover_cell_not_owned",
                     "move rejected: cell is no longer owned by this worker",
                 )
@@ -2095,6 +2132,7 @@ async fn flush_buffered_moves_for_cells(
                 buffered.dx,
                 buffered.dy,
                 buffered.epoch,
+                buffered.request_id,
             )
             .await
             {
@@ -2173,6 +2211,7 @@ async fn replay_handover_to_target(
                 &buffered.subscriber.tx,
                 cell,
                 buffered.epoch,
+                buffered.request_id,
                 "handover_move_expired",
                 "move rejected: handover move buffer entry expired",
             )
@@ -2189,7 +2228,11 @@ async fn replay_handover_to_target(
             dy: buffered.dy,
             epoch: buffered.epoch,
         };
-        replay_failures.push((buffered.subscriber.clone(), buffered.epoch));
+        replay_failures.push((
+            buffered.subscriber.clone(),
+            buffered.epoch,
+            buffered.request_id,
+        ));
         replay_moves.push(replay);
     }
 
@@ -2278,14 +2321,15 @@ async fn replay_handover_to_target(
 
 async fn reject_replay_moves_unavailable(
     cell: CellId,
-    moves: &[(CellSubscriber, u32)],
+    moves: &[(CellSubscriber, u32, Option<u64>)],
     code: &str,
 ) {
-    for (subscriber, epoch) in moves {
+    for (subscriber, epoch, request_id) in moves {
         let _ = enqueue_error(
             &subscriber.tx,
             cell,
             *epoch,
+            *request_id,
             code,
             "move rejected: handover replay target unavailable",
         );
@@ -3436,11 +3480,17 @@ fn enqueue_error(
     tx: &Sender<OutboundMsg>,
     cell: CellId,
     epoch: u32,
+    request_id: Option<u64>,
     code: &str,
     message: impl Into<String>,
 ) -> Result<(), ()> {
-    tx.try_send((cell, Some(epoch), make_error(code, message)))
-        .map_err(|_| ())
+    tx.try_send(OutboundMsg::new(
+        cell,
+        Some(epoch),
+        request_id,
+        make_error(code, message),
+    ))
+    .map_err(|_| ())
 }
 
 fn init_tracing() {
@@ -4096,6 +4146,7 @@ async fn apply_client_move(
     dx: f32,
     dy: f32,
     epoch: u32,
+    request_id: Option<u64>,
 ) -> MoveApplyOutcome {
     if !delta_is_finite(dx, dy) {
         warn!(
@@ -4109,6 +4160,7 @@ async fn apply_client_move(
             tx,
             cell,
             epoch,
+            request_id,
             "invalid_delta",
             "move rejected: invalid delta",
         )
@@ -4137,6 +4189,7 @@ async fn apply_client_move(
                 tx,
                 cell,
                 epoch,
+                request_id,
                 "actor_owned_by_other",
                 "move rejected: actor owned by another client",
             )
@@ -4173,6 +4226,7 @@ async fn apply_client_move(
                     tx,
                     cell,
                     epoch,
+                    request_id,
                     "actor_not_joined",
                     "move rejected: actor not joined",
                 )
@@ -4202,6 +4256,7 @@ async fn apply_client_move(
                     tx,
                     cell,
                     epoch,
+                    request_id,
                     "actor_not_joined",
                     "move rejected: actor not joined",
                 )
@@ -4227,6 +4282,7 @@ async fn apply_client_move(
                     tx,
                     cell,
                     epoch,
+                    request_id,
                     "actor_not_joined",
                     "move rejected: actor not joined",
                 )
@@ -4252,6 +4308,7 @@ async fn apply_client_move(
                 tx,
                 cell,
                 epoch,
+                request_id,
                 "position_overflow",
                 "move rejected: position overflow",
             )
@@ -4279,7 +4336,10 @@ async fn apply_client_move(
         cell,
         moved: vec![moved],
     };
-    if tx.try_send((cell, Some(epoch), delta)).is_err() {
+    if tx
+        .try_send(OutboundMsg::new(cell, Some(epoch), request_id, delta))
+        .is_err()
+    {
         warn!(
             target: "worker",
             %peer,
@@ -4363,12 +4423,15 @@ async fn handle_upstream_inner(
         tokio::spawn(async move {
             let mut seq_out: u64 = 0;
             let mut writer = writer;
-            while let Some((cell, epoch_override, msg)) = rx.recv().await {
-                let env_out = Envelope {
-                    cell,
+            while let Some(outbound) = rx.recv().await {
+                let env_out = ServerEnvelope {
+                    cell: outbound.cell,
                     seq: seq_out,
-                    epoch: epoch_override.unwrap_or_else(|| writer_epoch.load(Ordering::Relaxed)),
-                    payload: msg,
+                    epoch: outbound
+                        .epoch_override
+                        .unwrap_or_else(|| writer_epoch.load(Ordering::Relaxed)),
+                    request_id: outbound.request_id,
+                    payload: outbound.payload,
                 };
                 seq_out = seq_out.wrapping_add(1);
                 let frame = encode_frame(&env_out);
@@ -4424,6 +4487,7 @@ async fn handle_upstream_inner(
                 &tx,
                 cell,
                 env_in.epoch,
+                env_in.request_id,
                 "cell_not_owned",
                 "cell not owned by this worker",
             )
@@ -4443,7 +4507,12 @@ async fn handle_upstream_inner(
             ClientMsg::Ping { ts } => {
                 epoch.store(env_in.epoch, Ordering::Relaxed);
                 if tx
-                    .try_send((cell, Some(env_in.epoch), ServerMsg::Pong { ts }))
+                    .try_send(OutboundMsg::new(
+                        cell,
+                        Some(env_in.epoch),
+                        env_in.request_id,
+                        ServerMsg::Pong { ts },
+                    ))
                     .is_err()
                 {
                     warn!(
@@ -4468,6 +4537,7 @@ async fn handle_upstream_inner(
                         &tx,
                         cell,
                         env_in.epoch,
+                        env_in.request_id,
                         "invalid_position",
                         "join rejected: invalid position",
                     )
@@ -4497,6 +4567,7 @@ async fn handle_upstream_inner(
                         &tx,
                         cell,
                         env_in.epoch,
+                        env_in.request_id,
                         "actor_owned_by_other",
                         "join rejected: actor owned by another client",
                     )
@@ -4522,6 +4593,7 @@ async fn handle_upstream_inner(
                         pos,
                         &subscriber,
                         env_in.epoch,
+                        env_in.request_id,
                         matches!(claim, ClaimOutcome::GrantedReplayed),
                     )
                     .await
@@ -4631,6 +4703,7 @@ async fn handle_upstream_inner(
                         dx,
                         dy,
                         epoch: env_in.epoch,
+                        request_id: env_in.request_id,
                         buffered_at: Instant::now(),
                     };
                     if state.buffer_client_move(cell, buffered).await.is_err() {
@@ -4648,6 +4721,7 @@ async fn handle_upstream_inner(
                             &tx,
                             cell,
                             env_in.epoch,
+                            env_in.request_id,
                             "handover_move_buffer_full",
                             "move rejected: handover move buffer is full",
                         )
@@ -4673,6 +4747,7 @@ async fn handle_upstream_inner(
                     dx,
                     dy,
                     env_in.epoch,
+                    env_in.request_id,
                 )
                 .await
                 {
@@ -5417,6 +5492,7 @@ mod tests {
                     dx: 3.0,
                     dy: 4.0,
                     epoch: 11,
+                    request_id: None,
                     buffered_at: Instant::now(),
                 },
             )
@@ -5445,9 +5521,10 @@ mod tests {
         );
 
         let replay = rx.try_recv().expect("buffered move should replay");
-        assert_eq!(replay.0, cell);
-        assert_eq!(replay.1, Some(11));
-        match replay.2 {
+        assert_eq!(replay.cell, cell);
+        assert_eq!(replay.epoch_override, Some(11));
+        assert_eq!(replay.request_id, None);
+        match replay.payload {
             ServerMsg::Delta {
                 cell: delta_cell,
                 moved,
@@ -5614,13 +5691,14 @@ mod tests {
             1.0,
             1.0,
             13,
+            None,
         )
         .await;
         assert_eq!(outcome, MoveApplyOutcome::Applied);
         assert_eq!(state.owner_for(&cell, &actor).await, Some(session_owner_id));
 
         let replayed_move = rx.try_recv().expect("post-handover move response");
-        match replayed_move.2 {
+        match replayed_move.payload {
             ServerMsg::Delta { moved, .. } => {
                 assert_eq!(moved.len(), 1);
                 assert_eq!(moved[0].id, actor);
@@ -5679,12 +5757,13 @@ mod tests {
             1.0,
             1.0,
             12,
+            None,
         )
         .await;
         assert_eq!(denied, MoveApplyOutcome::Rejected);
 
         let rejected = rx.try_recv().expect("ownership rejection");
-        match rejected.2 {
+        match rejected.payload {
             ServerMsg::Error { code, .. } => assert_eq!(code, "actor_owned_by_other"),
             other => panic!("expected ownership error, got {other:?}"),
         }
@@ -5703,12 +5782,13 @@ mod tests {
             1.0,
             1.0,
             13,
+            None,
         )
         .await;
         assert_eq!(accepted, MoveApplyOutcome::Applied);
 
         let replayed_move = rx.try_recv().expect("owner-preserved move response");
-        match replayed_move.2 {
+        match replayed_move.payload {
             ServerMsg::Delta { moved, .. } => {
                 assert_eq!(moved.len(), 1);
                 assert_eq!(moved[0].id, actor);
@@ -5787,6 +5867,7 @@ mod tests {
                     dx: 3.0,
                     dy: 4.0,
                     epoch: 11,
+                    request_id: None,
                     buffered_at: Instant::now(),
                 },
             )
@@ -6007,9 +6088,9 @@ mod tests {
         let snapshot = watcher_rx
             .try_recv()
             .expect("existing client should receive adjacent snapshot after resync");
-        assert_eq!(snapshot.0, adjacent);
-        assert_eq!(snapshot.1, Some(77));
-        match snapshot.2 {
+        assert_eq!(snapshot.cell, adjacent);
+        assert_eq!(snapshot.epoch_override, Some(77));
+        match snapshot.payload {
             ServerMsg::Snapshot { cell, actors } => {
                 assert_eq!(cell, adjacent);
                 assert_eq!(actors.len(), 1);
@@ -6054,15 +6135,15 @@ mod tests {
         let initial_snapshot = watcher_rx
             .try_recv()
             .expect("initial resync should subscribe adjacent cell");
-        assert_eq!(initial_snapshot.0, adjacent);
+        assert_eq!(initial_snapshot.cell, adjacent);
 
         state.drop_cells(&HashSet::from([primary])).await;
         let despawn = watcher_rx
             .try_recv()
             .expect("dropping the root cell should broadcast despawn");
-        assert_eq!(despawn.0, primary);
+        assert_eq!(despawn.cell, primary);
         assert!(matches!(
-            despawn.2,
+            despawn.payload,
             ServerMsg::Despawn { ref actors, .. } if actors == &vec![EntityId(1)]
         ));
         state
@@ -6139,8 +6220,8 @@ mod tests {
         let snapshot = watcher_rx
             .try_recv()
             .expect("edge actor should receive adjacent snapshot");
-        assert_eq!(snapshot.0, adjacent);
-        assert_eq!(snapshot.1, Some(91));
+        assert_eq!(snapshot.cell, adjacent);
+        assert_eq!(snapshot.epoch_override, Some(91));
     }
 
     #[tokio::test]
@@ -6180,6 +6261,66 @@ mod tests {
         assert_eq!(reply.epoch, 99);
         assert_eq!(reply.seq, 0);
         assert!(matches!(reply.payload, ServerMsg::Pong { ts } if ts == 123));
+
+        drop(client);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn direct_replies_echo_request_id() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let state = Arc::new(SharedState::default());
+        let cell = CellId::grid(0, 0, 0);
+        let actor = EntityId(1);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+        let server = tokio::spawn(async move {
+            let (sock, peer) = listener.accept().await.expect("accept connection");
+            handle_upstream(sock, peer, state, owned_cells)
+                .await
+                .expect("handle upstream");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect client");
+        client
+            .write_all(&encode_frame(&ClientEnvelope {
+                cell,
+                seq: 0,
+                epoch: 10,
+                session: Some(77),
+                request_id: Some(101),
+                payload: ClientMsg::Join {
+                    actor,
+                    pos: Position { x: 0.0, y: 0.0 },
+                },
+            }))
+            .await
+            .expect("send join");
+        let join_reply = read_server_env(&mut client).await;
+        assert_eq!(join_reply.request_id, Some(101));
+        assert!(matches!(join_reply.payload, ServerMsg::Snapshot { .. }));
+
+        client
+            .write_all(&encode_frame(&ClientEnvelope {
+                cell,
+                seq: 1,
+                epoch: 11,
+                session: Some(77),
+                request_id: Some(102),
+                payload: ClientMsg::Move {
+                    actor,
+                    dx: 1.0,
+                    dy: 0.0,
+                },
+            }))
+            .await
+            .expect("send move");
+        let move_reply = read_server_env(&mut client).await;
+        assert_eq!(move_reply.request_id, Some(102));
+        assert!(matches!(move_reply.payload, ServerMsg::Delta { .. }));
 
         drop(client);
         let _ = server.await;
@@ -8093,7 +8234,7 @@ mod tests {
         let state_clone = Arc::clone(&state);
         let join_handle = tokio::spawn(async move {
             state_clone
-                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0, false)
+                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0, None, false)
                 .await
                 .expect("snapshot");
         });
@@ -8161,7 +8302,7 @@ mod tests {
         let subscriber = test_subscriber(1, tx_for_state, &disconnect_tx);
         state.subscribe(cell, &subscriber).await;
 
-        tx.try_send((cell, None, ServerMsg::Pong { ts: 0 }))
+        tx.try_send(OutboundMsg::push(cell, None, ServerMsg::Pong { ts: 0 }))
             .expect("fill outbound channel");
         state
             .broadcast(cell, ServerMsg::Pong { ts: 1 }, None, None)
@@ -8291,9 +8432,9 @@ mod tests {
         on_tick(Tick(1), state.as_ref()).await;
 
         let queued = watcher_rx.try_recv().expect("watcher delta should flush");
-        assert_eq!(queued.0, cell);
-        assert_eq!(queued.1, Some(55));
-        match queued.2 {
+        assert_eq!(queued.cell, cell);
+        assert_eq!(queued.epoch_override, Some(55));
+        match queued.payload {
             ServerMsg::Delta {
                 cell: delta_cell,
                 moved,
@@ -8350,8 +8491,8 @@ mod tests {
         let queued = watcher_rx
             .try_recv()
             .expect("watcher should receive coalesced delta");
-        assert_eq!(queued.1, Some(11));
-        match queued.2 {
+        assert_eq!(queued.epoch_override, Some(11));
+        match queued.payload {
             ServerMsg::Delta { moved, .. } => {
                 assert_eq!(moved.len(), 1);
                 assert_eq!(moved[0].id, actor);
@@ -8417,10 +8558,10 @@ mod tests {
             .await;
 
         let despawn = watcher_rx.try_recv().expect("despawn should be broadcast");
-        assert_eq!(despawn.0, cell);
-        assert_eq!(despawn.1, Some(30));
+        assert_eq!(despawn.cell, cell);
+        assert_eq!(despawn.epoch_override, Some(30));
         assert!(matches!(
-            despawn.2,
+            despawn.payload,
             ServerMsg::Despawn { ref actors, .. } if actors == &vec![actor]
         ));
 
@@ -8758,5 +8899,14 @@ mod tests {
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await.expect("read payload");
         serde_json::from_slice(&payload).expect("decode frame")
+    }
+
+    async fn read_server_env(stream: &mut TcpStream) -> ServerEnvelope {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.expect("read len");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.expect("read payload");
+        serde_json::from_slice(&payload).expect("decode server envelope")
     }
 }
