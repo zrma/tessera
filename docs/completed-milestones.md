@@ -126,12 +126,49 @@ cargo xt
 cargo xt dev metrics-smoke
 ```
 
+## P4.2 Internal GitOps Deployment
+
+Status: complete as of 2026-05-01.
+
+Completed slices:
+
+1. Added the first internal-only Tessera GitOps manifests in the k8s GitOps
+   repo: namespace, network policy, Harbor `ExternalSecret`, ArgoCD project and
+   application, and raw runtime manifests for Orchestrator, Worker, and
+   Gateway.
+2. Deployed one Orchestrator, one Worker, and one Gateway as ClusterIP-only
+   services with metrics ports `6100`, `5100`, and `4100`.
+3. Kept the custom Gateway `4000/TCP` protocol internal-only; no public
+   HTTPRoute or runtime split/merge activation was added.
+4. Published and verified the initial `ec8c42b4` runtime image as
+   `linux/amd64` for the cluster node platform.
+5. Confirmed ArgoCD `tessera` reached `Synced / Healthy`, all runtime pods were
+   ready, Gateway `ping --ts 123` worked through port-forward, Gateway `/ready`
+   reported ready, and Orchestrator `/split-merge/preview` returned
+   `assignments_changed=false`.
+
+Verification used for this slice:
+
+```sh
+cargo test
+cargo xt
+make validate
+docker buildx imagetools inspect harbor.1day1coding.com/1day1coding/tessera:ec8c42b4
+kubectl -n argocd get app tessera -o wide
+kubectl -n tessera get pods,svc,externalsecret -o wide
+cargo run -p tessera-client -- ping --ts 123
+curl http://127.0.0.1:4100/ready
+curl http://127.0.0.1:6100/split-merge/preview
+```
+
 ## Active Follow-Up
 
-Open P4 work now starts after P4.1:
+Open P4 work now starts after P4.2:
 
-1. Production Kubernetes manifests.
-2. Runtime split/merge activation.
+1. Harbor-backed GitHub Actions image publish is implemented but blocked on
+   Harbor push credentials or account permission.
+2. Runtime split/merge activation remains gated on assignment mutation
+   semantics.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.

@@ -8,25 +8,26 @@ P0 through P4.1 are complete through handover replay ownership, stable Gateway
 sessions, AOI precision controls, per-cell tick structure, observability
 endpoints, packaging samples, split/merge planner skeletons, and fixture-backed
 dry-run preview smoke, plus request-id-based Join/Move latency correlation.
-P4.2 internal GitOps manifests are prepared in the k8s GitOps repo, with
-cluster runtime smoke still pending. Completed milestone details are archived
-in `docs/completed-milestones.md`.
+P4.2 internal GitOps manifests are committed, pushed, synced by ArgoCD, and
+runtime-smoked on the MicroK8s cluster. Completed milestone details are
+archived in `docs/completed-milestones.md`.
 
 The next substantial milestones now cross either production cluster rollout or
 runtime assignment mutation.
 
 ## 2026-05-01 Decision Checkpoint
 
-P4.2 defaults were accepted for the first internal-only deployment slice.
-The remaining branches are:
+P4.2 defaults were accepted for the first internal-only deployment slice and
+the cluster rollout was verified. The remaining branches are:
 
-1. P4.2 rollout verification: push the k8s GitOps commit, let ArgoCD sync, and
-   run internal Gateway/Orchestrator smoke checks.
+1. Image publish follow-up: fix the GitHub Actions Harbor push credential or
+   account permission, rerun the build/push workflow, and promote the resulting
+   version tag through the k8s GitOps repo.
 2. P4.3 runtime split/merge: approve the first activation shape, target
    worker policy, multi-depth `CellId` semantics, and manual-vs-automatic plan
    submission.
 
-Default recommendation is finishing P4.2 rollout verification before opening
+Default recommendation is unblocking version-tag image promotion before opening
 P4.3 runtime mutation.
 
 ## P4.1 Non-Ping Request Latency Correlation
@@ -78,15 +79,14 @@ Completed implementation:
 
 ## P4.2 Production Kubernetes Manifests
 
-Status: internal-only manifest slice pushed and ArgoCD synced as of
-2026-05-01; runtime smoke is blocked until the image is rebuilt for the cluster
-node platform.
+Status: internal-only manifest slice pushed, ArgoCD synced, and runtime-smoked
+as of 2026-05-01.
 
 Implemented first-slice defaults:
 
-1. Bootstrapped `harbor.1day1coding.com/1day1coding/tessera:ec8c42b4` locally;
-   that image was `linux/arm64` only and could not run on the `linux/amd64`
-   MicroK8s nodes.
+1. Bootstrapped `harbor.1day1coding.com/1day1coding/tessera:ec8c42b4` locally,
+   then rebuilt the runtime image as `linux/amd64` after the initial local
+   image was `linux/arm64` only.
 2. Added namespace `tessera` with restricted pod-security labels and Istio
    revision label matching the current app namespace pattern.
 3. Added one Orchestrator, one Worker, and one Gateway, all behind ClusterIP
@@ -106,12 +106,16 @@ k8s GitOps repo files added or updated:
 - `k8s/argocd/project-tessera.yaml`
 - `k8s/argocd/project-common.yaml`
 
-Verification used for manifest prep:
+Verification used for manifest prep and rollout:
 
 ```sh
-docker build -t harbor.1day1coding.com/1day1coding/tessera:ec8c42b4 .
-docker push harbor.1day1coding.com/1day1coding/tessera:ec8c42b4
 make validate
+docker buildx imagetools inspect harbor.1day1coding.com/1day1coding/tessera:ec8c42b4
+kubectl -n argocd get app tessera -o wide
+kubectl -n tessera get pods,svc,externalsecret -o wide
+cargo run -p tessera-client -- ping --ts 123
+curl http://127.0.0.1:4100/ready
+curl http://127.0.0.1:6100/split-merge/preview
 ```
 
 Image publish follow-up:
@@ -124,13 +128,22 @@ The workflow builds `linux/amd64` on GitHub Actions and pushes a `vYYYY.MM.N`
 tag to Harbor. After it succeeds, update the k8s GitOps manifest image tag to
 that version tag and let ArgoCD roll out the new image.
 
-Remaining rollout checks:
+Current blocker:
 
-1. Update the k8s GitOps manifest tag to the GitHub Actions image tag.
-2. Confirm ArgoCD Application `tessera` reaches `Synced / Healthy`.
-3. Confirm `kubectl -n tessera get pods,svc` shows all components ready.
-4. Port-forward the internal Gateway and verify `tessera-client ping --ts 123`.
-5. Port-forward Orchestrator metrics and verify `/split-merge/preview` reports
+- The workflow currently reaches Docker login with registry
+  `harbor.1day1coding.com`, but Harbor returns `unauthorized`. This points to
+  `HARBOR_USERNAME`/`HARBOR_PASSWORD` or that account's push permission, not the
+  GitOps pull secret.
+
+Remaining image-promotion checks:
+
+1. Rerun the GitHub Actions build/push workflow after Harbor credentials or
+   permissions are fixed.
+2. Update the k8s GitOps manifest tag to the GitHub Actions image tag.
+3. Confirm ArgoCD Application `tessera` reaches `Synced / Healthy`.
+4. Confirm `kubectl -n tessera get pods,svc` shows all components ready.
+5. Port-forward the internal Gateway and verify `tessera-client ping --ts 123`.
+6. Port-forward Orchestrator metrics and verify `/split-merge/preview` reports
    `assignments_changed=false`.
 
 ## P4.3 Runtime Split/Merge Activation
@@ -157,7 +170,7 @@ Suggested implementation after approval:
 
 ## Recommendation
 
-Finish P4.2 rollout verification next if the goal is operating Tessera on the
-existing cluster. Choose P4.3 only when runtime split/merge semantics are the
+Finish Harbor-backed version-tag image promotion next if the goal is repeatable
+release automation. Choose P4.3 only when runtime split/merge semantics are the
 immediate priority; it should remain gated until target worker policy and
 assignment mutation rules are explicit.

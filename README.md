@@ -109,9 +109,10 @@ Cell-based world orchestration for real-time servers in Rust.
 
 ### 🚧 Planned / Upcoming
 - Worker 간 ghost relay와 request latency의 장기 scrape/tracing assertions
-- Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로 제공되며, 첫 internal-only production GitOps manifest slice는 k8s GitOps repo에 준비됐다. ArgoCD sync와 runtime smoke는 아직 남아 있다.
+- Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로 제공되며, 첫 internal-only production GitOps manifest slice는 k8s GitOps repo에서 ArgoCD sync와 runtime smoke까지 검증됐다.
+- GitHub Actions image publish workflow는 build/push only로 추가됐지만, Harbor push는 repository secret 또는 Harbor 계정 권한 정정 후 재실행해야 한다. Runtime GitOps tag promotion은 k8s GitOps repo에서 별도 커밋으로 진행한다.
 - 리밸런싱 자동화, 동적 분할(V1/V2) 런타임 구현은 아직 미구현이며, Orchestrator에는 비활성 split/merge planner skeleton과 fixture-backed dry-run preview smoke만 있다 (`docs/dynamic-split-merge.md`에 설계 노트)
-- P0/P1/P2/P3/P4.1 완료 기록은 `docs/completed-milestones.md`에 둔다.
+- P0/P1/P2/P3/P4.1/P4.2 완료 기록은 `docs/completed-milestones.md`에 둔다.
 - 현재 milestone decision gate와 rollout follow-up은 `docs/todo-next.md`와 `docs/todo-p4-next-milestones.md`에 둔다.
 
 ## Protocol Snapshot
