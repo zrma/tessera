@@ -218,13 +218,21 @@ Completed slices:
     default, requires `--allow-activation` before publishing a split, and
     requires `--with-failure --allow-scale` before scaling the target Worker
     down/up for failure and recovery evidence.
+14. Published `harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`, applied
+    the controlled two-Worker GitOps smoke topology, verified internal
+    MicroK8s split publish/failure/recovery with `cargo xt k8s
+    activation-smoke --allow-activation --with-failure --allow-scale`, and
+    validated the final report with `cargo xt k8s activation-report-check
+    --require-published --require-failure`.
+15. Closed the controlled smoke window through a follow-up k8s GitOps cleanup
+    revision that removed the manual activation flag and preview fixture while
+    keeping the `v2026.05.2` two-Worker topology healthy.
 
 Deferred from this slice:
 
-- Runtime merge activation implementation and actual internal MicroK8s
-  activation evidence from an approved two-Worker GitOps smoke topology. The P5
-  split-activation rollback policy is operator recovery plus GitOps backout, not
-  automatic merge rollback.
+- Runtime merge activation implementation, automatic planner submission, and
+  multi-depth split activation. The P5 split-activation rollback policy is
+  operator recovery plus GitOps backout, not automatic merge rollback.
 
 Verification used for this slice:
 
@@ -236,6 +244,9 @@ cargo xt dev activation-plan-smoke
 cargo xt dev activation-smoke
 cargo xt dev activation-failure-smoke
 cargo xt dev activation-soak
+cargo xt dev activation-report-check
+cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 --allow-activation --with-failure --allow-scale
+cargo xt k8s activation-report-check --require-published --require-failure --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2
 cargo xt dev up --with-orch
 cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
@@ -243,12 +254,12 @@ cargo xt dev down --with-orch
 
 ## Active Follow-Up
 
-Open P4 work now starts after the P4.3 replay/publish slice:
+Open work now starts after the P4.3/P5 split activation slice:
 
-1. Run internal MicroK8s activation smoke after the two-Worker GitOps topology
-   and image promotion are approved and synced.
-2. Keep runtime merge activation behind a later milestone with its own sibling
+1. Keep runtime merge activation behind a later milestone with its own sibling
    coalescing and safety policy.
+2. Keep automatic planner submission and multi-depth split activation behind
+   separate decision gates.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.

@@ -2,8 +2,9 @@
 
 Last reviewed: 2026-05-02
 
-This document maps the P5 objective to concrete Tessera artifacts. It is not a
-completion record yet. Treat unchecked or blocked rows as open work.
+This document maps the P5 objective to concrete Tessera artifacts and records
+the 2026-05-02 completion evidence. Treat the residual scope section as future
+work outside the P5 split-activation completion boundary.
 
 ## Objective Restatement
 
@@ -44,14 +45,14 @@ Completion requires all of the following:
 | Planner-to-operator flow | `cargo xt split-activation-plan`; `cargo xt dev activation-plan-smoke`; `.dev/reports/split-activation-plan-latest.json` | Covered locally |
 | Load/soak observation loop | `cargo xt dev activation-soak`; `.dev/reports/activation-soak-latest.json` | Covered locally |
 | Local/dev report validation | `cargo xt dev activation-report-check` validates latest plan/success/failure/soak reports, rollback policy, and local-only remaining uncovered state | Covered by helper |
-| Internal MicroK8s read-only preflight | `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera ...`; `.dev/reports/internal-microk8s-activation-smoke-latest.json` | Covered as blocked preflight |
-| Internal MicroK8s split publish | `cargo xt k8s activation-smoke --allow-activation` against approved two-Worker topology | Blocked |
-| Internal MicroK8s failure/recovery | `cargo xt k8s activation-smoke --allow-activation --with-failure --allow-scale` | Blocked |
+| Internal MicroK8s read-only preflight | `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera ...`; `.dev/reports/internal-microk8s-activation-smoke-latest.json` | Covered |
+| Internal MicroK8s split publish | `cargo xt k8s activation-smoke --allow-activation` against approved two-Worker topology | Covered in internal cluster |
+| Internal MicroK8s failure/recovery | `cargo xt k8s activation-smoke --allow-activation --with-failure --allow-scale` | Covered in internal cluster |
 | ArgoCD readiness gate before cluster smoke | `cargo xt k8s activation-smoke` checks Application `Synced / Healthy` unless `--skip-argocd-check` is passed | Covered by helper |
 | Runtime image freshness gate before cluster smoke | `cargo xt k8s activation-smoke --expected-image <tag>` checks live deployment images and records them in `cluster.deployment_images` | Covered by helper |
 | Final cluster evidence report validation | `cargo xt k8s activation-report-check --require-published --require-failure --expected-image <tag>` validates the final internal smoke report, including ArgoCD Synced/Healthy, clean preflight, ready plan, deployment image evidence for orchestrator/gateway/source Worker/target Worker, all-child success/recovery probes, and a failure probe that matches the target Worker plan map | Covered by helper |
-| Safe operator activation and recovery docs | `docs/internal-microk8s-activation-smoke.md` and `docs/dynamic-split-merge.md` | Covered by runbook; cluster execution blocked |
-| Merge/rollback policy | `docs/dynamic-split-merge.md` records `operator_recovery_no_automatic_merge_rollback_v1`; final report checker requires this policy and empty `remaining_uncovered` with `--require-failure` | Decided for P5 split activation |
+| Safe operator activation and recovery docs | `docs/internal-microk8s-activation-smoke.md` and `docs/dynamic-split-merge.md` | Covered |
+| Merge/rollback policy | `docs/dynamic-split-merge.md` records `operator_recovery_no_automatic_merge_rollback_v1`; final report checker requires this policy and empty `remaining_uncovered` with `--require-failure` | Verified for P5 split activation |
 
 ## Current Evidence Snapshot
 
@@ -85,6 +86,15 @@ cargo xt k8s activation-report-check \
 cargo xt k8s activation-report-check \
   --report .dev/reports/internal-microk8s-readiness-negative.json \
   --expect-preflight-error tessera-worker-b
+cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 \
+  --allow-activation \
+  --with-failure \
+  --allow-scale
+cargo xt k8s activation-report-check \
+  --require-published \
+  --require-failure \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2
 ```
 
 The local/dev activation reports were regenerated after the rollback policy
@@ -110,60 +120,62 @@ gate was fixed:
 - `cargo xt dev activation-report-check` validates those latest local/dev
   reports without relying on manual `jq` inspection.
 
-The internal MicroK8s helper wrote
+The internal MicroK8s completion run wrote
 `.dev/reports/internal-microk8s-activation-smoke-latest.json` with:
 
-- `stage=blocked_before_activation`
-- `activation_mutated=false`
-- `reason=preview returned no split candidate`
-- `preview.source=assignment_listing_zero_metrics`
-- `preview.plan_count=0`
-- `configured_workers=1`
-- `registered_workers=0`
-- `remaining_uncovered` lists internal MicroK8s publish and failure/recovery
-  evidence only. The current live one-Worker topology fails the stricter
-  `--require-target-worker` readiness gate until the two-Worker GitOps slice is
-  synced.
-- A stricter read-only readiness run with `--require-target-worker
-  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`
-  currently writes
-  `.dev/reports/internal-microk8s-readiness-negative.json` with
-  `stage=blocked_before_plan`, ArgoCD `Synced / Healthy`, the three existing
-  `v2026.05.1` deployment images, and the explicit failure that deployment
-  `tessera-worker-b` does not exist in the live namespace. The same failure is
-  also recorded as structured `preflight_errors[]` entries for machine checks.
-  `activation-report-check --expect-preflight-error tessera-worker-b` validates
-  that blocked readiness evidence without relying on the human-readable
-  `reason`.
-
-The expected-image negative preflight wrote
-`.dev/reports/internal-microk8s-expected-image-negative.json` with:
-
-- `stage=blocked_before_plan`
-- `activation_mutated=false`
-- `plan.status=not_run`
+- `schema=tessera.internal_microk8s_activation_smoke.v1`
+- `operation_id=internal-smoke-1777687783`
+- `stage=published`
+- `activation_mutated=true`
 - `cluster.argocd.sync=Synced`
 - `cluster.argocd.health=Healthy`
-- live deployment images still on
-  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.1`
+- all runtime deployments on
+  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`
+- `plan.status=ready`, `source_worker_id=worker-a`, and target map
+  `0=worker-a, 1=worker-b, 2=worker-a, 3=worker-b`
+- `checks.split_published=true`
+- `checks.gateway_ready_routes=4`
+- `checks.child_ping_all_routes=true`
+- `checks.gateway_close_counters_success_delta_zero=true`
+- `checks.post_publish_failure_smoke_ran=true`
+- `checks.target_worker_restart_recovered_convergence=true`
+- `checks.automatic_rollback_observed=false`
+- `success_probe.succeeded=[0,1,2,3]`
+- `failure_probe.succeeded=[0,2]` and `failure_probe.failures[].sub=[1,3]`,
+  matching the target Worker plan map for `worker-b`
+- `recovery_probe.succeeded=[0,1,2,3]`
 - `rollback_policy.policy_id=operator_recovery_no_automatic_merge_rollback_v1`
+- `remaining_uncovered=[]`
 
-## Remaining Blockers
+`cargo xt k8s activation-report-check --require-published --require-failure
+--expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`
+validated that report.
 
-Internal cluster activation is still blocked by the live topology and image:
+## Internal Cluster Rollout Record
 
-1. The live GitOps manifest still has one Orchestrator, one Worker, and one
-   Gateway.
-2. The live Orchestrator has no manual activation flag.
-3. The live preview emits no split candidate because it uses
-   assignment-listing zero metrics.
-4. The promoted image is still `v2026.05.1`, which predates this working-tree
-   helper and may not contain the latest activation evidence fixes.
+The controlled smoke image and topology were applied through GitOps:
 
-A local, unpushed GitOps draft exists in `../k8s` that changes
-`k8s/apps/tessera/manifests/tessera-runtime.yaml` to the expected
-`v2026.05.2` smoke image tag, adds `tessera-worker-b`, enables the manual
-activation flag, and adds the controlled preview fixture. It passed:
+1. Tessera `main` was pushed at commit `8dd5c48205d65b5aa592de64f8588dfbe7f84029`.
+2. GitHub Actions run
+   `https://github.com/zrma/tessera/actions/runs/25241047849` published
+   `harbor.1day1coding.com/1day1coding/tessera:v2026.05.2` for `linux/amd64`
+   with digest
+   `sha256:08a3fe1a5f560d1a487a99f2b036d842d47abd408ee05d9c6f80c8778e423235`.
+3. k8s GitOps commit `8196f720596f066437b06a1011bc1cd0f488489d` applied the
+   controlled smoke topology: two Workers, manual activation flag, preview
+   fixture, and `v2026.05.2`.
+4. ArgoCD Application `tessera` reached `Synced / Healthy` on that revision.
+5. The internal smoke command above published the split, verified failure and
+   recovery, and wrote the final report.
+6. k8s GitOps commit `bf363f87f9710ec7ad49be44572948f2cb259d64` closed the
+   smoke window by removing the manual activation flag and preview fixture
+   while keeping the `v2026.05.2` two-Worker topology.
+7. ArgoCD Application `tessera` reached `Synced / Healthy` on the post-smoke
+   revision. Live Orchestrator env now omits
+   `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` and
+   `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`.
+
+GitOps validation used before applying the controlled smoke topology:
 
 ```sh
 make validate-files FILES='k8s/apps/tessera/manifests/tessera-runtime.yaml'
@@ -172,24 +184,26 @@ kubectl --context microk8s-ts apply --dry-run=server \
   -f k8s/apps/tessera/manifests/tessera-runtime.yaml
 ```
 
-This draft must not be pushed until the matching Tessera image tag exists and
-the controlled smoke window is approved.
+Post-smoke cleanup validation used:
 
-Before P5 can be marked complete, an approved GitOps slice must:
+```sh
+make validate-files FILES='k8s/apps/tessera/manifests/tessera-runtime.yaml'
+make validate-repo-policies
+kubectl --context microk8s-ts apply --dry-run=server \
+  -f k8s/apps/tessera/manifests/tessera-runtime.yaml
+```
 
-1. Publish and promote a Tessera image containing this P5 working tree.
-2. Run a controlled two-Worker topology with `worker-a` and `worker-b`.
-3. Configure `TESSERA_WORKER_ADVERTISE_ADDR` for both Worker services.
-4. Enable `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual` only for the smoke
-   window.
-5. Provide either a controlled `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON` fixture
-   or real metrics that emit a split candidate.
-6. Run `cargo xt k8s activation-smoke --allow-activation --with-failure
-   --allow-scale`.
-7. Record the exact image tag, ArgoCD health, command output, report paths, and
-   final `activation-report-check --require-published --require-failure`
-   success. The final report must include
-   `rollback_policy.policy_id=operator_recovery_no_automatic_merge_rollback_v1`
-   and an empty `remaining_uncovered` list. Its failure probe must fail exactly
-   the child subs assigned to `cluster.target_worker_id` in `plan.targets[]`
-   while the remaining child subs continue through the Gateway.
+The full repo-wide `make validate` was not reused for the post-smoke cleanup
+commit because its Helm template hook attempted to rewrite unrelated Tailscale
+generated files. Those hook side effects were excluded from the Tessera cleanup
+logical unit.
+
+## Residual Scope
+
+P5 split activation is complete for the objective in this document. Remaining
+work is intentionally outside this completion boundary:
+
+1. Automatic planner submission from live metrics.
+2. Runtime merge activation and sibling coalescing policy.
+3. Multi-depth split activation beyond `depth=0/sub=0 -> depth=1/sub=0..3`.
+4. Persistent split state across Orchestrator restarts.

@@ -23,8 +23,10 @@ counters. A planner-to-operator helper converts dry-run preview output plus
 Orchestrator health/listing into mutation-free operator evidence and a manual
 submission command template. An internal MicroK8s helper now automates the
 port-forwarded plan, optional publish, and guarded target Worker scale-down/up
-failure recovery smoke, but live cluster evidence is still blocked until the
-two-Worker GitOps slice is approved and synced.
+failure recovery smoke. The 2026-05-02 `v2026.05.2` controlled GitOps smoke
+window verified live internal split publish, target-only failure detection, and
+target Worker recovery, then a cleanup GitOps revision removed the manual
+activation flag and preview fixture from the live Orchestrator.
 
 P4.3's first activation shape is now fixed as a manual, feature-flagged,
 split-only runtime slice. The implementation milestone should follow this
@@ -339,15 +341,16 @@ The P5 split-activation completion boundary uses
   a later milestone chooses sibling coalescing and rollback semantics.
 - Operator recovery is target restoration: restart or restore the failed target
   Worker and rerun convergence checks until all child routes answer.
-- GitOps backout for a controlled smoke window is to revert the smoke slice:
+- GitOps backout for a controlled smoke window can revert the smoke slice:
   image tag, second Worker topology, preview fixture, and manual activation
-  flag. Wait for ArgoCD `Synced / Healthy` before retrying activation.
+  flag. The 2026-05-02 post-smoke cleanup kept the `v2026.05.2` two-Worker
+  topology and removed only the preview fixture plus manual activation flag.
+  Wait for ArgoCD `Synced / Healthy` before retrying activation.
 - `cargo xt k8s activation-report-check --require-published --require-failure`
   requires the final cluster report to include this policy and to have an empty
   `remaining_uncovered` list.
 
-The next runtime slice must add focused checks for:
+Future runtime slices must add focused checks for:
 
-- Actual internal MicroK8s activation evidence after the approved two-Worker
-  GitOps smoke topology is synced, following
-  `docs/internal-microk8s-activation-smoke.md`.
+- Automatic planner submission from live metrics, runtime merge activation, and
+  multi-depth split activation if those decision gates are opened.

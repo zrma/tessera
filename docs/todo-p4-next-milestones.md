@@ -123,7 +123,8 @@ gh workflow run tessera.build-push.yml --ref main
 ```
 
 The workflow builds `linux/amd64` on GitHub Actions and pushes a `vYYYY.MM.N`
-tag to Harbor. The current promoted image tag is `v2026.05.1`.
+tag to Harbor. P4.2 first promoted `v2026.05.1`; P5 later promoted
+`v2026.05.2`.
 
 Completed image-promotion checks:
 
@@ -145,12 +146,14 @@ outage/restart recovery smoke, and local load/soak observation smoke
 implemented; P5 rollback policy is
 `operator_recovery_no_automatic_merge_rollback_v1`.
 `cargo xt k8s activation-smoke` now provides the internal MicroK8s
-port-forwarded operator helper, but the actual cluster evidence remains open
-until the approved two-Worker GitOps topology and image are synced.
-The 2026-05-02 plan-only run against the current live topology stopped before
-mutation with `no_split_candidate`, because the live preview source is
-`assignment_listing_zero_metrics` and the cluster has no controlled pressure
-fixture or real metrics candidate.
+port-forwarded operator helper, and the 2026-05-02 internal MicroK8s
+success/failure/recovery gate completed on the approved two-Worker
+`v2026.05.2` GitOps topology.
+The initial 2026-05-02 plan-only run against the prior live topology stopped
+before mutation with `no_split_candidate`, because the preview source was
+`assignment_listing_zero_metrics` and the cluster had no controlled pressure
+fixture or real metrics candidate. That block was cleared by the later
+controlled smoke GitOps revision.
 
 Chosen first slice:
 
@@ -194,15 +197,12 @@ Implemented slices:
 8. Abort prepared target replay payloads and keep the parent assignment
    unchanged when prepare or source replay fails.
 
-Remaining implementation:
+Remaining implementation outside P5:
 
-1. Run internal-cluster activation evidence before enabling the flag in any
-   environment beyond controlled smoke runs. The helper exists as
-   `cargo xt k8s activation-smoke`, but the cluster topology/image/flag slice is
-   not applied yet, and the smoke window also needs a controlled preview fixture
-   or real metrics candidate.
-2. Keep merge activation disabled until sibling coalescing and merge-runtime
+1. Keep merge activation disabled until sibling coalescing and merge-runtime
    safety semantics are chosen in a later milestone.
+2. Keep automatic planner submission disabled until live metrics ingestion and
+   operator policy gates are chosen in a later milestone.
 
 Internal MicroK8s activation preflight on 2026-05-02:
 
@@ -215,14 +215,12 @@ Internal MicroK8s activation preflight on 2026-05-02:
    `worker-a` and does not set
    `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`.
 
-Conclusion: internal activation smoke is intentionally blocked by the current
-single-worker, preview-only GitOps slice. The next cluster slice must be
-explicitly approved because it changes runtime topology: publish an image that
-contains the activation evidence harness, add a second Worker/service and
-Orchestrator target config, enable the manual activation flag for the controlled
-smoke environment, sync ArgoCD, then run success/failure/recovery smoke through
-port-forward or an in-cluster Job. The concrete command/checklist plan lives in
-`docs/internal-microk8s-activation-smoke.md`.
+Conclusion: the initial preflight block was cleared by publishing
+`v2026.05.2`, applying the controlled two-Worker GitOps smoke revision, and
+running the success/failure/recovery smoke through port-forward. The concrete
+command/checklist and final evidence live in
+`docs/internal-microk8s-activation-smoke.md` and
+`docs/p5-completion-audit.md`.
 
 Verification required for the implementation milestone:
 
@@ -261,7 +259,7 @@ evidence once the controlled topology exists.
 
 ## Recommendation
 
-Continue P4.3 only for approved cluster activation evidence. The implemented
+Close P4.3/P5 split activation as implemented and verified. The implemented
 shape is intentionally narrow: split-only, manual, default-off, one-level
 `CellId`, acked replay before atomic publication, local route
 convergence/load-soak smoke, guarded internal smoke helper, target Worker

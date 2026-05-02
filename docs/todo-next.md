@@ -9,12 +9,11 @@ Last reviewed: 2026-05-02
 - P4.1은 optional envelope-level `request_id`를 통한 Join/Move latency correlation까지 완료됐다.
 - P4.2는 internal-only GitOps manifest commit/push, ArgoCD sync, runtime smoke, GitHub Actions `v2026.05.1` image publish, k8s GitOps tag promotion까지 완료됐다.
 - P4.3 runtime split activation의 publish/replay/convergence slice는 split-only/manual/default-off `SubmitSplitActivation` gRPC surface, planner-to-operator `split-activation-plan` evidence helper, target map/depth/registration validation, target Worker replay prepare, source Worker parent snapshot/buffered move partition, child replay ack, atomic child assignment publish, replay 실패 시 assignments unchanged rollback, 로컬 two-Worker activation plan smoke/Gateway route convergence/source-target Worker refresh/stable-session post-split Move/remote AOI resync snapshot, post-publish target outage 감지 및 Worker restart recovery smoke, local load/soak observation smoke, internal MicroK8s port-forward smoke helper까지 구현됐다.
-- 2026-05-02 read-only internal MicroK8s preflight 결과, live `tessera` namespace와 GitOps manifest는 아직 one Orchestrator / one Worker / one Gateway 구조이고 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`이 꺼져 있다. 이어서 `cargo xt k8s activation-smoke` plan-only helper는 mutation 없이 중단했고, 현재 preview는 `assignment_listing_zero_metrics` 기반 `no_split_candidate`였다. 따라서 실제 publish/failure/recovery run은 새 image promotion, second Worker/Service, Orchestrator config target map, manual activation flag, controlled preview fixture 또는 실제 metrics candidate를 포함한 별도 GitOps slice 승인 후 실행해야 한다. 실행 계획은 `docs/internal-microk8s-activation-smoke.md`에 둔다.
-- P5 completion audit와 prompt-to-artifact checklist는 `docs/p5-completion-audit.md`에 둔다. P5 split activation rollback policy는 `operator_recovery_no_automatic_merge_rollback_v1`로 고정했다. P5는 internal publish/failure/recovery evidence와 final report verifier가 닫히기 전까지 완료로 보지 않는다.
-- `../k8s`에는 승인 대기용 `v2026.05.2` two-Worker GitOps draft가 로컬 diff로 준비되어 있으며, 단일 파일 pre-commit 검증은 통과했다. matching image tag publish와 controlled smoke window 승인 전에는 push하지 않는다.
+- 2026-05-02 internal MicroK8s P5 gate가 완료됐다. Tessera `v2026.05.2` image를 GitHub Actions로 publish했고, k8s GitOps controlled smoke revision에서 two-Worker topology, manual activation flag, preview fixture를 적용한 뒤 `cargo xt k8s activation-smoke --allow-activation --with-failure --allow-scale`와 final `activation-report-check --require-published --require-failure`가 통과했다.
+- P5 completion audit와 prompt-to-artifact checklist는 `docs/p5-completion-audit.md`에 둔다. P5 split activation rollback policy는 `operator_recovery_no_automatic_merge_rollback_v1`로 고정했고, final internal report는 `remaining_uncovered=[]`를 기록한다.
+- Post-smoke cleanup도 완료됐다. k8s GitOps cleanup revision은 `v2026.05.2` two-Worker topology를 유지하면서 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION`과 `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`을 제거했고, ArgoCD `tessera`는 `Synced / Healthy`에 도달했다.
 
-## P4
+## Next
 
-- 실행 계획: `docs/todo-p4-next-milestones.md`
-- 다음 milestone: internal MicroK8s activation GitOps slice 승인/적용/검증.
-- 에스컬레이션 필요: Tessera `v2026.05.2` image publish, k8s GitOps smoke topology push/sync, and controlled `--allow-activation --with-failure --allow-scale` execution.
+- 다음 milestone은 P5 이후 범위로 분리한다: automatic planner submission, runtime merge activation, multi-depth split, or persistent split state 중 하나를 별도 decision gate로 선택한다.
+- 실행 기록과 후속 boundary는 `docs/todo-p4-next-milestones.md`, `docs/p5-completion-audit.md`, `docs/internal-microk8s-activation-smoke.md`를 기준으로 본다.

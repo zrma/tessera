@@ -1,16 +1,15 @@
-# Internal MicroK8s Activation Smoke Plan
+# Internal MicroK8s Activation Smoke Evidence
 
 Last reviewed: 2026-05-02
 
 This is the controlled internal-cluster gate for turning the local
-default-off/manual split activation harness into cluster evidence. It is a
-plan, not completed evidence. The 2026-05-02 preflight found the live GitOps
-deployment still has one Orchestrator, one Worker, one Gateway, and no
-`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual` flag, so runtime activation smoke
-is blocked until a dedicated GitOps slice changes topology and exposes a split
-preview candidate.
+default-off/manual split activation harness into cluster evidence. The
+2026-05-02 run completed the controlled smoke window, verified split
+success/failure/recovery in MicroK8s, and then closed the mutating activation
+flag and preview fixture through GitOps while keeping the `v2026.05.2`
+two-Worker topology live.
 
-## Current Preflight Evidence
+## Preflight Evidence
 
 Read-only checks already performed:
 
@@ -43,7 +42,7 @@ Observed state:
   snapshot. The helper writes this blocked preflight to
   `.dev/reports/internal-microk8s-activation-smoke-latest.json` with
   `stage=blocked_before_activation` and `activation_mutated=false`.
-- The unpushed two-Worker GitOps draft passed Kubernetes server-side dry-run:
+- The two-Worker GitOps draft passed Kubernetes server-side dry-run:
 
 ```sh
 kubectl --context microk8s-ts apply --dry-run=server \
@@ -54,12 +53,12 @@ kubectl --context microk8s-ts apply --dry-run=server \
   `tessera-gateway`, plus create operations for `tessera-worker-b` Deployment
   and Service.
 
-## Required GitOps Slice
+## Controlled GitOps Slice
 
-This slice must be approved before applying because it changes runtime topology
-and enables a mutating activation flag in a controlled environment.
+This slice required explicit approval because it changed runtime topology and
+enabled a mutating activation flag in a controlled environment.
 
-Required changes in the k8s GitOps repo:
+Applied changes in the k8s GitOps repo:
 
 1. Promote a Tessera image tag that contains the current activation evidence
    harness and runtime fixes.
@@ -115,6 +114,50 @@ Required changes in the k8s GitOps repo:
 
 NetworkPolicy already allows same-namespace ingress/egress, so the split replay
 and Worker relay paths should work without additional namespace policy changes.
+
+## Completed Smoke Evidence
+
+Completed run:
+
+```sh
+cargo xt k8s activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 \
+  --allow-activation \
+  --with-failure \
+  --allow-scale
+cargo xt k8s activation-report-check \
+  --require-published \
+  --require-failure \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2
+```
+
+Evidence:
+
+- GitHub Actions run
+  `https://github.com/zrma/tessera/actions/runs/25241047849` published
+  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.2` for `linux/amd64`
+  with digest
+  `sha256:08a3fe1a5f560d1a487a99f2b036d842d47abd408ee05d9c6f80c8778e423235`.
+- k8s GitOps revision `8196f720596f066437b06a1011bc1cd0f488489d` applied the
+  controlled smoke topology and reached ArgoCD `Synced / Healthy`.
+- `.dev/reports/split-activation-plan-latest.json` recorded
+  `operation_id=internal-smoke-1777687783`, `status=ready`,
+  `activation_mutated=false`, `configured_workers=2`, `registered_workers=2`,
+  and target map `0=worker-a, 1=worker-b, 2=worker-a, 3=worker-b`.
+- `.dev/reports/internal-microk8s-activation-smoke-latest.json` recorded
+  `stage=published`, `activation_mutated=true`, `split_published=true`,
+  `gateway_ready_routes=4`, all-child success and recovery probes, target-only
+  failure for child subs `1` and `3`, `automatic_rollback_observed=false`, and
+  `remaining_uncovered=[]`.
+- `cargo xt k8s activation-report-check --require-published --require-failure
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`
+  accepted the final report.
+- k8s GitOps revision `bf363f87f9710ec7ad49be44572948f2cb259d64` closed the
+  smoke window by removing `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` and
+  `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`; ArgoCD reached `Synced / Healthy`
+  on that post-smoke revision.
 
 ## Port-Forwarded Operator Smoke
 
@@ -240,7 +283,7 @@ failure smoke exits early after scaling down.
 
 ## Exit Criteria
 
-The internal cluster slice is complete only when these artifacts exist:
+The internal cluster slice is complete because these artifacts exist:
 
 - GitOps commit and ArgoCD `Synced / Healthy` evidence for the two-Worker
   controlled-smoke topology.
@@ -254,7 +297,5 @@ The internal cluster slice is complete only when these artifacts exist:
 - `cargo xt k8s activation-report-check --require-published
   --require-failure --expected-image <tag>` passes, proving the report includes
   the P5 rollback policy and no remaining uncovered requirements.
-- Documentation update that records exact image tag, commands, timestamps, and
-  any newly observed operational caveats.
-
-Until then, the P5 goal remains open.
+- Documentation update records exact image tag, commands, report paths, ArgoCD
+  revisions, and the post-smoke cleanup caveat.
