@@ -270,8 +270,36 @@ keeping the failure state/ledger paths. After cleanup, ArgoCD returned to
 config/state/ledger paths, Gateway parent Ping returned `Pong { ts: 123 }`,
 `GET /operations` retained one `recovery_required` record, and
 `GET /split-merge/preview` again reported `assignment_listing_zero_metrics` with
-zero plans. Internal restart and completion-audit evidence remain follow-up
-gates.
+zero plans.
+
+The restart gate then ran in a third controlled window. k8s revision
+`085cd7715eeaae01e898225e2a07ded85e31ce7f` reopened the four-sibling topology
+with restart-specific PVC-backed assignment state and operation ledger paths,
+manual mutation flags, and the cold-sibling preview fixture. `cargo xt k8s
+operation-smoke --allow-execution --with-restart --allow-rollout-restart
+--expected-assignment-state-path
+/var/lib/tessera/assignment-state-p7-operation-restart-20260504.json` completed
+operation `p7-merge-w0-cx0-cy0-d0-s0-1586936fe8a4`, rollout-restarted
+`deploy/tessera-orch`, and wrote
+`.dev/reports/internal-microk8s-p7-operation-restart-smoke-latest.json`.
+`cargo xt k8s operation-report-check --require-published-execution
+--require-restart` validated that report against
+`harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`. The report records
+PVC-backed assignment-state storage, approved execution, persisted parent route
+and operation ledger recovery after Orchestrator restart, parent traffic, and a
+completed post-restart observation.
+
+Cleanup revision `50100c54363b22d759e61bfb1935af5bbe10327c` removed the manual
+execution flag, split/merge activation flag, and preview fixture while keeping
+the restart state/ledger paths. After cleanup, ArgoCD returned to `Synced /
+Healthy`, all Tessera deployments stayed on
+`harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`, the live Orchestrator
+env contained only non-mutating config/state/ledger paths, the ConfigMap
+returned to the root-cell default topology, Gateway parent Ping returned
+`Pong { ts: 123 }`, `GET /operations` retained one `completed` restart record,
+and `GET /split-merge/preview` again reported
+`assignment_listing_zero_metrics` with zero plans. Internal completion-audit
+evidence remains the follow-up gate.
 
 Current internal operation helper:
 

@@ -29,10 +29,11 @@ Last reviewed: 2026-05-04
   completion. `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
-  default-off. The internal baseline is ArgoCD `Synced / Healthy`, all Tessera
-  deployments on `harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`,
-  Gateway Ping smoke green, and `GET /operations` reporting
-  `persistence_enabled=true`.
+  default-off outside controlled smoke windows. Internal `v2026.05.5` controlled
+  windows have now covered approved execution/observation/soak, owner Worker
+  failure/recovery, Orchestrator restart recovery, ArgoCD `Synced / Healthy`
+  cleanup, Gateway parent Ping, and durable operation ledger persistence after
+  each cleanup.
 
 ## Next
 
@@ -70,12 +71,18 @@ Recommended next slices:
 4. Done: `test: add p7 operation soak smoke` - run sustained post-execution parent
    Ping/Move traffic and verify route count, latency histograms, and close
    counters stay clean while the operation closes to `completed`.
-5. `test: add internal p7 operation smoke` - add a repo-native `cargo xt k8s ...`
-   helper for approved P7 operation execution against a controlled GitOps smoke
-   window, with default-off cleanup and report checks.
-6. `feat: extend p7 executor beyond same-worker merge` - only after the
+5. Done: `test: add internal p7 operation smoke` - add a repo-native
+   `cargo xt k8s ...` helper for approved P7 operation execution against a
+   controlled GitOps smoke window, with default-off cleanup and report checks.
+6. Done: `test: add internal p7 operation recovery smoke` - record owner Worker
+   failure, recovery-required ledger state, operator scale-up recovery, and
+   post-smoke default-off cleanup.
+7. Done: `test: add internal p7 operation restart smoke` - record PVC-backed
+   assignment state, Orchestrator rollout restart recovery, completed
+   post-restart observation, and post-smoke default-off cleanup.
+8. `test: add p7 completion audit` - aggregate local, internal, rollout,
+   cleanup, observation, recovery, restart, and soak evidence and fail until all
+   P7 gates are backed by real artifacts.
+9. `feat: extend p7 executor beyond same-worker merge` - only after the
    observation/recovery/restart evidence exists, add split and canonical
    multi-depth execution gates.
-7. `test: add p7 completion audit` - aggregate local, internal, rollout, cleanup,
-   observation, recovery, restart, and soak evidence and fail until all gates are
-   backed by real artifacts.
