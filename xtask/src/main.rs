@@ -913,6 +913,8 @@ enum DevSub {
     P7OperationSplitExecutionSmoke,
     /// Start a full dev stack and close an approved P7 split execution with observation evidence
     P7OperationSplitObservationSmoke,
+    /// Start a full dev stack and prove an approved P7 split observation records target recovery
+    P7OperationSplitRecoverySmoke,
     /// Start a full dev stack and close an approved P7 merge execution with observation evidence
     P7OperationObservationSmoke,
     /// Start a full dev stack and prove a failed P7 observation stays recovery-required until operator recovery
@@ -1697,6 +1699,7 @@ fn main() -> Result<()> {
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
             DevSub::P7OperationSplitObservationSmoke => dev_p7_operation_split_observation_smoke()?,
+            DevSub::P7OperationSplitRecoverySmoke => dev_p7_operation_split_recovery_smoke()?,
             DevSub::P7OperationObservationSmoke => dev_p7_operation_observation_smoke()?,
             DevSub::P7OperationRecoverySmoke => dev_p7_operation_recovery_smoke()?,
             DevSub::P7OperationRestartSmoke => dev_p7_operation_restart_smoke()?,
@@ -3622,6 +3625,347 @@ fn dev_p7_operation_split_observation_smoke() -> Result<()> {
 
     println!(
         "P7 split operation observation smoke: approved split execution converged through Gateway/Worker child traffic evidence and completed observation, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p7_operation_split_recovery_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4390";
+    let gateway_metrics_addr = "127.0.0.1:4391";
+    let worker_a_addr = "127.0.0.1:5391";
+    let worker_b_addr = "127.0.0.1:5392";
+    let worker_a_metrics_addr = "127.0.0.1:5393";
+    let worker_b_metrics_addr = "127.0.0.1:5394";
+    let orch_addr = "127.0.0.1:6390";
+    let orch_metrics_addr = "127.0.0.1:6391";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let ledger_path = report_dir.join("p7-operation-split-recovery-ledger-latest.json");
+    let _ = fs::remove_file(&ledger_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+    );
+    let split_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", split_preview_json),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+    let worker_b_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_WORKER_ID", "worker-b"),
+        ("TESSERA_WORKER_ADDR", worker_b_addr),
+        ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+        ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+        ("TESSERA_WORKER_REFRESH_SECS", "1"),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-recovery-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-recovery-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-recovery-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &worker_b_envs,
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-recovery-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    assert_http_status_endpoint(
+        "P7 split operation recovery gateway readiness",
+        gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "P7 split operation recovery gateway before",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let actor_b = EntityId(7_902);
+    let _child3_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        parent,
+        actor_b,
+        activation_soak_position(3),
+    )?;
+
+    let proposal_response = http_json_post(
+        "P7 split operation recovery proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    let operation_id = json_array(&proposal_response, &["operation_ids"])?
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("P7 split operation recovery proposal response has no operation id")
+        })?
+        .to_string();
+    let proposal_snapshot = http_json_get(
+        "P7 split operation recovery ledger",
+        orch_metrics_addr,
+        "/operations",
+    )?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "split")?;
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "P7 split operation recovery approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p7-split-recovery-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p7-split-recovery-smoke&budget_key=p7-split-recovery-smoke"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+    let execution_response = http_json_post(
+        "P7 split operation recovery execution",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+
+    let expected_children = [
+        (activation_child_cell(0), "worker-a"),
+        (activation_child_cell(1), "worker-b"),
+        (activation_child_cell(2), "worker-a"),
+        (activation_child_cell(3), "worker-b"),
+    ];
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let success_probe = probe_split_convergence(gateway_addr, 8_900);
+    success_probe.assert_success()?;
+
+    stack.terminate_named("p7-operation-split-recovery-worker-b")?;
+    let failure_probe = probe_split_convergence(gateway_addr, 8_910);
+    failure_probe.assert_failed_only(&[1, 3])?;
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let gateway_metrics_after_failure = assert_metrics_endpoint_body_until(
+        "P7 split operation recovery gateway after failure",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_after_failure =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_failure)?;
+
+    let observation_response = http_json_post(
+        "P7 split operation failed observation",
+        orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=p7-split-recovery-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=false&counters_clean=false"
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "recovery_required")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], false)?;
+
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-recovery-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &worker_b_envs,
+        },
+    )?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let recovery_probe = probe_split_convergence(gateway_addr, 8_920);
+    recovery_probe.assert_success()?;
+    let gateway_metrics_after_recovery = assert_metrics_endpoint_body_until(
+        "P7 split operation recovery gateway after recovery",
+        gateway_metrics_addr,
+        &["tessera_gateway_routes"],
+    )?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false, true)?;
+    let record = find_p7_operation_record(&ledger, &operation_id)?;
+    validate_p7_recovery_required(record)?;
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_split_recovery_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "split",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers": before_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "gateway": {
+            "addr": gateway_addr,
+            "metrics_addr": gateway_metrics_addr,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after_failure": gateway_close_counters_json(gateway_close_after_failure)
+            },
+            "routes_after_failure": prometheus_sample_value(&gateway_metrics_after_failure, "tessera_gateway_routes")?,
+            "routes_after_recovery": prometheus_sample_value(&gateway_metrics_after_recovery, "tessera_gateway_routes")?
+        },
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records,
+            "recovery_required_records": ledger_summary.recovery_required_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "observation": observation_response
+        },
+        "failure": {
+            "target_worker_id": "worker-b",
+            "target_child_subs": [1, 3]
+        },
+        "probes": {
+            "success": split_convergence_probe_json(&success_probe),
+            "failure": split_convergence_probe_json(&failure_probe),
+            "recovery": split_convergence_probe_json(&recovery_probe)
+        },
+        "checks": {
+            "split_execution_published": true,
+            "target_outage_detected": true,
+            "observation_recovery_required": true,
+            "no_automatic_rollback": true,
+            "operator_recovery_confirmed": true,
+            "ledger_recovery_required": true
+        },
+        "remaining_uncovered": [
+            "split_operation_restart_recovery",
+            "split_operation_soak",
+            "multi_depth_runtime_execution",
+            "guarded_kubernetes_split_operation_recovery_smoke"
+        ]
+    });
+    validate_p7_operation_split_recovery_smoke_report(&report)?;
+    let report_path = write_p7_operation_split_recovery_smoke_report(&report)?;
+
+    println!(
+        "P7 split operation recovery smoke: target outage marked operation recovery_required and operator Worker restart restored child traffic, report={}, ledger={}",
         report_path.display(),
         ledger_path.display()
     );
@@ -13699,6 +14043,12 @@ fn default_p7_operation_split_observation_smoke_path() -> PathBuf {
         .join("p7-operation-split-observation-smoke-latest.json")
 }
 
+fn default_p7_operation_split_recovery_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p7-operation-split-recovery-smoke-latest.json")
+}
+
 fn default_p7_operation_recovery_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -13839,6 +14189,20 @@ fn write_p7_operation_split_observation_smoke_report(
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p7_operation_split_observation_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p7_operation_split_recovery_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p7-operation-split-recovery-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p7_operation_split_recovery_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -14318,6 +14682,61 @@ fn validate_p7_operation_split_observation_smoke_report(report: &serde_json::Val
     assert_json_bool_eq(report, &["checks", "observation_completed"], true)?;
     assert_json_bool_eq(report, &["checks", "ledger_observation_completed"], true)?;
     assert_remaining_uncovered_contains(report, "split_operation_failure_recovery")?;
+    Ok(())
+}
+
+fn validate_p7_operation_split_recovery_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.p7_operation_split_recovery_smoke.v1",
+    )?;
+    assert_json_str_eq(report, &["operation", "kind"], "split")?;
+    assert_json_str_eq(
+        report,
+        &["operation", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    let ledger_path = json_str(report, &["ledger", "path"])?;
+    if ledger_path.trim().is_empty() {
+        bail!("P7 split operation recovery smoke report has empty ledger.path");
+    }
+    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "recovery_required_records"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "observation", "status"],
+        "recovery_required",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "observation", "observation_accepted"],
+        false,
+    )?;
+    let failed_subs = failure_subs_from_report(report, &["probes", "failure", "failures"])?;
+    if failed_subs != vec![1, 3] {
+        bail!(
+            "P7 split recovery failure probe expected target child subs [1, 3], got {failed_subs:?}"
+        );
+    }
+    assert_json_array_nonempty(report, &["probes", "recovery", "succeeded"])?;
+    assert_json_bool_eq(report, &["checks", "split_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "target_outage_detected"], true)?;
+    assert_json_bool_eq(report, &["checks", "observation_recovery_required"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_automatic_rollback"], true)?;
+    assert_json_bool_eq(report, &["checks", "operator_recovery_confirmed"], true)?;
+    assert_json_bool_eq(report, &["checks", "ledger_recovery_required"], true)?;
+    assert_remaining_uncovered_contains(report, "split_operation_restart_recovery")?;
     Ok(())
 }
 
@@ -22603,6 +23022,104 @@ mod tests {
 
         validate_p7_operation_split_observation_smoke_report(&report)
             .expect("valid P7 split operation observation smoke report");
+    }
+
+    #[test]
+    fn p7_operation_split_recovery_smoke_report_accepts_target_recovery_evidence() {
+        let report = serde_json::json!({
+            "schema": "tessera.p7_operation_split_recovery_smoke.v1",
+            "unix_secs": 120,
+            "operation": {
+                "operation_id": "p7-split-1",
+                "kind": "split",
+                "proposal_hash": "fnv1a64:abc",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6390",
+                "metrics_addr": "127.0.0.1:6391",
+                "registered_workers": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after": {"workers": [], "handovers": 0}
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4390",
+                "metrics_addr": "127.0.0.1:4391",
+                "close_counters": {
+                    "before": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0},
+                    "after_failure": {"no_route": 0, "upstream_retry_exhausted": 2, "ambiguous_upstream": 0}
+                },
+                "routes_after_failure": 4,
+                "routes_after_recovery": 4
+            },
+            "ledger": {
+                "path": ".dev/reports/p7-operation-split-recovery-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "recovery_required_records": 1
+            },
+            "responses": {
+                "proposal": {
+                    "assignments_changed": false,
+                    "planned_count": 1,
+                    "recorded_count": 1,
+                    "already_recorded_count": 0,
+                    "operation_ids": ["p7-split-1"]
+                },
+                "approval": {
+                    "status": "approved",
+                    "assignments_changed": false
+                },
+                "execution": {
+                    "status": "published",
+                    "assignments_changed": true,
+                    "mutation_attempted": true,
+                    "mutation_allowed": true
+                },
+                "observation": {
+                    "status": "recovery_required",
+                    "observation_accepted": false,
+                    "assignments_changed": false
+                }
+            },
+            "failure": {
+                "target_worker_id": "worker-b",
+                "target_child_subs": [1, 3]
+            },
+            "probes": {
+                "success": {
+                    "succeeded": [0, 1, 2, 3],
+                    "failures": []
+                },
+                "failure": {
+                    "succeeded": [0, 2],
+                    "failures": [
+                        {"sub": 1, "error": "upstream retry exhausted"},
+                        {"sub": 3, "error": "upstream retry exhausted"}
+                    ]
+                },
+                "recovery": {
+                    "succeeded": [0, 1, 2, 3],
+                    "failures": []
+                }
+            },
+            "checks": {
+                "split_execution_published": true,
+                "target_outage_detected": true,
+                "observation_recovery_required": true,
+                "no_automatic_rollback": true,
+                "operator_recovery_confirmed": true,
+                "ledger_recovery_required": true
+            },
+            "remaining_uncovered": [
+                "split_operation_restart_recovery"
+            ]
+        });
+
+        validate_p7_operation_split_recovery_smoke_report(&report)
+            .expect("valid P7 split operation recovery smoke report");
     }
 
     #[test]
