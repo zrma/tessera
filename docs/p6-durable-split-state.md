@@ -162,6 +162,15 @@ Storage policy draft:
 - GitOps claim name: `tessera-orch-state`
 - Mount path: `/var/lib/tessera`
 
+The companion k8s GitOps draft for this storage policy has passed both
+client-side and server-side dry-run without applying it:
+
+```sh
+kubectl apply --dry-run=client -f k8s/apps/tessera/manifests
+kubectl --context microk8s-ts apply --dry-run=server \
+  -f k8s/apps/tessera/manifests/tessera-runtime.yaml
+```
+
 Prepared helper:
 
 ```sh

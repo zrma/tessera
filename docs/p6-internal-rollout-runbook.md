@@ -125,6 +125,19 @@ After the GitOps rollout is synced to the new image and PVC-backed state path,
 the restart preflight should stop producing the
 `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` error.
 
+The companion k8s GitOps repo currently has a local P6 storage draft change
+that adds `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`, mounts `/var/lib/tessera`, and
+creates PVC `tessera-orch-state`. It has been checked without applying it:
+
+```sh
+kubectl apply --dry-run=client -f k8s/apps/tessera/manifests
+kubectl --context microk8s-ts apply --dry-run=server \
+  -f k8s/apps/tessera/manifests/tessera-runtime.yaml
+```
+
+Both dry-runs accepted the runtime manifest, including the new
+`persistentvolumeclaim/tessera-orch-state` object.
+
 The planner policy report is read-only and should remain green:
 
 ```sh
