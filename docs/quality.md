@@ -57,8 +57,9 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `cargo xt dev p7-operation-split-execution-smoke`,
   `cargo xt dev p7-operation-split-observation-smoke`,
   `cargo xt dev p7-operation-split-recovery-smoke`, and
-  `cargo xt dev p7-operation-split-restart-smoke`. Split soak and canonical
-  multi-depth operation execution remain P7+ expansion gates.
+  `cargo xt dev p7-operation-split-restart-smoke`, plus sustained child-route
+  soak via `cargo xt dev p7-operation-split-soak-smoke`. Canonical multi-depth
+  operation execution remains the next P7+ expansion gate.
 - P7 internal operation coverage now has a repo-native helper/verifier surface:
   `cargo xt k8s operation-smoke` records internal MicroK8s proposal evidence by
   default and can run approved execution/observation/soak when

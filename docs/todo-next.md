@@ -26,10 +26,10 @@ Last reviewed: 2026-05-04
   execution idempotency, approved legacy split execution success/idempotency,
   approved legacy split observation completion, approved legacy split
   target-outage recovery-required handling, approved legacy split Orchestrator
-  restart recovery, local merge observation completion, and local
-  recovery-required owner-outage handling, plus Orchestrator restart recovery
-  for the published operation ledger and assignment state, and local load/soak
-  observation completion.
+  restart recovery, approved legacy split load/soak observation completion,
+  local merge observation completion, and local recovery-required owner-outage
+  handling, plus Orchestrator restart recovery for the published operation
+  ledger and assignment state, and local load/soak observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
@@ -99,8 +99,8 @@ Recommended next slices:
 12. Done: `test: add p7 split operation restart smoke` - restart the
    Orchestrator after approved legacy split publish, verify operation ledger and
    persisted child assignments survive, then close observation after restart.
-13. `test: add p7 split operation soak smoke` - extend the split path through
-   sustained child Ping/Move traffic before internal rollout.
+13. Done: `test: add p7 split operation soak smoke` - extend the split path
+   through sustained child Ping/Move traffic before internal rollout.
 14. `feat: extend p7 executor to canonical multi-depth operations` - after the
-   split restart/soak gates, add canonical explicit-child operation execution
+   split local gates, add canonical explicit-child operation execution
    and its local/internal evidence chain.

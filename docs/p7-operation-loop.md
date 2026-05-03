@@ -216,8 +216,31 @@ state. Gateway child routes, Worker child actor metrics, stable-session child
 traffic, and clean close counters are verified after restart before
 `POST /operations/observations` closes the operation to `completed`. The smoke
 writes `.dev/reports/p7-operation-split-restart-smoke-latest.json` plus
-`.dev/reports/p7-operation-split-restart-ledger-latest.json`. Split soak and
-internal MicroK8s evidence remain explicit P7+ follow-up gates.
+`.dev/reports/p7-operation-split-restart-ledger-latest.json`. The follow-up
+split soak smoke covers sustained child-route traffic; internal MicroK8s
+evidence remains an explicit P7+ follow-up gate.
+
+Current split soak expansion smoke:
+
+```sh
+cargo xt dev p7-operation-split-soak-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-split-soak-ledger-latest.json \
+  --require-approval \
+  --require-published-execution \
+  --require-completed-observation
+```
+
+This starts a full local dev stack, publishes an approved legacy split operation
+through the P7 executor, verifies all child routes converge, then runs sustained
+Ping/Move traffic against all four child routes. The smoke checks Gateway route
+retention, latency histogram growth, clean close counters, Worker child actor
+metrics, and remote AOI frames before `POST /operations/observations` closes the
+operation to `completed`. It writes
+`.dev/reports/p7-operation-split-soak-smoke-latest.json` plus
+`.dev/reports/p7-operation-split-soak-ledger-latest.json`. Canonical
+multi-depth operation execution and internal MicroK8s evidence remain explicit
+P7+ follow-up gates.
 
 Current observation smoke:
 
@@ -548,19 +571,24 @@ Each slice should be self-contained:
    and persisted child assignments survive Orchestrator restart and can still be
    closed with completed observation evidence. The first repo-native smoke is
    `cargo xt dev p7-operation-split-restart-smoke`.
-12. **Approved merge observation smoke**: verify that a published operation is
+12. **Approved split soak smoke**: verify that approved split child routes stay
+   converged under sustained Ping/Move traffic, Worker child actors remain
+   refreshed, remote AOI frames are observed, and the operation closes with
+   completed observation evidence. The first repo-native smoke is
+   `cargo xt dev p7-operation-split-soak-smoke`.
+13. **Approved merge observation smoke**: verify that a published operation is
    closed only after route convergence, Worker refresh, stable-session traffic,
    latency metrics, and clean close counters are recorded. The first repo-native
    smoke is `cargo xt dev p7-operation-observation-smoke`.
-13. **Approved merge recovery smoke**: verify that a post-publish owner outage
+14. **Approved merge recovery smoke**: verify that a post-publish owner outage
    records `recovery_required`, avoids automatic rollback, and recovers only
    after operator-visible Worker restart. The first repo-native smoke is
    `cargo xt dev p7-operation-recovery-smoke`.
-14. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
+15. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
    `cargo xt k8s operation-report-check` so internal MicroK8s can record P7
    proposal evidence by default and approved execution/observation/soak
    evidence during a controlled smoke window.
-15. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+16. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails
