@@ -190,6 +190,19 @@ live Orchestrator Deployment already has the PVC-backed state path. The current
 post-P5 live state is expected to block because it still runs the previous image
 and does not set the assignment-state env/volume.
 
+Latest read-only preflight against live `v2026.05.2` wrote
+`.dev/reports/internal-microk8s-restart-readiness-preflight.json` with
+`stage=blocked_before_plan`, `activation_mutated=false`,
+`checks.assignment_state_storage_configured=false`, and the expected
+`TESSERA_ORCH_ASSIGNMENT_STATE_PATH` preflight error. The verifier accepted this
+as negative pre-rollout evidence:
+
+```sh
+cargo xt k8s activation-report-check \
+  --report .dev/reports/internal-microk8s-restart-readiness-preflight.json \
+  --expect-preflight-error TESSERA_ORCH_ASSIGNMENT_STATE_PATH
+```
+
 ```sh
 cargo xt k8s activation-smoke \
   --context microk8s-ts \

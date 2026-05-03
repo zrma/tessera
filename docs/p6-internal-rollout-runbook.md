@@ -125,6 +125,13 @@ After the GitOps rollout is synced to the new image and PVC-backed state path,
 the restart preflight should stop producing the
 `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` error.
 
+The latest read-only run against live `v2026.05.2` produced
+`.dev/reports/internal-microk8s-restart-readiness-preflight.json` with
+`stage=blocked_before_plan`, `activation_mutated=false`, and
+`checks.assignment_state_storage_configured=false`. The report checker accepted
+the expected missing env error, so this is a current blocker record, not P6
+completion evidence.
+
 The companion k8s GitOps repo currently has a local P6 storage draft change
 that adds `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`, mounts `/var/lib/tessera`, and
 creates PVC `tessera-orch-state`. It has been checked without applying it:
