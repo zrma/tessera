@@ -70,6 +70,9 @@ enum Cmd {
         /// Require at least one completed observation phase/status
         #[arg(long, default_value_t = false)]
         require_completed_observation: bool,
+        /// Require at least one recovery-required observation phase/status
+        #[arg(long, default_value_t = false)]
+        require_recovery_required: bool,
         /// Print machine-readable JSON instead of text
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -782,6 +785,8 @@ enum DevSub {
     P7OperationExecutionSmoke,
     /// Start a full dev stack and close an approved P7 merge execution with observation evidence
     P7OperationObservationSmoke,
+    /// Start a full dev stack and prove a failed P7 observation stays recovery-required until operator recovery
+    P7OperationRecoverySmoke,
     /// Start a two-worker dev stack and prove canonical explicit child-cell split activation converges
     MultiDepthActivationSmoke,
     /// Start a two-worker dev stack and prove canonical split target outage is recoverable
@@ -975,6 +980,7 @@ fn main() -> Result<()> {
             require_blocked_execution,
             require_published_execution,
             require_completed_observation,
+            require_recovery_required,
             json,
         } => run_p7_operation_ledger_check(
             ledger.as_deref(),
@@ -982,6 +988,7 @@ fn main() -> Result<()> {
             require_blocked_execution,
             require_published_execution,
             require_completed_observation,
+            require_recovery_required,
             json,
         )?,
         Cmd::P6RolloutReportCheck {
@@ -1467,6 +1474,7 @@ fn main() -> Result<()> {
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationObservationSmoke => dev_p7_operation_observation_smoke()?,
+            DevSub::P7OperationRecoverySmoke => dev_p7_operation_recovery_smoke()?,
             DevSub::MultiDepthActivationSmoke => dev_multi_depth_activation_smoke()?,
             DevSub::MultiDepthActivationFailureSmoke => dev_multi_depth_activation_failure_smoke()?,
             DevSub::MultiDepthActivationRestartSmoke => dev_multi_depth_activation_restart_smoke()?,
@@ -2298,7 +2306,7 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
     }
 
     let ledger = read_json_report(&ledger_path)?;
-    let ledger_summary = validate_p7_operation_ledger(&ledger, true, true, false, false)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, true, false, false, false)?;
     if ledger_summary.records < cases.len()
         || ledger_summary.approval_records < cases.len()
         || ledger_summary.blocked_execution_records < cases.len()
@@ -2681,7 +2689,7 @@ fn dev_p7_operation_execution_smoke() -> Result<()> {
     }
 
     let ledger = read_json_report(&ledger_path)?;
-    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false, false)?;
     let record = find_p7_operation_record(&ledger, &operation_id)?;
     validate_p7_published_execution(record)?;
     let report = serde_json::json!({
@@ -3046,7 +3054,7 @@ fn dev_p7_operation_observation_smoke() -> Result<()> {
     assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
 
     let ledger = read_json_report(&ledger_path)?;
-    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, true)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, true, false)?;
     let record = find_p7_operation_record(&ledger, &operation_id)?;
     validate_p7_completed_observation(record)?;
     let report = serde_json::json!({
@@ -3129,6 +3137,349 @@ fn dev_p7_operation_observation_smoke() -> Result<()> {
 
     println!(
         "P7 operation observation smoke: approved merge execution converged through Gateway/Worker traffic evidence and completed observation, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p7_operation_recovery_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4340";
+    let gateway_metrics_addr = "127.0.0.1:4341";
+    let worker_a_addr = "127.0.0.1:5341";
+    let worker_b_addr = "127.0.0.1:5342";
+    let worker_a_metrics_addr = "127.0.0.1:5343";
+    let worker_b_metrics_addr = "127.0.0.1:5344";
+    let orch_addr = "127.0.0.1:6340";
+    let orch_metrics_addr = "127.0.0.1:6341";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let ledger_path = report_dir.join("p7-operation-recovery-ledger-latest.json");
+    let _ = fs::remove_file(&ledger_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":0}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":1}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":2}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":3}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+    );
+    let merge_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":0},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":1},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":2},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":3},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", merge_preview_json),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+    let worker_a_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_WORKER_ID", "worker-a"),
+        ("TESSERA_WORKER_ADDR", worker_a_addr),
+        ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+        ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+        ("TESSERA_WORKER_REFRESH_SECS", "1"),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-recovery-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-recovery-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &worker_a_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-recovery-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-recovery-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    assert_http_status_endpoint(
+        "P7 operation recovery gateway readiness",
+        gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "P7 operation recovery gateway before",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let child0 = activation_child_cell(0);
+    let actor_a = EntityId(7_801);
+    let mut child0_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        child0,
+        actor_a,
+        Position { x: 4.0, y: 4.0 },
+    )?;
+
+    let proposal_response = http_json_post(
+        "P7 operation proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    let operation_id = json_array(&proposal_response, &["operation_ids"])?
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("P7 operation proposal response has no operation id"))?
+        .to_string();
+    let proposal_snapshot = http_json_get("P7 operation ledger", orch_metrics_addr, "/operations")?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "merge")?;
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "P7 operation approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p7-recovery-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p7-recovery-smoke&budget_key=p7-recovery-smoke"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+    let execution_response = http_json_post(
+        "P7 operation execution",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    runtime.block_on(wait_for_split_listing(
+        &orch_endpoint,
+        &[(parent, "worker-a")],
+    ))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    assert_gateway_ping_until(gateway_addr, parent, 7_830)?;
+    let _move_observed = request_move_until_delta(
+        &mut child0_session,
+        parent,
+        actor_a,
+        1.0,
+        1.0,
+        "P7 operation recovery pre-failure parent move",
+    )?;
+    drop(child0_session);
+
+    stack.terminate_named("p7-operation-recovery-worker-a")?;
+    let failure_error = match assert_gateway_ping_until(gateway_addr, parent, 7_831) {
+        Ok(()) => bail!(
+            "P7 operation recovery smoke expected parent Ping to fail while owner Worker was down"
+        ),
+        Err(err) => err.to_string(),
+    };
+    runtime.block_on(wait_for_split_listing(
+        &orch_endpoint,
+        &[(parent, "worker-a")],
+    ))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    let gateway_metrics_after_failure = assert_metrics_endpoint_body_until(
+        "P7 operation recovery gateway after failure",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_after_failure =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_failure)?;
+
+    let observation_response = http_json_post(
+        "P7 operation failed observation",
+        orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=p7-recovery-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=false&counters_clean=false"
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "recovery_required")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], false)?;
+
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-recovery-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &worker_a_envs,
+        },
+    )?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    runtime.block_on(wait_for_split_listing(
+        &orch_endpoint,
+        &[(parent, "worker-a")],
+    ))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    assert_gateway_ping_until(gateway_addr, parent, 7_832)?;
+    let gateway_metrics_after_recovery = assert_metrics_endpoint_body_until(
+        "P7 operation recovery gateway after recovery",
+        gateway_metrics_addr,
+        &["tessera_gateway_routes"],
+    )?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false, true)?;
+    let record = find_p7_operation_record(&ledger, &operation_id)?;
+    validate_p7_recovery_required(record)?;
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_recovery_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "merge",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers": before_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "gateway": {
+            "addr": gateway_addr,
+            "metrics_addr": gateway_metrics_addr,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after_failure": gateway_close_counters_json(gateway_close_after_failure)
+            },
+            "routes_after_recovery": prometheus_sample_value(&gateway_metrics_after_recovery, "tessera_gateway_routes")?
+        },
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records,
+            "recovery_required_records": ledger_summary.recovery_required_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "observation": observation_response
+        },
+        "failure": {
+            "owner_worker_id": "worker-a",
+            "error": failure_error
+        },
+        "checks": {
+            "merge_execution_published": true,
+            "owner_outage_detected": true,
+            "observation_recovery_required": true,
+            "no_automatic_rollback": true,
+            "operator_recovery_confirmed": true,
+            "ledger_recovery_required": true
+        },
+        "remaining_uncovered": [
+            "split_runtime_execution",
+            "multi_depth_runtime_execution",
+            "restart_recovery",
+            "soak",
+            "guarded_kubernetes_operation_recovery_smoke",
+            "p7_completion_audit"
+        ]
+    });
+    validate_p7_operation_recovery_smoke_report(&report)?;
+    let report_path = write_p7_operation_recovery_smoke_report(&report)?;
+
+    println!(
+        "P7 operation recovery smoke: owner outage marked operation recovery_required and operator Worker restart restored parent traffic, report={}, ledger={}",
         report_path.display(),
         ledger_path.display()
     );
@@ -9940,12 +10291,19 @@ fn default_p7_operation_observation_smoke_path() -> PathBuf {
         .join("p7-operation-observation-smoke-latest.json")
 }
 
+fn default_p7_operation_recovery_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p7-operation-recovery-smoke-latest.json")
+}
+
 fn run_p7_operation_ledger_check(
     ledger: Option<&Path>,
     require_approval: bool,
     require_blocked_execution: bool,
     require_published_execution: bool,
     require_completed_observation: bool,
+    require_recovery_required: bool,
     json: bool,
 ) -> Result<()> {
     let ledger_path = ledger
@@ -9958,6 +10316,7 @@ fn run_p7_operation_ledger_check(
         require_blocked_execution,
         require_published_execution,
         require_completed_observation,
+        require_recovery_required,
     )
     .with_context(|| format!("validate P7 operation ledger {}", ledger_path.display()))?;
     if json {
@@ -9972,18 +10331,20 @@ fn run_p7_operation_ledger_check(
                 "approval_records": summary.approval_records,
                 "blocked_execution_records": summary.blocked_execution_records,
                 "published_execution_records": summary.published_execution_records,
-                "completed_observation_records": summary.completed_observation_records
+                "completed_observation_records": summary.completed_observation_records,
+                "recovery_required_records": summary.recovery_required_records
             }))?
         );
     } else {
         println!(
-            "P7 operation ledger ok: records={}, proposals={}, approvals={}, blocked_executions={}, published_executions={}, completed_observations={} ({})",
+            "P7 operation ledger ok: records={}, proposals={}, approvals={}, blocked_executions={}, published_executions={}, completed_observations={}, recovery_required={} ({})",
             summary.records,
             summary.proposal_records,
             summary.approval_records,
             summary.blocked_execution_records,
             summary.published_execution_records,
             summary.completed_observation_records,
+            summary.recovery_required_records,
             ledger_path.display()
         );
     }
@@ -10032,6 +10393,20 @@ fn write_p7_operation_observation_smoke_report(report: &serde_json::Value) -> Re
     Ok(latest)
 }
 
+fn write_p7_operation_recovery_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p7-operation-recovery-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p7_operation_recovery_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct P7OperationLedgerSummary {
     records: usize,
@@ -10040,6 +10415,7 @@ struct P7OperationLedgerSummary {
     blocked_execution_records: usize,
     published_execution_records: usize,
     completed_observation_records: usize,
+    recovery_required_records: usize,
 }
 
 fn validate_p7_operation_ledger(
@@ -10048,6 +10424,7 @@ fn validate_p7_operation_ledger(
     require_blocked_execution: bool,
     require_published_execution: bool,
     require_completed_observation: bool,
+    require_recovery_required: bool,
 ) -> Result<P7OperationLedgerSummary> {
     let schema = json_str(ledger, &["schema"])?;
     if schema != "tessera.orch.operation_ledger.v1" {
@@ -10063,6 +10440,7 @@ fn validate_p7_operation_ledger(
     let mut blocked_execution_records = 0_usize;
     let mut published_execution_records = 0_usize;
     let mut completed_observation_records = 0_usize;
+    let mut recovery_required_records = 0_usize;
     for record in records {
         validate_p7_operation_record(record)?;
         proposal_records += 1;
@@ -10078,6 +10456,9 @@ fn validate_p7_operation_ledger(
         if validate_p7_completed_observation(record).is_ok() {
             completed_observation_records += 1;
         }
+        if validate_p7_recovery_required(record).is_ok() {
+            recovery_required_records += 1;
+        }
     }
     if require_approval && approval_records == 0 {
         bail!("operation ledger is missing required approval evidence");
@@ -10091,6 +10472,9 @@ fn validate_p7_operation_ledger(
     if require_completed_observation && completed_observation_records == 0 {
         bail!("operation ledger is missing required completed observation evidence");
     }
+    if require_recovery_required && recovery_required_records == 0 {
+        bail!("operation ledger is missing required recovery-required evidence");
+    }
 
     Ok(P7OperationLedgerSummary {
         records: records.len(),
@@ -10099,6 +10483,7 @@ fn validate_p7_operation_ledger(
         blocked_execution_records,
         published_execution_records,
         completed_observation_records,
+        recovery_required_records,
     })
 }
 
@@ -10380,6 +10765,45 @@ fn validate_p7_operation_observation_smoke_report(report: &serde_json::Value) ->
     Ok(())
 }
 
+fn validate_p7_operation_recovery_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.p7_operation_recovery_smoke.v1",
+    )?;
+    assert_json_str_eq(report, &["operation", "kind"], "merge")?;
+    assert_json_str_eq(
+        report,
+        &["operation", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    let ledger_path = json_str(report, &["ledger", "path"])?;
+    if ledger_path.trim().is_empty() {
+        bail!("P7 operation recovery smoke report has empty ledger.path");
+    }
+    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "recovery_required_records"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_str_eq(
+        report,
+        &["responses", "observation", "status"],
+        "recovery_required",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "observation", "observation_accepted"],
+        false,
+    )?;
+    assert_json_bool_eq(report, &["checks", "merge_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "owner_outage_detected"], true)?;
+    assert_json_bool_eq(report, &["checks", "observation_recovery_required"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_automatic_rollback"], true)?;
+    assert_json_bool_eq(report, &["checks", "operator_recovery_confirmed"], true)?;
+    assert_remaining_uncovered_contains(report, "guarded_kubernetes_operation_recovery_smoke")?;
+    Ok(())
+}
+
 fn validate_p7_blocked_execution(record: &serde_json::Value) -> Result<()> {
     let operation_id = json_str(record, &["operation_id"])?;
     let status = json_str(record, &["status"])?;
@@ -10440,6 +10864,26 @@ fn validate_p7_completed_observation(record: &serde_json::Value) -> Result<()> {
             })
     }) {
         bail!("operation_id={operation_id} is missing succeeded observation_completed phase");
+    }
+    Ok(())
+}
+
+fn validate_p7_recovery_required(record: &serde_json::Value) -> Result<()> {
+    let operation_id = json_str(record, &["operation_id"])?;
+    let status = json_str(record, &["status"])?;
+    if status != "recovery_required" {
+        bail!("operation_id={operation_id} status is not recovery_required");
+    }
+    validate_p7_published_execution(record)?;
+    let phases = json_array(record, &["phases"])?;
+    if !phases.iter().any(|phase| {
+        json_str(phase, &["name"]).is_ok_and(|name| name == "observation_failed")
+            && json_str(phase, &["state"]).is_ok_and(|state| state == "failed")
+            && json_str(phase, &["reason"]).is_ok_and(|reason| {
+                reason.contains("traffic_confirmed") || reason.contains("counters_clean")
+            })
+    }) {
+        bail!("operation_id={operation_id} is missing failed observation_failed phase");
     }
     Ok(())
 }
@@ -17351,7 +17795,7 @@ mod tests {
             ]
         });
 
-        let summary = validate_p7_operation_ledger(&ledger, true, true, false, false)
+        let summary = validate_p7_operation_ledger(&ledger, true, true, false, false, false)
             .expect("valid P7 ledger");
 
         assert_eq!(
@@ -17363,6 +17807,7 @@ mod tests {
                 blocked_execution_records: 1,
                 published_execution_records: 0,
                 completed_observation_records: 0,
+                recovery_required_records: 0,
             }
         );
     }
@@ -17408,7 +17853,7 @@ mod tests {
             ]
         });
 
-        let summary = validate_p7_operation_ledger(&ledger, true, false, true, false)
+        let summary = validate_p7_operation_ledger(&ledger, true, false, true, false, false)
             .expect("valid P7 ledger");
 
         assert_eq!(
@@ -17420,6 +17865,7 @@ mod tests {
                 blocked_execution_records: 0,
                 published_execution_records: 1,
                 completed_observation_records: 0,
+                recovery_required_records: 0,
             }
         );
     }
@@ -17466,7 +17912,7 @@ mod tests {
             ]
         });
 
-        let summary = validate_p7_operation_ledger(&ledger, true, false, true, true)
+        let summary = validate_p7_operation_ledger(&ledger, true, false, true, true, false)
             .expect("valid P7 ledger");
 
         assert_eq!(
@@ -17478,6 +17924,66 @@ mod tests {
                 blocked_execution_records: 0,
                 published_execution_records: 1,
                 completed_observation_records: 1,
+                recovery_required_records: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn p7_operation_ledger_check_accepts_recovery_required_observation() {
+        let ledger = serde_json::json!({
+            "schema": "tessera.orch.operation_ledger.v1",
+            "records": [
+                {
+                    "operation_id": "p7-merge-1",
+                    "kind": "merge",
+                    "status": "recovery_required",
+                    "created_unix_secs": 100,
+                    "updated_unix_secs": 130,
+                    "proposal": {
+                        "source": "live_worker_metrics:test",
+                        "proposal_hash": "fnv1a64:abc",
+                        "parent": {"world": 0, "cx": 0, "cy": 0},
+                        "targets": [
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0}, "worker_id": "worker-a"}
+                        ],
+                        "preconditions": ["operator approval required"],
+                        "submission_command": "cargo xt merge-activation --operation-id p7-merge-1"
+                    },
+                    "approval": {
+                        "policy_id": "operator_approved_dynamic_operation_v1",
+                        "approver": "operator",
+                        "allowed_kind": "merge",
+                        "approved_unix_secs": 110,
+                        "expires_unix_secs": 710,
+                        "expected_proposal_hash": "fnv1a64:abc",
+                        "cooldown_key": "world-0",
+                        "budget_key": "daily"
+                    },
+                    "phases": [
+                        {"name": "proposal_recorded", "state": "succeeded", "unix_secs": 100, "reason": "proposal persisted"},
+                        {"name": "approval_recorded", "state": "succeeded", "unix_secs": 110, "reason": "approval persisted"},
+                        {"name": "execution_started", "state": "succeeded", "unix_secs": 120, "reason": "operation execution passed policy gates"},
+                        {"name": "execution_published", "state": "succeeded", "unix_secs": 121, "reason": "merge activation published"},
+                        {"name": "observation_failed", "state": "failed", "unix_secs": 130, "reason": "observer=smoke reported incomplete observation; missing=traffic_confirmed,counters_clean"}
+                    ]
+                }
+            ]
+        });
+
+        let summary = validate_p7_operation_ledger(&ledger, true, false, true, false, true)
+            .expect("valid P7 recovery-required ledger");
+
+        assert_eq!(
+            summary,
+            P7OperationLedgerSummary {
+                records: 1,
+                proposal_records: 1,
+                approval_records: 1,
+                blocked_execution_records: 0,
+                published_execution_records: 1,
+                completed_observation_records: 0,
+                recovery_required_records: 1,
             }
         );
     }
@@ -17721,6 +18227,72 @@ mod tests {
     }
 
     #[test]
+    fn p7_operation_recovery_smoke_report_accepts_recovery_evidence() {
+        let report = serde_json::json!({
+            "schema": "tessera.p7_operation_recovery_smoke.v1",
+            "unix_secs": 140,
+            "operation": {
+                "operation_id": "p7-merge-1",
+                "kind": "merge",
+                "proposal_hash": "fnv1a64:abc",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6340",
+                "metrics_addr": "127.0.0.1:6341",
+                "registered_workers": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after": {"workers": [], "handovers": 0}
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4340",
+                "metrics_addr": "127.0.0.1:4341",
+                "close_counters": {
+                    "before": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0},
+                    "after_failure": {"no_route": 0, "upstream_retry_exhausted": 1, "ambiguous_upstream": 0}
+                },
+                "routes_after_recovery": 1
+            },
+            "ledger": {
+                "path": ".dev/reports/p7-operation-recovery-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "recovery_required_records": 1
+            },
+            "responses": {
+                "proposal": {"assignments_changed": false, "operation_ids": ["p7-merge-1"]},
+                "approval": {"status": "approved", "assignments_changed": false},
+                "execution": {"status": "published", "assignments_changed": true},
+                "observation": {
+                    "status": "recovery_required",
+                    "assignments_changed": false,
+                    "observation_accepted": false
+                }
+            },
+            "failure": {
+                "owner_worker_id": "worker-a",
+                "error": "expected failure"
+            },
+            "checks": {
+                "merge_execution_published": true,
+                "owner_outage_detected": true,
+                "observation_recovery_required": true,
+                "no_automatic_rollback": true,
+                "operator_recovery_confirmed": true,
+                "ledger_recovery_required": true
+            },
+            "remaining_uncovered": [
+                "guarded_kubernetes_operation_recovery_smoke"
+            ]
+        });
+
+        validate_p7_operation_recovery_smoke_report(&report)
+            .expect("valid P7 operation recovery smoke report");
+    }
+
+    #[test]
     fn p7_operation_ledger_check_rejects_missing_blocked_execution() {
         let ledger = serde_json::json!({
             "schema": "tessera.orch.operation_ledger.v1",
@@ -17758,7 +18330,7 @@ mod tests {
             ]
         });
 
-        let err = validate_p7_operation_ledger(&ledger, true, true, false, false)
+        let err = validate_p7_operation_ledger(&ledger, true, true, false, false, false)
             .expect_err("missing blocked execution should fail");
 
         assert!(err.to_string().contains("blocked execution"));
