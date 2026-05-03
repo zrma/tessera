@@ -59,13 +59,15 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `cargo xt dev p7-operation-multi-depth-observation-smoke`,
   `cargo xt dev p7-operation-multi-depth-recovery-smoke`,
   `cargo xt dev p7-operation-multi-depth-restart-smoke`,
+  `cargo xt dev p7-operation-multi-depth-soak-smoke`,
   `cargo xt dev p7-operation-split-observation-smoke`,
   `cargo xt dev p7-operation-split-recovery-smoke`, and
   `cargo xt dev p7-operation-split-restart-smoke`, plus sustained child-route
   soak via `cargo xt dev p7-operation-split-soak-smoke`. Canonical multi-depth
   execution, completed observation, recovery-required target outage handling,
-  and Orchestrator restart recovery now have local full-stack evidence; soak and
-  internal MicroK8s operation evidence remain the next P7+ expansion gates.
+  Orchestrator restart recovery, and load/soak observation completion now have
+  local full-stack evidence; internal MicroK8s operation evidence remains the
+  next P7+ expansion gate.
 - P7 internal operation coverage now has a repo-native helper/verifier surface:
   `cargo xt k8s operation-smoke` records internal MicroK8s proposal evidence by
   default and can run approved execution/observation/soak when

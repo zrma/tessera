@@ -30,9 +30,10 @@ Last reviewed: 2026-05-04
   approved canonical multi-depth split execution success/idempotency, approved
   canonical multi-depth observation completion, approved canonical multi-depth
   target-outage recovery-required handling, approved canonical multi-depth
-  Orchestrator restart recovery, local merge observation completion, and local
-  recovery-required owner-outage handling, plus Orchestrator restart recovery
-  for the published operation ledger and assignment state, and local load/soak
+  Orchestrator restart recovery, approved canonical multi-depth load/soak
+  observation completion, local merge observation completion, and local
+  recovery-required owner-outage handling, plus Orchestrator restart recovery for
+  the published operation ledger and assignment state, and local load/soak
   observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
@@ -122,6 +123,9 @@ Recommended next slices:
    Orchestrator after approved canonical multi-depth publish, verify operation
    ledger and persisted canonical child assignments survive, then close
    observation after restart.
-18. `test: add p7 multi-depth operation soak smoke` - extend the canonical
+18. Done: `test: add p7 multi-depth operation soak smoke` - extend the canonical
    multi-depth operation path through sustained child Ping/Move traffic before
    internal rollout.
+19. `build: publish p7 multi-depth operation runtime image` - publish a new
+   image tag from the current local evidence set, then promote it through the
+   k8s GitOps repo before controlled internal MicroK8s operation smoke.
