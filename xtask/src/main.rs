@@ -469,7 +469,7 @@ enum K8sSub {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Build a port-forwarded internal canonical multi-depth split plan and stop before mutation
+    /// Build a port-forwarded internal canonical multi-depth split plan and optionally run guarded mutation
     MultiDepthActivationSmoke {
         /// Kubernetes namespace that contains the Tessera runtime
         #[arg(long, default_value = "tessera")]
@@ -534,9 +534,39 @@ enum K8sSub {
         /// Local Orchestrator gRPC port for kubectl port-forward
         #[arg(long, default_value_t = 6000)]
         local_orch_port: u16,
+        /// Local Gateway TCP port for kubectl port-forward when --allow-activation is set
+        #[arg(long, default_value_t = 4000)]
+        local_gateway_port: u16,
+        /// Local Gateway metrics/ready port for kubectl port-forward when --allow-activation is set
+        #[arg(long, default_value_t = 4100)]
+        local_gateway_metrics_port: u16,
         /// Operator-chosen operation id; defaults to a timestamped internal multi-depth id
         #[arg(long)]
         operation_id: Option<String>,
+        /// Actually submit SubmitSplitActivation after writing the read-only plan
+        #[arg(long, default_value_t = false)]
+        allow_activation: bool,
+        /// Also scale the target Worker down/up to verify failure and recovery
+        #[arg(long, default_value_t = false)]
+        with_failure: bool,
+        /// Required with --with-failure because it mutates the target Worker deployment replica count
+        #[arg(long, default_value_t = false)]
+        allow_scale: bool,
+        /// Also restart the Orchestrator deployment and verify persisted canonical split recovery
+        #[arg(long, default_value_t = false)]
+        with_restart: bool,
+        /// Required with --with-restart because it mutates the Orchestrator deployment rollout
+        #[arg(long, default_value_t = false)]
+        allow_rollout_restart: bool,
+        /// Run canonical child-route load/soak traffic after publish
+        #[arg(long, default_value_t = false)]
+        with_soak: bool,
+        /// Child-route soak iterations per child when --with-soak is set
+        #[arg(long, default_value_t = 32)]
+        soak_iterations: u32,
+        /// Sleep between child-route soak iterations
+        #[arg(long, default_value_t = 10)]
+        soak_sleep_ms: u64,
         /// Output JSON path. Defaults to .dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json
         #[arg(long)]
         out: Option<PathBuf>,
@@ -1223,7 +1253,17 @@ fn main() -> Result<()> {
                 skip_argocd_check,
                 expected_image,
                 local_orch_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
                 operation_id,
+                allow_activation,
+                with_failure,
+                allow_scale,
+                with_restart,
+                allow_rollout_restart,
+                with_soak,
+                soak_iterations,
+                soak_sleep_ms,
                 out,
             } => run_k8s_multi_depth_activation_smoke(K8sMultiDepthActivationSmokeOptions {
                 namespace,
@@ -1249,7 +1289,17 @@ fn main() -> Result<()> {
                 skip_argocd_check,
                 expected_image,
                 local_orch_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
                 operation_id,
+                allow_activation,
+                with_failure,
+                allow_scale,
+                with_restart,
+                allow_rollout_restart,
+                with_soak,
+                soak_iterations,
+                soak_sleep_ms,
                 out,
             })?,
             K8sSub::MultiDepthActivationReportCheck {
@@ -5475,7 +5525,17 @@ struct K8sMultiDepthActivationSmokeOptions {
     skip_argocd_check: bool,
     expected_image: Option<String>,
     local_orch_port: u16,
+    local_gateway_port: u16,
+    local_gateway_metrics_port: u16,
     operation_id: Option<String>,
+    allow_activation: bool,
+    with_failure: bool,
+    allow_scale: bool,
+    with_restart: bool,
+    allow_rollout_restart: bool,
+    with_soak: bool,
+    soak_iterations: u32,
+    soak_sleep_ms: u64,
     out: Option<PathBuf>,
 }
 
@@ -5953,6 +6013,27 @@ fn run_k8s_activation_smoke(options: K8sActivationSmokeOptions) -> Result<()> {
 fn run_k8s_multi_depth_activation_smoke(
     options: K8sMultiDepthActivationSmokeOptions,
 ) -> Result<()> {
+    if options.with_failure && !options.allow_scale {
+        bail!(
+            "internal k8s multi-depth failure smoke scales a deployment; pass --allow-scale with --with-failure"
+        );
+    }
+    if options.with_restart && !options.allow_rollout_restart {
+        bail!(
+            "internal k8s multi-depth restart smoke restarts a deployment; pass --allow-rollout-restart with --with-restart"
+        );
+    }
+    if (options.with_failure || options.with_restart || options.with_soak)
+        && !options.allow_activation
+    {
+        bail!(
+            "internal k8s multi-depth completion smoke needs a published split; pass --allow-activation"
+        );
+    }
+    if options.with_soak && options.soak_iterations == 0 {
+        bail!("internal k8s multi-depth soak requires --soak-iterations > 0");
+    }
+
     let context = resolve_kube_context(options.context.as_deref())?;
     let operation_id = options
         .operation_id
@@ -6024,6 +6105,8 @@ fn run_k8s_multi_depth_activation_smoke(
     }
 
     let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
     let mut forwards = ManagedK8sPortForwards::default();
     forwards.spawn(
         &context,
@@ -6032,6 +6115,18 @@ fn run_k8s_multi_depth_activation_smoke(
         "multi-depth-orchestrator",
         &[(options.local_orch_port, 6000)],
     )?;
+    if options.allow_activation {
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.gateway_service,
+            "multi-depth-gateway",
+            &[
+                (options.local_gateway_port, 4000),
+                (options.local_gateway_metrics_port, 4100),
+            ],
+        )?;
+    }
 
     let orch_endpoint = grpc_endpoint(&local_orch_addr);
     let runtime = tokio::runtime::Runtime::new()?;
@@ -6080,8 +6175,230 @@ fn run_k8s_multi_depth_activation_smoke(
             report_path.display()
         );
     }
+
+    if !options.allow_activation {
+        println!(
+            "internal k8s multi-depth activation readiness stopped before mutation; report={}",
+            report_path.display()
+        );
+        return Ok(());
+    }
+
+    let targets = plan
+        .targets
+        .iter()
+        .map(|target| (target.cell, target.worker_id.clone()))
+        .collect::<Vec<_>>();
+    let expected_listing = targets
+        .iter()
+        .map(|(cell, worker_id)| (*cell, worker_id.as_str()))
+        .collect::<Vec<_>>();
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+    let response = runtime.block_on(submit_split_activation_with_child_cells(
+        &orch_endpoint,
+        operation_id.clone(),
+        plan.parent,
+        &targets,
+    ))?;
+    assert_split_activation_published(&response)?;
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+    let success_probe =
+        probe_multi_depth_convergence(&local_gateway_addr, &expected_listing, 13_100);
+    success_probe.assert_success()?;
+
+    let mut completion = InternalK8sMultiDepthCompletion {
+        activation_mutated: true,
+        activation_allowed: true,
+        multi_depth_published: true,
+        ..InternalK8sMultiDepthCompletion::default()
+    };
+
+    if options.with_failure {
+        let expected_failed_cells = plan
+            .targets
+            .iter()
+            .filter(|target| target.worker_id == options.target_worker_id)
+            .map(|target| target.cell)
+            .collect::<Vec<_>>();
+        if expected_failed_cells.is_empty() {
+            bail!(
+                "internal k8s multi-depth failure smoke expected at least one child owned by --target-worker-id {}",
+                options.target_worker_id
+            );
+        }
+        let original_replicas = kubectl_deploy_spec_replicas(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+        )?;
+        if original_replicas == 0 {
+            bail!(
+                "target deployment {} already has 0 replicas; cannot run multi-depth failure/recovery smoke",
+                options.target_worker_deploy
+            );
+        }
+        kubectl_scale_deploy(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            0,
+        )?;
+        let mut restore = K8sScaleRestore::new(
+            context.clone(),
+            options.namespace.clone(),
+            options.target_worker_deploy.clone(),
+            original_replicas,
+        );
+        wait_for_kubectl_deploy_available_replicas(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            0,
+        )?;
+        let observed_failure =
+            probe_multi_depth_convergence(&local_gateway_addr, &expected_listing, 13_200);
+        let failure_assert = observed_failure.assert_failed_cells_only(&expected_failed_cells);
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+
+        kubectl_scale_deploy(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            original_replicas,
+        )?;
+        restore.disarm();
+        kubectl_rollout_status(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_available_replicas(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            original_replicas,
+        )?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+        let observed_recovery =
+            probe_multi_depth_convergence(&local_gateway_addr, &expected_listing, 13_300);
+        observed_recovery.assert_success()?;
+        failure_assert?;
+        completion.post_publish_failure_smoke_ran = true;
+        completion.target_worker_restart_recovered_convergence = true;
+    }
+
+    if options.with_restart {
+        forwards.stop_all();
+        kubectl_rollout_restart_deploy(&context, &options.namespace, &options.orch_deploy)?;
+        kubectl_rollout_status(
+            &context,
+            &options.namespace,
+            &options.orch_deploy,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_available_replicas(
+            &context,
+            &options.namespace,
+            &options.orch_deploy,
+            1,
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.orch_service,
+            "multi-depth-orchestrator",
+            &[(options.local_orch_port, 6000)],
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.gateway_service,
+            "multi-depth-gateway",
+            &[
+                (options.local_gateway_port, 4000),
+                (options.local_gateway_metrics_port, 4100),
+            ],
+        )?;
+        runtime.block_on(wait_for_orchestrator_registered(
+            &orch_endpoint,
+            plan.health.registered_workers.max(1),
+        ))?;
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+        let restart_probe =
+            probe_multi_depth_convergence(&local_gateway_addr, &expected_listing, 13_400);
+        restart_probe.assert_success()?;
+        completion.orchestrator_restart_smoke_ran = true;
+    }
+
+    if options.with_soak {
+        let cells = plan
+            .targets
+            .iter()
+            .map(|target| target.cell)
+            .collect::<Vec<_>>();
+        let stats = run_cell_activation_soak_loop(
+            &local_gateway_addr,
+            &cells,
+            options.soak_iterations,
+            Duration::from_millis(options.soak_sleep_ms),
+        )?;
+        let min_total = u64::from(options.soak_iterations) * cells.len() as u64;
+        if stats.pings_ok < min_total || stats.moves_ok < min_total {
+            bail!(
+                "internal multi-depth soak expected at least {min_total} pings/moves, got pings={} moves={}",
+                stats.pings_ok,
+                stats.moves_ok
+            );
+        }
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+        completion.load_soak_ran = true;
+    }
+
+    let report_path = write_internal_k8s_multi_depth_activation_report(
+        InternalK8sMultiDepthActivationReport {
+            context: &context,
+            namespace: &options.namespace,
+            orch_service: &options.orch_service,
+            gateway_service: &options.gateway_service,
+            source_worker_deploy: &options.source_worker_deploy,
+            source_worker_id: &options.source_worker_id,
+            target_worker_deploy: &options.target_worker_deploy,
+            target_worker_id: &options.target_worker_id,
+            argocd_namespace: &options.argocd_namespace,
+            argocd_app: &options.argocd_app,
+            argocd_status: preflight.argocd_status.as_ref(),
+            deployment_images: &preflight.deployment_images,
+            expected_image: options.expected_image.as_deref(),
+            operation_id: &operation_id,
+            plan: Some(&plan),
+            stage: "published",
+            reason: "canonical multi-depth activation published through guarded internal helper",
+            preflight_errors: &[],
+            completion,
+        },
+        options.out.as_deref(),
+    )?;
     println!(
-        "internal k8s multi-depth activation readiness stopped before mutation; report={}",
+        "internal k8s multi-depth activation smoke published and converged{}{}{}; report={}",
+        if options.with_failure {
+            ", failure/recovery verified"
+        } else {
+            ""
+        },
+        if options.with_restart {
+            ", orchestrator restart recovery verified"
+        } else {
+            ""
+        },
+        if options.with_soak {
+            ", load/soak verified"
+        } else {
+            ""
+        },
         report_path.display()
     );
     Ok(())

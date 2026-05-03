@@ -201,11 +201,12 @@ This is helper-path readiness evidence only. It does not close internal merge
 activation because no ready plan, publish, failure/recovery, restart, or
 load/soak evidence exists yet.
 
-## Read-Only Multi-Depth Readiness Probe
+## Default-Off Multi-Depth Readiness Probe
 
-The P6 canonical multi-depth internal path has a separate helper that must stay
-read-only until a rollout candidate and controlled multi-depth smoke window are
-approved:
+The P6 canonical multi-depth internal path has a separate helper. Its default
+mode is read-only: it builds the canonical parent/child plan, writes the
+internal report, and stops before submitting activation unless the operator
+passes explicit mutation flags:
 
 ```sh
 cargo xt k8s multi-depth-activation-smoke \
@@ -242,6 +243,39 @@ Observed 2026-05-03 state:
 This is helper-path readiness evidence only. It does not close internal
 multi-depth activation because no ready canonical parent plan, publish,
 failure/recovery, restart, or load/soak evidence exists yet.
+
+After a P6 image and controlled multi-depth topology are approved, the same
+helper can exercise the mutation path. Each mutating branch has an explicit
+guard:
+
+```sh
+cargo xt k8s multi-depth-activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-activation \
+  --with-failure \
+  --allow-scale \
+  --with-restart \
+  --allow-rollout-restart \
+  --with-soak
+cargo xt k8s multi-depth-activation-report-check \
+  --require-ready-plan \
+  --require-published \
+  --require-failure \
+  --require-restart \
+  --require-soak \
+  --expected-image <new-tag>
+```
+
+`--with-failure` is blocked unless `--allow-scale` is also present,
+`--with-restart` is blocked unless `--allow-rollout-restart` is present, and
+failure/restart/soak all require `--allow-activation`. A successful controlled
+run publishes canonical child assignments, verifies Gateway route convergence,
+detects the target Worker outage, restores the target Worker, verifies
+Orchestrator restart recovery, runs child-route soak traffic, and records those
+checks in
+`.dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json`.
 
 ## Port-Forwarded Operator Smoke
 

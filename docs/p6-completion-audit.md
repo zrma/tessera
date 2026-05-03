@@ -244,14 +244,19 @@ matching runtime deployment images, approved GitOps rollout revision, ArgoCD
   Worker same-Worker coalescing detection tests, xtask merge plan tests, and
   the canonical merge success/failure/restart/soak smoke/report-check set for
   a `depth>0/sub=0` parent. `cargo xt k8s
-  multi-depth-activation-smoke` now provides a read-only internal MicroK8s
-  readiness helper for canonical multi-depth split: it checks
+  multi-depth-activation-smoke` now provides a default-off internal MicroK8s
+  helper for canonical multi-depth split: it checks
   ArgoCD/image/source-target Worker preflight, validates the canonical parent
   and explicit child target map against live Orchestrator listing, writes
   `.dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json`,
-  and stops before mutation. `cargo xt k8s
-  multi-depth-activation-report-check --require-ready-plan` verifies the
-  no-mutation ready-plan contract. The 2026-05-03 read-only run against live
+  and stops before mutation unless `--allow-activation` is present. The same
+  helper can run guarded publish, target Worker failure/recovery, Orchestrator
+  restart recovery, and child-route load/soak with
+  `--allow-activation --with-failure --allow-scale --with-restart
+  --allow-rollout-restart --with-soak`. `cargo xt k8s
+  multi-depth-activation-report-check --require-ready-plan --require-published
+  --require-failure --require-restart --require-soak` verifies the final
+  internal evidence contract. The 2026-05-03 read-only run against live
   `v2026.05.2` verified the helper/report-check path but stopped with
   `plan.status=blocked`,
   `reason=canonical multi-depth parent is not currently assigned`, and
@@ -363,6 +368,33 @@ expected image assertion. It observed ArgoCD `Synced / Healthy`, live image
 Gateway, source Worker, and target Worker, `activation_mutated=false`, and
 `remaining_uncovered` still containing multi-depth ready-plan, publish,
 failure/recovery, restart, and load/soak gates.
+
+The current helper also exposes the controlled mutation path for the eventual
+P6 multi-depth smoke window:
+
+```sh
+cargo xt k8s multi-depth-activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-activation \
+  --with-failure \
+  --allow-scale \
+  --with-restart \
+  --allow-rollout-restart \
+  --with-soak
+cargo xt k8s multi-depth-activation-report-check \
+  --require-ready-plan \
+  --require-published \
+  --require-failure \
+  --require-restart \
+  --require-soak \
+  --expected-image <new-tag>
+```
+
+Those flags are default-off and policy-gated: the failure branch requires
+`--allow-scale`, the restart branch requires `--allow-rollout-restart`, and all
+post-publish branches require `--allow-activation`.
 
 The current P6+ completion gate was also exercised:
 

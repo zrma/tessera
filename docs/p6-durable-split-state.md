@@ -256,9 +256,10 @@ to the restart command and add `--require-live-metrics-plan` to the verifier.
 3. Run internal MicroK8s merge evidence for the same-Worker and cross-Worker
    local replay paths. Owner Worker restart actor state is currently excluded by
    `volatile_worker_actor_state_rejoin_required_v1`.
-4. Implement the leaf-coordinate multi-depth `CellId` decision from
-   `docs/multi-depth-cellid-decision.md`, then add nested split runtime smoke
-   and report verifier coverage before enabling nested activation.
+4. After a controlled topology assigns the canonical parent, run the guarded
+   internal multi-depth publish, failure/recovery, restart, and load/soak
+   helper with `--allow-activation`, `--allow-scale`, and
+   `--allow-rollout-restart`.
 5. Extend report verifiers so final P6 evidence covers local/dev and internal
    MicroK8s success, failure, restart recovery, load/soak, rollback/backout, and
    GitOps rollout state. Keep `docs/p6-completion-audit.md` updated as the
