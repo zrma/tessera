@@ -787,6 +787,8 @@ enum DevSub {
     P7OperationObservationSmoke,
     /// Start a full dev stack and prove a failed P7 observation stays recovery-required until operator recovery
     P7OperationRecoverySmoke,
+    /// Start a full dev stack and prove P7 operation state survives Orchestrator restart
+    P7OperationRestartSmoke,
     /// Start a two-worker dev stack and prove canonical explicit child-cell split activation converges
     MultiDepthActivationSmoke,
     /// Start a two-worker dev stack and prove canonical split target outage is recoverable
@@ -1475,6 +1477,7 @@ fn main() -> Result<()> {
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationObservationSmoke => dev_p7_operation_observation_smoke()?,
             DevSub::P7OperationRecoverySmoke => dev_p7_operation_recovery_smoke()?,
+            DevSub::P7OperationRestartSmoke => dev_p7_operation_restart_smoke()?,
             DevSub::MultiDepthActivationSmoke => dev_multi_depth_activation_smoke()?,
             DevSub::MultiDepthActivationFailureSmoke => dev_multi_depth_activation_failure_smoke()?,
             DevSub::MultiDepthActivationRestartSmoke => dev_multi_depth_activation_restart_smoke()?,
@@ -3480,6 +3483,458 @@ fn dev_p7_operation_recovery_smoke() -> Result<()> {
 
     println!(
         "P7 operation recovery smoke: owner outage marked operation recovery_required and operator Worker restart restored parent traffic, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p7_operation_restart_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4350";
+    let gateway_metrics_addr = "127.0.0.1:4351";
+    let worker_a_addr = "127.0.0.1:5351";
+    let worker_b_addr = "127.0.0.1:5352";
+    let worker_a_metrics_addr = "127.0.0.1:5353";
+    let worker_b_metrics_addr = "127.0.0.1:5354";
+    let orch_addr = "127.0.0.1:6350";
+    let orch_metrics_addr = "127.0.0.1:6351";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let ledger_path = report_dir.join("p7-operation-restart-ledger-latest.json");
+    let assignment_state_path =
+        report_dir.join("p7-operation-restart-assignment-state-latest.json");
+    let _ = fs::remove_file(&ledger_path);
+    let _ = fs::remove_file(&assignment_state_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+    let assignment_state_path_raw = assignment_state_path.to_string_lossy().into_owned();
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":0}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":1}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":2}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":3}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+    );
+    let merge_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":0},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":1},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":2},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":3},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", merge_preview_json),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        (
+            "TESSERA_ORCH_ASSIGNMENT_STATE_PATH",
+            assignment_state_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-restart-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-restart-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-restart-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-restart-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    assert_http_status_endpoint(
+        "P7 operation restart gateway readiness",
+        gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "P7 operation restart gateway before",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+    let gateway_routes_before =
+        prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let child0 = activation_child_cell(0);
+    let child3 = activation_child_cell(3);
+    let actor_a = EntityId(7_901);
+    let actor_b = EntityId(7_902);
+    let mut child0_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        child0,
+        actor_a,
+        Position { x: 4.0, y: 4.0 },
+    )?;
+    let _child3_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        child3,
+        actor_b,
+        Position { x: 24.0, y: 24.0 },
+    )?;
+
+    let proposal_response = http_json_post(
+        "P7 operation proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    let operation_id = json_array(&proposal_response, &["operation_ids"])?
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("P7 operation proposal response has no operation id"))?
+        .to_string();
+    let proposal_snapshot = http_json_get("P7 operation ledger", orch_metrics_addr, "/operations")?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "merge")?;
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "P7 operation approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p7-restart-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p7-restart-smoke&budget_key=p7-restart-smoke"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+    let execution_response = http_json_post(
+        "P7 operation execution",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+
+    runtime.block_on(wait_for_split_listing(
+        &orch_endpoint,
+        &[(parent, "worker-a")],
+    ))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    assert_gateway_ping_until(gateway_addr, parent, 7_930)?;
+    if !assignment_state_path.exists() {
+        bail!(
+            "P7 operation restart smoke expected assignment state file at {}",
+            assignment_state_path.display()
+        );
+    }
+
+    stack.terminate_named("p7-operation-restart-orch")?;
+    let restart_orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", merge_preview_json),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        (
+            "TESSERA_ORCH_ASSIGNMENT_STATE_PATH",
+            assignment_state_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-restart-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &restart_orch_envs,
+        },
+    )?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    runtime.block_on(wait_for_split_listing(
+        &orch_endpoint,
+        &[(parent, "worker-a")],
+    ))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    assert_gateway_ping_until(gateway_addr, parent, 7_931)?;
+
+    let restart_ledger_snapshot = http_json_get(
+        "P7 operation ledger after restart",
+        orch_metrics_addr,
+        "/operations",
+    )?;
+    let restart_record = find_p7_operation_record(&restart_ledger_snapshot, &operation_id)?;
+    validate_p7_published_execution(restart_record)?;
+
+    let move_observed = request_move_until_delta(
+        &mut child0_session,
+        parent,
+        actor_a,
+        1.0,
+        1.0,
+        "P7 operation restart parent move",
+    )?;
+    let worker_parent_metric = worker_cell_actor_count_metric(parent);
+    let worker_metrics_after_restart = assert_metrics_endpoint_body_until(
+        "P7 operation restart worker-a",
+        worker_a_metrics_addr,
+        &["tessera_worker_cell_actor_count"],
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 operation restart worker-a",
+        &worker_metrics_after_restart,
+        worker_parent_metric.as_str(),
+        2.0,
+    )?;
+    let worker_parent_actor_count =
+        prometheus_sample_value(&worker_metrics_after_restart, worker_parent_metric.as_str())?;
+    let gateway_metrics_after_restart = assert_metrics_endpoint_body_until(
+        "P7 operation restart gateway after restart",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_routes_after_restart =
+        prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_routes")?;
+    assert_prometheus_sample_at_least(
+        "P7 operation restart gateway",
+        &gateway_metrics_after_restart,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        1.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 operation restart gateway",
+        &gateway_metrics_after_restart,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        1.0,
+    )?;
+    let gateway_close_after_restart =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_restart)?;
+    assert_gateway_close_counters_not_increased(
+        "P7 operation restart gateway",
+        gateway_close_before,
+        gateway_close_after_restart,
+    )?;
+    let (after_restart_health, after_restart_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let route_converged_after_restart = (gateway_routes_after_restart - 1.0).abs() < f64::EPSILON;
+    let worker_refreshed_after_restart = worker_parent_actor_count >= 2.0;
+    let traffic_confirmed_after_restart = prometheus_sample_value(
+        &gateway_metrics_after_restart,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )? >= 1.0
+        && prometheus_sample_value(
+            &gateway_metrics_after_restart,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        )? >= 1.0;
+    let counters_clean = gateway_close_before == gateway_close_after_restart;
+    if !(route_converged_after_restart
+        && worker_refreshed_after_restart
+        && traffic_confirmed_after_restart
+        && counters_clean)
+    {
+        bail!(
+            "P7 operation restart evidence incomplete: route_converged_after_restart={route_converged_after_restart} worker_refreshed_after_restart={worker_refreshed_after_restart} traffic_confirmed_after_restart={traffic_confirmed_after_restart} counters_clean={counters_clean}"
+        );
+    }
+
+    let observation_response = http_json_post(
+        "P7 operation restart observation",
+        orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=p7-restart-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true"
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "completed")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, true, false)?;
+    let record = find_p7_operation_record(&ledger, &operation_id)?;
+    validate_p7_completed_observation(record)?;
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_restart_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "merge",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers_before": before_health.registered_workers,
+            "registered_workers_after_restart": after_restart_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after_restart": assignment_listing_summary_json(&after_restart_listing)?,
+            "assignment_state_path": assignment_state_path_raw.as_str()
+        },
+        "gateway": {
+            "addr": gateway_addr,
+            "metrics_addr": gateway_metrics_addr,
+            "routes_before": gateway_routes_before,
+            "routes_after_restart": gateway_routes_after_restart,
+            "ping_roundtrips": prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_ping_roundtrip_seconds_count")?,
+            "join_roundtrips": prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}")?,
+            "move_roundtrips": prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}")?,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after_restart": gateway_close_counters_json(gateway_close_after_restart)
+            }
+        },
+        "worker": {
+            "worker_a_addr": worker_a_addr,
+            "worker_a_metrics_addr": worker_a_metrics_addr,
+            "worker_b_addr": worker_b_addr,
+            "worker_b_metrics_addr": worker_b_metrics_addr,
+            "parent_actor_count_after_restart": worker_parent_actor_count
+        },
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records,
+            "completed_observation_records": ledger_summary.completed_observation_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "observation": observation_response
+        },
+        "checks": {
+            "merge_execution_published": true,
+            "assignment_state_persisted": true,
+            "orchestrator_restarted": true,
+            "ledger_execution_survived_restart": true,
+            "route_converged_after_restart": route_converged_after_restart,
+            "worker_refreshed_after_restart": worker_refreshed_after_restart,
+            "traffic_confirmed_after_restart": traffic_confirmed_after_restart,
+            "gateway_close_counters_clean": counters_clean,
+            "stable_session_parent_move_after_restart": true,
+            "observation_completed_after_restart": true,
+            "ledger_observation_completed": true
+        },
+        "frames": {
+            "ignored_before_parent_delta": move_observed.ignored_frames,
+            "remote_delta_before_parent_delta": move_observed.remote_delta_frames,
+            "remote_snapshot_before_parent_delta": move_observed.remote_snapshot_frames
+        },
+        "remaining_uncovered": [
+            "split_runtime_execution",
+            "multi_depth_runtime_execution",
+            "soak",
+            "internal_microk8s_operation_restart_smoke",
+            "p7_completion_audit"
+        ]
+    });
+    validate_p7_operation_restart_smoke_report(&report)?;
+    let report_path = write_p7_operation_restart_smoke_report(&report)?;
+
+    println!(
+        "P7 operation restart smoke: approved merge execution and ledger state survived Orchestrator restart, post-restart observation completed, report={}, ledger={}",
         report_path.display(),
         ledger_path.display()
     );
@@ -10297,6 +10752,12 @@ fn default_p7_operation_recovery_smoke_path() -> PathBuf {
         .join("p7-operation-recovery-smoke-latest.json")
 }
 
+fn default_p7_operation_restart_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p7-operation-restart-smoke-latest.json")
+}
+
 fn run_p7_operation_ledger_check(
     ledger: Option<&Path>,
     require_approval: bool,
@@ -10403,6 +10864,20 @@ fn write_p7_operation_recovery_smoke_report(report: &serde_json::Value) -> Resul
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p7_operation_recovery_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p7_operation_restart_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p7-operation-restart-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p7_operation_restart_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -10801,6 +11276,63 @@ fn validate_p7_operation_recovery_smoke_report(report: &serde_json::Value) -> Re
     assert_json_bool_eq(report, &["checks", "no_automatic_rollback"], true)?;
     assert_json_bool_eq(report, &["checks", "operator_recovery_confirmed"], true)?;
     assert_remaining_uncovered_contains(report, "internal_microk8s_operation_recovery_smoke")?;
+    Ok(())
+}
+
+fn validate_p7_operation_restart_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p7_operation_restart_smoke.v1")?;
+    assert_json_str_eq(report, &["operation", "kind"], "merge")?;
+    assert_json_str_eq(
+        report,
+        &["operation", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    let ledger_path = json_str(report, &["ledger", "path"])?;
+    if ledger_path.trim().is_empty() {
+        bail!("P7 operation restart smoke report has empty ledger.path");
+    }
+    let assignment_state_path = json_str(report, &["orchestrator", "assignment_state_path"])?;
+    if assignment_state_path.trim().is_empty() {
+        bail!("P7 operation restart smoke report has empty assignment_state_path");
+    }
+    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "completed_observation_records"], 1.0)?;
+    assert_json_number_at_least(
+        report,
+        &["orchestrator", "registered_workers_after_restart"],
+        2.0,
+    )?;
+    assert_json_number_at_least(report, &["gateway", "routes_after_restart"], 1.0)?;
+    assert_json_number_at_least(report, &["worker", "parent_actor_count_after_restart"], 2.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_str_eq(report, &["responses", "observation", "status"], "completed")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "observation", "observation_accepted"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "merge_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_state_persisted"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_restarted"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "ledger_execution_survived_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "route_converged_after_restart"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_refreshed_after_restart"], true)?;
+    assert_json_bool_eq(report, &["checks", "traffic_confirmed_after_restart"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "observation_completed_after_restart"],
+        true,
+    )?;
+    assert_remaining_uncovered_contains(report, "internal_microk8s_operation_restart_smoke")?;
     Ok(())
 }
 
@@ -18290,6 +18822,91 @@ mod tests {
 
         validate_p7_operation_recovery_smoke_report(&report)
             .expect("valid P7 operation recovery smoke report");
+    }
+
+    #[test]
+    fn p7_operation_restart_smoke_report_accepts_restart_evidence() {
+        let report = serde_json::json!({
+            "schema": "tessera.p7_operation_restart_smoke.v1",
+            "unix_secs": 150,
+            "operation": {
+                "operation_id": "p7-merge-1",
+                "kind": "merge",
+                "proposal_hash": "fnv1a64:abc",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6350",
+                "metrics_addr": "127.0.0.1:6351",
+                "registered_workers_before": 2,
+                "registered_workers_after_restart": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after_restart": {"workers": [], "handovers": 0},
+                "assignment_state_path": ".dev/reports/p7-operation-restart-assignment-state-latest.json"
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4350",
+                "metrics_addr": "127.0.0.1:4351",
+                "routes_before": 4,
+                "routes_after_restart": 1,
+                "ping_roundtrips": 2,
+                "join_roundtrips": 2,
+                "move_roundtrips": 1,
+                "close_counters": {
+                    "before": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0},
+                    "after_restart": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0}
+                }
+            },
+            "worker": {
+                "worker_a_addr": "127.0.0.1:5351",
+                "worker_a_metrics_addr": "127.0.0.1:5353",
+                "worker_b_addr": "127.0.0.1:5352",
+                "worker_b_metrics_addr": "127.0.0.1:5354",
+                "parent_actor_count_after_restart": 2
+            },
+            "ledger": {
+                "path": ".dev/reports/p7-operation-restart-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "completed_observation_records": 1
+            },
+            "responses": {
+                "proposal": {"assignments_changed": false, "operation_ids": ["p7-merge-1"]},
+                "approval": {"status": "approved", "assignments_changed": false},
+                "execution": {"status": "published", "assignments_changed": true},
+                "observation": {
+                    "status": "completed",
+                    "assignments_changed": false,
+                    "observation_accepted": true
+                }
+            },
+            "checks": {
+                "merge_execution_published": true,
+                "assignment_state_persisted": true,
+                "orchestrator_restarted": true,
+                "ledger_execution_survived_restart": true,
+                "route_converged_after_restart": true,
+                "worker_refreshed_after_restart": true,
+                "traffic_confirmed_after_restart": true,
+                "gateway_close_counters_clean": true,
+                "stable_session_parent_move_after_restart": true,
+                "observation_completed_after_restart": true,
+                "ledger_observation_completed": true
+            },
+            "frames": {
+                "ignored_before_parent_delta": 0,
+                "remote_delta_before_parent_delta": 0,
+                "remote_snapshot_before_parent_delta": 0
+            },
+            "remaining_uncovered": [
+                "internal_microk8s_operation_restart_smoke"
+            ]
+        });
+
+        validate_p7_operation_restart_smoke_report(&report)
+            .expect("valid P7 operation restart smoke report");
     }
 
     #[test]

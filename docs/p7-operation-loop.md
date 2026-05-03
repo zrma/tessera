@@ -75,7 +75,8 @@ artifact. It is not a replacement for runtime execution, observation,
 recovery, internal rollout, or final P7 completion audit evidence.
 Approved execution ledgers use the same checker with
 `--require-published-execution`; completed observation ledgers add
-`--require-completed-observation`.
+`--require-completed-observation`; recovery-required ledgers use
+`--require-recovery-required`.
 
 Current local closed-loop smoke:
 
@@ -152,8 +153,31 @@ operation observation is written with missing traffic/counter evidence, and the
 ledger ends with `status=recovery_required` plus a failed
 `observation_failed` phase. The smoke then restarts the owner Worker and proves
 the parent route and fresh parent Ping recover without automatic rollback.
-Restart, soak, and internal MicroK8s recovery evidence remain explicit follow-up
-gates.
+Soak and internal MicroK8s recovery evidence remain explicit follow-up gates.
+
+Current restart smoke:
+
+```sh
+cargo xt dev p7-operation-restart-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-restart-ledger-latest.json \
+  --require-approval \
+  --require-published-execution \
+  --require-completed-observation
+```
+
+This starts a full local dev stack with both
+`TESSERA_ORCH_OPERATION_LEDGER_PATH` and
+`TESSERA_ORCH_ASSIGNMENT_STATE_PATH`, publishes an approved same-Worker merge
+operation through the P7 HTTP endpoints, restarts the Orchestrator, and then
+verifies that the operation record remains in the published execution state,
+the parent assignment is restored from durable assignment state, Gateway routes
+converge to the parent, Worker parent actor metrics refresh, stable-session
+parent traffic succeeds, and `POST /operations/observations` can close the
+operation to `completed` after restart. The smoke writes
+`.dev/reports/p7-operation-restart-smoke-latest.json` plus
+`.dev/reports/p7-operation-restart-ledger-latest.json`. Soak and internal
+MicroK8s restart evidence remain explicit follow-up gates.
 
 Current internal rollout baseline:
 
