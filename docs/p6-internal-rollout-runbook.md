@@ -45,6 +45,34 @@ The rollout revision must apply the P6 image and runtime settings needed for
 the controlled smoke. The cleanup revision must return mutating flags and
 fixtures to default-off after the smoke.
 
+## Image Publish
+
+The Tessera image is published by the manual GitHub Actions workflow
+`.github/workflows/tessera.build-push.yml` (`build and push image`). The
+workflow has no custom dispatch inputs: it checks the selected commit, creates
+or reuses the latest `vYYYY.MM.N` tag for that commit, builds `linux/amd64`,
+and pushes:
+
+```text
+harbor.1day1coding.com/1day1coding/tessera:<tag>
+```
+
+After the workflow finishes, record the final Docker tag printed by the
+`Set final Docker tag` step and set `TESSERA_P6_IMAGE` to that tag. The tag
+must then be promoted in the k8s GitOps repo before the internal smoke commands
+below can count as P6 evidence.
+
+Recommended post-publish checks:
+
+```sh
+docker buildx imagetools inspect "$TESSERA_P6_IMAGE"
+cargo xt p6-completion-audit --json
+```
+
+The audit should still fail after image publish alone; it must not pass until
+GitOps rollout, controlled smoke, cleanup, and rollout report evidence all
+exist.
+
 ## Approval Boundary
 
 Read-only commands may be run before approval:
