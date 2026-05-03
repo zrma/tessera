@@ -56,11 +56,15 @@ This document is the repo-local quality map for agents. It keeps the expected au
   It also supports a separate guarded failure/recovery gate with
   `--allow-execution --with-failure --allow-scale`, which scales the owner
   Worker down, records `recovery_required`, scales it back up, and verifies
-  parent-route recovery.
+  parent-route recovery. `--allow-execution --with-restart
+  --allow-rollout-restart` separately preflights PVC-backed assignment state,
+  rollout-restarts the Orchestrator deployment, verifies parent-route recovery,
+  and completes observation after restart.
   `cargo xt k8s operation-report-check` validates the resulting operation
   ledger, parent route convergence, Worker refresh, traffic, close counters,
-  soak evidence, and recovery-required evidence. The `v2026.05.5` internal
-  controlled windows have passed approved execution, completed observation,
-  parent-route soak, owner Worker failure/recovery, and post-smoke default-off
-  cleanup; live restart and completion audit reports remain separate P7 gates.
+  soak evidence, recovery-required evidence, and restart evidence. The
+  `v2026.05.5` internal controlled windows have passed approved execution,
+  completed observation, parent-route soak, owner Worker failure/recovery, and
+  post-smoke default-off cleanup; live restart and completion audit reports
+  remain separate P7 gates.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

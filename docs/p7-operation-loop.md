@@ -296,6 +296,15 @@ cargo xt k8s operation-smoke \
   --with-failure \
   --allow-scale
 
+cargo xt k8s operation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-execution \
+  --with-restart \
+  --allow-rollout-restart \
+  --expected-assignment-state-path /var/lib/tessera/assignment-state-p7-operation-restart-20260504.json
+
 cargo xt k8s operation-report-check \
   --expected-image <new-tag> \
   --require-published-execution \
@@ -306,6 +315,11 @@ cargo xt k8s operation-report-check \
   --expected-image <new-tag> \
   --require-published-execution \
   --require-recovery-required
+
+cargo xt k8s operation-report-check \
+  --expected-image <new-tag> \
+  --require-published-execution \
+  --require-restart
 ```
 
 The default helper is read-only: it port-forwards the Orchestrator operation
@@ -321,7 +335,10 @@ after approved publish and pre-failure parent traffic, it scales the owner
 Worker deployment to zero, records parent Ping failure and a
 `recovery_required` observation, scales the deployment back to its original
 replica count, and requires fresh parent Ping recovery without automatic
-rollback.
+rollback. The restart helper is also separate: it preflights the configured
+assignment-state PVC path, publishes the operation, rollout-restarts the
+Orchestrator deployment, verifies that persisted parent assignment and operation
+ledger state reload, then closes the operation with a completed observation.
 
 Because P7 operation ids are deterministic from proposal content, the approved
 internal smoke window should use a fresh operation ledger path in the GitOps
