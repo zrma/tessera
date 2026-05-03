@@ -229,6 +229,43 @@ Ping returned `Pong { ts: 123 }`, `GET /operations` reported
 without mutation for the default topology. Approved internal P7 execution,
 observation, failure/recovery, restart, and soak remain follow-up gates.
 
+Current internal operation helper:
+
+```sh
+cargo xt k8s operation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag>
+
+cargo xt k8s operation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-execution \
+  --with-soak
+
+cargo xt k8s operation-report-check \
+  --expected-image <new-tag> \
+  --require-published-execution \
+  --require-completed-observation \
+  --require-soak
+```
+
+The default helper is read-only: it port-forwards the Orchestrator operation
+endpoint, records a P7 merge operation proposal when the live controlled-smoke
+topology exposes one, and writes
+`.dev/reports/internal-microk8s-p7-operation-smoke-latest.json` with
+ArgoCD/image/ledger evidence. The approved helper additionally port-forwards
+Gateway and owner Worker metrics, writes approval and execution records,
+verifies parent-route convergence, Worker parent refresh, traffic and close
+counters, optionally runs parent-route soak, and closes the operation via
+`POST /operations/observations`.
+
+Because P7 operation ids are deterministic from proposal content, the approved
+internal smoke window should use a fresh operation ledger path in the GitOps
+manifest, alongside the manual execution and split/merge activation flags.
+After the smoke, cleanup must remove mutating flags and preview fixtures again.
+
 ## Slice Cadence
 
 Each slice should be self-contained:
@@ -288,7 +325,11 @@ Each slice should be self-contained:
    records `recovery_required`, avoids automatic rollback, and recovers only
    after operator-visible Worker restart. The first repo-native smoke is
    `cargo xt dev p7-operation-recovery-smoke`.
-10. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+10. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
+   `cargo xt k8s operation-report-check` so internal MicroK8s can record P7
+   proposal evidence by default and approved execution/observation/soak
+   evidence during a controlled smoke window.
+11. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails
