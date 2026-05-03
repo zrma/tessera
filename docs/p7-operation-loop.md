@@ -74,6 +74,24 @@ This validates the first proposal -> approval -> default-off blocked execution
 artifact. It is not a replacement for runtime execution, observation,
 recovery, internal rollout, or final P7 completion audit evidence.
 
+Current local closed-loop smoke:
+
+```sh
+cargo xt dev p7-operation-loop-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-loop-ledger-latest.json \
+  --require-approval \
+  --require-blocked-execution
+```
+
+This starts an Orchestrator-only dev stack with registered two-Worker listing
+and a split preview candidate, records proposal -> approval -> default-off
+execution block, and writes `.dev/reports/p7-operation-loop-smoke-latest.json`
+plus `.dev/reports/p7-operation-loop-ledger-latest.json`. It covers the first
+split operation loop only; merge, canonical multi-depth, approved runtime
+execution, observation, recovery, restart, soak, and internal MicroK8s evidence
+remain explicit follow-up gates.
+
 ## Slice Cadence
 
 Each slice should be self-contained:
@@ -115,7 +133,9 @@ Each slice should be self-contained:
    durable `blocked_by_policy` phase/status while runtime mutation remains
    default-off.
 6. **Closed-loop smoke**: verify proposal-to-approval-to-execution locally for
-   split, merge, and canonical multi-depth paths.
+   split, merge, and canonical multi-depth paths. The first repo-native smoke is
+   `cargo xt dev p7-operation-loop-smoke`, which covers split proposal ->
+   approval -> default-off execution block without assignment mutation.
 7. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 

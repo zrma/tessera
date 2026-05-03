@@ -56,6 +56,8 @@ Cell-based world orchestration for real-time servers in Rust.
 - Policy-gated planner mutation 스모크:
   - `cargo xt dev planner-mutation-smoke` (planner-selected merge가 기본값에서는 `blocked_by_policy`로 mutation 없이 남고, `operator_approved_planner_mutation_v1` policy id와 `--allow-mutation`이 함께 있을 때만 parent assignment publish까지 진행하는지 확인하며 `.dev/reports/planner-activation-{blocked-,}latest.json` 증거를 남김)
   - `cargo xt dev activation-live-planner-mutation-smoke` (live Worker metrics에서 split planner candidate를 선택하고, 기본값은 `.dev/reports/planner-activation-live-blocked-latest.json`에 `blocked_by_policy` no-op으로 남으며, 같은 candidate가 `operator_approved_planner_mutation_v1` policy id와 `--allow-mutation`에서만 child assignment publish/Gateway convergence까지 진행하는지 `.dev/reports/planner-activation-latest.json`으로 검증)
+- P7 operation loop 스모크:
+  - `cargo xt dev p7-operation-loop-smoke` (Orchestrator-only dev stack에서 registered two-Worker listing과 split preview candidate를 사용해 proposal → approval → default-off execution block을 재현하고, assignment mutation 없이 `.dev/reports/p7-operation-loop-smoke-latest.json` 및 `.dev/reports/p7-operation-loop-ledger-latest.json` 증거를 남김)
 - Merge activation 스모크:
   - `cargo xt dev merge-activation-smoke` (네 depth-1 sibling이 같은 Worker에 있을 때 manual `SubmitMergeActivation`으로 parent assignment를 publish하고, Worker가 child actor/owner/root state를 parent로 coalesce하는지, Gateway가 parent route 1개로 수렴하는지, 기존 child session의 parent Move가 성공하는지 확인하며 `.dev/reports/merge-activation-smoke-latest.json` 증거를 남김)
   - `cargo xt dev canonical-merge-activation-smoke` (canonical `depth>0/sub=0` parent의 네 canonical child가 같은 Worker에 있을 때 manual `SubmitMergeActivation`으로 parent assignment를 publish하고, Worker canonical child coalescing, Gateway parent route convergence, stable-session parent Move를 검증하며 `.dev/reports/canonical-merge-activation-smoke-latest.json` 증거를 남김)
@@ -222,6 +224,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - P7 planner proposal 기록: 같은 Orchestrator metrics endpoint에서 `curl -X POST http://127.0.0.1:6100/operations/proposals` 실행. 현재 split/merge preview source의 후보를 stable operation id/proposal hash로 ledger에 append하며 assignment mutation은 하지 않음
 - P7 approval 기록: `curl -X POST 'http://127.0.0.1:6100/operations/approvals?operation_id=<id>&policy_id=<policy>&approver=<operator>&expected_proposal_hash=<hash>&ttl_secs=600&cooldown_key=<key>&budget_key=<key>'` 실행. 기존 proposal hash와 맞는 경우에만 durable approval record를 쓰며 assignment mutation은 하지 않음
 - P7 execution dry-run 기록: `curl -X POST 'http://127.0.0.1:6100/operations/executions?operation_id=<id>&expected_proposal_hash=<hash>&policy_id=<policy>'` 실행. 현재 slice의 executor는 default-off라서 runtime mutation 없이 `blocked_by_policy` phase/status만 durable ledger에 남김
+- P7 local closed-loop smoke: `cargo xt dev p7-operation-loop-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-loop-ledger-latest.json --require-approval --require-blocked-execution`
 - Gateway metrics/readiness 확인: `TESSERA_GW_METRICS_ADDR=127.0.0.1:4100 cargo run -p tessera-gateway` 후 `curl http://127.0.0.1:4100/metrics`, `curl http://127.0.0.1:4100/ready`
 - Worker metrics 확인: `TESSERA_WORKER_METRICS_ADDR=127.0.0.1:5100 cargo run -p tessera-worker` 후 `curl http://127.0.0.1:5100/metrics`
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
