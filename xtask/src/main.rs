@@ -799,6 +799,18 @@ enum K8sSub {
         /// Allow the smoke helper to scale the owner Worker deployment for --with-failure
         #[arg(long, default_value_t = false)]
         allow_scale: bool,
+        /// Restart the Orchestrator deployment after publish and close observation after recovery
+        #[arg(long, default_value_t = false)]
+        with_restart: bool,
+        /// Allow the smoke helper to rollout-restart the Orchestrator deployment for --with-restart
+        #[arg(long, default_value_t = false)]
+        allow_rollout_restart: bool,
+        /// Assignment state path expected on the Orchestrator deployment when --with-restart is set
+        #[arg(
+            long,
+            default_value = "/var/lib/tessera/assignment-state-p7-operation-restart-20260504.json"
+        )]
+        expected_assignment_state_path: String,
         /// Parent-route soak iterations per actor when --with-soak is set
         #[arg(long, default_value_t = 16)]
         soak_iterations: u32,
@@ -826,6 +838,9 @@ enum K8sSub {
         /// Require owner Worker outage and recovery_required operation evidence
         #[arg(long, default_value_t = false)]
         require_recovery_required: bool,
+        /// Require Orchestrator rollout restart recovery evidence after execution
+        #[arg(long, default_value_t = false)]
+        require_restart: bool,
         /// Require all recorded deployment images to match this image
         #[arg(long)]
         expected_image: Option<String>,
@@ -1585,6 +1600,9 @@ fn main() -> Result<()> {
                 with_soak,
                 with_failure,
                 allow_scale,
+                with_restart,
+                allow_rollout_restart,
+                expected_assignment_state_path,
                 soak_iterations,
                 soak_sleep_ms,
                 out,
@@ -1611,6 +1629,9 @@ fn main() -> Result<()> {
                 with_soak,
                 with_failure,
                 allow_scale,
+                with_restart,
+                allow_rollout_restart,
+                expected_assignment_state_path,
                 soak_iterations,
                 soak_sleep_ms,
                 out,
@@ -1621,6 +1642,7 @@ fn main() -> Result<()> {
                 require_completed_observation,
                 require_soak,
                 require_recovery_required,
+                require_restart,
                 expected_image,
                 expect_preflight_errors,
             } => run_k8s_operation_report_check(
@@ -1630,6 +1652,7 @@ fn main() -> Result<()> {
                     require_completed_observation,
                     require_soak,
                     require_recovery_required,
+                    require_restart,
                 },
                 expected_image.as_deref(),
                 &expect_preflight_errors,
@@ -9232,6 +9255,9 @@ struct K8sOperationSmokeOptions {
     with_soak: bool,
     with_failure: bool,
     allow_scale: bool,
+    with_restart: bool,
+    allow_rollout_restart: bool,
+    expected_assignment_state_path: String,
     soak_iterations: u32,
     soak_sleep_ms: u64,
     out: Option<PathBuf>,
@@ -9256,6 +9282,21 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
             "internal k8s P7 operation --with-failure and --with-soak are separate evidence gates; run them separately"
         );
     }
+    if options.with_restart && !options.allow_execution {
+        bail!(
+            "internal k8s P7 operation restart needs a published execution; pass --allow-execution"
+        );
+    }
+    if options.with_restart && !options.allow_rollout_restart {
+        bail!(
+            "internal k8s P7 operation restart rolls the Orchestrator deployment; pass --allow-rollout-restart"
+        );
+    }
+    if options.with_restart && (options.with_failure || options.with_soak) {
+        bail!(
+            "internal k8s P7 operation restart, failure, and soak are separate evidence gates; run them separately"
+        );
+    }
     let context = resolve_kube_context(options.context.as_deref())?;
     let preflight_result = k8s_operation_preflight(&context, &options);
     let preflight = preflight_result.preflight;
@@ -9277,6 +9318,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 argocd_app: &options.argocd_app,
                 argocd_status: preflight.argocd_status.as_ref(),
                 deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
                 expected_image: options.expected_image.as_deref(),
                 stage: "blocked_before_proposal",
                 reason: &reason,
@@ -9320,6 +9362,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 argocd_app: &options.argocd_app,
                 argocd_status: preflight.argocd_status.as_ref(),
                 deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
                 expected_image: options.expected_image.as_deref(),
                 stage: "blocked_before_proposal",
                 reason: &reason,
@@ -9405,6 +9448,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                     argocd_app: &options.argocd_app,
                     argocd_status: preflight.argocd_status.as_ref(),
                     deployment_images: &preflight.deployment_images,
+                    assignment_state_storage: preflight.assignment_state_storage.as_ref(),
                     expected_image: options.expected_image.as_deref(),
                     stage: "blocked_before_proposal",
                     reason: &reason,
@@ -9522,6 +9566,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                     argocd_app: &options.argocd_app,
                     argocd_status: preflight.argocd_status.as_ref(),
                     deployment_images: &preflight.deployment_images,
+                    assignment_state_storage: preflight.assignment_state_storage.as_ref(),
                     expected_image: options.expected_image.as_deref(),
                     stage: "blocked_before_execution",
                     reason: &reason,
@@ -9572,6 +9617,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 argocd_app: &options.argocd_app,
                 argocd_status: preflight.argocd_status.as_ref(),
                 deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
                 expected_image: options.expected_image.as_deref(),
                 stage: "planned_without_execution",
                 reason: "P7 merge operation proposal is recorded; helper stopped before approval/execution because --allow-execution was not provided",
@@ -9950,6 +9996,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
             observation_recovery_required: true,
             operator_recovery_confirmed: true,
             ledger_recovery_required: true,
+            orchestrator_restart_smoke_ran: false,
             load_soak_ran: false,
         };
         let report_path = write_internal_k8s_operation_report(
@@ -9965,6 +10012,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 argocd_app: &options.argocd_app,
                 argocd_status: preflight.argocd_status.as_ref(),
                 deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
                 expected_image: options.expected_image.as_deref(),
                 stage: "recovery_required",
                 reason: "P7 merge operation owner outage was observed as recovery_required and operator-scaled Worker recovery restored parent traffic",
@@ -9987,6 +10035,256 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         )?;
         println!(
             "internal P7 operation failure/recovery smoke completed: operation={} report={}",
+            operation.operation_id,
+            report_path.display()
+        );
+        return Ok(());
+    }
+
+    if options.with_restart {
+        forwards.stop_all();
+        kubectl_rollout_restart_deploy(&context, &options.namespace, &options.orch_deploy)?;
+        kubectl_rollout_status(
+            &context,
+            &options.namespace,
+            &options.orch_deploy,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_available_replicas(
+            &context,
+            &options.namespace,
+            &options.orch_deploy,
+            1,
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.orch_service,
+            "p7-operation-restart-orchestrator",
+            &[
+                (options.local_orch_port, 6000),
+                (options.local_orch_metrics_port, 6100),
+            ],
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.gateway_service,
+            "p7-operation-restart-gateway",
+            &[
+                (options.local_gateway_port, 4000),
+                (options.local_gateway_metrics_port, 4100),
+            ],
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.owner_worker_service,
+            "p7-operation-restart-owner-worker",
+            &[(options.local_owner_worker_metrics_port, 5100)],
+        )?;
+
+        runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &[(operation.parent, operation.owner_worker_id.as_str())],
+        ))?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+        assert_gateway_ping_until(&local_gateway_addr, operation.parent, 17_004)?;
+        let restart_ledger_snapshot = http_json_get(
+            "internal P7 operation ledger after restart",
+            &local_orch_metrics_addr,
+            "/operations",
+        )?;
+        let restart_record =
+            find_p7_operation_record(&restart_ledger_snapshot, &operation.operation_id)?;
+        validate_p7_published_execution(restart_record)?;
+
+        let restart_actor = EntityId(8_704);
+        let mut restart_session = open_gateway_join_until_snapshot(
+            &local_gateway_addr,
+            operation.parent,
+            restart_actor,
+            Position { x: 16.0, y: 16.0 },
+        )?;
+        let _move_observed = request_move_until_delta(
+            &mut restart_session,
+            operation.parent,
+            restart_actor,
+            1.0,
+            1.0,
+            "internal P7 operation restart parent move",
+        )?;
+        let worker_parent_metric = worker_cell_actor_count_metric(operation.parent);
+        let worker_metrics_after_restart = assert_metrics_endpoint_body_until(
+            "internal P7 operation owner worker after restart",
+            &local_owner_worker_metrics_addr,
+            &[
+                "tessera_worker_cell_actor_count",
+                "tessera_worker_accepted_connections_total",
+            ],
+        )?;
+        assert_prometheus_sample_at_least(
+            "internal P7 operation owner worker after restart",
+            &worker_metrics_after_restart,
+            worker_parent_metric.as_str(),
+            1.0,
+        )?;
+        let worker_parent_actor_count =
+            prometheus_sample_value(&worker_metrics_after_restart, worker_parent_metric.as_str())?;
+        let gateway_metrics_after_restart = assert_metrics_endpoint_body_until(
+            "internal P7 operation gateway after restart",
+            &local_gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_ping_roundtrip_seconds_count",
+                "tessera_gateway_request_roundtrip_seconds_count",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_routes_after_restart =
+            prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_routes")?;
+        let ping_roundtrips_after_restart = prometheus_sample_value(
+            &gateway_metrics_after_restart,
+            "tessera_gateway_ping_roundtrip_seconds_count",
+        )?;
+        let join_roundtrips_after_restart = prometheus_sample_value(
+            &gateway_metrics_after_restart,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+        )?;
+        let move_roundtrips_after_restart = prometheus_sample_value(
+            &gateway_metrics_after_restart,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        )?;
+        assert_prometheus_sample_at_least(
+            "internal P7 operation gateway after restart",
+            &gateway_metrics_after_restart,
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            1.0,
+        )?;
+        assert_prometheus_sample_at_least(
+            "internal P7 operation gateway after restart",
+            &gateway_metrics_after_restart,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+            1.0,
+        )?;
+        let gateway_close_after_restart =
+            gateway_close_counters_from_metrics(&gateway_metrics_after_restart)?;
+        assert_gateway_close_counters_not_increased(
+            "internal P7 operation gateway after restart",
+            gateway_close_before,
+            gateway_close_after_restart,
+        )?;
+        if let Some(gateway) = gateway_evidence.as_mut() {
+            gateway.routes_after = Some(gateway_routes_after_restart);
+            gateway.ping_roundtrips = Some(ping_roundtrips_after_restart);
+            gateway.join_roundtrips = Some(join_roundtrips_after_restart);
+            gateway.move_roundtrips = Some(move_roundtrips_after_restart);
+            gateway.close_after = Some(gateway_close_after_restart);
+        }
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        orchestrator_evidence.registered_workers_after = Some(after_listing.workers.len() as u64);
+        orchestrator_evidence.assignment_listing_after =
+            Some(assignment_listing_summary_json(&after_listing)?);
+
+        let route_converged_after_restart =
+            (gateway_routes_after_restart - 1.0).abs() < f64::EPSILON;
+        let worker_refreshed_after_restart = worker_parent_actor_count >= 1.0;
+        let traffic_confirmed_after_restart =
+            ping_roundtrips_after_restart >= 1.0 && move_roundtrips_after_restart >= 1.0;
+        let counters_clean_after_restart = gateway_close_before == gateway_close_after_restart;
+        if !(route_converged_after_restart
+            && worker_refreshed_after_restart
+            && traffic_confirmed_after_restart
+            && counters_clean_after_restart)
+        {
+            bail!(
+                "internal P7 operation restart evidence incomplete: route_converged={route_converged_after_restart} worker_refreshed={worker_refreshed_after_restart} traffic_confirmed={traffic_confirmed_after_restart} counters_clean={counters_clean_after_restart}"
+            );
+        }
+
+        let observation_response = http_json_post(
+            "internal P7 operation restart observation",
+            &local_orch_metrics_addr,
+            &format!(
+                "/operations/observations?operation_id={}&expected_proposal_hash={}&observer=internal-p7-operation-restart-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true",
+                operation.operation_id, operation.proposal_hash
+            ),
+        )?;
+        assert_json_str_eq(&observation_response, &["status"], "completed")?;
+        assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+        assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
+
+        let completed_snapshot = http_json_get(
+            "internal P7 operation ledger",
+            &local_orch_metrics_addr,
+            "/operations",
+        )?;
+        let completed_summary =
+            validate_p7_operation_ledger(&completed_snapshot, true, false, true, true, false)?;
+        let completed_record =
+            find_p7_operation_record(&completed_snapshot, &operation.operation_id)?;
+        validate_p7_completed_observation(completed_record)?;
+        let worker_evidence = InternalK8sOperationWorkerEvidence {
+            worker_id: options.owner_worker_id.clone(),
+            metrics_addr: local_owner_worker_metrics_addr.clone(),
+            parent_actor_count: worker_parent_actor_count,
+        };
+        let completion = InternalK8sOperationCompletion {
+            operation_recorded: true,
+            approval_recorded: true,
+            execution_published: true,
+            route_converged: route_converged_after_restart,
+            worker_refreshed: worker_refreshed_after_restart,
+            traffic_confirmed: traffic_confirmed_after_restart,
+            gateway_close_counters_clean: counters_clean_after_restart,
+            observation_completed: true,
+            owner_outage_detected: false,
+            observation_recovery_required: false,
+            operator_recovery_confirmed: false,
+            ledger_recovery_required: false,
+            orchestrator_restart_smoke_ran: true,
+            load_soak_ran: false,
+        };
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
+                expected_image: options.expected_image.as_deref(),
+                stage: "completed",
+                reason: "P7 merge operation survived Orchestrator rollout restart and observation completed",
+                preflight_errors: &[],
+                operation: Some(&operation),
+                proposal_response: Some(&proposal_response),
+                approval_response: Some(&approval_response),
+                execution_response: Some(&execution_response),
+                observation_response: Some(&observation_response),
+                ledger_snapshot: Some(&completed_snapshot),
+                ledger_summary: Some(completed_summary),
+                orchestrator: Some(&orchestrator_evidence),
+                gateway: gateway_evidence.as_ref(),
+                worker: Some(&worker_evidence),
+                soak: None,
+                failure: None,
+                completion,
+            },
+            options.out.as_deref(),
+        )?;
+        println!(
+            "internal P7 operation restart smoke completed: operation={} report={}",
             operation.operation_id,
             report_path.display()
         );
@@ -10027,6 +10325,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         observation_recovery_required: false,
         operator_recovery_confirmed: false,
         ledger_recovery_required: false,
+        orchestrator_restart_smoke_ran: false,
         load_soak_ran: options.with_soak,
     };
     let report_path = write_internal_k8s_operation_report(
@@ -10042,6 +10341,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
             argocd_app: &options.argocd_app,
             argocd_status: preflight.argocd_status.as_ref(),
             deployment_images: &preflight.deployment_images,
+            assignment_state_storage: preflight.assignment_state_storage.as_ref(),
             expected_image: options.expected_image.as_deref(),
             stage: "completed",
             reason: "P7 merge operation executed through guarded internal helper and observation completed",
@@ -10224,6 +10524,7 @@ struct K8sMultiDepthActivationPreflightResult {
 struct K8sOperationPreflight {
     argocd_status: Option<ArgoCdAppStatus>,
     deployment_images: Vec<K8sDeploymentImage>,
+    assignment_state_storage: Option<K8sAssignmentStateStorage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10258,6 +10559,24 @@ fn k8s_operation_preflight(
     let (deployment_images, deployment_errors) =
         collect_k8s_operation_deployment_images(context, options);
     errors.extend(deployment_errors);
+    let assignment_state_storage = if options.with_restart {
+        match kubectl_assignment_state_storage(
+            context,
+            &options.namespace,
+            &options.orch_deploy,
+            &options.expected_assignment_state_path,
+        ) {
+            Ok(storage) => Some(storage),
+            Err(err) => {
+                errors.push(format!(
+                    "orchestrator assignment state storage preflight failed: {err:#}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
     for resource in [
         format!("svc/{}", options.orch_service),
         format!("svc/{}", options.gateway_service),
@@ -10281,6 +10600,7 @@ fn k8s_operation_preflight(
         preflight: K8sOperationPreflight {
             argocd_status,
             deployment_images,
+            assignment_state_storage,
         },
         errors,
     }
@@ -11250,6 +11570,7 @@ struct InternalK8sOperationReport<'a> {
     argocd_app: &'a str,
     argocd_status: Option<&'a ArgoCdAppStatus>,
     deployment_images: &'a [K8sDeploymentImage],
+    assignment_state_storage: Option<&'a K8sAssignmentStateStorage>,
     expected_image: Option<&'a str>,
     stage: &'a str,
     reason: &'a str,
@@ -11353,6 +11674,7 @@ struct InternalK8sOperationCompletion {
     observation_recovery_required: bool,
     operator_recovery_confirmed: bool,
     ledger_recovery_required: bool,
+    orchestrator_restart_smoke_ran: bool,
     load_soak_ran: bool,
 }
 
@@ -11427,8 +11749,7 @@ fn write_internal_k8s_activation_preflight_report(
                 input.argocd_status
             ),
             "expected_image": input.expected_image,
-            "deployment_images": k8s_deployment_images_json(input.deployment_images),
-            "assignment_state_storage": k8s_assignment_state_storage_json(input.assignment_state_storage)
+            "deployment_images": k8s_deployment_images_json(input.deployment_images)
         },
         "plan": internal_k8s_preflight_plan_json(
             input.plan_report_path,
@@ -11972,7 +12293,9 @@ fn write_internal_k8s_operation_report(
     if !completion.observation_recovery_required {
         remaining_uncovered.push("guarded_kubernetes_operation_failure_recovery_smoke");
     }
-    remaining_uncovered.push("guarded_kubernetes_operation_restart_smoke");
+    if !completion.orchestrator_restart_smoke_ran {
+        remaining_uncovered.push("guarded_kubernetes_operation_restart_smoke");
+    }
     remaining_uncovered.push("p7_completion_audit");
 
     let report = serde_json::json!({
@@ -11998,7 +12321,8 @@ fn write_internal_k8s_operation_report(
                 input.argocd_status
             ),
             "expected_image": input.expected_image,
-            "deployment_images": k8s_deployment_images_json(input.deployment_images)
+            "deployment_images": k8s_deployment_images_json(input.deployment_images),
+            "assignment_state_storage": k8s_assignment_state_storage_json(input.assignment_state_storage)
         },
         "operation": internal_k8s_operation_selection_json(input.operation),
         "orchestrator": internal_k8s_operation_orchestrator_json(input.orchestrator),
@@ -12026,6 +12350,7 @@ fn write_internal_k8s_operation_report(
             "observation_recovery_required": completion.observation_recovery_required,
             "operator_recovery_confirmed": completion.operator_recovery_confirmed,
             "ledger_recovery_required": completion.ledger_recovery_required,
+            "orchestrator_restart_smoke_ran": completion.orchestrator_restart_smoke_ran,
             "load_soak_ran": completion.load_soak_ran,
             "automatic_rollback_observed": false
         },
@@ -12411,6 +12736,7 @@ struct InternalP7OperationRequirements {
     require_completed_observation: bool,
     require_soak: bool,
     require_recovery_required: bool,
+    require_restart: bool,
 }
 
 fn run_k8s_merge_activation_report_check(
@@ -15353,8 +15679,12 @@ fn validate_internal_k8s_operation_report(
         || requirements.require_completed_observation
         || requirements.require_soak
         || requirements.require_recovery_required
+        || requirements.require_restart
     {
-        if requirements.require_completed_observation || requirements.require_soak {
+        if requirements.require_completed_observation
+            || requirements.require_soak
+            || requirements.require_restart
+        {
             assert_json_str_eq(report, &["stage"], "completed")?;
         } else if requirements.require_recovery_required {
             assert_json_str_eq(report, &["stage"], "recovery_required")?;
@@ -15427,6 +15757,36 @@ fn validate_internal_k8s_operation_report(
             expected_actor_requests,
         )?;
         assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_soak_smoke")?;
+    }
+    if requirements.require_restart {
+        assert_json_bool_eq(report, &["checks", "orchestrator_restart_smoke_ran"], true)?;
+        assert_json_bool_eq(
+            report,
+            &["cluster", "assignment_state_storage", "checked"],
+            true,
+        )?;
+        assert_json_str_eq(
+            report,
+            &["cluster", "assignment_state_storage", "policy_id"],
+            ORCH_ASSIGNMENT_STATE_STORAGE_POLICY,
+        )?;
+        assert_json_str_eq(
+            report,
+            &["cluster", "assignment_state_storage", "env"],
+            ORCH_ASSIGNMENT_STATE_ENV,
+        )?;
+        let path = json_str(report, &["cluster", "assignment_state_storage", "path"])?;
+        if path.trim().is_empty() {
+            bail!("internal P7 operation restart report has empty assignment state path");
+        }
+        assert_json_bool_eq(report, &["checks", "route_converged"], true)?;
+        assert_json_bool_eq(report, &["checks", "worker_refreshed"], true)?;
+        assert_json_bool_eq(report, &["checks", "traffic_confirmed"], true)?;
+        assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], true)?;
+        assert_json_bool_eq(report, &["checks", "observation_completed"], true)?;
+        let ledger = json_field(report, &["ledger", "snapshot"])?;
+        validate_p7_operation_ledger(ledger, true, false, true, true, false)?;
+        assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_restart_smoke")?;
     }
     if requirements.require_recovery_required {
         assert_json_bool_eq(report, &["checks", "route_converged"], true)?;
@@ -21380,6 +21740,7 @@ mod tests {
                 require_completed_observation: true,
                 require_soak: true,
                 require_recovery_required: false,
+                require_restart: false,
             },
             Some("repo/tessera:v1"),
             &[],
@@ -21557,11 +21918,152 @@ mod tests {
                 require_completed_observation: false,
                 require_soak: false,
                 require_recovery_required: true,
+                require_restart: false,
             },
             Some("repo/tessera:v1"),
             &[],
         )
         .expect("valid internal P7 operation recovery report");
+    }
+
+    #[test]
+    fn internal_k8s_p7_operation_report_check_accepts_restart_evidence() {
+        let ledger = serde_json::json!({
+            "schema": "tessera.orch.operation_ledger.v1",
+            "records": [
+                {
+                    "operation_id": "p7-merge-restart-1",
+                    "kind": "merge",
+                    "status": "completed",
+                    "created_unix_secs": 100,
+                    "updated_unix_secs": 150,
+                    "proposal": {
+                        "source": "split_merge_preview:test",
+                        "proposal_hash": "fnv1a64:restart",
+                        "parent": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                        "targets": [
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0}, "worker_id": "worker-a"}
+                        ],
+                        "preconditions": ["operator approval required"],
+                        "submission_command": "cargo xt merge-activation --operation-id p7-merge-restart-1"
+                    },
+                    "approval": {
+                        "policy_id": "operator_approved_dynamic_operation_v1",
+                        "approver": "operator",
+                        "allowed_kind": "merge",
+                        "approved_unix_secs": 110,
+                        "expires_unix_secs": 710,
+                        "expected_proposal_hash": "fnv1a64:restart",
+                        "cooldown_key": "world-0",
+                        "budget_key": "daily"
+                    },
+                    "phases": [
+                        {"name": "proposal_recorded", "state": "succeeded", "unix_secs": 100, "reason": "proposal persisted"},
+                        {"name": "approval_recorded", "state": "succeeded", "unix_secs": 110, "reason": "approval persisted"},
+                        {"name": "execution_started", "state": "succeeded", "unix_secs": 120, "reason": "operation execution passed policy gates"},
+                        {"name": "execution_published", "state": "succeeded", "unix_secs": 121, "reason": "merge activation published"},
+                        {"name": "observation_completed", "state": "succeeded", "unix_secs": 150, "reason": "observer=internal confirmed route_converged, worker_refreshed, traffic_confirmed, counters_clean"}
+                    ]
+                }
+            ]
+        });
+        let report = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_p7_operation_smoke.v1",
+            "unix_ts": 150,
+            "stage": "completed",
+            "operation_mode": "policy_gated_manual",
+            "execution_mutated": true,
+            "execution_allowed": true,
+            "reason": "restart recovered",
+            "preflight_errors": [],
+            "cluster": {
+                "context": "example-cluster",
+                "namespace": "tessera",
+                "orchestrator_service": "tessera-orch",
+                "gateway_service": "tessera-gateway",
+                "owner_worker_deployment": "tessera-worker",
+                "owner_worker_service": "tessera-worker",
+                "owner_worker_id": "worker-a",
+                "argocd": {"checked": true, "sync": "Synced", "health": "Healthy"},
+                "expected_image": "repo/tessera:v1",
+                "deployment_images": [
+                    {"role": "orchestrator", "deployment": "tessera-orch", "image": "repo/tessera:v1"},
+                    {"role": "gateway", "deployment": "tessera-gateway", "image": "repo/tessera:v1"},
+                    {"role": "owner_worker", "deployment": "tessera-worker", "image": "repo/tessera:v1"}
+                ],
+                "assignment_state_storage": {
+                    "checked": true,
+                    "policy_id": "orchestrator_assignment_state_pvc_rwo_v1",
+                    "env": "TESSERA_ORCH_ASSIGNMENT_STATE_PATH",
+                    "path": "/var/lib/tessera/assignment-state-p7-operation-restart-20260504.json",
+                    "mount_path": "/var/lib/tessera",
+                    "volume": "orch-state",
+                    "persistent_volume_claim": "tessera-orch-state"
+                }
+            },
+            "operation": {
+                "operation_id": "p7-merge-restart-1",
+                "kind": "merge",
+                "proposal_hash": "fnv1a64:restart",
+                "parent": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                "owner_worker_id": "worker-a",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "ledger": {
+                "summary": {
+                    "records": 1,
+                    "proposal_records": 1,
+                    "approval_records": 1,
+                    "blocked_execution_records": 0,
+                    "published_execution_records": 1,
+                    "completed_observation_records": 1,
+                    "recovery_required_records": 0
+                },
+                "snapshot": ledger
+            },
+            "responses": {
+                "proposal": {"assignments_changed": false, "operation_ids": ["p7-merge-restart-1"]},
+                "approval": {"status": "approved", "assignments_changed": false},
+                "execution": {"status": "published", "assignments_changed": true, "mutation_attempted": true, "mutation_allowed": true},
+                "observation": {"status": "completed", "assignments_changed": false, "observation_accepted": true}
+            },
+            "checks": {
+                "operation_recorded": true,
+                "approval_recorded": true,
+                "execution_published": true,
+                "route_converged": true,
+                "worker_refreshed": true,
+                "traffic_confirmed": true,
+                "gateway_close_counters_clean": true,
+                "observation_completed": true,
+                "owner_outage_detected": false,
+                "observation_recovery_required": false,
+                "operator_recovery_confirmed": false,
+                "ledger_recovery_required": false,
+                "orchestrator_restart_smoke_ran": true,
+                "load_soak_ran": false,
+                "automatic_rollback_observed": false
+            },
+            "remaining_uncovered": [
+                "guarded_kubernetes_operation_soak_smoke",
+                "guarded_kubernetes_operation_failure_recovery_smoke",
+                "p7_completion_audit"
+            ]
+        });
+
+        validate_internal_k8s_operation_report(
+            &report,
+            InternalP7OperationRequirements {
+                require_published_execution: true,
+                require_completed_observation: false,
+                require_soak: false,
+                require_recovery_required: false,
+                require_restart: true,
+            },
+            Some("repo/tessera:v1"),
+            &[],
+        )
+        .expect("valid internal P7 operation restart report");
     }
 
     #[test]
