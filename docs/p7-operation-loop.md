@@ -123,8 +123,29 @@ This starts an Orchestrator-only dev stack with
 published execution for an approved same-Worker merge operation, verifies that a
 repeat execution returns `already_published` without another mutation, and
 writes `.dev/reports/p7-operation-execution-smoke-latest.json` plus
-`.dev/reports/p7-operation-execution-ledger-latest.json`. Split runtime
-execution and canonical multi-depth runtime execution remain default-off.
+`.dev/reports/p7-operation-execution-ledger-latest.json`. Canonical multi-depth
+runtime execution remains default-off.
+
+Current split execution expansion smoke:
+
+```sh
+cargo xt dev p7-operation-split-execution-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-split-execution-ledger-latest.json \
+  --require-approval \
+  --require-published-execution
+```
+
+This starts a full local dev stack with
+`TESSERA_ORCH_OPERATION_EXECUTION=manual` and
+`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`, records proposal -> approval ->
+published execution for an approved legacy split operation, verifies that the
+parent assignment is removed and four child assignments are published, then
+verifies repeat execution returns `already_published` without another mutation.
+It writes `.dev/reports/p7-operation-split-execution-smoke-latest.json` plus
+`.dev/reports/p7-operation-split-execution-ledger-latest.json`. Split
+observation, failure/recovery, restart, soak, and internal MicroK8s evidence
+remain explicit P7+ follow-up gates.
 
 Current observation smoke:
 
@@ -426,7 +447,9 @@ Each slice should be self-contained:
    records a durable `blocked_by_policy` phase/status. A controlled execution
    window additionally requires `TESSERA_ORCH_OPERATION_EXECUTION=manual` and
    `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`; the first runtime mutation path
-   is approved same-Worker merge publish with idempotent repeat execution.
+   is approved same-Worker merge publish with idempotent repeat execution. The
+   P7+ expansion now also covers approved legacy split publish/idempotent repeat
+   execution locally.
 6. **Closed-loop smoke**: verify proposal-to-approval-to-execution locally for
    split, merge, and canonical multi-depth paths. The first repo-native smoke is
    `cargo xt dev p7-operation-loop-smoke`, which covers split/merge/canonical
@@ -436,19 +459,23 @@ Each slice should be self-contained:
    operation can publish once through the P7 executor and that duplicate execute
    calls are idempotent. The first repo-native smoke is
    `cargo xt dev p7-operation-execution-smoke`.
-8. **Approved merge observation smoke**: verify that a published operation is
+8. **Approved split execution smoke**: verify that an approved legacy split
+   operation can publish child assignments once through the P7 executor and that
+   duplicate execute calls are idempotent. The first repo-native smoke is
+   `cargo xt dev p7-operation-split-execution-smoke`.
+9. **Approved merge observation smoke**: verify that a published operation is
    closed only after route convergence, Worker refresh, stable-session traffic,
    latency metrics, and clean close counters are recorded. The first repo-native
    smoke is `cargo xt dev p7-operation-observation-smoke`.
-9. **Approved merge recovery smoke**: verify that a post-publish owner outage
+10. **Approved merge recovery smoke**: verify that a post-publish owner outage
    records `recovery_required`, avoids automatic rollback, and recovers only
    after operator-visible Worker restart. The first repo-native smoke is
    `cargo xt dev p7-operation-recovery-smoke`.
-10. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
+11. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
    `cargo xt k8s operation-report-check` so internal MicroK8s can record P7
    proposal evidence by default and approved execution/observation/soak
    evidence during a controlled smoke window.
-11. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+12. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails

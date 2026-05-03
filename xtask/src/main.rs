@@ -909,6 +909,8 @@ enum DevSub {
     P7OperationLoopSmoke,
     /// Start an Orchestrator-only dev stack and prove approved P7 merge execution publishes once
     P7OperationExecutionSmoke,
+    /// Start a full dev stack and prove approved P7 split execution publishes once
+    P7OperationSplitExecutionSmoke,
     /// Start a full dev stack and close an approved P7 merge execution with observation evidence
     P7OperationObservationSmoke,
     /// Start a full dev stack and prove a failed P7 observation stays recovery-required until operator recovery
@@ -1691,6 +1693,7 @@ fn main() -> Result<()> {
             }
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
+            DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
             DevSub::P7OperationObservationSmoke => dev_p7_operation_observation_smoke()?,
             DevSub::P7OperationRecoverySmoke => dev_p7_operation_recovery_smoke()?,
             DevSub::P7OperationRestartSmoke => dev_p7_operation_restart_smoke()?,
@@ -2966,6 +2969,237 @@ fn dev_p7_operation_execution_smoke() -> Result<()> {
 
     println!(
         "P7 operation execution smoke: approved merge operation published once and repeat execution was idempotent, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p7_operation_split_execution_smoke() -> Result<()> {
+    let orch_addr = "127.0.0.1:6370";
+    let orch_metrics_addr = "127.0.0.1:6371";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let worker_a_addr = "127.0.0.1:5371";
+    let worker_b_addr = "127.0.0.1:5372";
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let ledger_path = report_dir.join("p7-operation-split-execution-ledger-latest.json");
+    let _ = fs::remove_file(&ledger_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+
+    let mut build = Command::new("cargo");
+    build.args(["build", "--bin", "tessera-worker", "--bin", "tessera-orch"]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+    );
+    let split_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", split_preview_json),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-execution-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-execution-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-split-execution-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let proposal_response = http_json_post(
+        "P7 split operation proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    let operation_id = json_array(&proposal_response, &["operation_ids"])?
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("P7 split operation proposal response has no operation id"))?
+        .to_string();
+    let proposal_snapshot = http_json_get(
+        "P7 split operation ledger",
+        orch_metrics_addr,
+        "/operations",
+    )?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "split")?;
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "P7 split operation approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p7-split-execution-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p7-split-execution-smoke&budget_key=p7-split-execution-smoke"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+    let execution_response = http_json_post(
+        "P7 split operation execution",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+    let repeat_execution_response = http_json_post(
+        "P7 split operation execution repeat",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&repeat_execution_response, &["status"], "already_published")?;
+    assert_json_bool_eq(&repeat_execution_response, &["assignments_changed"], false)?;
+    assert_json_bool_eq(&repeat_execution_response, &["mutation_attempted"], false)?;
+
+    let expected_children = [
+        (activation_child_cell(0), "worker-a"),
+        (activation_child_cell(1), "worker-b"),
+        (activation_child_cell(2), "worker-a"),
+        (activation_child_cell(3), "worker-b"),
+    ];
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let root_parent_owners = listing_cell_owners(&after_listing, CellId::grid(0, 0, 0))?;
+    if !root_parent_owners.is_empty() {
+        bail!("P7 split operation execution left root parent assigned: {root_parent_owners:?}");
+    }
+    for (child, worker_id) in expected_children {
+        let owners = listing_cell_owners(&after_listing, child)?;
+        if owners != vec![worker_id.to_string()] {
+            bail!(
+                "P7 split operation execution expected child {:?} owner {worker_id}, got {owners:?}",
+                child
+            );
+        }
+    }
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false, false)?;
+    let record = find_p7_operation_record(&ledger, &operation_id)?;
+    validate_p7_published_execution(record)?;
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_split_execution_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "split",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers": before_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "repeat_execution": repeat_execution_response
+        },
+        "checks": {
+            "split_execution_published": true,
+            "child_assignments_published": true,
+            "parent_assignment_removed": true,
+            "repeat_execution_idempotent": true,
+            "ledger_execution_published": true
+        },
+        "remaining_uncovered": [
+            "split_operation_observation",
+            "split_operation_failure_recovery",
+            "split_operation_restart_recovery",
+            "split_operation_soak",
+            "multi_depth_runtime_execution",
+            "internal_microk8s_split_operation_execution_smoke"
+        ]
+    });
+    validate_p7_operation_split_execution_smoke_report(&report)?;
+    let report_path = write_p7_operation_split_execution_smoke_report(&report)?;
+
+    println!(
+        "P7 split operation execution smoke: approved split operation published once and repeat execution was idempotent, report={}, ledger={}",
         report_path.display(),
         ledger_path.display()
     );
@@ -13137,6 +13371,20 @@ fn write_p7_operation_execution_smoke_report(report: &serde_json::Value) -> Resu
     Ok(latest)
 }
 
+fn write_p7_operation_split_execution_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p7-operation-split-execution-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = report_dir.join("p7-operation-split-execution-smoke-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
 fn write_p7_operation_observation_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
     let report_dir = workspace_root().join(".dev/reports");
     fs::create_dir_all(&report_dir)?;
@@ -13504,6 +13752,67 @@ fn validate_p7_operation_execution_smoke_report(report: &serde_json::Value) -> R
     assert_json_bool_eq(report, &["checks", "repeat_execution_idempotent"], true)?;
     assert_json_bool_eq(report, &["checks", "ledger_execution_published"], true)?;
     assert_remaining_uncovered_contains(report, "internal_microk8s_operation_execution_smoke")?;
+    Ok(())
+}
+
+fn validate_p7_operation_split_execution_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.p7_operation_split_execution_smoke.v1",
+    )?;
+    assert_json_str_eq(report, &["operation", "kind"], "split")?;
+    assert_json_str_eq(
+        report,
+        &["operation", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    let ledger_path = json_str(report, &["ledger", "path"])?;
+    if ledger_path.trim().is_empty() {
+        bail!("P7 split operation execution smoke report has empty ledger.path");
+    }
+    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_attempted"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_allowed"],
+        true,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "repeat_execution", "status"],
+        "already_published",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "repeat_execution", "assignments_changed"],
+        false,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "repeat_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_bool_eq(report, &["checks", "split_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "child_assignments_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "parent_assignment_removed"], true)?;
+    assert_json_bool_eq(report, &["checks", "repeat_execution_idempotent"], true)?;
+    assert_json_bool_eq(report, &["checks", "ledger_execution_published"], true)?;
+    assert_remaining_uncovered_contains(report, "split_operation_observation")?;
     Ok(())
 }
 
@@ -21628,6 +21937,72 @@ mod tests {
 
         validate_p7_operation_execution_smoke_report(&report)
             .expect("valid P7 operation execution smoke report");
+    }
+
+    #[test]
+    fn p7_operation_split_execution_smoke_report_accepts_published_split_evidence() {
+        let report = serde_json::json!({
+            "schema": "tessera.p7_operation_split_execution_smoke.v1",
+            "unix_secs": 120,
+            "operation": {
+                "operation_id": "p7-split-1",
+                "kind": "split",
+                "proposal_hash": "fnv1a64:abc",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6370",
+                "metrics_addr": "127.0.0.1:6371",
+                "registered_workers": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after": {"workers": [], "handovers": 0}
+            },
+            "ledger": {
+                "path": ".dev/reports/p7-operation-split-execution-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1
+            },
+            "responses": {
+                "proposal": {
+                    "assignments_changed": false,
+                    "planned_count": 1,
+                    "recorded_count": 1,
+                    "already_recorded_count": 0,
+                    "operation_ids": ["p7-split-1"]
+                },
+                "approval": {
+                    "status": "approved",
+                    "assignments_changed": false
+                },
+                "execution": {
+                    "status": "published",
+                    "assignments_changed": true,
+                    "mutation_attempted": true,
+                    "mutation_allowed": true
+                },
+                "repeat_execution": {
+                    "status": "already_published",
+                    "assignments_changed": false,
+                    "mutation_attempted": false,
+                    "mutation_allowed": true
+                }
+            },
+            "checks": {
+                "split_execution_published": true,
+                "child_assignments_published": true,
+                "parent_assignment_removed": true,
+                "repeat_execution_idempotent": true,
+                "ledger_execution_published": true
+            },
+            "remaining_uncovered": [
+                "split_operation_observation"
+            ]
+        });
+
+        validate_p7_operation_split_execution_smoke_report(&report)
+            .expect("valid P7 split operation execution smoke report");
     }
 
     #[test]
