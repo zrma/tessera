@@ -742,6 +742,9 @@ enum K8sSub {
     },
     /// Build a port-forwarded internal P7 operation plan and optionally run guarded execution
     OperationSmoke {
+        /// Operation kind to exercise: merge or multi-depth-split
+        #[arg(long, default_value = "merge")]
+        operation_kind: String,
         /// Kubernetes namespace that contains the Tessera runtime
         #[arg(long, default_value = "tessera")]
         namespace: String,
@@ -769,6 +772,18 @@ enum K8sSub {
         /// Worker id expected to own the merge operation
         #[arg(long, default_value = "worker-a")]
         owner_worker_id: String,
+        /// Target Worker deployment used for multi-depth split operation evidence
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_deploy: String,
+        /// Target Worker service used for multi-depth split child actor metrics
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_service: String,
+        /// Target Worker id used for multi-depth split operation evidence
+        #[arg(long, default_value = "worker-b")]
+        target_worker_id: String,
+        /// Canonical parent cell for multi-depth operation smoke, as world,cx,cy,depth,sub
+        #[arg(long, default_value = "0,-2,3,2,0")]
+        multi_depth_parent: String,
         /// ArgoCD Application namespace used for Synced/Healthy preflight
         #[arg(long, default_value = "argocd")]
         argocd_namespace: String,
@@ -796,6 +811,9 @@ enum K8sSub {
         /// Local owner Worker metrics port for kubectl port-forward when --allow-execution is set
         #[arg(long, default_value_t = 5100)]
         local_owner_worker_metrics_port: u16,
+        /// Local target Worker metrics port for multi-depth split operation smoke
+        #[arg(long, default_value_t = 5101)]
+        local_target_worker_metrics_port: u16,
         /// Approve and execute the selected P7 merge operation
         #[arg(long, default_value_t = false)]
         allow_execution: bool,
@@ -1622,6 +1640,7 @@ fn main() -> Result<()> {
                 &expect_preflight_errors,
             )?,
             K8sSub::OperationSmoke {
+                operation_kind,
                 namespace,
                 context,
                 orch_service,
@@ -1631,6 +1650,10 @@ fn main() -> Result<()> {
                 owner_worker_deploy,
                 owner_worker_service,
                 owner_worker_id,
+                target_worker_deploy,
+                target_worker_service,
+                target_worker_id,
+                multi_depth_parent,
                 argocd_namespace,
                 argocd_app,
                 skip_argocd_check,
@@ -1640,6 +1663,7 @@ fn main() -> Result<()> {
                 local_gateway_port,
                 local_gateway_metrics_port,
                 local_owner_worker_metrics_port,
+                local_target_worker_metrics_port,
                 allow_execution,
                 with_soak,
                 with_failure,
@@ -1651,6 +1675,7 @@ fn main() -> Result<()> {
                 soak_sleep_ms,
                 out,
             } => run_k8s_operation_smoke(K8sOperationSmokeOptions {
+                operation_kind,
                 namespace,
                 context,
                 orch_service,
@@ -1660,6 +1685,10 @@ fn main() -> Result<()> {
                 owner_worker_deploy,
                 owner_worker_service,
                 owner_worker_id,
+                target_worker_deploy,
+                target_worker_service,
+                target_worker_id,
+                multi_depth_parent,
                 argocd_namespace,
                 argocd_app,
                 skip_argocd_check,
@@ -1669,6 +1698,7 @@ fn main() -> Result<()> {
                 local_gateway_port,
                 local_gateway_metrics_port,
                 local_owner_worker_metrics_port,
+                local_target_worker_metrics_port,
                 allow_execution,
                 with_soak,
                 with_failure,
@@ -13551,6 +13581,7 @@ fn run_k8s_merge_activation_smoke(options: K8sMergeActivationSmokeOptions) -> Re
 
 #[derive(Debug)]
 struct K8sOperationSmokeOptions {
+    operation_kind: String,
     namespace: String,
     context: Option<String>,
     orch_service: String,
@@ -13560,6 +13591,10 @@ struct K8sOperationSmokeOptions {
     owner_worker_deploy: String,
     owner_worker_service: String,
     owner_worker_id: String,
+    target_worker_deploy: String,
+    target_worker_service: String,
+    target_worker_id: String,
+    multi_depth_parent: String,
     argocd_namespace: String,
     argocd_app: String,
     skip_argocd_check: bool,
@@ -13569,6 +13604,7 @@ struct K8sOperationSmokeOptions {
     local_gateway_port: u16,
     local_gateway_metrics_port: u16,
     local_owner_worker_metrics_port: u16,
+    local_target_worker_metrics_port: u16,
     allow_execution: bool,
     with_soak: bool,
     with_failure: bool,
@@ -13582,6 +13618,15 @@ struct K8sOperationSmokeOptions {
 }
 
 fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
+    match options.operation_kind.as_str() {
+        "merge" => {}
+        "multi-depth-split" | "multi_depth_split" => {
+            return run_k8s_multi_depth_operation_smoke(options);
+        }
+        other => bail!(
+            "unsupported internal k8s P7 operation kind `{other}`; expected merge or multi-depth-split"
+        ),
+    }
     if options.with_soak && !options.allow_execution {
         bail!("internal k8s P7 operation soak needs a published execution; pass --allow-execution");
     }
@@ -14067,6 +14112,9 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         worker_id: options.owner_worker_id.clone(),
         metrics_addr: local_owner_worker_metrics_addr.clone(),
         parent_actor_count: worker_parent_actor_count,
+        target_worker_id: None,
+        target_metrics_addr: None,
+        child_actor_count: None,
     };
 
     let gateway_metrics_after = assert_metrics_endpoint_body_until(
@@ -14550,6 +14598,9 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
             worker_id: options.owner_worker_id.clone(),
             metrics_addr: local_owner_worker_metrics_addr.clone(),
             parent_actor_count: worker_parent_actor_count,
+            target_worker_id: None,
+            target_metrics_addr: None,
+            child_actor_count: None,
         };
         let completion = InternalK8sOperationCompletion {
             operation_recorded: true,
@@ -14688,6 +14739,534 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         } else {
             ""
         },
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn run_k8s_multi_depth_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
+    if options.with_failure {
+        bail!(
+            "internal k8s multi-depth P7 operation failure/recovery is a separate future gate; this helper currently supports read-only proposal and --allow-execution --with-soak"
+        );
+    }
+    if options.with_restart {
+        bail!(
+            "internal k8s multi-depth P7 operation restart is a separate future gate; this helper currently supports read-only proposal and --allow-execution --with-soak"
+        );
+    }
+    if options.allow_execution && !options.with_soak {
+        bail!(
+            "internal k8s multi-depth P7 operation execution requires --with-soak so child-route traffic and observation evidence are recorded"
+        );
+    }
+    if options.with_soak && options.soak_iterations == 0 {
+        bail!("internal k8s multi-depth P7 operation soak iterations must be greater than zero");
+    }
+
+    let parent = parse_cell_id_tuple(&options.multi_depth_parent)?;
+    let children = parent
+        .canonical_children()
+        .ok_or_else(|| anyhow::anyhow!("multi-depth operation parent must be canonical"))?;
+    let expected_listing = vec![
+        (children[0], options.owner_worker_id.as_str()),
+        (children[1], options.target_worker_id.as_str()),
+        (children[2], options.owner_worker_id.as_str()),
+        (children[3], options.target_worker_id.as_str()),
+    ];
+    let default_report_path = default_internal_k8s_multi_depth_operation_smoke_path();
+    let report_out = options
+        .out
+        .as_deref()
+        .unwrap_or(default_report_path.as_path());
+
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let preflight_result = k8s_operation_preflight(&context, &options);
+    let preflight = preflight_result.preflight;
+    if !preflight_result.errors.is_empty() {
+        let reason = format!(
+            "internal k8s P7 multi-depth operation preflight failed: {}",
+            preflight_result.errors.join("; ")
+        );
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
+                expected_image: options.expected_image.as_deref(),
+                stage: "blocked_before_proposal",
+                reason: &reason,
+                preflight_errors: &preflight_result.errors,
+                operation: None,
+                proposal_response: None,
+                approval_response: None,
+                execution_response: None,
+                observation_response: None,
+                ledger_snapshot: None,
+                ledger_summary: None,
+                orchestrator: None,
+                gateway: None,
+                worker: None,
+                soak: None,
+                failure: None,
+                completion: InternalK8sOperationCompletion::default(),
+            },
+            Some(report_out),
+        )?;
+        bail!(
+            "{reason}; internal P7 multi-depth operation report={}",
+            report_path.display()
+        );
+    }
+    if let Some(expected_image) = options.expected_image.as_deref()
+        && let Err(err) =
+            validate_k8s_deployment_images(&preflight.deployment_images, expected_image)
+    {
+        let reason = err.to_string();
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
+                expected_image: options.expected_image.as_deref(),
+                stage: "blocked_before_proposal",
+                reason: &reason,
+                preflight_errors: &[],
+                operation: None,
+                proposal_response: None,
+                approval_response: None,
+                execution_response: None,
+                observation_response: None,
+                ledger_snapshot: None,
+                ledger_summary: None,
+                orchestrator: None,
+                gateway: None,
+                worker: None,
+                soak: None,
+                failure: None,
+                completion: InternalK8sOperationCompletion::default(),
+            },
+            Some(report_out),
+        )?;
+        bail!(
+            "{reason}; internal P7 multi-depth operation report={}",
+            report_path.display()
+        );
+    }
+
+    let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_orch_metrics_addr = format!("127.0.0.1:{}", options.local_orch_metrics_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
+    let local_owner_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_owner_worker_metrics_port);
+    let local_target_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_target_worker_metrics_port);
+
+    let mut forwards = ManagedK8sPortForwards::default();
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.orch_service,
+        "p7-multi-depth-operation-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    if options.allow_execution {
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.gateway_service,
+            "p7-multi-depth-operation-gateway",
+            &[
+                (options.local_gateway_port, 4000),
+                (options.local_gateway_metrics_port, 4100),
+            ],
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.owner_worker_service,
+            "p7-multi-depth-operation-source-worker",
+            &[(options.local_owner_worker_metrics_port, 5100)],
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.target_worker_service,
+            "p7-multi-depth-operation-target-worker",
+            &[(options.local_target_worker_metrics_port, 5100)],
+        )?;
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let orch_endpoint = grpc_endpoint(&local_orch_addr);
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let mut orchestrator_evidence = InternalK8sOperationOrchestratorEvidence {
+        grpc_addr: local_orch_addr.clone(),
+        metrics_addr: local_orch_metrics_addr.clone(),
+        registered_workers_before: before_health.registered_workers,
+        registered_workers_after: None,
+        assignment_listing_before: assignment_listing_summary_json(&before_listing)?,
+        assignment_listing_after: None,
+    };
+
+    let proposal_response = http_json_post(
+        "internal P7 multi-depth operation proposal",
+        &local_orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+    let proposal_snapshot = http_json_get(
+        "internal P7 multi-depth operation ledger",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let (operation, proposal_record) = select_internal_p7_operation_kind(
+        &proposal_response,
+        &proposal_snapshot,
+        "multi_depth_split",
+        &options.owner_worker_id,
+    )?;
+    validate_p7_operation_record(proposal_record)?;
+    if operation.parent != parent {
+        bail!(
+            "internal P7 multi-depth operation expected parent {:?}, got {:?}",
+            parent,
+            operation.parent
+        );
+    }
+    let proposal_summary =
+        validate_p7_operation_ledger(&proposal_snapshot, false, false, false, false, false)?;
+    if !options.allow_execution {
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                assignment_state_storage: preflight.assignment_state_storage.as_ref(),
+                expected_image: options.expected_image.as_deref(),
+                stage: "planned_without_execution",
+                reason: "P7 multi-depth split operation proposal is recorded; helper stopped before approval/execution because --allow-execution was not provided",
+                preflight_errors: &[],
+                operation: Some(&operation),
+                proposal_response: Some(&proposal_response),
+                approval_response: None,
+                execution_response: None,
+                observation_response: None,
+                ledger_snapshot: Some(&proposal_snapshot),
+                ledger_summary: Some(proposal_summary),
+                orchestrator: Some(&orchestrator_evidence),
+                gateway: None,
+                worker: None,
+                soak: None,
+                failure: None,
+                completion: InternalK8sOperationCompletion {
+                    operation_recorded: true,
+                    ..InternalK8sOperationCompletion::default()
+                },
+            },
+            Some(report_out),
+        )?;
+        println!(
+            "internal P7 multi-depth operation smoke stopped before mutation; operation={} report={}",
+            operation.operation_id,
+            report_path.display()
+        );
+        return Ok(());
+    }
+
+    assert_http_status_endpoint(
+        "internal P7 multi-depth operation gateway readiness",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "internal P7 multi-depth operation gateway before",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_routes_before =
+        prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "internal P7 multi-depth operation approval",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={}&policy_id={policy_id}&approver=internal-p7-multi-depth-operation-smoke&expected_proposal_hash={}&ttl_secs=600&cooldown_key=internal-p7-multi-depth-operation-smoke&budget_key=internal-p7-multi-depth-operation-smoke",
+            operation.operation_id, operation.proposal_hash
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+    assert_json_bool_eq(&approval_response, &["assignments_changed"], false)?;
+
+    let execution_response = http_json_post(
+        "internal P7 multi-depth operation execution",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={}&expected_proposal_hash={}&policy_id={policy_id}",
+            operation.operation_id, operation.proposal_hash
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+    let pre_soak_probe =
+        probe_multi_depth_convergence(&local_gateway_addr, &expected_listing, 18_100);
+    pre_soak_probe.assert_success()?;
+    let child_cells = [children[0], children[1], children[2], children[3]];
+    let soak_run = run_cell_activation_soak_loop_keepalive(
+        &local_gateway_addr,
+        &child_cells,
+        options.soak_iterations,
+        Duration::from_millis(options.soak_sleep_ms),
+    )?;
+    let stats = soak_run.stats;
+    let expected_actor_requests = u64::from(options.soak_iterations) * 4;
+    if stats.pings_ok < expected_actor_requests || stats.moves_ok < expected_actor_requests {
+        bail!(
+            "internal P7 multi-depth operation soak traffic incomplete: pings_ok={} moves_ok={} expected={expected_actor_requests}",
+            stats.pings_ok,
+            stats.moves_ok
+        );
+    }
+
+    let source_child0_metric = worker_cell_actor_count_metric(children[0]);
+    let source_child2_metric = worker_cell_actor_count_metric(children[2]);
+    let target_child1_metric = worker_cell_actor_count_metric(children[1]);
+    let target_child3_metric = worker_cell_actor_count_metric(children[3]);
+    let source_child0_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P7 multi-depth operation source worker child0",
+        &local_owner_worker_metrics_addr,
+        source_child0_metric.as_str(),
+        1.0,
+    )?;
+    let source_child2_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P7 multi-depth operation source worker child2",
+        &local_owner_worker_metrics_addr,
+        source_child2_metric.as_str(),
+        1.0,
+    )?;
+    let target_child1_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P7 multi-depth operation target worker child1",
+        &local_target_worker_metrics_addr,
+        target_child1_metric.as_str(),
+        1.0,
+    )?;
+    let target_child3_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P7 multi-depth operation target worker child3",
+        &local_target_worker_metrics_addr,
+        target_child3_metric.as_str(),
+        1.0,
+    )?;
+    let child_actor_count = source_child0_actor_count
+        + source_child2_actor_count
+        + target_child1_actor_count
+        + target_child3_actor_count;
+
+    let gateway_metrics_after = assert_metrics_endpoint_body_until(
+        "internal P7 multi-depth operation gateway after soak",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P7 multi-depth operation gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        expected_actor_requests as f64,
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P7 multi-depth operation gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        expected_actor_requests as f64,
+    )?;
+    let gateway_routes_after =
+        prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_routes")?;
+    let ping_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )?;
+    let join_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+    )?;
+    let move_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+    )?;
+    let gateway_close_after = gateway_close_counters_from_metrics(&gateway_metrics_after)?;
+    assert_gateway_close_counters_not_increased(
+        "internal P7 multi-depth operation gateway",
+        gateway_close_before,
+        gateway_close_after,
+    )?;
+    let route_converged = (gateway_routes_after - 4.0).abs() < f64::EPSILON;
+    let worker_refreshed = child_actor_count >= 4.0;
+    let traffic_confirmed =
+        stats.pings_ok >= expected_actor_requests && stats.moves_ok >= expected_actor_requests;
+    let counters_clean = gateway_close_before == gateway_close_after;
+    if !(route_converged && worker_refreshed && traffic_confirmed && counters_clean) {
+        bail!(
+            "internal P7 multi-depth operation evidence incomplete: route_converged={route_converged} worker_refreshed={worker_refreshed} traffic_confirmed={traffic_confirmed} counters_clean={counters_clean}"
+        );
+    }
+
+    let observation_response = http_json_post(
+        "internal P7 multi-depth operation observation",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={}&expected_proposal_hash={}&observer=internal-p7-multi-depth-operation-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true",
+            operation.operation_id, operation.proposal_hash
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "completed")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+    assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
+
+    let completed_snapshot = http_json_get(
+        "internal P7 multi-depth operation ledger",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let completed_summary =
+        validate_p7_operation_ledger(&completed_snapshot, true, false, true, true, false)?;
+    let completed_record = find_p7_operation_record(&completed_snapshot, &operation.operation_id)?;
+    validate_p7_completed_observation(completed_record)?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    orchestrator_evidence.registered_workers_after = Some(after_listing.workers.len() as u64);
+    orchestrator_evidence.assignment_listing_after =
+        Some(assignment_listing_summary_json(&after_listing)?);
+    let gateway_evidence = InternalK8sOperationGatewayEvidence {
+        addr: local_gateway_addr.clone(),
+        metrics_addr: local_gateway_metrics_addr.clone(),
+        routes_before: Some(gateway_routes_before),
+        routes_after: Some(gateway_routes_after),
+        ping_roundtrips: Some(ping_roundtrips),
+        join_roundtrips: Some(join_roundtrips),
+        move_roundtrips: Some(move_roundtrips),
+        close_before: Some(gateway_close_before),
+        close_after: Some(gateway_close_after),
+    };
+    let worker_evidence = InternalK8sOperationWorkerEvidence {
+        worker_id: options.owner_worker_id.clone(),
+        metrics_addr: local_owner_worker_metrics_addr.clone(),
+        parent_actor_count: 0.0,
+        target_worker_id: Some(options.target_worker_id.clone()),
+        target_metrics_addr: Some(local_target_worker_metrics_addr.clone()),
+        child_actor_count: Some(child_actor_count),
+    };
+    let soak_evidence = InternalK8sOperationSoakEvidence {
+        iterations: options.soak_iterations,
+        sleep_ms: options.soak_sleep_ms,
+        pings_ok: stats.pings_ok,
+        moves_ok: stats.moves_ok,
+        expected_actor_requests,
+    };
+    let completion = InternalK8sOperationCompletion {
+        operation_recorded: true,
+        approval_recorded: true,
+        execution_published: true,
+        route_converged,
+        worker_refreshed,
+        traffic_confirmed,
+        gateway_close_counters_clean: counters_clean,
+        observation_completed: true,
+        owner_outage_detected: false,
+        observation_recovery_required: false,
+        operator_recovery_confirmed: false,
+        ledger_recovery_required: false,
+        orchestrator_restart_smoke_ran: false,
+        load_soak_ran: true,
+    };
+    let report_path = write_internal_k8s_operation_report(
+        InternalK8sOperationReport {
+            context: &context,
+            namespace: &options.namespace,
+            orch_service: &options.orch_service,
+            gateway_service: &options.gateway_service,
+            owner_worker_deploy: &options.owner_worker_deploy,
+            owner_worker_service: &options.owner_worker_service,
+            owner_worker_id: &options.owner_worker_id,
+            argocd_namespace: &options.argocd_namespace,
+            argocd_app: &options.argocd_app,
+            argocd_status: preflight.argocd_status.as_ref(),
+            deployment_images: &preflight.deployment_images,
+            assignment_state_storage: preflight.assignment_state_storage.as_ref(),
+            expected_image: options.expected_image.as_deref(),
+            stage: "completed",
+            reason: "P7 multi-depth split operation executed through guarded internal helper, child-route soak completed, and observation completed",
+            preflight_errors: &[],
+            operation: Some(&operation),
+            proposal_response: Some(&proposal_response),
+            approval_response: Some(&approval_response),
+            execution_response: Some(&execution_response),
+            observation_response: Some(&observation_response),
+            ledger_snapshot: Some(&completed_snapshot),
+            ledger_summary: Some(completed_summary),
+            orchestrator: Some(&orchestrator_evidence),
+            gateway: Some(&gateway_evidence),
+            worker: Some(&worker_evidence),
+            soak: Some(&soak_evidence),
+            failure: None,
+            completion,
+        },
+        Some(report_out),
+    )?;
+    println!(
+        "internal P7 multi-depth operation smoke completed: operation={}, child soak verified, report={}",
+        operation.operation_id,
         report_path.display()
     );
     Ok(())
@@ -14906,12 +15485,38 @@ fn k8s_operation_preflight(
             ));
         }
     }
+    if matches!(
+        options.operation_kind.as_str(),
+        "multi-depth-split" | "multi_depth_split"
+    ) {
+        for resource in [
+            format!("deploy/{}", options.target_worker_deploy),
+            format!("svc/{}", options.target_worker_service),
+        ] {
+            if let Err(err) = kubectl_resource_name(context, &options.namespace, &resource) {
+                errors.push(format!(
+                    "required resource {resource} is not ready: {err:#}"
+                ));
+            }
+        }
+    }
     if options.allow_execution {
         let resource = format!("svc/{}", options.owner_worker_service);
         if let Err(err) = kubectl_resource_name(context, &options.namespace, &resource) {
             errors.push(format!(
                 "required resource {resource} is not ready: {err:#}"
             ));
+        }
+        if matches!(
+            options.operation_kind.as_str(),
+            "multi-depth-split" | "multi_depth_split"
+        ) {
+            let resource = format!("svc/{}", options.target_worker_service);
+            if let Err(err) = kubectl_resource_name(context, &options.namespace, &resource) {
+                errors.push(format!(
+                    "required resource {resource} is not ready: {err:#}"
+                ));
+            }
         }
     }
     K8sOperationPreflightResult {
@@ -14928,11 +15533,17 @@ fn collect_k8s_operation_deployment_images(
     context: &str,
     options: &K8sOperationSmokeOptions,
 ) -> (Vec<K8sDeploymentImage>, Vec<String>) {
-    let deployments = [
+    let mut deployments = vec![
         ("orchestrator", options.orch_deploy.as_str()),
         ("gateway", options.gateway_deploy.as_str()),
         ("owner_worker", options.owner_worker_deploy.as_str()),
     ];
+    if matches!(
+        options.operation_kind.as_str(),
+        "multi-depth-split" | "multi_depth_split"
+    ) {
+        deployments.push(("target_worker", options.target_worker_deploy.as_str()));
+    }
 
     let mut images = Vec::new();
     let mut errors = Vec::new();
@@ -15946,6 +16557,9 @@ struct InternalK8sOperationWorkerEvidence {
     worker_id: String,
     metrics_addr: String,
     parent_actor_count: f64,
+    target_worker_id: Option<String>,
+    target_metrics_addr: Option<String>,
+    child_actor_count: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -16545,6 +17159,12 @@ fn default_internal_k8s_operation_smoke_path() -> PathBuf {
         .join("internal-microk8s-p7-operation-smoke-latest.json")
 }
 
+fn default_internal_k8s_multi_depth_operation_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("internal-microk8s-p7-multi-depth-operation-smoke-latest.json")
+}
+
 fn select_internal_p7_merge_operation<'a>(
     proposal_response: &serde_json::Value,
     ledger_snapshot: &'a serde_json::Value,
@@ -16582,6 +17202,44 @@ fn select_internal_p7_merge_operation<'a>(
         ));
     }
     bail!("internal P7 operation proposal response did not include an executable merge operation")
+}
+
+fn select_internal_p7_operation_kind<'a>(
+    proposal_response: &serde_json::Value,
+    ledger_snapshot: &'a serde_json::Value,
+    expected_kind: &str,
+    owner_worker_id: &str,
+) -> Result<(InternalK8sOperationSelection, &'a serde_json::Value)> {
+    let operation_ids = json_array(proposal_response, &["operation_ids"])?;
+    if operation_ids.is_empty() {
+        bail!("internal P7 operation proposal response has no operation_ids");
+    }
+    for operation_id in operation_ids {
+        let Some(operation_id) = operation_id.as_str() else {
+            continue;
+        };
+        let record = find_p7_operation_record(ledger_snapshot, operation_id)?;
+        let kind = json_str(record, &["kind"])?;
+        if kind != expected_kind {
+            continue;
+        }
+        let proposal_hash = json_str(record, &["proposal", "proposal_hash"])?.to_string();
+        let parent = json_cell_id(record, &["proposal", "parent"])?;
+        return Ok((
+            InternalK8sOperationSelection {
+                operation_id: operation_id.to_string(),
+                kind: kind.to_string(),
+                proposal_hash,
+                parent,
+                owner_worker_id: owner_worker_id.to_string(),
+                policy_id: "operator_approved_dynamic_operation_v1",
+            },
+            record,
+        ));
+    }
+    bail!(
+        "internal P7 operation proposal response did not include an executable {expected_kind} operation"
+    )
 }
 
 fn write_internal_k8s_operation_report(
@@ -16753,7 +17411,10 @@ fn internal_k8s_operation_worker_json(
     serde_json::json!({
         "worker_id": evidence.worker_id.as_str(),
         "metrics_addr": evidence.metrics_addr.as_str(),
-        "parent_actor_count": evidence.parent_actor_count
+        "parent_actor_count": evidence.parent_actor_count,
+        "target_worker_id": evidence.target_worker_id.as_deref(),
+        "target_metrics_addr": evidence.target_metrics_addr.as_deref(),
+        "child_actor_count": evidence.child_actor_count
     })
 }
 
@@ -20097,6 +20758,28 @@ fn p7_completion_findings(report_dir: &Path) -> Vec<P7CompletionFinding> {
             )
         },
     );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_internal_multi_depth_operation_soak",
+        "internal-microk8s-p7-multi-depth-operation-smoke-latest.json",
+        "internal MicroK8s approved canonical multi-depth split operation, child-route soak, and completed observation report",
+        |report| {
+            assert_json_str_eq(report, &["operation", "kind"], "multi_depth_split")?;
+            validate_internal_k8s_operation_report(
+                report,
+                InternalP7OperationRequirements {
+                    require_published_execution: true,
+                    require_completed_observation: true,
+                    require_soak: true,
+                    require_recovery_required: false,
+                    require_restart: false,
+                },
+                expected_image,
+                &[],
+            )
+        },
+    );
 
     findings
 }
@@ -21490,7 +22173,11 @@ fn validate_internal_k8s_operation_report(
 
     if stage == "planned_without_execution" || stage == "completed" || stage == "recovery_required"
     {
-        assert_json_str_eq(report, &["operation", "kind"], "merge")?;
+        let operation_kind = json_str(report, &["operation", "kind"])?;
+        match operation_kind {
+            "merge" | "multi_depth_split" => {}
+            other => bail!("internal P7 operation report has unsupported operation kind `{other}`"),
+        }
         assert_json_str_eq(
             report,
             &["operation", "policy_id"],
@@ -21574,11 +22261,30 @@ fn validate_internal_k8s_operation_report(
             &["responses", "observation", "observation_accepted"],
             true,
         )?;
-        assert_json_number_at_least(report, &["gateway", "routes_after"], 1.0)?;
+        let operation_kind = json_str(report, &["operation", "kind"])?;
+        let min_routes = if operation_kind == "multi_depth_split" {
+            4.0
+        } else {
+            1.0
+        };
+        assert_json_number_at_least(report, &["gateway", "routes_after"], min_routes)?;
         assert_json_number_at_least(report, &["gateway", "ping_roundtrips"], 1.0)?;
-        assert_json_number_at_least(report, &["gateway", "join_roundtrips"], 3.0)?;
+        let min_join_roundtrips = if operation_kind == "multi_depth_split" {
+            4.0
+        } else {
+            3.0
+        };
+        assert_json_number_at_least(report, &["gateway", "join_roundtrips"], min_join_roundtrips)?;
         assert_json_number_at_least(report, &["gateway", "move_roundtrips"], 1.0)?;
-        assert_json_number_at_least(report, &["worker", "parent_actor_count"], 1.0)?;
+        if operation_kind == "multi_depth_split" {
+            assert_json_number_at_least(report, &["worker", "child_actor_count"], 4.0)?;
+            let target_worker_id = json_str(report, &["worker", "target_worker_id"])?;
+            if target_worker_id.trim().is_empty() {
+                bail!("internal P7 multi-depth operation report has empty target_worker_id");
+            }
+        } else {
+            assert_json_number_at_least(report, &["worker", "parent_actor_count"], 1.0)?;
+        }
         let ledger = json_field(report, &["ledger", "snapshot"])?;
         validate_p7_operation_ledger(ledger, true, false, true, true, false)?;
         assert_remaining_uncovered_absent(report, "internal_microk8s_operation_observation_smoke")?;
@@ -28619,6 +29325,45 @@ mod tests {
             &[],
         )
         .expect("valid internal P7 operation smoke report");
+
+        let mut multi_depth = report.clone();
+        multi_depth["operation"]["operation_id"] = serde_json::json!("p7-multi-depth-1");
+        multi_depth["operation"]["kind"] = serde_json::json!("multi_depth_split");
+        multi_depth["operation"]["parent"] =
+            serde_json::json!({"world": 0, "cx": -2, "cy": 3, "depth": 2, "sub": 0});
+        multi_depth["gateway"]["routes_before"] = serde_json::json!(1);
+        multi_depth["gateway"]["routes_after"] = serde_json::json!(4);
+        multi_depth["worker"]["parent_actor_count"] = serde_json::json!(0);
+        multi_depth["worker"]["target_worker_id"] = serde_json::json!("worker-b");
+        multi_depth["worker"]["target_metrics_addr"] = serde_json::json!("127.0.0.1:5101");
+        multi_depth["worker"]["child_actor_count"] = serde_json::json!(4);
+        multi_depth["ledger"]["snapshot"]["records"][0]["operation_id"] =
+            serde_json::json!("p7-multi-depth-1");
+        multi_depth["ledger"]["snapshot"]["records"][0]["kind"] =
+            serde_json::json!("multi_depth_split");
+        multi_depth["ledger"]["snapshot"]["records"][0]["proposal"]["parent"] =
+            serde_json::json!({"world": 0, "cx": -2, "cy": 3, "depth": 2, "sub": 0});
+        multi_depth["ledger"]["snapshot"]["records"][0]["proposal"]["targets"] = serde_json::json!([
+            {"cell": {"world": 0, "cx": -4, "cy": 6, "depth": 3, "sub": 0}, "worker_id": "worker-a"},
+            {"cell": {"world": 0, "cx": -4, "cy": 7, "depth": 3, "sub": 1}, "worker_id": "worker-b"},
+            {"cell": {"world": 0, "cx": -3, "cy": 6, "depth": 3, "sub": 2}, "worker_id": "worker-a"},
+            {"cell": {"world": 0, "cx": -3, "cy": 7, "depth": 3, "sub": 3}, "worker_id": "worker-b"}
+        ]);
+        multi_depth["ledger"]["snapshot"]["records"][0]["approval"]["allowed_kind"] =
+            serde_json::json!("multi_depth_split");
+        validate_internal_k8s_operation_report(
+            &multi_depth,
+            InternalP7OperationRequirements {
+                require_published_execution: true,
+                require_completed_observation: true,
+                require_soak: true,
+                require_recovery_required: false,
+                require_restart: false,
+            },
+            Some("repo/tessera:v1"),
+            &[],
+        )
+        .expect("valid internal P7 multi-depth operation smoke report");
     }
 
     #[test]
