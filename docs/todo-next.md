@@ -22,12 +22,13 @@ Last reviewed: 2026-05-04
 - P6 completion audit details remain in `docs/p6-completion-audit.md`. The next
   active design boundary is `docs/p7-operation-loop.md`.
 - P7 initial local/dev slices are complete through durable proposal records,
-  explicit approvals, default-off execution blocks, and approved same-Worker
-  merge execution idempotency. `v2026.05.4` has been published and promoted
+  explicit approvals, default-off execution blocks, approved same-Worker merge
+  execution idempotency, local observation completion, and local recovery-required
+  owner-outage handling. `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
   default-off. The internal baseline is ArgoCD `Synced / Healthy`, all Tessera
-  deployments on `harbor.1day1coding.com/1day1coding/tessera:v2026.05.4`,
+  deployments on `harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`,
   Gateway Ping smoke green, and `GET /operations` reporting
   `persistence_enabled=true`.
 
@@ -57,9 +58,10 @@ Recommended next slices:
    records route convergence, Worker refresh, stable-session traffic,
    latency/close-counter evidence, and transitions a published same-Worker merge
    operation from `observing` to `completed`.
-2. `test: add p7 execution recovery smoke` - inject owner/target outage after an
-   approved execution, record `recovery_required`, verify no automatic rollback,
-   and prove operator-visible recovery.
+2. Done: `test: add p7 execution recovery smoke` - after approved same-Worker
+   merge publish, owner Worker outage records `recovery_required`, leaves parent
+   assignment published without automatic rollback, and proves operator-visible
+   Worker restart recovery.
 3. `test: add p7 execution restart smoke` - restart the Orchestrator with the
    operation ledger and assignment state mounted, then verify operation state and
    route convergence survive.

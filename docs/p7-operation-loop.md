@@ -134,35 +134,56 @@ ends with `status=completed` and a succeeded `observation_completed` phase in
 soak, and internal MicroK8s observation evidence remain explicit follow-up
 gates.
 
+Current recovery smoke:
+
+```sh
+cargo xt dev p7-operation-recovery-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-recovery-ledger-latest.json \
+  --require-approval \
+  --require-published-execution \
+  --require-recovery-required
+```
+
+This starts a full local dev stack, publishes an approved same-Worker merge
+operation through the P7 HTTP endpoints, then terminates the owner Worker after
+publish. Gateway parent Ping failure is recorded as the failure signal, the
+operation observation is written with missing traffic/counter evidence, and the
+ledger ends with `status=recovery_required` plus a failed
+`observation_failed` phase. The smoke then restarts the owner Worker and proves
+the parent route and fresh parent Ping recover without automatic rollback.
+Restart, soak, and internal MicroK8s recovery evidence remain explicit follow-up
+gates.
+
 Current internal rollout baseline:
 
 ```sh
 cargo xt p6-rollout-report \
   --context microk8s-ts \
   --namespace tessera \
-  --image harbor.1day1coding.com/1day1coding/tessera:v2026.05.4 \
-  --rollout-revision 41875041c48bb5b8bb50f2d062172ba70342185e \
-  --cleanup-revision 41875041c48bb5b8bb50f2d062172ba70342185e \
+  --image harbor.1day1coding.com/1day1coding/tessera:v2026.05.5 \
+  --rollout-revision 2c01847475ecbc65f43e9a5979449422f3ed2b4f \
+  --cleanup-revision 2c01847475ecbc65f43e9a5979449422f3ed2b4f \
   --image-published \
   --gitops-rollout-approved \
   --post-smoke-default-off-cleanup \
   --manual-activation-default-off \
   --preview-fixture-removed
 cargo xt p6-rollout-report-check \
-  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.4
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.5
 ```
 
-The `v2026.05.4` rollout carries the P7 ledger/executor code and enables
+The `v2026.05.5` rollout carries the P7 ledger/executor/observation code and enables
 `TESSERA_ORCH_OPERATION_LEDGER_PATH=/var/lib/tessera/operation-ledger.json` on
 the live Orchestrator while leaving `TESSERA_ORCH_OPERATION_EXECUTION` and
 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` unset/default-off. ArgoCD `tessera` is
 `Synced / Healthy` at GitOps revision
-`41875041c48bb5b8bb50f2d062172ba70342185e`, all four Tessera deployments run
-`harbor.1day1coding.com/1day1coding/tessera:v2026.05.4`, Gateway port-forward
-Ping returned `Pong { ts: 123 }`, and `GET /operations` reported
-`persistence_enabled=true`. The default topology currently returns zero
-split/merge preview plans, so approved internal P7 execution, observation,
-failure/recovery, restart, and soak remain follow-up gates.
+`2c01847475ecbc65f43e9a5979449422f3ed2b4f`, all four Tessera deployments run
+`harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`, Gateway port-forward
+Ping returned `Pong { ts: 123 }`, `GET /operations` reported
+`persistence_enabled=true`, and `POST /operations/proposals` returned zero plans
+without mutation for the default topology. Approved internal P7 execution,
+observation, failure/recovery, restart, and soak remain follow-up gates.
 
 ## Slice Cadence
 
@@ -219,7 +240,11 @@ Each slice should be self-contained:
    closed only after route convergence, Worker refresh, stable-session traffic,
    latency metrics, and clean close counters are recorded. The first repo-native
    smoke is `cargo xt dev p7-operation-observation-smoke`.
-9. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+9. **Approved merge recovery smoke**: verify that a post-publish owner outage
+   records `recovery_required`, avoids automatic rollback, and recovers only
+   after operator-visible Worker restart. The first repo-native smoke is
+   `cargo xt dev p7-operation-recovery-smoke`.
+10. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails
