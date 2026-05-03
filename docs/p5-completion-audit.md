@@ -203,7 +203,10 @@ logical unit.
 P5 split activation is complete for the objective in this document. Remaining
 work is intentionally outside this completion boundary:
 
-1. Automatic planner submission from live metrics.
+1. Automatic planner mutation from live metrics.
 2. Runtime merge activation and sibling coalescing policy.
 3. Multi-depth split activation beyond `depth=0/sub=0 -> depth=1/sub=0..3`.
-4. Persistent split state across Orchestrator restarts.
+4. Persistent split state internal MicroK8s restart evidence remains P6
+   follow-up scope. The local durable assignment-state slice, prepared
+   PVC-backed storage draft, and restart verifier are tracked in
+   `docs/p6-durable-split-state.md`.

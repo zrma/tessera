@@ -1,6 +1,6 @@
 # Dynamic Split/Merge Design Note
 
-Last reviewed: 2026-05-02
+Last reviewed: 2026-05-03
 
 ## Scope
 
@@ -9,33 +9,97 @@ Orchestrator now has an inactive split/merge planner skeleton with deterministic
 ranking, hysteresis/cooldown, churn-budget, complete sibling validation, overlap
 tests, an assignment-safe dry-run preview endpoint, a fixture-backed runtime
 smoke that proves the preview can emit a non-empty split plan, and a
-default-off manual split activation replay/publish RPC. Automatic rebalancing,
-runtime merge activation, real metrics ingestion, and multi-depth assignment
-changes are not implemented yet. A local two-Worker activation smoke now proves
-successful manual split publication, Gateway child route convergence,
-source/target Worker owned-cell refresh, stable-session post-split Move, and
-remote child AOI resync. A companion failure smoke injects a post-publish target
-Worker outage, records failed child convergence without automatic rollback, and
-verifies target Worker restart recovery. A local activation soak smoke runs
+default-off manual split activation replay/publish RPC, default-off manual
+same-Worker merge coalescing and cross-Worker merge replay RPC paths, and an
+opt-in persistent assignment state path for Orchestrator restart recovery. A
+policy-gated `cargo xt planner-activation` helper now keeps selected planner
+mutation default-off unless `--allow-mutation --policy-id
+operator_approved_planner_mutation_v1` are both present.
+Automatic rebalancing, Orchestrator-side continuous metrics ingestion, and multi-depth
+assignment changes are not implemented yet. A local
+two-Worker activation smoke now proves successful manual split publication,
+Gateway child route convergence, source/target Worker owned-cell refresh,
+stable-session post-split Move, and remote child AOI resync. A companion failure
+smoke injects a post-publish target Worker outage, records failed child
+convergence without automatic rollback, and verifies target Worker restart
+recovery. A local activation soak smoke runs
 sustained child Ping/Move traffic after publish and records route convergence,
 remote AOI frames, Gateway latency histogram growth, and Gateway client close
 counters. A planner-to-operator helper converts dry-run preview output plus
 Orchestrator health/listing into mutation-free operator evidence and a manual
-submission command template. An internal MicroK8s helper now automates the
-port-forwarded plan, optional publish, and guarded target Worker scale-down/up
-failure recovery smoke. The 2026-05-02 `v2026.05.2` controlled GitOps smoke
-window verified live internal split publish, target-only failure detection, and
-target Worker recovery, then a cleanup GitOps revision removed the manual
-activation flag and preview fixture from the live Orchestrator.
+submission command template. The same helper can now use live Worker metrics
+scraped from `--live-worker-metrics worker-id=addr`, backed by per-cell actor
+and pending-move gauges, to produce operator evidence without a preview fixture
+or assignment mutation. A local live metrics activation smoke uses that
+operator target map for manual `SubmitSplitActivation` and verifies Gateway
+route convergence, stable-session post-split Move, and remote AOI resync. A
+local live metrics planner mutation smoke feeds the same Worker metrics source
+through `cargo xt planner-activation --kind split`, proves the default report is
+`blocked_by_policy` without assignment mutation, and then proves only
+`--allow-mutation --policy-id operator_approved_planner_mutation_v1` publishes
+child assignments and Gateway convergence. The `--require-planner-live-metrics`
+report-check flag verifies that planner evidence source. A P6
+restart smoke persists published assignments, restarts the Orchestrator with
+manual activation disabled, and verifies Worker assignment refresh, Gateway
+route convergence, child traffic, and AOI resync from the recovered listing. An
+internal MicroK8s helper now automates the
+port-forwarded plan, optional publish, guarded target Worker scale-down/up
+failure recovery smoke, and a P6 opt-in Orchestrator rollout restart recovery
+path that requires PVC-backed assignment state storage. The 2026-05-02
+`v2026.05.2` controlled GitOps smoke window verified live internal split
+publish, target-only failure detection, and target Worker recovery, then a
+cleanup GitOps revision removed the manual activation flag and preview fixture
+from the live Orchestrator. The P6 internal restart helper and GitOps storage
+draft are prepared, and the internal helper can now build a read-only plan from
+live Worker metrics with `--use-live-worker-metrics` plus verify it with
+`--require-live-metrics-plan`; live P6 restart/live-metrics evidence still
+requires a new image and an approved rollout. The runtime merge slice is
+manual/default-off for complete legacy shallow or canonical sibling families:
+same-Worker families use Worker assignment refresh to coalesce child
+actor/owner/root/pending state into the parent, while mixed-owner families
+pre-stage the owner Worker parent and replay remote child actor/owner state
+before parent assignment publish. Canonical `depth>0/sub=0` merge sibling
+detection is now covered in the Orchestrator planner/runtime, Worker same-Worker
+coalescing detection, xtask merge plan builder, and
+`cargo xt dev canonical-merge-activation-smoke`; canonical merge internal
+readiness has a read-only `cargo xt k8s merge-activation-smoke` helper and
+`cargo xt k8s merge-activation-report-check --require-ready-plan` verifier, but
+merge publish/failure/restart/soak cluster evidence is still a separate gate.
+The 2026-05-03 read-only run against live `v2026.05.2` exercised that helper
+and verifier without mutation, but stopped at `no_merge_candidate` from
+`assignment_listing_zero_metrics`; it is negative readiness evidence only.
+Canonical multi-depth internal readiness also has a read-only `cargo xt k8s
+multi-depth-activation-smoke` helper and `cargo xt k8s
+multi-depth-activation-report-check --require-ready-plan` verifier. The
+2026-05-03 live `v2026.05.2` run verified the helper/report-check path without
+mutation, but stopped because the canonical parent
+`world=0,cx=-2,cy=3,depth=2,sub=0` is not currently assigned; it is negative
+readiness evidence only.
+`cargo xt dev merge-activation-smoke` verifies same-Worker Gateway parent route
+convergence plus stable-session parent Move,
+`cargo xt dev canonical-merge-activation-smoke` verifies the same path for a
+canonical parent, `cargo xt dev canonical-merge-activation-failure-smoke`,
+`cargo xt dev canonical-merge-activation-restart-smoke`, and
+`cargo xt dev canonical-merge-activation-soak` verify canonical owner outage,
+restart, and load/soak paths, and
+`cargo xt dev merge-activation-cross-worker-smoke` verifies mixed-owner remote
+child replay plus local/remote stable-session parent Moves. `cargo xt dev
+merge-activation-soak` adds sustained parent Ping/Move traffic, Gateway latency
+histogram, and close-counter evidence for the same manual merge path. `cargo xt
+dev planner-mutation-smoke` verifies that planner-selected merge mutation is
+blocked/no-op by default and publishes only with the explicit policy id.
 
-P4.3's first activation shape is now fixed as a manual, feature-flagged,
-split-only runtime slice. The implementation milestone should follow this
-contract instead of widening into automatic rebalancing or merge activation.
+P4.3's first activation shape was fixed as a manual, feature-flagged,
+split-only runtime slice. P6 extends that with same-Worker merge coalescing and
+cross-Worker merge replay, but automatic rebalancing remains outside this
+boundary.
 The local post-publish failure smoke verifies failure evidence and target Worker
 restart recovery; it does not implement automatic rollback or runtime cooldown
 enforcement. The P5 recovery policy is explicit operator recovery plus GitOps
-backout for controlled smoke rollback; runtime merge activation stays outside
-this completion boundary.
+backout for controlled smoke rollback; automatic merge rollback stays outside
+this completion boundary. The P6 persistent state slice stores only published
+assignment maps. In-flight `staged_splits` remain memory-only and are cleared by
+process restart rather than resumed.
 
 The design assumes the existing V0/V1 foundations stay intact:
 
@@ -57,9 +121,11 @@ The design assumes the existing V0/V1 foundations stay intact:
 
 - No automatic multi-region migration.
 - No hard real-time guarantee during split/merge windows.
-- No direct mutation of assignments without the handover state machine.
-- No merge activation in the first runtime slice.
-- No automatic planner submission in the first runtime slice.
+- No direct mutation of assignments outside explicit default-off activation
+  commands or the handover state machine.
+- No automatic cross-Worker merge submission in the first merge runtime slice.
+- No planner submission without an explicit policy id in the first runtime
+  slice.
 - No deep quadtree encoding change in the first runtime slice.
 
 ## Split Inputs
@@ -117,16 +183,16 @@ The Orchestrator planner should enforce a hard budget before emitting commands:
 - No overlapping plans that touch the same parent, child, source Worker, and
   target Worker pair unless explicitly allowed by policy.
 
-The first safe default should be one active split/merge plan per world and one
-handover commit at a time per cell family.
+The first safe default should be one active split/merge plan per world, one
+handover commit at a time per cell family, and up to four cells moved per
+interval so a complete sibling merge can appear as a dry-run operator plan.
 
 ## P4.3 First Activation Spec
 
 Chosen shape:
 
-1. Split-only activation. Runtime merge stays disabled; the merge planner remains
-   dry-run/design evidence until a later milestone chooses a merge rollback and
-   sibling coalescing policy.
+1. Split-first activation. P4.3/P5 are split-only; P6 permits only the later
+   same-Worker merge slice described below.
 2. Manual activation only. The planner may continue to rank candidates and expose
    preview output, but it must not submit mutating plans from observed metrics.
 3. Default-off feature flag. A mutating command surface must reject activation
@@ -143,12 +209,38 @@ Chosen shape:
    the source Worker to partition the parent snapshot and buffered moves, and
    publishes child assignments only after all child replay paths ack success.
 
+## P6 Same-Worker Merge Activation
+
+The first merge runtime slice is intentionally narrower than the planner model:
+
+- `SubmitMergeActivation` requires `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`.
+- The request names a `depth=0/sub=0` parent and `owner_worker_id`.
+- The parent must be unpublished.
+- All four `depth=1/sub=0..3` siblings must be assigned to configured and
+  currently registered Workers; `owner_worker_id` selects the parent owner.
+- Active handover and staged split overlap with the parent/sibling family are
+  rejected.
+- Publication replaces the four child assignments with the parent assignment in
+  one persisted assignment-map update.
+- Worker assignment refresh treats local child -> parent transitions as
+  coalesce events, moving child actors, owners, client root actors, buffered
+  moves, pending broadcasts, and replay claims to the parent before local child
+  cells are dropped. For mixed-owner families, remote source Workers replay
+  child actor/owner state to a source-specific staged parent operation on the
+  owner Worker before publication.
+
+This slice does not implement unapproved planner submission, cooldown
+persistence, internal MicroK8s merge evidence, or internal planner mutation
+evidence yet.
+
 ### Target Worker Selection
 
 The mutating split command must require an explicit target map for all four
 children. The operator can use planner output as a recommendation, but the
 assignment-changing request must name the final target Worker for each child
-`sub` value.
+`sub` value. P6 also adds an optional explicit child `cell` field to the
+`SplitChildTarget` wire shape so nested canonical families can be validated
+before runtime support is enabled.
 
 Validation rules for the first runtime slice:
 
@@ -157,6 +249,33 @@ Validation rules for the first runtime slice:
   split can commit.
 - The target map must cover child `sub` values `0`, `1`, `2`, and `3` exactly
   once.
+- Explicit child-cell targets must form exactly one complete legacy shallow
+  family or one complete canonical leaf-coordinate family, and must not be
+  mixed with legacy `sub` targets in the same request.
+- Canonical leaf-coordinate target families can publish only through the
+  default-off/manual gRPC path with explicit child cells. Worker replay batch
+  construction partitions canonical child families by exact child `CellId`,
+  Gateway assignment listing updates keep exact canonical child route keys, and
+  Worker assignment refresh/AOI helpers have focused canonical coverage.
+  `cargo xt dev multi-depth-activation-smoke` covers the local success path for
+  canonical split publish, Gateway convergence, child traffic, stable-session
+  post-split Move, remote AOI resync, and route-change/relay metrics. The
+  `cargo xt dev multi-depth-activation-failure-smoke` path covers local target
+  Worker outage detection, no automatic rollback, retained child assignments,
+  and target Worker restart recovery for exact canonical child routes. The
+  `cargo xt dev multi-depth-activation-restart-smoke` path covers persisted
+  canonical child assignment recovery after Orchestrator restart with manual
+  activation disabled, Worker refresh, Gateway route convergence, child Ping,
+  and remote AOI interest resync metrics. The
+  `cargo xt dev multi-depth-activation-soak` path covers sustained Ping/Move
+  traffic over exact canonical child cells, route convergence retention, remote
+  AOI frame observation, Gateway latency histogram growth, and zero Gateway
+  client close counters. The multi-depth completion gate remains closed until
+  internal MicroK8s evidence exists.
+- The operator helper accepts canonical requests with `cargo xt
+  split-activation --depth <d> --target-cell
+  world,cx,cy,depth,sub=worker-id` repeated exactly four times. Do not mix
+  `--target` and `--target-cell` in one command.
 - At least one child should target a non-source Worker; otherwise the plan does
   not relieve load and should stay a dry-run/no-op recommendation.
 - A target Worker may receive more than one child, but the command must keep the
@@ -168,7 +287,7 @@ Validation rules for the first runtime slice:
 
 ### `CellId.depth/sub` Semantics
 
-The first activation slice supports only a single split level:
+The legacy activation smoke path supports only the shallow split alias:
 
 - Parent: `CellId { world, cx, cy, depth: 0, sub: 0 }`.
 - Children: the same `world/cx/cy`, `depth: 1`, and `sub` values `0..=3`.
@@ -180,14 +299,17 @@ The first activation slice supports only a single split level:
 - Parent and child cells must not be published as simultaneously writable
   assignments. Child assignments may exist only in a private staged plan until
   the split commits atomically.
-- Runtime activation must reject parent cells with `depth > 0` and any request
-  that would create `depth > 1` cells.
+- The legacy `--target sub=worker-id` request shape must reject parent cells
+  with `depth > 0` and any request that would create `depth > 1` cells.
 
 This keeps the current shallow `CellId.depth/sub` encoding honest. The existing
 shape is not sufficient for arbitrary nested quadtree paths because `sub` stores
-only one local quadrant, not the full path from the root. A later multi-depth
-milestone must first choose an encoding such as path bits, leaf-resolution
-`cx/cy`, or another explicit quadtree id before enabling nested splits.
+only one local quadrant, not the full path from the root. The canonical
+multi-depth request shape uses the leaf-resolution coordinate decision in
+`docs/multi-depth-cellid-decision.md`: explicit child-cell targets use
+leaf-resolution `cx/cy`, `depth=parent.depth+1`, and `sub=0`. That path now has
+local success, recovery, restart, and soak smoke/report evidence; internal
+evidence remains a future gate.
 
 ### Rollback And Error Handling
 
@@ -209,6 +331,11 @@ boundary:
 7. Verify Gateway route convergence, Worker owned-cell refresh, and AOI resync;
    then clear the operation. A later automated planner policy may also clear a
    cooldown marker here.
+
+If `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` is set, step 6 first persists the
+complete assignment map to the state file with an atomic temp-file replace. A
+persistence failure restores the pre-publish in-memory assignment map and leaves
+the split unpublished.
 
 Rollback rules:
 
@@ -279,8 +406,9 @@ The current P4.3 replay/publish slice adds focused checks for:
 - Manual target map validation: missing children, duplicate `sub` values,
   unknown targets, unregistered targets, and source-only no-op plans are
   rejected.
-- `CellId` depth validation: only `depth=0/sub=0` parents can split into
-  `depth=1/sub=0..3` children.
+- `CellId` depth validation: only the legacy `depth=0/sub=0` parent publish path
+  can split into `depth=1/sub=0..3` children; canonical explicit-child target
+  requests are validated but rejected before runtime mutation.
 - Assignment atomicity before publication: disabled activation, validation
   failures, unregistered targets, and staged-family conflicts leave the parent
   assignment published and publish no child assignment.
@@ -302,6 +430,14 @@ The current P4.3 replay/publish slice adds focused checks for:
   published, restarts the target Worker, and verifies all child routes recover.
   The smoke writes the latest local evidence to
   `.dev/reports/activation-failure-smoke-latest.json`.
+- Local Orchestrator restart recovery smoke:
+  `cargo xt dev activation-restart-smoke` publishes the same split with
+  `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` enabled, verifies the state file is
+  written, restarts the Orchestrator without manual activation enabled, waits
+  for Worker re-registration, restarts the Gateway against the recovered
+  listing, verifies four child routes, pings all children, and verifies
+  post-restart AOI resync. The smoke writes evidence to
+  `.dev/reports/activation-restart-smoke-latest.json`.
 - Local activation soak smoke: `cargo xt dev activation-soak [--iterations 32]
   [--sleep-ms 10]` publishes the same split, runs repeated child Ping/Move
   traffic, verifies route convergence remains at four child routes, observes
@@ -317,17 +453,137 @@ The current P4.3 replay/publish slice adds focused checks for:
   deterministic `worker-a`/`worker-b` target map, and confirms assignments stay
   unchanged. The helper writes evidence to
   `.dev/reports/split-activation-plan-latest.json`.
+- Live metrics planner-to-operator smoke:
+  `cargo xt dev activation-live-plan-smoke` starts the same two-Worker dev
+  stack without preview fixture pressure, creates real Gateway traffic, scrapes
+  Worker per-cell actor metrics through `--live-worker-metrics`, verifies a
+  ready operator plan, and confirms assignments stay unchanged. This keeps live
+  metric usage in the operator evidence lane rather than auto-submitting
+  mutations.
+- Live metrics activation smoke:
+  `cargo xt dev activation-live-metrics-smoke` builds the operator plan from
+  live Worker metrics, writes the plan report, submits the recommended target
+  map through the same default-off manual RPC, and verifies route convergence,
+  stable-session post-split Move, and remote AOI resync. The activation report
+  records the linked `operator_plan.source` and plan report path.
+- Merge planner-to-operator smoke:
+  `cargo xt dev merge-plan-smoke` starts a two-Worker dev stack with four
+  depth-1 siblings assigned to one Worker and a cold merge preview fixture, runs
+  `cargo xt merge-activation-plan`, verifies the report is ready, and confirms
+  assignments stay unchanged. The report records `activation_mutated=false` and
+  a ready same-owner merge precondition.
+- Merge activation smoke:
+  `cargo xt dev merge-activation-smoke` starts the same sibling topology,
+  records the merge operator plan, submits `SubmitMergeActivation`, verifies the
+  Orchestrator listing converges to the parent assignment, waits for Gateway
+  route count 1, checks parent Ping, verifies Worker parent actor metrics after
+  coalescing, and proves a pre-merge child session can issue a parent Move. The
+  smoke writes `.dev/reports/merge-activation-smoke-latest.json`.
+- Canonical merge activation smoke:
+  `cargo xt dev canonical-merge-activation-smoke` starts a canonical
+  `depth>0/sub=0` sibling topology, records the merge operator plan, submits
+  `SubmitMergeActivation`, verifies the Orchestrator listing converges to the
+  canonical parent assignment, waits for Gateway route count 1, checks parent
+  Ping, verifies Worker parent actor metrics after canonical child coalescing,
+  and proves a pre-merge child session can issue a parent Move. The smoke writes
+  `.dev/reports/canonical-merge-activation-smoke-latest.json`.
+- Canonical merge activation failure/restart/soak smokes:
+  `cargo xt dev canonical-merge-activation-failure-smoke` injects owner Worker
+  outage after canonical parent publish and verifies no automatic rollback plus
+  owner restart recovery.
+  `cargo xt dev canonical-merge-activation-restart-smoke` persists the canonical
+  parent assignment and verifies Orchestrator restart recovery without the
+  manual activation flag.
+  `cargo xt dev canonical-merge-activation-soak` runs sustained parent
+  Ping/Move traffic with Gateway latency histogram and close-counter checks.
+- Merge activation cross-Worker smoke:
+  `cargo xt dev merge-activation-cross-worker-smoke` starts a mixed-owner
+  sibling topology, submits the same default-off manual merge RPC with
+  `owner_worker_id=worker-a`, prepares the owner Worker parent with source-specific
+  replay operation ids, has the remote child Worker replay actor/owner state to
+  the parent, publishes the parent assignment, and proves both local-child and
+  remote-child stable Gateway sessions can issue parent Moves. The smoke writes
+  `.dev/reports/merge-activation-cross-worker-smoke-latest.json`.
+- Merge activation failure smoke:
+  `cargo xt dev merge-activation-failure-smoke` injects a post-publish owner
+  Worker outage, verifies parent route traffic fails while the parent assignment
+  remains published and no automatic rollback is observed, then restarts the
+  owner Worker and verifies parent route plus fresh Ping recovery. The smoke
+  writes `.dev/reports/merge-activation-failure-smoke-latest.json`. The report
+  includes `actor_state_recovery_policy.policy_id=volatile_worker_actor_state_rejoin_required_v1`:
+  same-Worker merge assignment state is durable, but Worker actor runtime state
+  is still volatile in this slice, so owner Worker restart recovery requires
+  parent route convergence plus affected client rejoin/reseed.
+- Merge activation restart smoke:
+  `cargo xt dev merge-activation-restart-smoke` runs the same manual merge with
+  persisted assignment state enabled, restarts Orchestrator with manual
+  activation disabled, and verifies the parent assignment, Gateway parent route,
+  parent Ping/Move, and Worker coalesced actor metrics survive restart. The
+  smoke writes `.dev/reports/merge-activation-restart-smoke-latest.json`.
+- Merge activation soak smoke:
+  `cargo xt dev merge-activation-soak [--iterations 32] [--sleep-ms 10]` runs
+  the same manual merge, then exercises the published parent route with four
+  parent actors and sustained Ping/Move traffic. It verifies parent route count
+  retention, Gateway Ping/Join/Move histogram growth, zero Gateway close
+  counters, and writes `.dev/reports/merge-activation-soak-latest.json`.
+  `cargo xt dev activation-report-check --merge-plan-report ... --merge-activation-report ... --merge-cross-worker-report ... --merge-failure-report ... --merge-restart-report ... --merge-soak-report ... --planner-mutation-report ...`
+  validates the local merge evidence contract.
+- Policy-gated planner mutation smoke:
+  `cargo xt dev planner-mutation-smoke` runs a selected merge plan twice. The
+  first pass omits policy approval and writes a `blocked_by_policy` no-mutation
+  report; the second pass includes
+  `--allow-mutation --policy-id operator_approved_planner_mutation_v1`, submits
+  the selected plan, verifies parent route convergence, and writes
+  `.dev/reports/planner-activation-latest.json`.
+  `cargo xt dev activation-live-planner-mutation-smoke` runs a selected split
+  plan from live Worker metrics twice. The first pass writes
+  `.dev/reports/planner-activation-live-blocked-latest.json` without mutation;
+  the second pass uses the same explicit policy id, publishes child
+  assignments, verifies Gateway convergence, and leaves
+  `.dev/reports/planner-activation-latest.json` with a `live_worker_metrics:`
+  source. The `--planner-mutation-report ... --require-planner-live-metrics`
+  report-check flags validate that report shape.
 - Operator activation helper: `cargo xt split-activation` submits the same
   default-off manual RPC using an explicit `--target sub=worker-id` map and exits
   non-zero unless the operation publishes four child assignments.
+  `cargo xt merge-activation` submits the same default-off manual merge RPC with
+  an explicit `--owner-worker-id` and exits non-zero unless four children are
+  replaced by the parent assignment. Canonical merge parents are submitted with
+  `--depth <n>` and `sub=0`; root `depth=0` remains the legacy shallow alias.
+  `cargo xt planner-activation` reads the planner-selected split or merge plan
+  and only submits it when `--allow-mutation --policy-id
+  operator_approved_planner_mutation_v1` are both present. For split, it can use
+  `--live-worker-metrics worker-id=addr` to select the plan from Worker metrics
+  instead of the Orchestrator preview fixture.
 - Internal MicroK8s activation helper: `cargo xt k8s activation-smoke` starts
   Orchestrator/Gateway service port-forwards, writes a mutation-free plan by
   default, requires `--allow-activation` before `SubmitSplitActivation`, and
   requires `--with-failure --allow-scale` before scaling the target Worker down
   and back up. `--require-target-worker` extends the read-only preflight so the
   target Worker deployment and image must exist before the plan is trusted.
-  Successful cluster runs write
+  `--use-live-worker-metrics` also port-forwards the source/target Worker
+  metrics services and uses their per-cell actor/pending-move gauges as the
+  plan source instead of Orchestrator preview fixture data; the report verifier
+  uses `--require-live-metrics-plan` to assert this source remained
+  mutation-free.
+  `--require-assignment-state-storage` extends the read-only preflight so the
+  Orchestrator Deployment must already expose a PVC-backed assignment-state
+  path before a P6 restart smoke is attempted.
+  `--with-restart --allow-rollout-restart` extends the controlled run by
+  requiring `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` to be backed by a writable PVC,
+  restarting the Orchestrator Deployment after publish, and verifying recovered
+  child assignments, Worker registration, Gateway convergence, child traffic,
+  and AOI resync. Successful cluster runs write
   `.dev/reports/internal-microk8s-activation-smoke-latest.json`.
+- Internal MicroK8s merge readiness helper:
+  `cargo xt k8s merge-activation-smoke` runs ArgoCD/image/deployment preflight,
+  opens the Orchestrator service port-forward, builds the merge operator plan,
+  writes `.dev/reports/internal-microk8s-merge-activation-smoke-latest.json`,
+  and stops before activation mutation.
+  `cargo xt k8s merge-activation-report-check --require-ready-plan` validates
+  that report's no-mutation ready-plan contract. Internal merge publish,
+  failure/recovery, restart, and load/soak evidence remain separate approval
+  gates.
 
 ### P5 rollback and recovery policy
 
@@ -336,9 +592,13 @@ The P5 split-activation completion boundary uses
 
 - Automatic rollback is disabled for this slice. A post-publish target outage
   must be surfaced as operator evidence instead of silently merging back.
-- Runtime merge activation remains deferred outside the P5 split-activation
-  completion boundary. The merge planner can stay dry-run/design evidence until
-  a later milestone chooses sibling coalescing and rollback semantics.
+- Same-Worker merge activation exists only as an operator-controlled P6 slice.
+  Cross-Worker sibling replay is also operator-controlled/manual and is not
+  automatic rollback for split failure.
+- Same-Worker merge actor state is intentionally volatile until a future durable
+  Worker state slice. After owner Worker restart, the recovery contract is
+  parent route convergence plus client rejoin/reseed, recorded as
+  `volatile_worker_actor_state_rejoin_required_v1`.
 - Operator recovery is target restoration: restart or restore the failed target
   Worker and rerun convergence checks until all child routes answer.
 - GitOps backout for a controlled smoke window can revert the smoke slice:
@@ -352,5 +612,14 @@ The P5 split-activation completion boundary uses
 
 Future runtime slices must add focused checks for:
 
-- Automatic planner submission from live metrics, runtime merge activation, and
-  multi-depth split activation if those decision gates are opened.
+- Internal MicroK8s restart recovery evidence run for
+  `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` using the prepared PVC/GitOps draft,
+  helper, and `--require-restart` report verifier.
+- Internal MicroK8s live metrics planner-to-operator evidence run using
+  `--use-live-worker-metrics` and `--require-live-metrics-plan`, still without
+  automatic mutation by default.
+- Cross-Worker merge replay, merge failure/recovery smoke, and internal
+  MicroK8s merge evidence.
+- Canonical merge end-to-end smoke plus internal planner mutation evidence and
+  multi-depth publish/failure/restart/soak internal evidence if those decision
+  gates are opened.

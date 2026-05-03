@@ -228,7 +228,7 @@ Completed slices:
     revision that removed the manual activation flag and preview fixture while
     keeping the `v2026.05.2` two-Worker topology healthy.
 
-Deferred from this slice:
+Deferred from this slice at P5 close:
 
 - Runtime merge activation implementation, automatic planner submission, and
   multi-depth split activation. The P5 split-activation rollback policy is
@@ -256,10 +256,13 @@ cargo xt dev down --with-orch
 
 Open work now starts after the P4.3/P5 split activation slice:
 
-1. Keep runtime merge activation behind a later milestone with its own sibling
-   coalescing and safety policy.
-2. Keep automatic planner submission and multi-depth split activation behind
-   separate decision gates.
+1. Same-Worker runtime merge activation has since moved into the P6 local slice;
+   cross-Worker merge replay also has local evidence, while internal merge
+   evidence remains a separate gate.
+2. Keep unapproved planner submission disabled. The local policy-gated helper
+   exists, but internal planner mutation evidence remains a separate gate.
+3. Multi-depth split activation has local evidence; internal multi-depth
+   evidence remains a separate gate.
 
 Use `docs/todo-next.md` for the current open-work index and
 `docs/todo-p4-next-milestones.md` for the decision gates.

@@ -1,6 +1,6 @@
 # Internal MicroK8s Activation Smoke Evidence
 
-Last reviewed: 2026-05-02
+Last reviewed: 2026-05-03
 
 This is the controlled internal-cluster gate for turning the local
 default-off/manual split activation harness into cluster evidence. The
@@ -159,6 +159,90 @@ Evidence:
   `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`; ArgoCD reached `Synced / Healthy`
   on that post-smoke revision.
 
+## Read-Only Merge Readiness Probe
+
+The P6 merge internal path has a separate helper that must stay read-only until
+a rollout candidate and controlled merge smoke window are approved:
+
+```sh
+bash ~/.codex/skills/microk8s-cluster-ops/scripts/env_guard.sh
+cargo xt k8s merge-activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 \
+  --operation-id internal-merge-readiness-2026-05-03
+cargo xt k8s merge-activation-report-check \
+  --report .dev/reports/internal-microk8s-merge-activation-smoke-latest.json \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2
+```
+
+Observed 2026-05-03 state:
+
+- ArgoCD `tessera` was `Synced / Healthy`.
+- `tessera-orch`, `tessera-gateway`, and `tessera-worker` were all running
+  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`.
+- The helper opened the Orchestrator port-forward, built the merge plan, then
+  stopped before mutation with `status=no_merge_candidate` and
+  `reason=preview returned no merge candidate`.
+- `.dev/reports/merge-activation-plan-latest.json` recorded
+  `preview.source=assignment_listing_zero_metrics`,
+  `activation_mutated=false`, empty `recommendation.siblings`, and no
+  submission command.
+- `.dev/reports/internal-microk8s-merge-activation-smoke-latest.json` recorded
+  `stage=blocked_before_activation`, `activation_mutated=false`,
+  `checks.merge_plan_ready=false`, `checks.merge_published=false`, and
+  `remaining_uncovered` entries for merge ready-plan, publish,
+  failure/recovery, restart, and load/soak.
+- `cargo xt k8s merge-activation-report-check --report
+  .dev/reports/internal-microk8s-merge-activation-smoke-latest.json` accepted
+  the blocked/no-mutation report.
+
+This is helper-path readiness evidence only. It does not close internal merge
+activation because no ready plan, publish, failure/recovery, restart, or
+load/soak evidence exists yet.
+
+## Read-Only Multi-Depth Readiness Probe
+
+The P6 canonical multi-depth internal path has a separate helper that must stay
+read-only until a rollout candidate and controlled multi-depth smoke window are
+approved:
+
+```sh
+cargo xt k8s multi-depth-activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 \
+  --operation-id internal-multi-depth-readiness-2026-05-03
+cargo xt k8s multi-depth-activation-report-check \
+  --report .dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2
+```
+
+Observed 2026-05-03 state:
+
+- ArgoCD `tessera` was `Synced / Healthy`.
+- `tessera-orch`, `tessera-gateway`, `tessera-worker`, and
+  `tessera-worker-b` were all running
+  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`.
+- The helper opened the Orchestrator port-forward, read health/listing, then
+  stopped before mutation with `status=blocked` and
+  `reason=canonical multi-depth parent is not currently assigned`.
+- `.dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json`
+  recorded `stage=blocked_before_activation`, `activation_mutated=false`,
+  canonical parent `world=0,cx=-2,cy=3,depth=2,sub=0`, explicit canonical
+  child target map split across `worker-a`/`worker-b`,
+  `checks.multi_depth_plan_ready=false`, `checks.multi_depth_published=false`,
+  and `remaining_uncovered` entries for multi-depth ready-plan, publish,
+  failure/recovery, restart, and load/soak.
+- `cargo xt k8s multi-depth-activation-report-check --report
+  .dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`
+  accepted the blocked/no-mutation report.
+
+This is helper-path readiness evidence only. It does not close internal
+multi-depth activation because no ready canonical parent plan, publish,
+failure/recovery, restart, or load/soak evidence exists yet.
+
 ## Port-Forwarded Operator Smoke
 
 After ArgoCD reports `tessera` as `Synced / Healthy`, run from the Tessera
@@ -194,6 +278,70 @@ cargo xt k8s activation-report-check \
   --report .dev/reports/internal-microk8s-readiness-negative.json \
   --expect-preflight-error tessera-worker-b
 ```
+
+To exercise the P6 live metrics planner-to-operator path without mutation, use
+the Worker service metrics port-forwards instead of the Orchestrator preview
+fixture:
+
+```sh
+cargo xt k8s activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --require-target-worker \
+  --use-live-worker-metrics \
+  --live-min-pressure-signals 1
+cargo xt k8s activation-report-check \
+  --report .dev/reports/internal-microk8s-activation-smoke-latest.json \
+  --require-live-metrics-plan \
+  --expected-image <new-tag>
+```
+
+This path remains read-only unless `--allow-activation` is also present. It
+port-forwards `tessera-worker` and `tessera-worker-b` metrics services, scrapes
+their per-cell actor/pending-move gauges, writes
+`plan.preview.source=live_worker_metrics:...`, and requires a ready four-target
+operator map. It needs a Tessera image that exposes the per-cell Worker metrics;
+the post-P5 `v2026.05.2` live image is therefore only a baseline for the older
+preview-backed smoke, not completion evidence for this P6 live metrics gate.
+
+Read-only evidence captured on 2026-05-03:
+
+```sh
+cargo xt k8s activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 \
+  --require-target-worker \
+  --use-live-worker-metrics \
+  --live-min-pressure-signals 1 \
+  --local-orch-port 6600 \
+  --local-orch-metrics-port 6601 \
+  --local-gateway-port 4600 \
+  --local-gateway-metrics-port 4601 \
+  --local-source-worker-metrics-port 5603 \
+  --local-target-worker-metrics-port 5604 \
+  --out .dev/reports/internal-microk8s-live-metrics-readiness-negative.json
+```
+
+The command stopped before mutation with
+`stage=blocked_before_activation`, `activation_mutated=false`,
+`plan.status=no_split_candidate`, `plan.preview.source=live_worker_metrics:...`,
+`plan.preview.plan_count=0`, and all recorded deployment images still matching
+`v2026.05.2`. This verifies the read-only helper path and records that live
+metrics internal completion still needs a new image/evidence run that produces a
+ready plan.
+
+Policy-gated planner mutation from live metrics is currently covered by local
+evidence only (`cargo xt dev activation-live-planner-mutation-smoke`). The
+internal variant is a separate approved mutation gate: after a P6 image rollout
+and explicit smoke window approval, an operator may port-forward Orchestrator
+gRPC plus the Worker metrics services and run `cargo xt planner-activation
+--kind split --live-worker-metrics worker-a=<addr> --live-worker-metrics
+worker-b=<addr> --allow-mutation --policy-id
+operator_approved_planner_mutation_v1`. Without both `--allow-mutation` and the
+policy id, the helper must only write a `blocked_by_policy` report and leave
+assignments unchanged.
 
 During the approved controlled smoke window, run the mutating success path:
 
@@ -236,6 +384,8 @@ Minimum success evidence:
   `health=Healthy`.
 - `preflight_errors` is absent or empty, and `plan.status=ready` with four
   target mappings.
+- If `--require-live-metrics-plan` is used, `plan.preview.source` starts with
+  `live_worker_metrics:` and `plan.preview.plan_count >= 1`.
 - The final report checker compares `failure_probe.failures[].sub` and
   `failure_probe.succeeded[]` against `cluster.target_worker_id` and
   `plan.targets[]`, so target-owned children must fail during the guarded
@@ -280,6 +430,68 @@ Expected evidence is:
 
 The helper restores `tessera-worker-b` to its original replica count if the
 failure smoke exits early after scaling down.
+
+## P6 Restart Recovery Draft
+
+The P6 durable assignment-state implementation adds an internal restart helper,
+but the internal evidence is not complete until a new Tessera image is published
+and the GitOps storage patch is approved and rolled out.
+
+GitOps storage draft:
+
+- `tessera-orch` sets
+  `TESSERA_ORCH_ASSIGNMENT_STATE_PATH=/var/lib/tessera/assignment-state.json`.
+- `tessera-orch` mounts a writable PVC-backed volume at `/var/lib/tessera`.
+- The PVC is `tessera-orch-state` with `ReadWriteOnce` access.
+- The helper treats `emptyDir` as insufficient for this internal restart gate.
+
+Prepared controlled command:
+
+```sh
+cargo xt k8s activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --require-target-worker \
+  --require-assignment-state-storage \
+  --out .dev/reports/internal-microk8s-restart-readiness-negative.json
+cargo xt k8s activation-report-check \
+  --report .dev/reports/internal-microk8s-restart-readiness-negative.json \
+  --expect-preflight-error TESSERA_ORCH_ASSIGNMENT_STATE_PATH
+```
+
+The readiness command is read-only and is expected to block before the P6 image
+and PVC-backed Orchestrator state storage are rolled out.
+
+```sh
+cargo xt k8s activation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-activation \
+  --with-failure \
+  --allow-scale \
+  --with-restart \
+  --allow-rollout-restart
+cargo xt k8s activation-report-check \
+  --require-published \
+  --require-failure \
+  --require-restart \
+  --expected-image <new-tag>
+```
+
+`--with-restart` is blocked unless `--allow-rollout-restart` is also present.
+Before mutation, the helper checks ArgoCD readiness, deployment image freshness,
+the two-Worker target topology, and the live Orchestrator Deployment's
+PVC-backed state path. After publish it restarts the Orchestrator Deployment,
+recreates port-forwards, waits for both Workers to re-register, verifies the
+four child assignments survived the rollout, checks Gateway route convergence,
+and runs child traffic plus AOI resync observation. The report checker accepts
+this gate only with `--require-restart`.
+
+The restart command may be combined with `--use-live-worker-metrics` after the
+new image and GitOps rollout expose Worker per-cell metrics. In that case the
+final verifier should include `--require-live-metrics-plan` in addition to
+`--require-restart`.
 
 ## Exit Criteria
 

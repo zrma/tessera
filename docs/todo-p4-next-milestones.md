@@ -1,6 +1,6 @@
 # Tessera P4 Next Milestones
 
-Last reviewed: 2026-05-02
+Last reviewed: 2026-05-03
 
 ## Baseline
 
@@ -157,9 +157,9 @@ controlled smoke GitOps revision.
 
 Chosen first slice:
 
-1. Split-only activation. Merge remains dry-run/design-only until a later
-   milestone chooses sibling coalescing behavior and a separate merge activation
-   safety model.
+1. Split-first activation. P4.3/P5 remain split-only. P6 now includes
+   manual/default-off same-Worker merge coalescing and mixed-owner child replay;
+   internal merge evidence stays deferred to a separate gate.
 2. Manual activation. Planner output can recommend candidates, but it must not
    auto-submit runtime mutations from observed metrics.
 3. Default-off feature flag. Mutating activation should reject unless an
@@ -197,12 +197,84 @@ Implemented slices:
 8. Abort prepared target replay payloads and keep the parent assignment
    unchanged when prepare or source replay fails.
 
-Remaining implementation outside P5:
+P6 first slice:
 
-1. Keep merge activation disabled until sibling coalescing and merge-runtime
-   safety semantics are chosen in a later milestone.
-2. Keep automatic planner submission disabled until live metrics ingestion and
-   operator policy gates are chosen in a later milestone.
+1. Opt-in durable assignment state is implemented with
+   `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`.
+2. Handover and split assignment publish persist the full assignment map before
+   listing/watch publication; persistence failure rolls the in-memory mutation
+   back.
+3. Orchestrator restart loads the persisted assignment map and Worker
+   re-registration receives recovered split child assignments.
+4. `cargo xt dev activation-restart-smoke` covers local restart recovery,
+   Worker assignment refresh, Gateway route convergence, child traffic, and AOI
+   resync.
+5. The internal MicroK8s restart helper/verifier is prepared with read-only
+   `cargo xt k8s activation-smoke --require-assignment-state-storage`,
+   mutating `cargo xt k8s activation-smoke --with-restart
+   --allow-rollout-restart`, and `cargo xt k8s activation-report-check
+   --require-restart`.
+6. The k8s GitOps manifest draft uses PVC-backed state storage:
+   `tessera-orch-state` mounted at `/var/lib/tessera`, with
+   `TESSERA_ORCH_ASSIGNMENT_STATE_PATH=/var/lib/tessera/assignment-state.json`.
+7. Worker metrics expose per-cell actor and pending-move gauges, and
+   `cargo xt split-activation-plan --live-worker-metrics worker-id=addr` can
+   turn live metrics plus Orchestrator health/listing into mutation-free
+   operator evidence. `cargo xt dev activation-live-plan-smoke` covers the
+   plan-only path locally, and `cargo xt dev activation-live-metrics-smoke`
+   covers manual submission using the live metrics plan's target map. The local
+   verifier accepts `--require-live-metrics-plan` for this evidence lane.
+8. The internal MicroK8s helper/verifier can now use live Worker metrics without
+   mutation: `cargo xt k8s activation-smoke --use-live-worker-metrics` opens
+   source/target Worker metrics port-forwards, and
+   `cargo xt k8s activation-report-check --require-live-metrics-plan` verifies
+   `plan.preview.source=live_worker_metrics:...` plus a ready four-target map.
+9. The policy-gated planner mutation lane can use live Worker metrics for split
+   locally: `cargo xt planner-activation --kind split --live-worker-metrics ...`
+   writes a default `blocked_by_policy` no-op report, and `cargo xt dev
+   activation-live-planner-mutation-smoke` verifies that only
+   `--allow-mutation --policy-id operator_approved_planner_mutation_v1`
+   publishes child assignments and Gateway convergence.
+10. The merge planner-to-operator lane is open without runtime mutation:
+   `cargo xt merge-activation-plan` validates a dry-run merge candidate against
+   Orchestrator health/listing, and `cargo xt dev merge-plan-smoke` records
+   `.dev/reports/merge-activation-plan-latest.json`.
+11. The first runtime merge activation lane is open for same-Worker and
+    mixed-owner sibling families under the manual/default-off flag. Canonical
+    `depth>0/sub=0` sibling detection is locally covered in the Orchestrator
+    planner/runtime, Worker coalescing detection, xtask merge plan builder, and
+    the `cargo xt dev canonical-merge-activation-*` success/failure/restart/soak
+    smoke set; canonical merge internal evidence is still a separate gate.
+12. The internal MicroK8s merge readiness lane is prepared without cluster
+    mutation: `cargo xt k8s merge-activation-smoke` records ArgoCD/image/owner
+    Worker preflight plus a port-forwarded ready merge plan, and
+    `cargo xt k8s merge-activation-report-check --require-ready-plan` validates
+    that read-only report. Internal merge publish/failure/restart/soak evidence
+    remains unrun until an approved image/GitOps rollout gate.
+13. The internal MicroK8s canonical multi-depth readiness lane is prepared
+    without cluster mutation: `cargo xt k8s multi-depth-activation-smoke`
+    records ArgoCD/image/source-target Worker preflight plus a live-listing
+    canonical parent/child target plan, and
+    `cargo xt k8s multi-depth-activation-report-check --require-ready-plan`
+    validates that read-only report. Internal multi-depth
+    publish/failure/restart/soak evidence remains unrun until an approved
+    image/GitOps rollout gate.
+
+Remaining implementation outside the current slice:
+
+1. Publish a new image and run the approved internal MicroK8s restart recovery
+   evidence gate for persistent split state.
+2. Run the approved internal MicroK8s live metrics plan evidence gate after the
+   new image exposes per-cell Worker metrics.
+3. Run approved internal MicroK8s merge publish/failure/restart/soak evidence
+   after the read-only readiness report passes against the rollout candidate.
+4. Run approved internal MicroK8s canonical multi-depth
+   publish/failure/restart/soak evidence after the read-only readiness report
+   passes against the rollout candidate.
+5. Keep unapproved planner mutation disabled. The explicit local policy gate
+   exists for preview-backed merge and live-metrics-backed split; internal
+   planner mutation evidence still requires a separate approved rollout gate
+   after live metrics/internal plan evidence is available.
 
 Internal MicroK8s activation preflight on 2026-05-02:
 
@@ -228,12 +300,33 @@ Verification required for the implementation milestone:
 cargo xt
 cargo test
 cargo xt dev activation-plan-smoke
+cargo xt dev activation-live-plan-smoke
+cargo xt dev activation-live-planner-mutation-smoke
+cargo xt dev merge-plan-smoke
+cargo xt dev merge-activation-smoke
+cargo xt dev canonical-merge-activation-smoke
+cargo xt dev canonical-merge-activation-report-check
+cargo xt dev canonical-merge-activation-failure-smoke
+cargo xt dev canonical-merge-activation-failure-report-check
+cargo xt dev canonical-merge-activation-restart-smoke
+cargo xt dev canonical-merge-activation-restart-report-check
+cargo xt dev canonical-merge-activation-soak --iterations 8 --sleep-ms 5
+cargo xt dev canonical-merge-activation-soak-report-check --min-iterations 8
+cargo xt dev merge-activation-failure-smoke
+cargo xt dev merge-activation-restart-smoke
+cargo xt dev merge-activation-soak
 cargo xt dev activation-smoke
 cargo xt dev activation-failure-smoke
+cargo xt dev activation-restart-smoke
 cargo xt dev activation-soak
-cargo xt dev activation-report-check
+cargo xt dev activation-report-check --restart-report .dev/reports/activation-restart-smoke-latest.json
+cargo xt dev activation-report-check --merge-plan-report .dev/reports/merge-activation-plan-latest.json --merge-activation-report .dev/reports/merge-activation-smoke-latest.json --merge-failure-report .dev/reports/merge-activation-failure-smoke-latest.json --merge-restart-report .dev/reports/merge-activation-restart-smoke-latest.json --merge-soak-report .dev/reports/merge-activation-soak-latest.json --planner-mutation-report .dev/reports/planner-activation-latest.json --require-planner-live-metrics
 cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --require-target-worker
+cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --require-target-worker --require-assignment-state-storage --out .dev/reports/internal-microk8s-restart-readiness-negative.json
+cargo xt k8s activation-report-check --report .dev/reports/internal-microk8s-restart-readiness-negative.json --expect-preflight-error TESSERA_ORCH_ASSIGNMENT_STATE_PATH
 cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --allow-activation --with-failure --allow-scale
+cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-activation --with-failure --allow-scale --with-restart --allow-rollout-restart
+cargo xt k8s activation-report-check --require-published --require-failure --require-restart --expected-image <new-tag>
 cargo xt dev up --with-orch
 cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
@@ -241,14 +334,26 @@ cargo xt dev down --with-orch
 
 The current operator/dev flow has `cargo xt split-activation-plan` for
 preview-to-operator evidence without mutation, `cargo xt split-activation` for
-explicit manual submission, and `cargo xt dev activation-plan-smoke` to prove a
-preview split candidate becomes a ready operator plan while assignments remain
-unchanged. `cargo xt dev activation-smoke` covers successful split publication,
+explicit manual submission, `cargo xt merge-activation-plan`/`cargo xt
+merge-activation --depth <n>` for legacy or canonical merge
+planning/submission, and `cargo xt dev
+activation-plan-smoke` to prove a preview split candidate becomes a ready
+operator plan while assignments remain unchanged. `cargo xt dev
+merge-plan-smoke` proves a merge candidate becomes a ready operator plan without
+mutation, `cargo xt dev merge-activation-smoke` proves the manual same-Worker
+merge publish/coalesce route locally, `cargo xt dev
+canonical-merge-activation-smoke` proves the same route for canonical
+`depth>0/sub=0` siblings, the canonical failure/restart/soak smokes prove the
+canonical owner outage/restart/load lanes, and `cargo xt dev
+merge-activation-soak` proves parent route load/soak evidence. `cargo xt dev activation-smoke` covers successful split publication,
 Gateway route convergence, source/target Worker owned-cell refresh, target
 replay, stable-session post-split Move, remote AOI resync snapshot, and local
 JSON evidence. `cargo xt dev activation-failure-smoke` adds post-publish target
 outage detection, failed child convergence evidence, no-automatic-rollback
 observation, and target Worker restart recovery evidence. `cargo xt dev
+activation-restart-smoke` adds durable assignment state, Orchestrator restart
+with manual activation disabled, Worker assignment refresh, Gateway route
+convergence, child traffic, AOI resync, and local JSON evidence. `cargo xt dev
 activation-soak` adds sustained child Ping/Move traffic, route convergence
 retention, remote AOI frame observation, Gateway latency histogram growth, zero
 Gateway close counters, and local JSON evidence. `cargo xt k8s
