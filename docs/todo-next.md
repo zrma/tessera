@@ -25,7 +25,8 @@ Last reviewed: 2026-05-04
   explicit approvals, default-off execution blocks, approved same-Worker merge
   execution idempotency, local observation completion, and local recovery-required
   owner-outage handling, plus Orchestrator restart recovery for the published
-  operation ledger and assignment state. `v2026.05.5` has been published and promoted
+  operation ledger and assignment state, and local load/soak observation
+  completion. `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
   default-off. The internal baseline is ArgoCD `Synced / Healthy`, all Tessera
@@ -66,7 +67,7 @@ Recommended next slices:
 3. Done: `test: add p7 execution restart smoke` - restart the Orchestrator with the
    operation ledger and assignment state mounted, then verify operation state and
    route convergence survive, and complete observation after restart.
-4. `test: add p7 operation soak smoke` - run sustained post-execution parent
+4. Done: `test: add p7 operation soak smoke` - run sustained post-execution parent
    Ping/Move traffic and verify route count, latency histograms, and close
    counters stay clean while the operation closes to `completed`.
 5. `test: add internal p7 operation smoke` - add a repo-native `cargo xt k8s ...`

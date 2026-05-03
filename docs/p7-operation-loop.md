@@ -176,8 +176,28 @@ converge to the parent, Worker parent actor metrics refresh, stable-session
 parent traffic succeeds, and `POST /operations/observations` can close the
 operation to `completed` after restart. The smoke writes
 `.dev/reports/p7-operation-restart-smoke-latest.json` plus
-`.dev/reports/p7-operation-restart-ledger-latest.json`. Soak and internal
-MicroK8s restart evidence remain explicit follow-up gates.
+`.dev/reports/p7-operation-restart-ledger-latest.json`. Internal MicroK8s
+restart evidence remains an explicit follow-up gate.
+
+Current soak smoke:
+
+```sh
+cargo xt dev p7-operation-soak-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-soak-ledger-latest.json \
+  --require-approval \
+  --require-published-execution \
+  --require-completed-observation
+```
+
+This starts a full local dev stack, publishes an approved same-Worker merge
+operation through the P7 HTTP endpoints, runs sustained parent-route Ping/Move
+traffic with `--iterations` and `--sleep-ms`, verifies Gateway route count,
+latency histograms, clean close counters, and Worker parent actor metrics, then
+closes the operation with `POST /operations/observations`. The smoke writes
+`.dev/reports/p7-operation-soak-smoke-latest.json` plus
+`.dev/reports/p7-operation-soak-ledger-latest.json`. Internal MicroK8s soak
+evidence remains an explicit follow-up gate.
 
 Current internal rollout baseline:
 
