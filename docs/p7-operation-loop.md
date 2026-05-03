@@ -83,9 +83,13 @@ Each slice should be self-contained:
    `GET /operations` endpoint.
 2. **Ledger append/update path**: let Orchestrator-owned proposal and phase
    writes persist durable records across restart, using the repo's existing
-   conservative persistence style before introducing heavier storage.
+   conservative persistence style before introducing heavier storage. The
+   first write surface is `POST /operations/proposals`, which appends planner
+   proposals only and leaves assignment mutation disabled.
 3. **Proposal writer**: convert live metrics split candidates and assignment
-   listing merge candidates into durable proposals.
+   listing merge candidates into durable proposals with stable operation ids,
+   proposal hashes, target cells, worker roles, preconditions, and submission
+   commands.
 4. **Approval gate**: add explicit approval records with TTL, policy id,
    expected proposal hash, cooldown, and budget constraints.
 5. **Executor dry run**: report blocked execution by default and approved

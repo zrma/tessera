@@ -259,6 +259,35 @@ struct OperationLedgerSnapshot {
     records: Vec<OperationRecord>,
 }
 
+#[derive(Debug, Serialize)]
+struct OperationProposalWriteResponse {
+    schema: String,
+    mode: &'static str,
+    source: String,
+    assignments_changed: bool,
+    planned_count: usize,
+    recorded_count: usize,
+    already_recorded_count: usize,
+    skipped_count: usize,
+    operation_ids: Vec<String>,
+    skipped: Vec<OperationProposalSkip>,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationProposalSkip {
+    kind: String,
+    cell: CellId,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct OperationProposalWorker {
+    worker_id: String,
+    cell_count: usize,
+    registered: bool,
+    active_handover: bool,
+}
+
 impl OperationLedgerFile {
     fn empty() -> Self {
         Self {
@@ -843,6 +872,415 @@ fn operation_ledger_tmp_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("operation-ledger.json");
     path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
+}
+
+fn build_operation_record_for_plan(
+    source: &str,
+    snapshot: &split_merge_planner::SplitMergeMetricsSnapshot,
+    plan: &split_merge_planner::SplitMergePlan,
+    workers: &[OperationProposalWorker],
+    now_unix_secs: u64,
+) -> Result<OperationRecord, String> {
+    match plan.kind {
+        split_merge_planner::SplitMergePlanKind::Split => {
+            build_split_operation_record(source, snapshot, plan, workers, now_unix_secs)
+        }
+        split_merge_planner::SplitMergePlanKind::Merge => {
+            build_merge_operation_record(source, snapshot, plan, workers, now_unix_secs)
+        }
+    }
+}
+
+fn build_split_operation_record(
+    source: &str,
+    snapshot: &split_merge_planner::SplitMergeMetricsSnapshot,
+    plan: &split_merge_planner::SplitMergePlan,
+    workers: &[OperationProposalWorker],
+    now_unix_secs: u64,
+) -> Result<OperationRecord, String> {
+    let parent = plan.cell;
+    let source_worker_id = snapshot
+        .cells
+        .iter()
+        .find(|cell| cell.cell == parent)
+        .and_then(|cell| cell.owner_worker_id.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "split plan parent world={},cx={},cy={},depth={},sub={} has no owner_worker_id",
+                parent.world, parent.cx, parent.cy, parent.depth, parent.sub
+            )
+        })?;
+    let children = split_proposal_children(parent)?;
+    let targets = infer_split_operation_targets(workers, source_worker_id, &children)?;
+    let preconditions = vec![
+        format!("planner selected split candidate from {source}"),
+        format!("source worker {source_worker_id} owns the parent cell and is registered"),
+        "target workers are registered and have no active handover".to_string(),
+        "operator approval must match proposal_hash before mutation".to_string(),
+        "TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual is enabled only for a controlled execution window".to_string(),
+    ];
+    let proposal_hash = operation_proposal_hash(source, plan, &targets, &preconditions);
+    let kind = if parent.depth == 0 {
+        DynamicOperationKind::Split
+    } else {
+        DynamicOperationKind::MultiDepthSplit
+    };
+    let operation_id = operation_id_for(kind, parent, &proposal_hash);
+    let submission_command = split_operation_submission_command(&operation_id, parent, &targets);
+
+    Ok(OperationRecord {
+        operation_id,
+        kind,
+        status: OperationStatus::Proposed,
+        created_unix_secs: now_unix_secs,
+        updated_unix_secs: now_unix_secs,
+        proposal: OperationProposal {
+            source: source.to_string(),
+            proposal_hash,
+            parent: Some(parent),
+            targets,
+            preconditions,
+            submission_command,
+        },
+        approval: None,
+        phases: vec![OperationPhase {
+            name: "proposal_recorded".to_string(),
+            state: OperationPhaseState::Succeeded,
+            unix_secs: now_unix_secs,
+            reason: "planner proposal persisted without assignment mutation".to_string(),
+        }],
+    })
+}
+
+fn build_merge_operation_record(
+    source: &str,
+    snapshot: &split_merge_planner::SplitMergeMetricsSnapshot,
+    plan: &split_merge_planner::SplitMergePlan,
+    workers: &[OperationProposalWorker],
+    now_unix_secs: u64,
+) -> Result<OperationRecord, String> {
+    let parent = plan.cell;
+    let (owner_worker_id, children) = merge_proposal_owner_and_children(snapshot, parent)?;
+    let owner = workers
+        .iter()
+        .find(|worker| worker.worker_id == owner_worker_id)
+        .ok_or_else(|| format!("merge owner worker {owner_worker_id} is not configured"))?;
+    if !owner.registered {
+        return Err(format!(
+            "merge owner worker {owner_worker_id} is not registered"
+        ));
+    }
+    if owner.active_handover {
+        return Err(format!(
+            "merge owner worker {owner_worker_id} has an active handover"
+        ));
+    }
+
+    let mut targets = children
+        .into_iter()
+        .map(|cell| OperationTarget {
+            cell,
+            worker_id: owner_worker_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    sort_operation_targets(&mut targets);
+    let preconditions = vec![
+        format!("planner selected merge candidate from {source}"),
+        format!("complete child family shares registered owner worker {owner_worker_id}"),
+        "parent route is not already published".to_string(),
+        "operator approval must match proposal_hash before mutation".to_string(),
+        "TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual is enabled only for a controlled execution window".to_string(),
+    ];
+    let proposal_hash = operation_proposal_hash(source, plan, &targets, &preconditions);
+    let operation_id = operation_id_for(DynamicOperationKind::Merge, parent, &proposal_hash);
+    let submission_command =
+        merge_operation_submission_command(&operation_id, parent, owner_worker_id.as_str());
+
+    Ok(OperationRecord {
+        operation_id,
+        kind: DynamicOperationKind::Merge,
+        status: OperationStatus::Proposed,
+        created_unix_secs: now_unix_secs,
+        updated_unix_secs: now_unix_secs,
+        proposal: OperationProposal {
+            source: source.to_string(),
+            proposal_hash,
+            parent: Some(parent),
+            targets,
+            preconditions,
+            submission_command,
+        },
+        approval: None,
+        phases: vec![OperationPhase {
+            name: "proposal_recorded".to_string(),
+            state: OperationPhaseState::Succeeded,
+            unix_secs: now_unix_secs,
+            reason: "planner proposal persisted without assignment mutation".to_string(),
+        }],
+    })
+}
+
+fn split_proposal_children(parent: CellId) -> Result<[CellId; 4], String> {
+    if parent.depth == 0 && parent.sub == 0 {
+        return parent
+            .legacy_shallow_children()
+            .ok_or_else(|| "legacy split proposal requires a depth=0/sub=0 parent".to_string());
+    }
+    parent.canonical_children().ok_or_else(|| {
+        format!(
+            "multi-depth split proposal requires a canonical parent; got depth={},sub={}",
+            parent.depth, parent.sub
+        )
+    })
+}
+
+fn infer_split_operation_targets(
+    workers: &[OperationProposalWorker],
+    source_worker_id: &str,
+    children: &[CellId; 4],
+) -> Result<Vec<OperationTarget>, String> {
+    let source = workers
+        .iter()
+        .find(|worker| worker.worker_id == source_worker_id)
+        .ok_or_else(|| format!("source worker {source_worker_id} is not configured"))?;
+    if !source.registered {
+        return Err(format!(
+            "source worker {source_worker_id} is not registered"
+        ));
+    }
+    if source.active_handover {
+        return Err(format!(
+            "source worker {source_worker_id} has an active handover"
+        ));
+    }
+
+    let mut non_source = workers
+        .iter()
+        .filter(|worker| worker.worker_id != source_worker_id)
+        .filter(|worker| worker.registered)
+        .filter(|worker| !worker.active_handover)
+        .collect::<Vec<_>>();
+    non_source.sort_by(|left, right| {
+        left.cell_count
+            .cmp(&right.cell_count)
+            .then_with(|| left.worker_id.cmp(&right.worker_id))
+    });
+    let Some(first_target) = non_source.first() else {
+        return Err("no registered non-source worker is available for split proposal".to_string());
+    };
+    let second_target = non_source.get(1).unwrap_or(first_target);
+    let worker_ids = [
+        source_worker_id,
+        first_target.worker_id.as_str(),
+        source_worker_id,
+        second_target.worker_id.as_str(),
+    ];
+    let mut targets = children
+        .iter()
+        .zip(worker_ids)
+        .map(|(cell, worker_id)| OperationTarget {
+            cell: *cell,
+            worker_id: worker_id.to_string(),
+        })
+        .collect::<Vec<_>>();
+    sort_operation_targets(&mut targets);
+    Ok(targets)
+}
+
+fn merge_proposal_owner_and_children(
+    snapshot: &split_merge_planner::SplitMergeMetricsSnapshot,
+    parent: CellId,
+) -> Result<(String, Vec<CellId>), String> {
+    for children in merge_child_family_candidates(parent) {
+        let mut owner_worker_id: Option<String> = None;
+        let mut matched = Vec::new();
+        for child in children {
+            let Some(metrics) = snapshot.cells.iter().find(|cell| cell.cell == child) else {
+                matched.clear();
+                break;
+            };
+            let Some(owner) = metrics.owner_worker_id.as_deref() else {
+                matched.clear();
+                break;
+            };
+            if owner_worker_id
+                .as_deref()
+                .is_some_and(|existing| existing != owner)
+            {
+                matched.clear();
+                break;
+            }
+            owner_worker_id.get_or_insert_with(|| owner.to_string());
+            matched.push(child);
+        }
+        if matched.len() == 4
+            && let Some(owner) = owner_worker_id
+        {
+            return Ok((owner, matched));
+        }
+    }
+    Err(format!(
+        "merge proposal requires a complete same-owner child family for parent world={},cx={},cy={},depth={},sub={}",
+        parent.world, parent.cx, parent.cy, parent.depth, parent.sub
+    ))
+}
+
+fn operation_proposal_hash(
+    source: &str,
+    plan: &split_merge_planner::SplitMergePlan,
+    targets: &[OperationTarget],
+    preconditions: &[String],
+) -> String {
+    let mut body = String::new();
+    body.push_str("source=");
+    body.push_str(source);
+    body.push('\n');
+    body.push_str("kind=");
+    body.push_str(split_merge_plan_kind_slug(plan.kind));
+    body.push('\n');
+    push_cell_hash_part(&mut body, "cell", plan.cell);
+    body.push_str(&format!(
+        "pressure_signals={}\nscore={}\nrequired_handover_ops={}\ncells_moved={}\n",
+        plan.pressure_signals, plan.score, plan.required_handover_ops, plan.cells_moved
+    ));
+    for target in targets {
+        push_cell_hash_part(&mut body, "target", target.cell);
+        body.push_str("worker=");
+        body.push_str(&target.worker_id);
+        body.push('\n');
+    }
+    for precondition in preconditions {
+        body.push_str("precondition=");
+        body.push_str(precondition);
+        body.push('\n');
+    }
+    format!("fnv1a64:{:016x}", fnv1a64(body.as_bytes()))
+}
+
+fn push_cell_hash_part(out: &mut String, label: &str, cell: CellId) {
+    out.push_str(label);
+    out.push('=');
+    out.push_str(&format!(
+        "{},{},{},{},{}",
+        cell.world, cell.cx, cell.cy, cell.depth, cell.sub
+    ));
+    out.push('\n');
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn operation_id_for(kind: DynamicOperationKind, cell: CellId, proposal_hash: &str) -> String {
+    let hash = proposal_hash
+        .strip_prefix("fnv1a64:")
+        .unwrap_or(proposal_hash)
+        .chars()
+        .take(12)
+        .collect::<String>();
+    format!(
+        "p7-{}-w{}-cx{}-cy{}-d{}-s{}-{}",
+        dynamic_operation_kind_slug(kind),
+        cell.world,
+        cell.cx,
+        cell.cy,
+        cell.depth,
+        cell.sub,
+        hash
+    )
+}
+
+fn split_operation_submission_command(
+    operation_id: &str,
+    parent: CellId,
+    targets: &[OperationTarget],
+) -> String {
+    let mut parts = vec![
+        "cargo xt split-activation".to_string(),
+        "--orch-addr ${TESSERA_ORCH_ADDR:-127.0.0.1:6000}".to_string(),
+        format!("--operation-id {operation_id}"),
+        format!("--world {}", parent.world),
+        format!("--cx {}", parent.cx),
+        format!("--cy {}", parent.cy),
+    ];
+    if parent.depth > 0 || parent.sub > 0 {
+        parts.push(format!("--depth {}", parent.depth));
+        parts.push(format!("--sub {}", parent.sub));
+    }
+
+    let mut targets = targets.to_vec();
+    sort_operation_targets(&mut targets);
+    if parent.depth == 0 && parent.sub == 0 {
+        parts.extend(
+            targets
+                .into_iter()
+                .map(|target| format!("--target {}={}", target.cell.sub, target.worker_id)),
+        );
+    } else {
+        parts.extend(targets.into_iter().map(|target| {
+            format!(
+                "--target-cell {},{},{},{},{}={}",
+                target.cell.world,
+                target.cell.cx,
+                target.cell.cy,
+                target.cell.depth,
+                target.cell.sub,
+                target.worker_id
+            )
+        }));
+    }
+    parts.join(" ")
+}
+
+fn merge_operation_submission_command(
+    operation_id: &str,
+    parent: CellId,
+    owner_worker_id: &str,
+) -> String {
+    [
+        "cargo xt merge-activation".to_string(),
+        "--orch-addr ${TESSERA_ORCH_ADDR:-127.0.0.1:6000}".to_string(),
+        format!("--operation-id {operation_id}"),
+        format!("--world {}", parent.world),
+        format!("--cx {}", parent.cx),
+        format!("--cy {}", parent.cy),
+        format!("--depth {}", parent.depth),
+        format!("--owner-worker-id {owner_worker_id}"),
+    ]
+    .join(" ")
+}
+
+fn sort_operation_targets(targets: &mut [OperationTarget]) {
+    targets.sort_by_key(|target| {
+        (
+            target.cell.world,
+            target.cell.cy,
+            target.cell.cx,
+            target.cell.depth,
+            target.cell.sub,
+            target.worker_id.clone(),
+        )
+    });
+}
+
+fn split_merge_plan_kind_slug(kind: split_merge_planner::SplitMergePlanKind) -> &'static str {
+    match kind {
+        split_merge_planner::SplitMergePlanKind::Split => "split",
+        split_merge_planner::SplitMergePlanKind::Merge => "merge",
+    }
+}
+
+fn dynamic_operation_kind_slug(kind: DynamicOperationKind) -> &'static str {
+    match kind {
+        DynamicOperationKind::Split => "split",
+        DynamicOperationKind::Merge => "merge",
+        DynamicOperationKind::MultiDepthSplit => "multi-depth-split",
+    }
 }
 
 fn listing_with_runtime(
@@ -1501,7 +1939,7 @@ struct OrchestratorService {
     metrics: Arc<OrchestratorMetricsCounters>,
     split_activation_mode: SplitActivationMode,
     assignment_state_path: Option<Arc<PathBuf>>,
-    operation_ledger_persistence_enabled: bool,
+    operation_ledger_path: Option<Arc<PathBuf>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1547,7 +1985,7 @@ impl OrchestratorService {
             load_initial_assignments(&config, assignment_state_path.as_deref())?;
         let initial_operation_ledger =
             load_initial_operation_ledger(operation_ledger_path.as_deref())?;
-        let operation_ledger_persistence_enabled = operation_ledger_path.is_some();
+        let operation_ledger_path = operation_ledger_path.map(Arc::new);
         let initial_listing = listing_with_runtime(
             &config,
             &initial_assignments,
@@ -1566,7 +2004,7 @@ impl OrchestratorService {
             metrics: Arc::new(OrchestratorMetricsCounters::default()),
             split_activation_mode,
             assignment_state_path: assignment_state_path.map(Arc::new),
-            operation_ledger_persistence_enabled,
+            operation_ledger_path,
         })
     }
 
@@ -1603,9 +2041,134 @@ impl OrchestratorService {
         let ledger = self.operation_ledger.read().await;
         OperationLedgerSnapshot {
             schema: ledger.schema.clone(),
-            persistence_enabled: self.operation_ledger_persistence_enabled,
+            persistence_enabled: self.operation_ledger_path.is_some(),
             records: ledger.records.clone(),
         }
+    }
+
+    async fn record_split_merge_proposals(&self) -> Result<OperationProposalWriteResponse, String> {
+        let (source, snapshot) = self.split_merge_preview_snapshot().await?;
+        self.record_split_merge_proposals_from_snapshot(source, snapshot, SystemTime::now())
+            .await
+    }
+
+    async fn record_split_merge_proposals_from_snapshot(
+        &self,
+        source: String,
+        snapshot: split_merge_planner::SplitMergeMetricsSnapshot,
+        now: SystemTime,
+    ) -> Result<OperationProposalWriteResponse, String> {
+        if self.operation_ledger_path.is_none() {
+            return Err(
+                "operation ledger persistence is disabled; set TESSERA_ORCH_OPERATION_LEDGER_PATH"
+                    .to_string(),
+            );
+        }
+
+        let plans = split_merge_planner::plan_split_merge(
+            &snapshot,
+            &split_merge_planner::SplitMergePlannerConfig::default(),
+        );
+        let workers = self.operation_proposal_workers().await;
+        let now_unix_secs = unix_timestamp_secs(now);
+        let mut records = Vec::new();
+        let mut skipped = Vec::new();
+        for plan in &plans {
+            match build_operation_record_for_plan(&source, &snapshot, plan, &workers, now_unix_secs)
+            {
+                Ok(record) => records.push(record),
+                Err(reason) => skipped.push(OperationProposalSkip {
+                    kind: split_merge_plan_kind_slug(plan.kind).to_string(),
+                    cell: plan.cell,
+                    reason,
+                }),
+            }
+        }
+        let planned_count = plans.len();
+        let skipped_count = skipped.len();
+        let (operation_ids, recorded_count, already_recorded_count) =
+            self.append_operation_records(records).await?;
+
+        Ok(OperationProposalWriteResponse {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            mode: "planner_proposal_recording",
+            source,
+            assignments_changed: false,
+            planned_count,
+            recorded_count,
+            already_recorded_count,
+            skipped_count,
+            operation_ids,
+            skipped,
+        })
+    }
+
+    async fn operation_proposal_workers(&self) -> Vec<OperationProposalWorker> {
+        let runtime = self.runtime.read().await.clone();
+        let assignments = self.assignments.read().await.clone();
+        let handovers = self.handovers.read().await.clone();
+        let mut workers = self
+            .config
+            .workers
+            .keys()
+            .map(|worker_id| OperationProposalWorker {
+                worker_id: worker_id.clone(),
+                cell_count: assignments
+                    .get(worker_id.as_str())
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                registered: runtime.contains_key(worker_id.as_str()),
+                active_handover: handovers.values().any(|handover| {
+                    handover.source_worker_id == *worker_id
+                        || handover.target_worker_id == *worker_id
+                }),
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
+        workers
+    }
+
+    async fn append_operation_records(
+        &self,
+        records: Vec<OperationRecord>,
+    ) -> Result<(Vec<String>, usize, usize), String> {
+        let Some(path) = self.operation_ledger_path.as_ref() else {
+            return Err(
+                "operation ledger persistence is disabled; set TESSERA_ORCH_OPERATION_LEDGER_PATH"
+                    .to_string(),
+            );
+        };
+        let mut ledger = self.operation_ledger.write().await;
+        let mut next_ledger = ledger.clone();
+        let mut operation_ids = Vec::new();
+        let mut recorded_count = 0;
+        let mut already_recorded_count = 0;
+        for record in records {
+            operation_ids.push(record.operation_id.clone());
+            if let Some(existing) = next_ledger
+                .records
+                .iter()
+                .find(|existing| existing.operation_id == record.operation_id)
+            {
+                if existing.proposal.proposal_hash != record.proposal.proposal_hash {
+                    return Err(format!(
+                        "operation_id={} already exists with a different proposal_hash",
+                        record.operation_id
+                    ));
+                }
+                already_recorded_count += 1;
+                continue;
+            }
+            next_ledger.records.push(record);
+            recorded_count += 1;
+        }
+        if recorded_count > 0 {
+            write_operation_ledger_file(path.as_path(), &next_ledger).map_err(|err| {
+                format!("persist operation ledger to {}: {err:#}", path.display())
+            })?;
+            *ledger = next_ledger;
+        }
+        Ok((operation_ids, recorded_count, already_recorded_count))
     }
 
     fn persist_assignment_map(&self, assignments: &AssignmentMap) -> Result<(), String> {
@@ -3365,6 +3928,24 @@ async fn handle_prometheus_metrics_request(
         let body = serde_json::to_string_pretty(&snapshot)
             .context("serialize operation ledger response")?;
         write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
+    } else if method == "POST" && path == "/operations/proposals" {
+        match service.record_split_merge_proposals().await {
+            Ok(response) => {
+                let body = serde_json::to_string_pretty(&response)
+                    .context("serialize operation proposal write response")?;
+                write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
+            }
+            Err(reason) => {
+                let status = if reason.contains("TESSERA_ORCH_OPERATION_LEDGER_PATH") {
+                    "409 Conflict"
+                } else {
+                    "500 Internal Server Error"
+                };
+                let body = format!("operation proposal recording unavailable: {reason}\n");
+                write_http_response(&mut stream, status, "text/plain; charset=utf-8", &body)
+                    .await?;
+            }
+        }
     } else {
         write_http_response(
             &mut stream,
@@ -5494,6 +6075,158 @@ mod tests {
         let _ = fs::remove_file(ledger_path);
     }
 
+    #[tokio::test]
+    async fn operation_ledger_records_split_planner_proposal_without_assignment_mutation() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-split-proposal");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        register_worker_for_test(&service, "worker-a", "127.0.0.1:5101").await;
+        register_worker_for_test(&service, "worker-b", "127.0.0.1:5102").await;
+        let before = service.listing().await;
+        let mut candidate = split_metrics(CellId::grid(0, 0, 0));
+        candidate.actor_count = 140;
+        candidate.move_queue_pressure = 70;
+        let snapshot = SplitMergeMetricsSnapshot {
+            cells: vec![candidate],
+            active_plans: Vec::new(),
+        };
+
+        let response = service
+            .record_split_merge_proposals_from_snapshot(
+                "live_worker_metrics:test".to_string(),
+                snapshot.clone(),
+                UNIX_EPOCH + std::time::Duration::from_secs(200),
+            )
+            .await
+            .expect("record proposal");
+        let after = service.listing().await;
+
+        assert!(!response.assignments_changed);
+        assert_eq!(response.planned_count, 1);
+        assert_eq!(response.recorded_count, 1);
+        assert_eq!(response.already_recorded_count, 0);
+        assert_eq!(response.skipped_count, 0);
+        assert_eq!(before, after);
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records.len(), 1);
+        let record = &loaded.records[0];
+        assert_eq!(record.kind, DynamicOperationKind::Split);
+        assert_eq!(record.status, OperationStatus::Proposed);
+        assert_eq!(record.created_unix_secs, 200);
+        assert_eq!(record.proposal.source, "live_worker_metrics:test");
+        assert_eq!(record.proposal.parent, Some(CellId::grid(0, 0, 0)));
+        assert_eq!(record.proposal.targets.len(), 4);
+        assert!(
+            record
+                .proposal
+                .targets
+                .iter()
+                .any(|target| target.worker_id == "worker-b")
+        );
+        assert!(
+            record
+                .proposal
+                .submission_command
+                .contains(&record.operation_id)
+        );
+        assert!(
+            record
+                .proposal
+                .submission_command
+                .contains("cargo xt split-activation")
+        );
+
+        let repeat = service
+            .record_split_merge_proposals_from_snapshot(
+                "live_worker_metrics:test".to_string(),
+                snapshot,
+                UNIX_EPOCH + std::time::Duration::from_secs(201),
+            )
+            .await
+            .expect("repeat proposal");
+        let loaded_after_repeat =
+            load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(repeat.recorded_count, 0);
+        assert_eq!(repeat.already_recorded_count, 1);
+        assert_eq!(loaded_after_repeat.records.len(), 1);
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_records_merge_planner_proposal() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-merge-proposal");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_merge_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        register_worker_for_test(&service, "worker-a", "127.0.0.1:5101").await;
+        let snapshot = SplitMergeMetricsSnapshot {
+            cells: vec![
+                merge_metrics(0, 0, 0, 0, "worker-a"),
+                merge_metrics(0, 0, 0, 1, "worker-a"),
+                merge_metrics(0, 0, 0, 2, "worker-a"),
+                merge_metrics(0, 0, 0, 3, "worker-a"),
+            ],
+            active_plans: Vec::new(),
+        };
+
+        let response = service
+            .record_split_merge_proposals_from_snapshot(
+                "assignment_listing_zero_metrics".to_string(),
+                snapshot,
+                UNIX_EPOCH + std::time::Duration::from_secs(300),
+            )
+            .await
+            .expect("record merge proposal");
+
+        assert_eq!(response.planned_count, 1);
+        assert_eq!(response.recorded_count, 1);
+        assert_eq!(response.skipped_count, 0);
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records.len(), 1);
+        let record = &loaded.records[0];
+        assert_eq!(record.kind, DynamicOperationKind::Merge);
+        assert_eq!(record.proposal.parent, Some(CellId::grid(0, 0, 0)));
+        assert_eq!(record.proposal.targets.len(), 4);
+        assert!(
+            record
+                .proposal
+                .targets
+                .iter()
+                .all(|target| target.worker_id == "worker-a")
+        );
+        assert!(
+            record
+                .proposal
+                .submission_command
+                .contains("cargo xt merge-activation")
+        );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_proposal_recording_requires_persistence_path() {
+        let service = OrchestratorService::new(two_worker_handover_config());
+        let err = service
+            .record_split_merge_proposals_from_snapshot(
+                "test".to_string(),
+                SplitMergeMetricsSnapshot::default(),
+                UNIX_EPOCH,
+            )
+            .await
+            .expect_err("persistence disabled should reject writes");
+
+        assert!(err.contains("TESSERA_ORCH_OPERATION_LEDGER_PATH"));
+    }
+
     #[test]
     fn parse_config_single_worker() {
         let json = r#"
@@ -6560,6 +7293,51 @@ mod tests {
         assert!(response.contains(r#""schema": "tessera.orch.operation_ledger.v1""#));
         assert!(response.contains(r#""persistence_enabled": true"#));
         assert!(response.contains(r#""records": []"#));
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_records_empty_proposal_batch() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http-proposals");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proposal listener");
+        let addr = listener.local_addr().expect("proposal listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept proposal request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle proposal request");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect proposals");
+        client
+            .write_all(b"POST /operations/proposals HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write proposal request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read proposal response");
+        server.await.expect("proposal server task");
+
+        let response = String::from_utf8(response).expect("utf8 proposal response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains(r#""mode": "planner_proposal_recording""#));
+        assert!(response.contains(r#""assignments_changed": false"#));
+        assert!(response.contains(r#""planned_count": 0"#));
+        assert!(response.contains(r#""recorded_count": 0"#));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert!(loaded.records.is_empty());
         let _ = fs::remove_file(ledger_path);
     }
 }
