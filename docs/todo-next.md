@@ -25,10 +25,11 @@ Last reviewed: 2026-05-04
   explicit approvals, default-off execution blocks, approved same-Worker merge
   execution idempotency, approved legacy split execution success/idempotency,
   approved legacy split observation completion, approved legacy split
-  target-outage recovery-required handling, local merge observation completion,
-  and local recovery-required owner-outage handling, plus Orchestrator restart
-  recovery for the published operation ledger and assignment state, and local
-  load/soak observation completion.
+  target-outage recovery-required handling, approved legacy split Orchestrator
+  restart recovery, local merge observation completion, and local
+  recovery-required owner-outage handling, plus Orchestrator restart recovery
+  for the published operation ledger and assignment state, and local load/soak
+  observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
@@ -95,9 +96,11 @@ Recommended next slices:
 11. Done: `test: add p7 split operation recovery smoke` - target Worker outage
    records `recovery_required`, leaves child assignments published without
    automatic rollback, and proves operator-visible Worker restart recovery.
-12. `test: add p7 split operation restart/soak smoke` - extend the split path
-   through Orchestrator restart recovery and sustained child traffic before
-   internal rollout.
-13. `feat: extend p7 executor to canonical multi-depth operations` - after the
+12. Done: `test: add p7 split operation restart smoke` - restart the
+   Orchestrator after approved legacy split publish, verify operation ledger and
+   persisted child assignments survive, then close observation after restart.
+13. `test: add p7 split operation soak smoke` - extend the split path through
+   sustained child Ping/Move traffic before internal rollout.
+14. `feat: extend p7 executor to canonical multi-depth operations` - after the
    split restart/soak gates, add canonical explicit-child operation execution
    and its local/internal evidence chain.

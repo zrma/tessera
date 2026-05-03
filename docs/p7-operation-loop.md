@@ -191,8 +191,33 @@ evidence, and verifies the ledger reaches `status=recovery_required`. It then
 restarts the target Worker and proves all child routes recover without automatic
 rollback. The smoke writes
 `.dev/reports/p7-operation-split-recovery-smoke-latest.json` plus
-`.dev/reports/p7-operation-split-recovery-ledger-latest.json`. Split restart,
-soak, and internal MicroK8s evidence remain explicit P7+ follow-up gates.
+`.dev/reports/p7-operation-split-recovery-ledger-latest.json`. The follow-up
+split restart smoke covers Orchestrator restart recovery; split soak and
+internal MicroK8s evidence remain explicit P7+ follow-up gates.
+
+Current split restart expansion smoke:
+
+```sh
+cargo xt dev p7-operation-split-restart-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-split-restart-ledger-latest.json \
+  --require-approval \
+  --require-published-execution \
+  --require-completed-observation
+```
+
+This starts a full local dev stack with both
+`TESSERA_ORCH_OPERATION_LEDGER_PATH` and
+`TESSERA_ORCH_ASSIGNMENT_STATE_PATH`, publishes an approved legacy split
+operation through the P7 executor, verifies all child routes succeed, restarts
+the Orchestrator, then proves the operation record remains in the published
+execution state and the child assignment map is restored from durable assignment
+state. Gateway child routes, Worker child actor metrics, stable-session child
+traffic, and clean close counters are verified after restart before
+`POST /operations/observations` closes the operation to `completed`. The smoke
+writes `.dev/reports/p7-operation-split-restart-smoke-latest.json` plus
+`.dev/reports/p7-operation-split-restart-ledger-latest.json`. Split soak and
+internal MicroK8s evidence remain explicit P7+ follow-up gates.
 
 Current observation smoke:
 
@@ -519,19 +544,23 @@ Each slice should be self-contained:
    records `recovery_required`, avoids automatic rollback, and recovers only
    after operator-visible Worker restart. The first repo-native smoke is
    `cargo xt dev p7-operation-split-recovery-smoke`.
-11. **Approved merge observation smoke**: verify that a published operation is
+11. **Approved split restart smoke**: verify that split operation ledger state
+   and persisted child assignments survive Orchestrator restart and can still be
+   closed with completed observation evidence. The first repo-native smoke is
+   `cargo xt dev p7-operation-split-restart-smoke`.
+12. **Approved merge observation smoke**: verify that a published operation is
    closed only after route convergence, Worker refresh, stable-session traffic,
    latency metrics, and clean close counters are recorded. The first repo-native
    smoke is `cargo xt dev p7-operation-observation-smoke`.
-12. **Approved merge recovery smoke**: verify that a post-publish owner outage
+13. **Approved merge recovery smoke**: verify that a post-publish owner outage
    records `recovery_required`, avoids automatic rollback, and recovers only
    after operator-visible Worker restart. The first repo-native smoke is
    `cargo xt dev p7-operation-recovery-smoke`.
-13. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
+14. **Internal operation helper**: add `cargo xt k8s operation-smoke` and
    `cargo xt k8s operation-report-check` so internal MicroK8s can record P7
    proposal evidence by default and approved execution/observation/soak
    evidence during a controlled smoke window.
-14. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+15. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails

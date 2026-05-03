@@ -52,11 +52,13 @@ This document is the repo-local quality map for agents. It keeps the expected au
 - P7 local operation coverage includes default-off split/merge/canonical
   multi-depth proposal and approval records, approved same-Worker merge
   execution/observation/recovery/restart/soak, and approved legacy split
-  execution, completed observation, and target-outage recovery-required handling via
-  `cargo xt dev p7-operation-split-execution-smoke` and
-  `cargo xt dev p7-operation-split-observation-smoke` and
-  `cargo xt dev p7-operation-split-recovery-smoke`. Split restart/soak and
-  canonical multi-depth operation execution remain P7+ expansion gates.
+  execution, completed observation, target-outage recovery-required handling,
+  and Orchestrator restart recovery via
+  `cargo xt dev p7-operation-split-execution-smoke`,
+  `cargo xt dev p7-operation-split-observation-smoke`,
+  `cargo xt dev p7-operation-split-recovery-smoke`, and
+  `cargo xt dev p7-operation-split-restart-smoke`. Split soak and canonical
+  multi-depth operation execution remain P7+ expansion gates.
 - P7 internal operation coverage now has a repo-native helper/verifier surface:
   `cargo xt k8s operation-smoke` records internal MicroK8s proposal evidence by
   default and can run approved execution/observation/soak when
