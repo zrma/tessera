@@ -113,6 +113,36 @@ writes `.dev/reports/p7-operation-execution-smoke-latest.json` plus
 execution, canonical multi-depth runtime execution, observation, recovery,
 restart, soak, and internal MicroK8s evidence remain explicit follow-up gates.
 
+Current internal rollout baseline:
+
+```sh
+cargo xt p6-rollout-report \
+  --context microk8s-ts \
+  --namespace tessera \
+  --image harbor.1day1coding.com/1day1coding/tessera:v2026.05.4 \
+  --rollout-revision 41875041c48bb5b8bb50f2d062172ba70342185e \
+  --cleanup-revision 41875041c48bb5b8bb50f2d062172ba70342185e \
+  --image-published \
+  --gitops-rollout-approved \
+  --post-smoke-default-off-cleanup \
+  --manual-activation-default-off \
+  --preview-fixture-removed
+cargo xt p6-rollout-report-check \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.4
+```
+
+The `v2026.05.4` rollout carries the P7 ledger/executor code and enables
+`TESSERA_ORCH_OPERATION_LEDGER_PATH=/var/lib/tessera/operation-ledger.json` on
+the live Orchestrator while leaving `TESSERA_ORCH_OPERATION_EXECUTION` and
+`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` unset/default-off. ArgoCD `tessera` is
+`Synced / Healthy` at GitOps revision
+`41875041c48bb5b8bb50f2d062172ba70342185e`, all four Tessera deployments run
+`harbor.1day1coding.com/1day1coding/tessera:v2026.05.4`, Gateway port-forward
+Ping returned `Pong { ts: 123 }`, and `GET /operations` reported
+`persistence_enabled=true`. The default topology currently returns zero
+split/merge preview plans, so approved internal P7 execution, observation,
+failure/recovery, restart, and soak remain follow-up gates.
+
 ## Slice Cadence
 
 Each slice should be self-contained:

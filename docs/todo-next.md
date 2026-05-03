@@ -1,6 +1,6 @@
 # Tessera Next Todo
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-04
 
 ## Baseline
 
@@ -21,6 +21,15 @@ Last reviewed: 2026-05-03
   preview fixtures, and left ArgoCD `tessera` `Synced / Healthy`.
 - P6 completion audit details remain in `docs/p6-completion-audit.md`. The next
   active design boundary is `docs/p7-operation-loop.md`.
+- P7 initial local/dev slices are complete through durable proposal records,
+  explicit approvals, default-off execution blocks, and approved same-Worker
+  merge execution idempotency. `v2026.05.4` has been published and promoted
+  through the k8s GitOps repo with the P7 operation ledger path enabled on the
+  live Orchestrator, while executor and split/merge activation flags remain
+  default-off. The internal baseline is ArgoCD `Synced / Healthy`, all Tessera
+  deployments on `harbor.1day1coding.com/1day1coding/tessera:v2026.05.4`,
+  Gateway Ping smoke green, and `GET /operations` reporting
+  `persistence_enabled=true`.
 
 ## Next
 
@@ -42,19 +51,23 @@ track is a durable, auditable operation loop:
    success/failure/restart/soak smoke, default-off cleanup, and verifier
    reports.
 
-Recommended first slices:
+Recommended next slices:
 
-1. `docs: open p7 operation loop` - establish the P7 checklist, completion
-   criteria, and commit/push/smoke cadence.
-2. `feat: add dynamic operation ledger` - add durable operation record types and
-   persistence without planner or activation mutation.
-3. `feat: record planner proposals` - turn live metrics and assignment listing
-   candidates into mutation-free operation proposals.
-4. `feat: gate approved operation execution` - require policy id, operator
-   approval, cooldown, and budget checks before executing a proposal.
-5. `test: verify closed-loop recovery evidence` - add local/dev smoke and
-   report checks for proposal-to-execution-to-recovery flow.
-6. `chore: roll out p7 operation loop internally` - publish image, promote via
-   GitOps, run controlled smoke, clean up default-off state, and record rollout
-   evidence.
-
+1. `test: add p7 execution observation smoke` - after a published operation,
+   record route convergence, Worker refresh, AOI/latency/close-counter evidence,
+   and transition from `observing` toward completion.
+2. `test: add p7 execution recovery smoke` - inject owner/target outage after an
+   approved execution, record `recovery_required`, verify no automatic rollback,
+   and prove operator-visible recovery.
+3. `test: add p7 execution restart smoke` - restart the Orchestrator with the
+   operation ledger and assignment state mounted, then verify operation state and
+   route convergence survive.
+4. `test: add internal p7 operation smoke` - add a repo-native `cargo xt k8s ...`
+   helper for approved P7 operation execution against a controlled GitOps smoke
+   window, with default-off cleanup and report checks.
+5. `feat: extend p7 executor beyond same-worker merge` - only after the
+   observation/recovery/restart evidence exists, add split and canonical
+   multi-depth execution gates.
+6. `test: add p7 completion audit` - aggregate local, internal, rollout, cleanup,
+   observation, recovery, restart, and soak evidence and fail until all gates are
+   backed by real artifacts.
