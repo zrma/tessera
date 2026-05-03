@@ -5890,6 +5890,13 @@ fn run_k8s_activation_smoke(options: K8sActivationSmokeOptions) -> Result<()> {
             0,
             Duration::from_secs(120),
         )?;
+        wait_for_kubectl_deploy_pods(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            0,
+            Duration::from_secs(120),
+        )?;
         let observed_failure = probe_split_convergence(&local_gateway_addr, 12_100);
         let failure_assert = observed_failure.assert_failed_only(&expected_failed_subs);
         runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
@@ -6271,6 +6278,13 @@ fn run_k8s_multi_depth_activation_smoke(
             0,
         )?;
         wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            0,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_pods(
             &context,
             &options.namespace,
             &options.target_worker_deploy,
@@ -6715,6 +6729,13 @@ fn run_k8s_merge_activation_smoke(options: K8sMergeActivationSmokeOptions) -> Re
             0,
         )?;
         wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            0,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_pods(
             &context,
             &options.namespace,
             &options.owner_worker_deploy,
@@ -7647,6 +7668,71 @@ fn wait_for_kubectl_service_ready_endpoints(
         if Instant::now() >= deadline {
             bail!(
                 "service {service} did not reach ready EndpointSlice endpoints={expected} before timeout; last ready endpoints={ready}"
+            );
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn kubectl_deploy_selector(context: &str, namespace: &str, deploy: &str) -> Result<String> {
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args(["get", "deploy", deploy, "-o", "json"]);
+    let output = command_stdout(&mut cmd)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parse Kubernetes Deployment JSON")?;
+    let labels = document
+        .pointer("/spec/selector/matchLabels")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            anyhow::anyhow!("deployment {deploy} is missing spec.selector.matchLabels")
+        })?;
+    if labels.is_empty() {
+        bail!("deployment {deploy} has an empty selector");
+    }
+    let mut selector_parts = labels
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow::anyhow!("deployment {deploy} selector label {key} is not a string")
+            })?;
+            Ok(format!("{key}={value}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    selector_parts.sort();
+    Ok(selector_parts.join(","))
+}
+
+fn kubectl_deploy_pods(context: &str, namespace: &str, deploy: &str) -> Result<u32> {
+    let selector = kubectl_deploy_selector(context, namespace, deploy)?;
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args(["get", "pods", "-l", &selector, "-o", "json"]);
+    let output = command_stdout(&mut cmd)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parse Kubernetes PodList JSON")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("PodList JSON is missing items[]"))?;
+    u32::try_from(items.len())
+        .map_err(|err| anyhow::anyhow!("pod count for deployment {deploy} overflowed u32: {err}"))
+}
+
+fn wait_for_kubectl_deploy_pods(
+    context: &str,
+    namespace: &str,
+    deploy: &str,
+    expected: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let pods = kubectl_deploy_pods(context, namespace, deploy)?;
+        if pods == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "deployment {deploy} did not reach pod count {expected} before timeout; last pod count={pods}"
             );
         }
         thread::sleep(Duration::from_secs(1));
