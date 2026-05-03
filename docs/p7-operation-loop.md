@@ -217,17 +217,40 @@ cargo xt p6-rollout-report-check \
   --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.5
 ```
 
-The `v2026.05.5` rollout carries the P7 ledger/executor/observation code and enables
-`TESSERA_ORCH_OPERATION_LEDGER_PATH=/var/lib/tessera/operation-ledger.json` on
-the live Orchestrator while leaving `TESSERA_ORCH_OPERATION_EXECUTION` and
-`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` unset/default-off. ArgoCD `tessera` is
+The `v2026.05.5` rollout carries the P7 ledger/executor/observation code. The
+initial default-off rollout enabled operation ledger persistence on the live
+Orchestrator while leaving `TESSERA_ORCH_OPERATION_EXECUTION` and
+`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` unset. ArgoCD `tessera` reached
 `Synced / Healthy` at GitOps revision
-`2c01847475ecbc65f43e9a5979449422f3ed2b4f`, all four Tessera deployments run
+`2c01847475ecbc65f43e9a5979449422f3ed2b4f`, all four Tessera deployments ran
 `harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`, Gateway port-forward
 Ping returned `Pong { ts: 123 }`, `GET /operations` reported
 `persistence_enabled=true`, and `POST /operations/proposals` returned zero plans
-without mutation for the default topology. Approved internal P7 execution,
-observation, failure/recovery, restart, and soak remain follow-up gates.
+without mutation for the default topology.
+
+On 2026-05-04 KST, the internal controlled window opened via k8s GitOps
+revisions `0d2cc86aa29be5220d14f49936c4e8e95c5b19dd` and
+`2a172c6ba6c7acb3ed15563b077c7531cd2301e1`: worker-a owned the four shallow
+merge siblings, the Orchestrator used fresh assignment-state and operation-ledger
+paths, and manual operation execution plus split/merge activation were enabled
+with a cold-sibling preview fixture. `cargo xt k8s operation-smoke
+--allow-execution --with-soak` completed operation
+`p7-merge-w0-cx0-cy0-d0-s0-1586936fe8a4`, and
+`cargo xt k8s operation-report-check --require-published-execution
+--require-completed-observation --require-soak` validated the report at
+`.dev/reports/internal-microk8s-p7-operation-smoke-latest.json`. The report
+records approved merge execution, parent-route convergence, Worker parent actor
+refresh, clean Gateway close counters, 64 successful soak pings, 64 successful
+soak moves, and completed observation.
+
+Cleanup revision `b5ae307da1309633f9b5f15df0ebb807ec364c2d` removed the manual
+execution flag, split/merge activation flag, and preview fixture while keeping
+the fresh state/ledger paths. After cleanup, ArgoCD returned to
+`Synced / Healthy`, Gateway parent Ping still returned `Pong { ts: 123 }`,
+`GET /operations` retained the completed operation record, and
+`GET /split-merge/preview` reported `assignment_listing_zero_metrics` with zero
+plans. Internal failure/recovery, restart, and completion-audit evidence remain
+follow-up gates.
 
 Current internal operation helper:
 

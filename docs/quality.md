@@ -55,6 +55,8 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `--allow-execution --with-soak` is used during a controlled smoke window.
   `cargo xt k8s operation-report-check` validates the resulting operation
   ledger, parent route convergence, Worker refresh, traffic, close counters,
-  and soak evidence. Live approved internal evidence still requires image
-  publish, GitOps rollout, controlled flags, fresh ledger path, and cleanup.
+  and soak evidence. The `v2026.05.5` internal controlled window has passed
+  approved execution, completed observation, parent-route soak, and default-off
+  cleanup; failure/recovery, restart, and completion audit remain separate P7
+  gates.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
