@@ -28,10 +28,11 @@ Last reviewed: 2026-05-04
   target-outage recovery-required handling, approved legacy split Orchestrator
   restart recovery, approved legacy split load/soak observation completion,
   approved canonical multi-depth split execution success/idempotency, approved
-  canonical multi-depth observation completion, local merge observation
-  completion, and local recovery-required owner-outage handling, plus
-  Orchestrator restart recovery for the published operation ledger and
-  assignment state, and local load/soak observation completion.
+  canonical multi-depth observation completion, approved canonical multi-depth
+  target-outage recovery-required handling, local merge observation completion,
+  and local recovery-required owner-outage handling, plus Orchestrator restart
+  recovery for the published operation ledger and assignment state, and local
+  load/soak observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
@@ -112,7 +113,11 @@ Recommended next slices:
    canonical multi-depth operation path with Gateway/Worker child route
    convergence, stable-session child Move, remote AOI resync, clean counters,
    and completed observation evidence.
-16. `test: add p7 multi-depth operation recovery smoke` - target Worker outage
-   should record `recovery_required`, preserve canonical child assignments
-   without automatic rollback, and verify operator-visible Worker restart
+16. Done: `test: add p7 multi-depth operation recovery smoke` - target Worker
+   outage records `recovery_required`, preserves canonical child assignments
+   without automatic rollback, and verifies operator-visible Worker restart
    recovery.
+17. `test: add p7 multi-depth operation restart smoke` - restart the
+   Orchestrator after approved canonical multi-depth publish, verify operation
+   ledger and persisted canonical child assignments survive, then close
+   observation after restart.
