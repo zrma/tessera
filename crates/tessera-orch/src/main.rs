@@ -346,6 +346,27 @@ struct OperationExecutionRequest {
     policy_id: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct OperationObservationWriteResponse {
+    schema: String,
+    operation_id: String,
+    status: &'static str,
+    assignments_changed: bool,
+    observation_accepted: bool,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct OperationObservationRequest {
+    operation_id: String,
+    expected_proposal_hash: String,
+    observer: String,
+    route_converged: bool,
+    worker_refreshed: bool,
+    traffic_confirmed: bool,
+    counters_clean: bool,
+}
+
 struct OperationActivationResult {
     published: bool,
     assignments_changed: bool,
@@ -1466,6 +1487,23 @@ fn operation_execution_disabled_reason() -> String {
 
 fn split_merge_activation_disabled_reason() -> String {
     "split/merge activation is disabled; set TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual before operation execution".to_string()
+}
+
+fn operation_observation_missing(request: &OperationObservationRequest) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !request.route_converged {
+        missing.push("route_converged");
+    }
+    if !request.worker_refreshed {
+        missing.push("worker_refreshed");
+    }
+    if !request.traffic_confirmed {
+        missing.push("traffic_confirmed");
+    }
+    if !request.counters_clean {
+        missing.push("counters_clean");
+    }
+    missing
 }
 
 fn operation_execution_kind_disabled_reason(kind: DynamicOperationKind) -> String {
@@ -2638,6 +2676,130 @@ impl OrchestratorService {
                 mutation_attempted: true,
                 mutation_allowed: true,
                 reason: result.reason,
+            })
+        }
+    }
+
+    async fn record_operation_observation(
+        &self,
+        request: OperationObservationRequest,
+        now: SystemTime,
+    ) -> Result<OperationObservationWriteResponse, String> {
+        let Some(path) = self.operation_ledger_path.as_ref() else {
+            return Err(
+                "operation ledger persistence is disabled; set TESSERA_ORCH_OPERATION_LEDGER_PATH"
+                    .to_string(),
+            );
+        };
+        if request.observer.trim().is_empty() {
+            return Err("observer must not be empty".to_string());
+        }
+        let now_unix_secs = unix_timestamp_secs(now);
+        let mut ledger = self.operation_ledger.write().await;
+        let mut next_ledger = ledger.clone();
+        let Some(record) = next_ledger
+            .records
+            .iter_mut()
+            .find(|record| record.operation_id == request.operation_id)
+        else {
+            return Err(format!("operation_id={} not found", request.operation_id));
+        };
+        if record.proposal.proposal_hash != request.expected_proposal_hash {
+            return Err(format!(
+                "operation_id={} expected_proposal_hash does not match proposal_hash",
+                request.operation_id
+            ));
+        }
+        if record
+            .phases
+            .iter()
+            .any(|phase| phase.name == "observation_completed")
+        {
+            return Ok(OperationObservationWriteResponse {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                operation_id: request.operation_id,
+                status: "already_completed",
+                assignments_changed: false,
+                observation_accepted: true,
+                reason: "operation observation was already completed; idempotent no-op".to_string(),
+            });
+        }
+        if let Some(existing) = record
+            .phases
+            .iter()
+            .find(|phase| phase.name == "observation_failed")
+        {
+            return Ok(OperationObservationWriteResponse {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                operation_id: request.operation_id,
+                status: "already_recovery_required",
+                assignments_changed: false,
+                observation_accepted: false,
+                reason: existing.reason.clone(),
+            });
+        }
+        if !record
+            .phases
+            .iter()
+            .any(|phase| phase.name == "execution_published")
+        {
+            return Err(format!(
+                "operation_id={} must have execution_published before observation",
+                request.operation_id
+            ));
+        }
+
+        let missing = operation_observation_missing(&request);
+        if missing.is_empty() {
+            let reason = format!(
+                "observer={} confirmed route_converged, worker_refreshed, traffic_confirmed, counters_clean",
+                request.observer
+            );
+            record.status = OperationStatus::Completed;
+            record.updated_unix_secs = now_unix_secs;
+            record.phases.push(OperationPhase {
+                name: "observation_completed".to_string(),
+                state: OperationPhaseState::Succeeded,
+                unix_secs: now_unix_secs,
+                reason: reason.clone(),
+            });
+            write_operation_ledger_file(path.as_path(), &next_ledger).map_err(|err| {
+                format!("persist operation ledger to {}: {err:#}", path.display())
+            })?;
+            *ledger = next_ledger;
+            Ok(OperationObservationWriteResponse {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                operation_id: request.operation_id,
+                status: "completed",
+                assignments_changed: false,
+                observation_accepted: true,
+                reason,
+            })
+        } else {
+            let reason = format!(
+                "observer={} reported incomplete observation; missing={}",
+                request.observer,
+                missing.join(",")
+            );
+            record.status = OperationStatus::RecoveryRequired;
+            record.updated_unix_secs = now_unix_secs;
+            record.phases.push(OperationPhase {
+                name: "observation_failed".to_string(),
+                state: OperationPhaseState::Failed,
+                unix_secs: now_unix_secs,
+                reason: reason.clone(),
+            });
+            write_operation_ledger_file(path.as_path(), &next_ledger).map_err(|err| {
+                format!("persist operation ledger to {}: {err:#}", path.display())
+            })?;
+            *ledger = next_ledger;
+            Ok(OperationObservationWriteResponse {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                operation_id: request.operation_id,
+                status: "recovery_required",
+                assignments_changed: false,
+                observation_accepted: false,
+                reason,
             })
         }
     }
@@ -3818,6 +3980,33 @@ fn parse_operation_execution_request(query: &str) -> Result<OperationExecutionRe
     })
 }
 
+fn parse_operation_observation_request(query: &str) -> Result<OperationObservationRequest, String> {
+    let params = parse_query_params(query)?;
+    Ok(OperationObservationRequest {
+        operation_id: required_query_param(&params, "operation_id")?.to_string(),
+        expected_proposal_hash: required_query_param(&params, "expected_proposal_hash")?
+            .to_string(),
+        observer: required_query_param(&params, "observer")?.to_string(),
+        route_converged: required_bool_query_param(&params, "route_converged")?,
+        worker_refreshed: required_bool_query_param(&params, "worker_refreshed")?,
+        traffic_confirmed: required_bool_query_param(&params, "traffic_confirmed")?,
+        counters_clean: required_bool_query_param(&params, "counters_clean")?,
+    })
+}
+
+fn required_bool_query_param(params: &HashMap<String, String>, key: &str) -> Result<bool, String> {
+    match required_query_param(params, key)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        value => Err(format!(
+            "invalid boolean query parameter `{key}`={value}; expected true or false"
+        )),
+    }
+}
+
 fn parse_query_params(query: &str) -> Result<HashMap<String, String>, String> {
     let mut params = HashMap::new();
     if query.trim().is_empty() {
@@ -4570,6 +4759,39 @@ async fn handle_prometheus_metrics_request(
                 .await?;
             }
         }
+    } else if method == "POST" && path == "/operations/observations" {
+        match parse_operation_observation_request(query) {
+            Ok(request) => match service
+                .record_operation_observation(request, SystemTime::now())
+                .await
+            {
+                Ok(response) => {
+                    let body = serde_json::to_string_pretty(&response)
+                        .context("serialize operation observation write response")?;
+                    write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
+                }
+                Err(reason) => {
+                    let status = if reason.contains("TESSERA_ORCH_OPERATION_LEDGER_PATH") {
+                        "409 Conflict"
+                    } else {
+                        "400 Bad Request"
+                    };
+                    let body = format!("operation observation unavailable: {reason}\n");
+                    write_http_response(&mut stream, status, "text/plain; charset=utf-8", &body)
+                        .await?;
+                }
+            },
+            Err(reason) => {
+                let body = format!("operation observation request invalid: {reason}\n");
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    &body,
+                )
+                .await?;
+            }
+        }
     } else {
         write_http_response(
             &mut stream,
@@ -5268,6 +5490,25 @@ mod tests {
                 reason: "planner proposal persisted without assignment mutation".to_string(),
             }],
         }
+    }
+
+    fn sample_observing_operation_record(operation_id: &str) -> OperationRecord {
+        let mut record = sample_operation_record(operation_id);
+        record.status = OperationStatus::Observing;
+        record.updated_unix_secs = 121;
+        record.phases.push(OperationPhase {
+            name: "execution_started".to_string(),
+            state: OperationPhaseState::Succeeded,
+            unix_secs: 120,
+            reason: "operation execution passed policy gates and started activation".to_string(),
+        });
+        record.phases.push(OperationPhase {
+            name: "execution_published".to_string(),
+            state: OperationPhaseState::Succeeded,
+            unix_secs: 121,
+            reason: "merge activation published".to_string(),
+        });
+        record
     }
 
     fn spawn_split_replay_ack_server(
@@ -7215,6 +7456,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_ledger_observation_completes_published_operation_idempotently() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-observation-complete");
+        let record = sample_observing_operation_record("observe-complete-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let before = service.listing().await;
+        let request = OperationObservationRequest {
+            operation_id: "observe-complete-op".to_string(),
+            expected_proposal_hash: proposal_hash,
+            observer: "unit-test".to_string(),
+            route_converged: true,
+            worker_refreshed: true,
+            traffic_confirmed: true,
+            counters_clean: true,
+        };
+
+        let response = service
+            .record_operation_observation(
+                request.clone(),
+                UNIX_EPOCH + std::time::Duration::from_secs(600),
+            )
+            .await
+            .expect("record observation");
+        let repeat = service
+            .record_operation_observation(request, UNIX_EPOCH + std::time::Duration::from_secs(601))
+            .await
+            .expect("repeat observation");
+        let after = service.listing().await;
+
+        assert_eq!(response.status, "completed");
+        assert!(response.observation_accepted);
+        assert!(!response.assignments_changed);
+        assert_eq!(repeat.status, "already_completed");
+        assert_eq!(before, after);
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        let record = &loaded.records[0];
+        assert_eq!(record.status, OperationStatus::Completed);
+        assert_eq!(
+            record
+                .phases
+                .iter()
+                .filter(|phase| phase.name == "observation_completed")
+                .count(),
+            1
+        );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_observation_marks_recovery_required_for_failed_checks() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-observation-failed");
+        let record = sample_observing_operation_record("observe-failed-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let request = OperationObservationRequest {
+            operation_id: "observe-failed-op".to_string(),
+            expected_proposal_hash: proposal_hash,
+            observer: "unit-test".to_string(),
+            route_converged: true,
+            worker_refreshed: false,
+            traffic_confirmed: true,
+            counters_clean: true,
+        };
+
+        let response = service
+            .record_operation_observation(
+                request.clone(),
+                UNIX_EPOCH + std::time::Duration::from_secs(600),
+            )
+            .await
+            .expect("record failed observation");
+        let repeat = service
+            .record_operation_observation(request, UNIX_EPOCH + std::time::Duration::from_secs(601))
+            .await
+            .expect("repeat failed observation");
+
+        assert_eq!(response.status, "recovery_required");
+        assert!(!response.observation_accepted);
+        assert!(response.reason.contains("worker_refreshed"));
+        assert_eq!(repeat.status, "already_recovery_required");
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        let record = &loaded.records[0];
+        assert_eq!(record.status, OperationStatus::RecoveryRequired);
+        assert_eq!(
+            record
+                .phases
+                .iter()
+                .filter(|phase| phase.name == "observation_failed")
+                .count(),
+            1
+        );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_observation_rejects_unpublished_execution() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-observation-unpublished");
+        let record = sample_operation_record("observe-unpublished-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+
+        let err = service
+            .record_operation_observation(
+                OperationObservationRequest {
+                    operation_id: "observe-unpublished-op".to_string(),
+                    expected_proposal_hash: proposal_hash,
+                    observer: "unit-test".to_string(),
+                    route_converged: true,
+                    worker_refreshed: true,
+                    traffic_confirmed: true,
+                    counters_clean: true,
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(600),
+            )
+            .await
+            .expect_err("observation before execution should fail");
+
+        assert!(err.contains("execution_published"));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::Proposed);
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
     async fn operation_ledger_execution_keeps_split_runtime_default_off_in_manual_mode() {
         let ledger_path = unique_assignment_state_path("operation-ledger-execution-split-manual");
         let mut record = sample_operation_record("execute-split-manual-op");
@@ -8565,6 +8972,61 @@ mod tests {
         assert!(response.contains(r#""mutation_attempted": false"#));
         let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
         assert_eq!(loaded.records[0].status, OperationStatus::BlockedByPolicy);
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_records_completed_observation() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http-observation");
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![sample_observing_operation_record("http-observe-op")],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind observation listener");
+        let addr = listener.local_addr().expect("observation listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept observation request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle observation request");
+        });
+
+        let request = b"POST /operations/observations?operation_id=http-observe-op&expected_proposal_hash=proposal-hash-1&observer=http-test&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("connect observations");
+        client
+            .write_all(request)
+            .await
+            .expect("write observation request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read observation response");
+        server.await.expect("observation server task");
+
+        let response = String::from_utf8(response).expect("utf8 observation response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains(r#""status": "completed""#));
+        assert!(response.contains(r#""observation_accepted": true"#));
+        assert!(response.contains(r#""assignments_changed": false"#));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::Completed);
         let _ = fs::remove_file(ledger_path);
     }
 }
