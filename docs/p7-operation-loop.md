@@ -1,6 +1,6 @@
 # P7 Operation Loop
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-04
 
 ## Objective
 
@@ -73,6 +73,8 @@ cargo xt p7-operation-ledger-check \
 This validates the first proposal -> approval -> default-off blocked execution
 artifact. It is not a replacement for runtime execution, observation,
 recovery, internal rollout, or final P7 completion audit evidence.
+Approved execution ledgers use the same checker with
+`--require-published-execution`.
 
 Current local closed-loop smoke:
 
@@ -89,7 +91,26 @@ split, merge, and canonical multi-depth preview candidates, records proposal ->
 approval -> default-off execution block for each path, and writes
 `.dev/reports/p7-operation-loop-smoke-latest.json` plus
 `.dev/reports/p7-operation-loop-ledger-latest.json`. It still covers only
-default-off execution. Approved runtime execution, observation, recovery,
+default-off execution.
+
+Current approved execution smoke:
+
+```sh
+cargo xt dev p7-operation-execution-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-execution-ledger-latest.json \
+  --require-approval \
+  --require-published-execution
+```
+
+This starts an Orchestrator-only dev stack with
+`TESSERA_ORCH_OPERATION_EXECUTION=manual` and
+`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`, records proposal -> approval ->
+published execution for an approved same-Worker merge operation, verifies that a
+repeat execution returns `already_published` without another mutation, and
+writes `.dev/reports/p7-operation-execution-smoke-latest.json` plus
+`.dev/reports/p7-operation-execution-ledger-latest.json`. Split runtime
+execution, canonical multi-depth runtime execution, observation, recovery,
 restart, soak, and internal MicroK8s evidence remain explicit follow-up gates.
 
 ## Slice Cadence
@@ -126,18 +147,24 @@ Each slice should be self-contained:
    kind. The first write surface is `POST /operations/approvals?...`; it
    approves an existing proposal only when the supplied proposal hash still
    matches and still leaves execution mutation disabled.
-5. **Executor dry run**: report blocked execution by default and approved
-   execution only under explicit policy. The first surface is
+5. **Executor dry run and first manual execution**: report blocked execution by
+   default and approved execution only under explicit policy. The first surface is
    `POST /operations/executions?...`, which evaluates proposal hash,
-   approval, policy, TTL, cooldown, and budget metadata but records only a
-   durable `blocked_by_policy` phase/status while runtime mutation remains
-   default-off.
+   approval, policy, TTL, cooldown, and budget metadata. Default-off execution
+   records a durable `blocked_by_policy` phase/status. A controlled execution
+   window additionally requires `TESSERA_ORCH_OPERATION_EXECUTION=manual` and
+   `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`; the first runtime mutation path
+   is approved same-Worker merge publish with idempotent repeat execution.
 6. **Closed-loop smoke**: verify proposal-to-approval-to-execution locally for
    split, merge, and canonical multi-depth paths. The first repo-native smoke is
    `cargo xt dev p7-operation-loop-smoke`, which covers split/merge/canonical
    multi-depth proposal -> approval -> default-off execution block without
    assignment mutation.
-7. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+7. **Approved merge execution smoke**: verify that an approved same-Worker merge
+   operation can publish once through the P7 executor and that duplicate execute
+   calls are idempotent. The first repo-native smoke is
+   `cargo xt dev p7-operation-execution-smoke`.
+8. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails
