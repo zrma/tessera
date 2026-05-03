@@ -27,10 +27,11 @@ Last reviewed: 2026-05-04
   approved legacy split observation completion, approved legacy split
   target-outage recovery-required handling, approved legacy split Orchestrator
   restart recovery, approved legacy split load/soak observation completion,
-  approved canonical multi-depth split execution success/idempotency, local
-  merge observation completion, and local recovery-required owner-outage
-  handling, plus Orchestrator restart recovery for the published operation
-  ledger and assignment state, and local load/soak observation completion.
+  approved canonical multi-depth split execution success/idempotency, approved
+  canonical multi-depth observation completion, local merge observation
+  completion, and local recovery-required owner-outage handling, plus
+  Orchestrator restart recovery for the published operation ledger and
+  assignment state, and local load/soak observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
@@ -107,6 +108,11 @@ Recommended next slices:
    assignments once, removes the canonical parent assignment, proves Gateway
    child route convergence, stable-session child Move, remote AOI resync, and
    repeat execution idempotency.
-15. `test: add p7 multi-depth operation observation smoke` - close the canonical
-   multi-depth operation path with completed observation evidence before moving
-   to failure/restart/soak and internal MicroK8s rollout.
+15. Done: `test: add p7 multi-depth operation observation smoke` - close the
+   canonical multi-depth operation path with Gateway/Worker child route
+   convergence, stable-session child Move, remote AOI resync, clean counters,
+   and completed observation evidence.
+16. `test: add p7 multi-depth operation recovery smoke` - target Worker outage
+   should record `recovery_required`, preserve canonical child assignments
+   without automatic rollback, and verify operator-visible Worker restart
+   recovery.
