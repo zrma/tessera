@@ -24,10 +24,11 @@ Last reviewed: 2026-05-04
 - P7 initial local/dev slices are complete through durable proposal records,
   explicit approvals, default-off execution blocks, approved same-Worker merge
   execution idempotency, approved legacy split execution success/idempotency,
-  approved legacy split observation completion, local merge observation
-  completion, and local recovery-required owner-outage handling, plus
-  Orchestrator restart recovery for the published operation ledger and
-  assignment state, and local load/soak observation completion.
+  approved legacy split observation completion, approved legacy split
+  target-outage recovery-required handling, local merge observation completion,
+  and local recovery-required owner-outage handling, plus Orchestrator restart
+  recovery for the published operation ledger and assignment state, and local
+  load/soak observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
@@ -91,9 +92,12 @@ Recommended next slices:
 10. Done: `test: add p7 split operation observation smoke` - close the split
    execution path with Gateway child route convergence, Worker child refresh,
    child traffic, metrics, and `completed` observation evidence.
-11. `test: add p7 split operation recovery/restart/soak smoke` - extend the
-   split path through target outage recovery, Orchestrator restart recovery, and
-   sustained child traffic before internal rollout.
-12. `feat: extend p7 executor to canonical multi-depth operations` - after the
-   split observation/recovery/restart/soak gates, add canonical explicit-child
-   operation execution and its local/internal evidence chain.
+11. Done: `test: add p7 split operation recovery smoke` - target Worker outage
+   records `recovery_required`, leaves child assignments published without
+   automatic rollback, and proves operator-visible Worker restart recovery.
+12. `test: add p7 split operation restart/soak smoke` - extend the split path
+   through Orchestrator restart recovery and sustained child traffic before
+   internal rollout.
+13. `feat: extend p7 executor to canonical multi-depth operations` - after the
+   split restart/soak gates, add canonical explicit-child operation execution
+   and its local/internal evidence chain.
