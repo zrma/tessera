@@ -34,6 +34,7 @@ use tracing::{error, info, warn};
 
 const HANDOVER_COMMIT_RETRY_LIMIT: u32 = 3;
 const ASSIGNMENT_STATE_SCHEMA: &str = "tessera.orch.assignment_state.v1";
+const OPERATION_LEDGER_SCHEMA: &str = "tessera.orch.operation_ledger.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplitActivationMode {
@@ -72,6 +73,20 @@ fn load_assignment_state_path() -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(trimmed)))
 }
 
+fn load_operation_ledger_path() -> Result<Option<PathBuf>> {
+    let Ok(raw) = std::env::var("TESSERA_ORCH_OPERATION_LEDGER_PATH") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(trimmed)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -81,16 +96,19 @@ async fn main() -> Result<()> {
         load_split_activation_mode().context("load split/merge activation mode")?;
     let assignment_state_path =
         load_assignment_state_path().context("load orchestrator assignment state path")?;
+    let operation_ledger_path =
+        load_operation_ledger_path().context("load orchestrator operation ledger path")?;
     let addr_raw =
         std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
     let listen_addr = resolve_socket_addr(&addr_raw)
         .await
         .with_context(|| format!("resolve TESSERA_ORCH_ADDR={addr_raw}"))?;
 
-    let service = OrchestratorService::try_new_with_split_activation(
+    let service = OrchestratorService::try_new_with_persistence(
         config,
         split_activation_mode,
         assignment_state_path,
+        operation_ledger_path,
     )?;
     let metrics_listener = load_metrics_listener().await?;
     info!(target: "orch", %listen_addr, "tessera-orch listening");
@@ -150,6 +168,104 @@ struct AssignmentStateFile {
 struct AssignmentStateWorker {
     worker_id: String,
     cells: Vec<CellId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OperationLedgerFile {
+    schema: String,
+    records: Vec<OperationRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OperationRecord {
+    operation_id: String,
+    kind: DynamicOperationKind,
+    status: OperationStatus,
+    created_unix_secs: u64,
+    updated_unix_secs: u64,
+    proposal: OperationProposal,
+    approval: Option<OperationApproval>,
+    phases: Vec<OperationPhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DynamicOperationKind {
+    Split,
+    Merge,
+    MultiDepthSplit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationStatus {
+    Proposed,
+    BlockedByPolicy,
+    Approved,
+    Executing,
+    Observing,
+    RecoveryRequired,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OperationProposal {
+    source: String,
+    proposal_hash: String,
+    parent: Option<CellId>,
+    targets: Vec<OperationTarget>,
+    preconditions: Vec<String>,
+    submission_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OperationTarget {
+    cell: CellId,
+    worker_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OperationApproval {
+    policy_id: String,
+    approver: String,
+    approved_unix_secs: u64,
+    expires_unix_secs: u64,
+    expected_proposal_hash: String,
+    cooldown_key: String,
+    budget_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OperationPhase {
+    name: String,
+    state: OperationPhaseState,
+    unix_secs: u64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationPhaseState {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationLedgerSnapshot {
+    schema: String,
+    persistence_enabled: bool,
+    records: Vec<OperationRecord>,
+}
+
+impl OperationLedgerFile {
+    fn empty() -> Self {
+        Self {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: Vec::new(),
+        }
+    }
 }
 
 impl Config {
@@ -540,6 +656,192 @@ fn assignment_state_tmp_path(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("assignment-state.json");
+    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
+}
+
+fn validate_operation_ledger(ledger: &OperationLedgerFile) -> Result<()> {
+    if ledger.schema != OPERATION_LEDGER_SCHEMA {
+        return Err(anyhow!(
+            "operation ledger schema must be {}; got {}",
+            OPERATION_LEDGER_SCHEMA,
+            ledger.schema
+        ));
+    }
+    let mut seen_operations = HashMap::new();
+    for record in &ledger.records {
+        let operation_id = record.operation_id.trim();
+        if operation_id.is_empty() {
+            return Err(anyhow!("operation ledger operation_id must not be empty"));
+        }
+        if seen_operations
+            .insert(operation_id.to_string(), ())
+            .is_some()
+        {
+            return Err(anyhow!(
+                "operation ledger contains duplicate operation_id={operation_id}"
+            ));
+        }
+        if record.updated_unix_secs < record.created_unix_secs {
+            return Err(anyhow!(
+                "operation ledger operation_id={operation_id} has updated_unix_secs before created_unix_secs"
+            ));
+        }
+        validate_operation_proposal(operation_id, &record.proposal)?;
+        if let Some(approval) = &record.approval {
+            validate_operation_approval(operation_id, &record.proposal, approval)?;
+        }
+        for phase in &record.phases {
+            validate_operation_phase(operation_id, phase)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_proposal(operation_id: &str, proposal: &OperationProposal) -> Result<()> {
+    if proposal.source.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} proposal.source must not be empty"
+        ));
+    }
+    if proposal.proposal_hash.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} proposal.proposal_hash must not be empty"
+        ));
+    }
+    if proposal.submission_command.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} proposal.submission_command must not be empty"
+        ));
+    }
+    let mut seen_targets = HashMap::new();
+    for target in &proposal.targets {
+        if target.worker_id.trim().is_empty() {
+            return Err(anyhow!(
+                "operation ledger operation_id={operation_id} target.worker_id must not be empty"
+            ));
+        }
+        if let Some(prev_worker) = seen_targets.insert(target.cell, target.worker_id.as_str()) {
+            return Err(anyhow!(
+                "operation ledger operation_id={operation_id} assigns target cell world={},cx={},cy={},depth={},sub={} to both {} and {}",
+                target.cell.world,
+                target.cell.cx,
+                target.cell.cy,
+                target.cell.depth,
+                target.cell.sub,
+                prev_worker,
+                target.worker_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_operation_approval(
+    operation_id: &str,
+    proposal: &OperationProposal,
+    approval: &OperationApproval,
+) -> Result<()> {
+    if approval.policy_id.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval.policy_id must not be empty"
+        ));
+    }
+    if approval.approver.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval.approver must not be empty"
+        ));
+    }
+    if approval.expires_unix_secs <= approval.approved_unix_secs {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval must expire after approval time"
+        ));
+    }
+    if approval.expected_proposal_hash != proposal.proposal_hash {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval expected_proposal_hash does not match proposal_hash"
+        ));
+    }
+    if approval.cooldown_key.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval.cooldown_key must not be empty"
+        ));
+    }
+    if approval.budget_key.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval.budget_key must not be empty"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_phase(operation_id: &str, phase: &OperationPhase) -> Result<()> {
+    if phase.name.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} phase.name must not be empty"
+        ));
+    }
+    if phase.reason.trim().is_empty() {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} phase.reason must not be empty"
+        ));
+    }
+    Ok(())
+}
+
+fn load_operation_ledger_file(path: &Path) -> Result<OperationLedgerFile> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read orchestrator operation ledger from {}", path.display()))?;
+    let ledger: OperationLedgerFile =
+        serde_json::from_str(&raw).context("parse orchestrator operation ledger as JSON")?;
+    validate_operation_ledger(&ledger)?;
+    Ok(ledger)
+}
+
+fn load_initial_operation_ledger(path: Option<&Path>) -> Result<OperationLedgerFile> {
+    let Some(path) = path else {
+        return Ok(OperationLedgerFile::empty());
+    };
+    if path
+        .try_exists()
+        .with_context(|| format!("check operation ledger path {}", path.display()))?
+    {
+        return load_operation_ledger_file(path);
+    }
+    let ledger = OperationLedgerFile::empty();
+    write_operation_ledger_file(path, &ledger)?;
+    Ok(ledger)
+}
+
+fn write_operation_ledger_file(path: &Path, ledger: &OperationLedgerFile) -> Result<()> {
+    validate_operation_ledger(ledger)?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create operation ledger dir {}", parent.display()))?;
+    }
+    let body = format!(
+        "{}\n",
+        serde_json::to_string_pretty(ledger).context("serialize orchestrator operation ledger")?
+    );
+    let tmp_path = operation_ledger_tmp_path(path);
+    fs::write(&tmp_path, body)
+        .with_context(|| format!("write operation ledger temp file {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "atomically replace operation ledger {} from {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn operation_ledger_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("operation-ledger.json");
     path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
 }
 
@@ -1194,10 +1496,12 @@ struct OrchestratorService {
     runtime: Arc<RwLock<HashMap<String, WorkerRuntime>>>,
     handovers: Arc<RwLock<HashMap<CellId, HandoverRuntime>>>,
     staged_splits: Arc<RwLock<HashMap<CellId, StagedSplitActivation>>>,
+    operation_ledger: Arc<RwLock<OperationLedgerFile>>,
     listing_tx: watch::Sender<AssignmentListing>,
     metrics: Arc<OrchestratorMetricsCounters>,
     split_activation_mode: SplitActivationMode,
     assignment_state_path: Option<Arc<PathBuf>>,
+    operation_ledger_persistence_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1223,14 +1527,27 @@ impl OrchestratorService {
             .expect("construct orchestrator service")
     }
 
+    #[cfg(test)]
     fn try_new_with_split_activation(
         config: Config,
         split_activation_mode: SplitActivationMode,
         assignment_state_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::try_new_with_persistence(config, split_activation_mode, assignment_state_path, None)
+    }
+
+    fn try_new_with_persistence(
+        config: Config,
+        split_activation_mode: SplitActivationMode,
+        assignment_state_path: Option<PathBuf>,
+        operation_ledger_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let config = Arc::new(config);
         let initial_assignments =
             load_initial_assignments(&config, assignment_state_path.as_deref())?;
+        let initial_operation_ledger =
+            load_initial_operation_ledger(operation_ledger_path.as_deref())?;
+        let operation_ledger_persistence_enabled = operation_ledger_path.is_some();
         let initial_listing = listing_with_runtime(
             &config,
             &initial_assignments,
@@ -1244,10 +1561,12 @@ impl OrchestratorService {
             runtime: Arc::new(RwLock::new(HashMap::new())),
             handovers: Arc::new(RwLock::new(HashMap::new())),
             staged_splits: Arc::new(RwLock::new(HashMap::new())),
+            operation_ledger: Arc::new(RwLock::new(initial_operation_ledger)),
             listing_tx,
             metrics: Arc::new(OrchestratorMetricsCounters::default()),
             split_activation_mode,
             assignment_state_path: assignment_state_path.map(Arc::new),
+            operation_ledger_persistence_enabled,
         })
     }
 
@@ -1278,6 +1597,15 @@ impl OrchestratorService {
         // `send_replace` updates the stored value even when there are no receivers yet.
         let _ = self.listing_tx.send_replace(listing);
         self.metrics.listing_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn operation_ledger_snapshot(&self) -> OperationLedgerSnapshot {
+        let ledger = self.operation_ledger.read().await;
+        OperationLedgerSnapshot {
+            schema: ledger.schema.clone(),
+            persistence_enabled: self.operation_ledger_persistence_enabled,
+            records: ledger.records.clone(),
+        }
     }
 
     fn persist_assignment_map(&self, assignments: &AssignmentMap) -> Result<(), String> {
@@ -3032,6 +3360,11 @@ async fn handle_prometheus_metrics_request(
                 .await?;
             }
         }
+    } else if method == "GET" && path == "/operations" {
+        let snapshot = service.operation_ledger_snapshot().await;
+        let body = serde_json::to_string_pretty(&snapshot)
+            .context("serialize operation ledger response")?;
+        write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
     } else {
         write_http_response(
             &mut stream,
@@ -3678,6 +4011,43 @@ mod tests {
             "tessera-orch-{name}-{}-{nanos}.json",
             std::process::id()
         ))
+    }
+
+    fn sample_operation_record(operation_id: &str) -> OperationRecord {
+        OperationRecord {
+            operation_id: operation_id.to_string(),
+            kind: DynamicOperationKind::Split,
+            status: OperationStatus::Proposed,
+            created_unix_secs: 100,
+            updated_unix_secs: 100,
+            proposal: OperationProposal {
+                source: "live_worker_metrics:worker-a=127.0.0.1:5100".to_string(),
+                proposal_hash: "proposal-hash-1".to_string(),
+                parent: Some(CellId::grid(0, 0, 0)),
+                targets: vec![
+                    OperationTarget {
+                        cell: split_child_cell(CellId::grid(0, 0, 0), 0),
+                        worker_id: "worker-a".to_string(),
+                    },
+                    OperationTarget {
+                        cell: split_child_cell(CellId::grid(0, 0, 0), 1),
+                        worker_id: "worker-b".to_string(),
+                    },
+                ],
+                preconditions: vec![
+                    "source worker registered".to_string(),
+                    "target worker registered".to_string(),
+                ],
+                submission_command: "cargo xt split-activation --operation-id op-1".to_string(),
+            },
+            approval: None,
+            phases: vec![OperationPhase {
+                name: "proposal_recorded".to_string(),
+                state: OperationPhaseState::Succeeded,
+                unix_secs: 100,
+                reason: "planner proposal persisted without assignment mutation".to_string(),
+            }],
+        }
     }
 
     fn spawn_split_replay_ack_server(
@@ -5050,6 +5420,81 @@ mod tests {
     }
 
     #[test]
+    fn operation_ledger_round_trips_proposal_records() {
+        let ledger_path = unique_assignment_state_path("operation-ledger");
+        let record = sample_operation_record("op-1");
+        let ledger = OperationLedgerFile {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: vec![record.clone()],
+        };
+
+        write_operation_ledger_file(&ledger_path, &ledger).expect("write operation ledger");
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+
+        assert_eq!(loaded.schema, OPERATION_LEDGER_SCHEMA);
+        assert_eq!(loaded.records, vec![record]);
+        let raw = fs::read_to_string(&ledger_path).expect("read ledger json");
+        assert!(raw.contains(OPERATION_LEDGER_SCHEMA));
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn operation_ledger_rejects_duplicate_operation_id() {
+        let ledger = OperationLedgerFile {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: vec![
+                sample_operation_record("duplicate-op"),
+                sample_operation_record("duplicate-op"),
+            ],
+        };
+
+        let err = validate_operation_ledger(&ledger).expect_err("duplicate id should fail");
+        assert!(err.to_string().contains("duplicate operation_id"));
+    }
+
+    #[test]
+    fn operation_ledger_rejects_mismatched_approval_hash() {
+        let mut record = sample_operation_record("approved-op");
+        record.status = OperationStatus::Approved;
+        record.approval = Some(OperationApproval {
+            policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+            approver: "operator".to_string(),
+            approved_unix_secs: 100,
+            expires_unix_secs: 200,
+            expected_proposal_hash: "other-hash".to_string(),
+            cooldown_key: "world-0".to_string(),
+            budget_key: "dynamic-ops-daily".to_string(),
+        });
+        let ledger = OperationLedgerFile {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: vec![record],
+        };
+
+        let err = validate_operation_ledger(&ledger).expect_err("mismatched hash should fail");
+        assert!(err.to_string().contains("expected_proposal_hash"));
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_path_initializes_empty_read_only_snapshot() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-init");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+
+        let snapshot = service.operation_ledger_snapshot().await;
+        assert_eq!(snapshot.schema, OPERATION_LEDGER_SCHEMA);
+        assert!(snapshot.persistence_enabled);
+        assert!(snapshot.records.is_empty());
+        let raw = fs::read_to_string(&ledger_path).expect("read initialized ledger");
+        assert!(raw.contains(OPERATION_LEDGER_SCHEMA));
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[test]
     fn parse_config_single_worker() {
         let json = r#"
         {
@@ -6073,5 +6518,48 @@ mod tests {
         assert!(response.contains(r#""mode": "dry_run""#));
         assert!(response.contains(r#""assignments_changed": false"#));
         assert!(response.contains(r#""plans": []"#));
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_serves_read_only_snapshot() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind operations listener");
+        let addr = listener.local_addr().expect("operations listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept operations request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle operations request");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect operations");
+        client
+            .write_all(b"GET /operations HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write operations request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read operations response");
+        server.await.expect("operations server task");
+
+        let response = String::from_utf8(response).expect("utf8 operations response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains(r#""schema": "tessera.orch.operation_ledger.v1""#));
+        assert!(response.contains(r#""persistence_enabled": true"#));
+        assert!(response.contains(r#""records": []"#));
+        let _ = fs::remove_file(ledger_path);
     }
 }
