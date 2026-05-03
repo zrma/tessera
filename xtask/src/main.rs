@@ -917,6 +917,8 @@ enum DevSub {
     P7OperationMultiDepthObservationSmoke,
     /// Start a full dev stack and prove an approved P7 canonical multi-depth observation records target recovery
     P7OperationMultiDepthRecoverySmoke,
+    /// Start a full dev stack and prove approved P7 canonical multi-depth execution survives Orchestrator restart
+    P7OperationMultiDepthRestartSmoke,
     /// Start a full dev stack and close an approved P7 split execution with observation evidence
     P7OperationSplitObservationSmoke,
     /// Start a full dev stack and prove an approved P7 split observation records target recovery
@@ -1723,6 +1725,9 @@ fn main() -> Result<()> {
             }
             DevSub::P7OperationMultiDepthRecoverySmoke => {
                 dev_p7_operation_multi_depth_recovery_smoke()?
+            }
+            DevSub::P7OperationMultiDepthRestartSmoke => {
+                dev_p7_operation_multi_depth_restart_smoke()?
             }
             DevSub::P7OperationSplitObservationSmoke => dev_p7_operation_split_observation_smoke()?,
             DevSub::P7OperationSplitRecoverySmoke => dev_p7_operation_split_recovery_smoke()?,
@@ -4557,6 +4562,565 @@ fn dev_p7_operation_multi_depth_recovery_smoke() -> Result<()> {
 
     println!(
         "P7 multi-depth operation recovery smoke: target outage marked canonical operation recovery_required and operator Worker restart restored child traffic, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p7_operation_multi_depth_restart_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4450";
+    let gateway_metrics_addr = "127.0.0.1:4451";
+    let worker_a_addr = "127.0.0.1:5451";
+    let worker_b_addr = "127.0.0.1:5452";
+    let worker_a_metrics_addr = "127.0.0.1:5453";
+    let worker_b_metrics_addr = "127.0.0.1:5454";
+    let orch_addr = "127.0.0.1:6450";
+    let orch_metrics_addr = "127.0.0.1:6451";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let ledger_path = report_dir.join("p7-operation-multi-depth-restart-ledger-latest.json");
+    let assignment_state_path =
+        report_dir.join("p7-operation-multi-depth-restart-assignment-state-latest.json");
+    let _ = fs::remove_file(&ledger_path);
+    let _ = fs::remove_file(&assignment_state_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+    let assignment_state_path_raw = assignment_state_path.to_string_lossy().into_owned();
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let parent = multi_depth_activation_parent();
+    let children = parent
+        .canonical_children()
+        .ok_or_else(|| anyhow::anyhow!("P7 multi-depth restart parent must be canonical"))?;
+    let expected_targets = [
+        (children[0], "worker-a"),
+        (children[1], "worker-b"),
+        (children[2], "worker-a"),
+        (children[3], "worker-b"),
+    ];
+    let expected_listing = expected_targets
+        .iter()
+        .map(|(cell, worker_id)| (*cell, *worker_id))
+        .collect::<Vec<_>>();
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":{},"cx":{},"cy":{},"depth":{},"sub":{}}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#,
+        parent.world, parent.cx, parent.cy, parent.depth, parent.sub
+    );
+    let multi_depth_preview_json = format!(
+        r#"{{"cells":[{{"cell":{{"world":{},"cx":{},"cy":{},"depth":{},"sub":{}}},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}}]}}"#,
+        parent.world, parent.cx, parent.cy, parent.depth, parent.sub
+    );
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        (
+            "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON",
+            multi_depth_preview_json.as_str(),
+        ),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        (
+            "TESSERA_ORCH_ASSIGNMENT_STATE_PATH",
+            assignment_state_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+    let worker_b_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_WORKER_ID", "worker-b"),
+        ("TESSERA_WORKER_ADDR", worker_b_addr),
+        ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+        ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+        ("TESSERA_WORKER_REFRESH_SECS", "1"),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-restart-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-restart-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-restart-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &worker_b_envs,
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-restart-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    assert_http_status_endpoint(
+        "P7 multi-depth operation restart gateway readiness",
+        gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "P7 multi-depth operation restart gateway before",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+    let gateway_routes_before =
+        prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let actor_a = EntityId(7_731);
+    let actor_b = EntityId(7_732);
+    let _child0_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        parent,
+        actor_a,
+        activation_soak_position(0),
+    )?;
+    let mut child3_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        parent,
+        actor_b,
+        activation_soak_position(3),
+    )?;
+
+    let proposal_response = http_json_post(
+        "P7 multi-depth operation restart proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    let operation_id = json_array(&proposal_response, &["operation_ids"])?
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "P7 multi-depth operation restart proposal response has no operation id"
+            )
+        })?
+        .to_string();
+    let proposal_snapshot = http_json_get(
+        "P7 multi-depth operation restart ledger",
+        orch_metrics_addr,
+        "/operations",
+    )?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "multi_depth_split")?;
+    let proposal_parent = json_cell_id(proposal_record, &["proposal", "parent"])?;
+    if proposal_parent != parent {
+        bail!(
+            "P7 multi-depth restart expected parent {:?}, got {:?}",
+            parent,
+            proposal_parent
+        );
+    }
+    let mut proposal_targets = Vec::new();
+    for target in json_array(proposal_record, &["proposal", "targets"])? {
+        proposal_targets.push((
+            json_cell_id(target, &["cell"])?,
+            json_str(target, &["worker_id"])?.to_string(),
+        ));
+    }
+    proposal_targets.sort_by_key(|(cell, worker_id)| {
+        (
+            cell.world,
+            cell.cy,
+            cell.cx,
+            cell.depth,
+            cell.sub,
+            worker_id.clone(),
+        )
+    });
+    let mut expected_targets_for_compare = expected_targets
+        .iter()
+        .map(|(cell, worker_id)| (*cell, (*worker_id).to_string()))
+        .collect::<Vec<_>>();
+    expected_targets_for_compare.sort_by_key(|(cell, worker_id)| {
+        (
+            cell.world,
+            cell.cy,
+            cell.cx,
+            cell.depth,
+            cell.sub,
+            worker_id.clone(),
+        )
+    });
+    if proposal_targets != expected_targets_for_compare {
+        bail!(
+            "P7 multi-depth restart expected proposal targets {:?}, got {:?}",
+            expected_targets_for_compare,
+            proposal_targets
+        );
+    }
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "P7 multi-depth operation restart approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p7-multi-depth-restart-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p7-multi-depth-restart-smoke&budget_key=p7-multi-depth-restart-smoke"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+    let execution_response = http_json_post(
+        "P7 multi-depth operation restart execution",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let pre_restart_probe = probe_multi_depth_convergence(gateway_addr, &expected_listing, 9_930);
+    pre_restart_probe.assert_success()?;
+    if !assignment_state_path.exists() {
+        bail!(
+            "P7 multi-depth operation restart smoke expected assignment state file at {}",
+            assignment_state_path.display()
+        );
+    }
+
+    stack.terminate_named("p7-operation-multi-depth-restart-orch")?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-restart-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let post_restart_probe = probe_multi_depth_convergence(gateway_addr, &expected_listing, 9_940);
+    post_restart_probe.assert_success()?;
+
+    let restart_ledger_snapshot = http_json_get(
+        "P7 multi-depth operation ledger after restart",
+        orch_metrics_addr,
+        "/operations",
+    )?;
+    let restart_record = find_p7_operation_record(&restart_ledger_snapshot, &operation_id)?;
+    validate_p7_published_execution(restart_record)?;
+
+    let remote_aoi_actor = EntityId(7_733);
+    let _remote_aoi_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        children[2],
+        remote_aoi_actor,
+        Position { x: 8.0, y: 24.0 },
+    )?;
+    let (moved, remote_aoi_snapshot) = request_move_until_delta_and_snapshot(
+        &mut child3_session,
+        children[3],
+        actor_b,
+        children[2],
+        remote_aoi_actor,
+    )?;
+    assert_delta_contains(
+        "P7 multi-depth operation restart child move",
+        moved,
+        children[3],
+        actor_b,
+    )?;
+    assert_snapshot_contains(
+        "P7 multi-depth operation restart AOI resync snapshot",
+        remote_aoi_snapshot,
+        children[2],
+        remote_aoi_actor,
+    )?;
+
+    let worker_a_child_metric = worker_cell_actor_count_metric(children[0]);
+    let worker_b_child_metric = worker_cell_actor_count_metric(children[3]);
+    let worker_a_metrics_after_restart = assert_metrics_endpoint_body_until(
+        "P7 multi-depth operation restart worker-a",
+        worker_a_metrics_addr,
+        &["tessera_worker_cell_actor_count"],
+    )?;
+    let worker_b_metrics_after_restart = assert_metrics_endpoint_body_until(
+        "P7 multi-depth operation restart worker-b",
+        worker_b_metrics_addr,
+        &["tessera_worker_cell_actor_count"],
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation restart worker-a",
+        &worker_a_metrics_after_restart,
+        worker_a_child_metric.as_str(),
+        1.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation restart worker-b",
+        &worker_b_metrics_after_restart,
+        worker_b_child_metric.as_str(),
+        1.0,
+    )?;
+    let worker_a_child_actor_count = prometheus_sample_value(
+        &worker_a_metrics_after_restart,
+        worker_a_child_metric.as_str(),
+    )?;
+    let worker_b_child_actor_count = prometheus_sample_value(
+        &worker_b_metrics_after_restart,
+        worker_b_child_metric.as_str(),
+    )?;
+
+    let gateway_metrics_after_restart = assert_metrics_endpoint_body_until(
+        "P7 multi-depth operation restart gateway after restart",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_routes_after_restart =
+        prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_routes")?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation restart gateway",
+        &gateway_metrics_after_restart,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        8.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation restart gateway",
+        &gateway_metrics_after_restart,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+        3.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation restart gateway",
+        &gateway_metrics_after_restart,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        1.0,
+    )?;
+    let gateway_close_after_restart =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_restart)?;
+    assert_gateway_close_counters_not_increased(
+        "P7 multi-depth operation restart gateway",
+        gateway_close_before,
+        gateway_close_after_restart,
+    )?;
+    let (after_restart_health, after_restart_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let route_converged_after_restart = (gateway_routes_after_restart - 4.0).abs() < f64::EPSILON;
+    let worker_refreshed_after_restart =
+        worker_a_child_actor_count >= 1.0 && worker_b_child_actor_count >= 1.0;
+    let traffic_confirmed_after_restart = prometheus_sample_value(
+        &gateway_metrics_after_restart,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )? >= 8.0
+        && prometheus_sample_value(
+            &gateway_metrics_after_restart,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        )? >= 1.0;
+    let counters_clean = gateway_close_before == gateway_close_after_restart;
+    if !(route_converged_after_restart
+        && worker_refreshed_after_restart
+        && traffic_confirmed_after_restart
+        && counters_clean)
+    {
+        bail!(
+            "P7 multi-depth operation restart evidence incomplete: route_converged_after_restart={route_converged_after_restart} worker_refreshed_after_restart={worker_refreshed_after_restart} traffic_confirmed_after_restart={traffic_confirmed_after_restart} counters_clean={counters_clean}"
+        );
+    }
+
+    let observation_response = http_json_post(
+        "P7 multi-depth operation restart observation",
+        orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=p7-multi-depth-restart-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true"
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "completed")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+    assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, true, false)?;
+    let record = find_p7_operation_record(&ledger, &operation_id)?;
+    validate_p7_completed_observation(record)?;
+    let report_children = expected_targets
+        .iter()
+        .map(|(cell, worker_id)| {
+            serde_json::json!({
+                "cell": cell_id_json(*cell),
+                "worker_id": *worker_id
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_multi_depth_restart_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "multi_depth_split",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id,
+            "parent": cell_id_json(parent),
+            "children": report_children
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers_before": before_health.registered_workers,
+            "registered_workers_after_restart": after_restart_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after_restart": assignment_listing_summary_json(&after_restart_listing)?,
+            "assignment_state_path": assignment_state_path_raw.as_str()
+        },
+        "gateway": {
+            "addr": gateway_addr,
+            "metrics_addr": gateway_metrics_addr,
+            "routes_before": gateway_routes_before,
+            "routes_after_restart": gateway_routes_after_restart,
+            "ping_roundtrips": prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_ping_roundtrip_seconds_count")?,
+            "join_roundtrips": prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}")?,
+            "move_roundtrips": prometheus_sample_value(&gateway_metrics_after_restart, "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}")?,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after_restart": gateway_close_counters_json(gateway_close_after_restart)
+            }
+        },
+        "worker": {
+            "worker_a_addr": worker_a_addr,
+            "worker_a_metrics_addr": worker_a_metrics_addr,
+            "worker_b_addr": worker_b_addr,
+            "worker_b_metrics_addr": worker_b_metrics_addr,
+            "worker_a_child_actor_count_after_restart": worker_a_child_actor_count,
+            "worker_b_child_actor_count_after_restart": worker_b_child_actor_count
+        },
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records,
+            "completed_observation_records": ledger_summary.completed_observation_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "observation": observation_response
+        },
+        "probes": {
+            "pre_restart": multi_depth_convergence_probe_json(&pre_restart_probe),
+            "post_restart": multi_depth_convergence_probe_json(&post_restart_probe)
+        },
+        "checks": {
+            "multi_depth_execution_published": true,
+            "assignment_state_persisted": true,
+            "orchestrator_restarted": true,
+            "ledger_execution_survived_restart": true,
+            "canonical_child_routes_converged_after_restart": route_converged_after_restart,
+            "worker_child_refresh_after_restart": worker_refreshed_after_restart,
+            "child_traffic_confirmed_after_restart": traffic_confirmed_after_restart,
+            "gateway_close_counters_clean": counters_clean,
+            "stable_session_child_move_after_restart": true,
+            "remote_aoi_resynced_after_restart": true,
+            "observation_completed_after_restart": true,
+            "ledger_observation_completed": true
+        },
+        "remaining_uncovered": [
+            "multi_depth_operation_soak",
+            "guarded_kubernetes_multi_depth_operation_restart_smoke"
+        ]
+    });
+    validate_p7_operation_multi_depth_restart_smoke_report(&report)?;
+    let report_path = write_p7_operation_multi_depth_restart_smoke_report(&report)?;
+
+    println!(
+        "P7 multi-depth operation restart smoke: approved canonical split execution and ledger state survived Orchestrator restart, post-restart observation completed, report={}, ledger={}",
         report_path.display(),
         ledger_path.display()
     );
@@ -16328,6 +16892,12 @@ fn default_p7_operation_multi_depth_recovery_smoke_path() -> PathBuf {
         .join("p7-operation-multi-depth-recovery-smoke-latest.json")
 }
 
+fn default_p7_operation_multi_depth_restart_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p7-operation-multi-depth-restart-smoke-latest.json")
+}
+
 fn default_p7_operation_split_observation_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -16510,6 +17080,22 @@ fn write_p7_operation_multi_depth_recovery_smoke_report(
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p7_operation_multi_depth_recovery_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p7_operation_multi_depth_restart_smoke_report(
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p7-operation-multi-depth-restart-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p7_operation_multi_depth_restart_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -17334,6 +17920,140 @@ fn validate_p7_operation_multi_depth_recovery_smoke_report(
     assert_remaining_uncovered_contains(
         report,
         "guarded_kubernetes_multi_depth_operation_recovery_smoke",
+    )?;
+    Ok(())
+}
+
+fn validate_p7_operation_multi_depth_restart_smoke_report(
+    report: &serde_json::Value,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.p7_operation_multi_depth_restart_smoke.v1",
+    )?;
+    assert_json_str_eq(report, &["operation", "kind"], "multi_depth_split")?;
+    assert_json_str_eq(
+        report,
+        &["operation", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    let parent = json_cell_id(report, &["operation", "parent"])?;
+    if parent.depth == 0 || parent.sub != 0 || !parent.is_canonical_leaf() {
+        bail!(
+            "P7 multi-depth restart report parent must be a non-root canonical leaf, got {:?}",
+            parent
+        );
+    }
+    let expected_children = parent.canonical_children().ok_or_else(|| {
+        anyhow::anyhow!("P7 multi-depth restart parent has no canonical children")
+    })?;
+    assert_json_array_len(report, &["operation", "children"], 4)?;
+    let mut actual_children = json_array(report, &["operation", "children"])?
+        .iter()
+        .map(|child| json_cell_id(child, &["cell"]))
+        .collect::<Result<Vec<_>>>()?;
+    sort_cells(&mut actual_children);
+    let mut expected = expected_children.to_vec();
+    sort_cells(&mut expected);
+    if actual_children != expected {
+        bail!(
+            "P7 multi-depth restart report expected canonical children {:?}, got {:?}",
+            expected,
+            actual_children
+        );
+    }
+    let ledger_path = json_str(report, &["ledger", "path"])?;
+    if ledger_path.trim().is_empty() {
+        bail!("P7 multi-depth operation restart smoke report has empty ledger.path");
+    }
+    let assignment_state_path = json_str(report, &["orchestrator", "assignment_state_path"])?;
+    if assignment_state_path.trim().is_empty() {
+        bail!("P7 multi-depth operation restart smoke report has empty assignment_state_path");
+    }
+    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "completed_observation_records"], 1.0)?;
+    assert_json_number_at_least(
+        report,
+        &["orchestrator", "registered_workers_after_restart"],
+        2.0,
+    )?;
+    assert_json_number_at_least(report, &["gateway", "routes_after_restart"], 4.0)?;
+    assert_json_number_at_least(
+        report,
+        &["worker", "worker_a_child_actor_count_after_restart"],
+        1.0,
+    )?;
+    assert_json_number_at_least(
+        report,
+        &["worker", "worker_b_child_actor_count_after_restart"],
+        1.0,
+    )?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_str_eq(report, &["responses", "observation", "status"], "completed")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "observation", "observation_accepted"],
+        true,
+    )?;
+    assert_json_array_len(report, &["probes", "pre_restart", "succeeded"], 4)?;
+    assert_json_array_len(report, &["probes", "pre_restart", "failures"], 0)?;
+    assert_json_array_len(report, &["probes", "post_restart", "succeeded"], 4)?;
+    assert_json_array_len(report, &["probes", "post_restart", "failures"], 0)?;
+    assert_json_bool_eq(report, &["checks", "multi_depth_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_state_persisted"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_restarted"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "ledger_execution_survived_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "canonical_child_routes_converged_after_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "worker_child_refresh_after_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "child_traffic_confirmed_after_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "stable_session_child_move_after_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "remote_aoi_resynced_after_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "observation_completed_after_restart"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "ledger_observation_completed"], true)?;
+    assert_remaining_uncovered_absent(report, "multi_depth_operation_restart_recovery")?;
+    assert_remaining_uncovered_contains(report, "multi_depth_operation_soak")?;
+    assert_remaining_uncovered_contains(
+        report,
+        "guarded_kubernetes_multi_depth_operation_restart_smoke",
     )?;
     Ok(())
 }
@@ -26164,6 +26884,123 @@ mod tests {
 
         validate_p7_operation_multi_depth_recovery_smoke_report(&report)
             .expect("valid P7 multi-depth operation recovery smoke report");
+    }
+
+    #[test]
+    fn p7_operation_multi_depth_restart_smoke_report_accepts_restart_evidence() {
+        let parent = multi_depth_activation_parent();
+        let children = parent.canonical_children().expect("canonical children");
+        let report = serde_json::json!({
+            "schema": "tessera.p7_operation_multi_depth_restart_smoke.v1",
+            "unix_secs": 130,
+            "operation": {
+                "operation_id": "p7-multi-depth-1",
+                "kind": "multi_depth_split",
+                "proposal_hash": "fnv1a64:abc",
+                "policy_id": "operator_approved_dynamic_operation_v1",
+                "parent": cell_id_json(parent),
+                "children": [
+                    {"cell": cell_id_json(children[0]), "worker_id": "worker-a"},
+                    {"cell": cell_id_json(children[1]), "worker_id": "worker-b"},
+                    {"cell": cell_id_json(children[2]), "worker_id": "worker-a"},
+                    {"cell": cell_id_json(children[3]), "worker_id": "worker-b"}
+                ]
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6450",
+                "metrics_addr": "127.0.0.1:6451",
+                "registered_workers_before": 2,
+                "registered_workers_after_restart": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after_restart": {"workers": [], "handovers": 0},
+                "assignment_state_path": ".dev/reports/p7-operation-multi-depth-restart-assignment-state-latest.json"
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4450",
+                "metrics_addr": "127.0.0.1:4451",
+                "routes_before": 1,
+                "routes_after_restart": 4,
+                "ping_roundtrips": 8,
+                "join_roundtrips": 3,
+                "move_roundtrips": 1,
+                "close_counters": {
+                    "before": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0},
+                    "after_restart": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0}
+                }
+            },
+            "worker": {
+                "worker_a_addr": "127.0.0.1:5451",
+                "worker_a_metrics_addr": "127.0.0.1:5453",
+                "worker_b_addr": "127.0.0.1:5452",
+                "worker_b_metrics_addr": "127.0.0.1:5454",
+                "worker_a_child_actor_count_after_restart": 1,
+                "worker_b_child_actor_count_after_restart": 1
+            },
+            "ledger": {
+                "path": ".dev/reports/p7-operation-multi-depth-restart-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "completed_observation_records": 1
+            },
+            "responses": {
+                "proposal": {"assignments_changed": false, "operation_ids": ["p7-multi-depth-1"]},
+                "approval": {"status": "approved", "assignments_changed": false},
+                "execution": {
+                    "status": "published",
+                    "assignments_changed": true,
+                    "mutation_attempted": true,
+                    "mutation_allowed": true
+                },
+                "observation": {
+                    "status": "completed",
+                    "assignments_changed": false,
+                    "observation_accepted": true
+                }
+            },
+            "probes": {
+                "pre_restart": {
+                    "succeeded": [
+                        cell_id_json(children[0]),
+                        cell_id_json(children[1]),
+                        cell_id_json(children[2]),
+                        cell_id_json(children[3])
+                    ],
+                    "failures": []
+                },
+                "post_restart": {
+                    "succeeded": [
+                        cell_id_json(children[0]),
+                        cell_id_json(children[1]),
+                        cell_id_json(children[2]),
+                        cell_id_json(children[3])
+                    ],
+                    "failures": []
+                }
+            },
+            "checks": {
+                "multi_depth_execution_published": true,
+                "assignment_state_persisted": true,
+                "orchestrator_restarted": true,
+                "ledger_execution_survived_restart": true,
+                "canonical_child_routes_converged_after_restart": true,
+                "worker_child_refresh_after_restart": true,
+                "child_traffic_confirmed_after_restart": true,
+                "gateway_close_counters_clean": true,
+                "stable_session_child_move_after_restart": true,
+                "remote_aoi_resynced_after_restart": true,
+                "observation_completed_after_restart": true,
+                "ledger_observation_completed": true
+            },
+            "remaining_uncovered": [
+                "multi_depth_operation_soak",
+                "guarded_kubernetes_multi_depth_operation_restart_smoke"
+            ]
+        });
+
+        validate_p7_operation_multi_depth_restart_smoke_report(&report)
+            .expect("valid P7 multi-depth operation restart smoke report");
     }
 
     #[test]
