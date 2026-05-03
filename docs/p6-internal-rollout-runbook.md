@@ -2,10 +2,10 @@
 
 Last reviewed: 2026-05-03
 
-This runbook is the approval packet for the remaining P6+ internal MicroK8s
-evidence. Do not run the mutating commands here until the operator explicitly
-approves the smoke window, image tag, GitOps rollout revision, and cleanup
-revision.
+This runbook is the historical approval packet used to close the P6+ internal
+MicroK8s evidence. P6+ is now complete on
+`harbor.1day1coding.com/1day1coding/tessera:v2026.05.3`; keep this file as the
+reference for how the controlled smoke window was structured.
 
 The current machine gate is:
 
@@ -13,22 +13,8 @@ The current machine gate is:
 cargo xt p6-completion-audit --json
 ```
 
-It currently fails with 14 missing gates:
-
-- `p6_internal_restart_recovery`
-- `p6_internal_live_metrics_plan`
-- `p6_gitops_rollout_image`
-- `p6_gitops_rollout_evidence`
-- `p6_internal_merge_ready_plan`
-- `p6_internal_merge_publish`
-- `p6_internal_merge_failure_recovery`
-- `p6_internal_merge_restart_recovery`
-- `p6_internal_merge_load_soak`
-- `p6_internal_multi_depth_ready_plan`
-- `p6_internal_multi_depth_publish`
-- `p6_internal_multi_depth_failure_recovery`
-- `p6_internal_multi_depth_restart_recovery`
-- `p6_internal_multi_depth_load_soak`
+It currently passes with `complete=true` and `findings=[]`. The rollout and
+cleanup revisions are recorded in `docs/p6-completion-audit.md`.
 
 ## Required Inputs
 

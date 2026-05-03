@@ -4,32 +4,57 @@ Last reviewed: 2026-05-03
 
 ## Baseline
 
-- V0 범위는 고정 그리드 셀, Gateway/Worker TCP 파이프라인, Orchestrator assignment snapshot/watch, Worker AOI ghost relay까지 구현된 상태다.
-- P0/P1/P2/P3는 handover replay ownership, stable Gateway sessions, AOI precision, per-cell tick pipeline, observability/packaging sample, split/merge planner skeleton, fixture-backed dry-run preview smoke까지 완료됐다. 완료 상세 기록은 `docs/completed-milestones.md`로 옮겼다.
-- P4.1은 optional envelope-level `request_id`를 통한 Join/Move latency correlation까지 완료됐다.
-- P4.2는 internal-only GitOps manifest commit/push, ArgoCD sync, runtime smoke, GitHub Actions `v2026.05.1` image publish, k8s GitOps tag promotion까지 완료됐다.
-- P4.3 runtime split activation의 publish/replay/convergence slice는 split-only/manual/default-off `SubmitSplitActivation` gRPC surface, planner-to-operator `split-activation-plan` evidence helper, target map/depth/registration validation, target Worker replay prepare, source Worker parent snapshot/buffered move partition, child replay ack, atomic child assignment publish, replay 실패 시 assignments unchanged rollback, 로컬 two-Worker activation plan smoke/Gateway route convergence/source-target Worker refresh/stable-session post-split Move/remote AOI resync snapshot, post-publish target outage 감지 및 Worker restart recovery smoke, local load/soak observation smoke, internal MicroK8s port-forward smoke helper까지 구현됐다.
-- 2026-05-02 internal MicroK8s P5 gate가 완료됐다. Tessera `v2026.05.2` image를 GitHub Actions로 publish했고, k8s GitOps controlled smoke revision에서 two-Worker topology, manual activation flag, preview fixture를 적용한 뒤 `cargo xt k8s activation-smoke --allow-activation --with-failure --allow-scale`와 final `activation-report-check --require-published --require-failure`가 통과했다.
-- P5 completion audit와 prompt-to-artifact checklist는 `docs/p5-completion-audit.md`에 둔다. P5 split activation rollback policy는 `operator_recovery_no_automatic_merge_rollback_v1`로 고정했고, final internal report는 `remaining_uncovered=[]`를 기록한다.
-- Post-smoke cleanup도 완료됐다. k8s GitOps cleanup revision은 `v2026.05.2` two-Worker topology를 유지하면서 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION`과 `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`을 제거했고, ArgoCD `tessera`는 `Synced / Healthy`에 도달했다.
-- P6 첫 slice로 opt-in persistent assignment state를 추가했다. `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`가 설정되면 handover/split assignment publish가 JSON state 파일에 atomic persist되고, Orchestrator restart 후 저장된 split child assignments가 복구된다. 로컬 증거는 `cargo test -p tessera-orch`와 `cargo xt dev activation-restart-smoke`이며 상세는 `docs/p6-durable-split-state.md`에 둔다.
-- P6 internal restart gate 준비로 read-only `cargo xt k8s activation-smoke --require-assignment-state-storage`, mutating `--with-restart --allow-rollout-restart`, 그리고 `activation-report-check --require-restart`를 추가하고, k8s GitOps manifest draft에 `tessera-orch-state` PVC와 `/var/lib/tessera/assignment-state.json` state path를 추가했다. 최신 read-only preflight는 live `v2026.05.2`에서 `stage=blocked_before_plan`, `activation_mutated=false`, `checks.assignment_state_storage_configured=false`와 expected `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` error를 기록했고 report checker가 이를 negative evidence로 수락했다. 실제 internal evidence는 새 image publish와 승인된 GitOps rollout 뒤에만 완료된다.
-- P6 live metrics planner-to-operator 첫 slice로 Worker `/metrics`에 per-cell actor/pending-move gauges를 추가하고, `cargo xt split-activation-plan --live-worker-metrics worker-id=addr`가 preview fixture 없이 live metrics에서 mutation-free operator split plan을 만들 수 있게 했다. 로컬 plan 증거는 `cargo xt dev activation-live-plan-smoke`이고, local planner-to-operator submission 증거는 `cargo xt dev activation-live-metrics-smoke`와 `cargo xt dev activation-report-check --require-live-metrics-plan`이다.
-- P6 internal live metrics plan 준비로 `cargo xt k8s activation-smoke --use-live-worker-metrics`가 source/target Worker metrics service를 port-forward해 read-only plan을 만들고, `cargo xt k8s activation-report-check --require-live-metrics-plan`이 internal report source와 target map을 검증한다. 실제 internal evidence는 per-cell metrics가 포함된 새 image rollout 뒤에만 완료된다.
-- 2026-05-03 read-only internal live metrics readiness run은 현재 `v2026.05.2` live topology에서 mutation 전에 `plan.status=no_split_candidate`, `plan.preview.source=live_worker_metrics:...`, `activation_mutated=false`를 기록했다. 이는 helper path 확인용 negative evidence이며 P6 completion evidence는 아니다.
-- Runtime merge activation local slices로 `cargo xt merge-activation-plan`, `cargo xt merge-activation`, `SubmitMergeActivation`, Worker same-Worker child-to-parent coalescing, mixed-owner cross-Worker child replay, `cargo xt dev merge-plan-smoke`, `cargo xt dev merge-activation-smoke`, `cargo xt dev canonical-merge-activation-smoke`, `cargo xt dev canonical-merge-activation-report-check`, `cargo xt dev canonical-merge-activation-failure-smoke`, `cargo xt dev canonical-merge-activation-failure-report-check`, `cargo xt dev canonical-merge-activation-restart-smoke`, `cargo xt dev canonical-merge-activation-restart-report-check`, `cargo xt dev canonical-merge-activation-soak`, `cargo xt dev canonical-merge-activation-soak-report-check`, `cargo xt dev merge-activation-cross-worker-smoke`, `cargo xt dev merge-activation-failure-smoke`, `cargo xt dev merge-activation-restart-smoke`, `cargo xt dev merge-activation-soak`, 그리고 merge report checker flags를 추가했다. 현재 merge mutation은 parent가 미발행이고 complete legacy shallow 또는 canonical sibling family가 registered Worker에 완전히 소유된 경우만 manual/default-off로 허용되며, same-Worker family는 assignment refresh coalescing으로, mixed-owner family는 owner Worker parent pre-stage + remote child replay 후 parent publish로 처리한다. owner Worker outage detection/recovery, persisted assignment state로 Orchestrator restart 후 parent route recovery, parent route load/soak, cross-Worker replay, canonical same-Worker merge success/failure/restart/soak까지 local evidence가 있다. Canonical merge sibling detection은 Orchestrator planner/runtime unit, Worker coalescing detection unit, xtask merge plan unit과 end-to-end canonical merge smoke set으로 닫혔다. owner Worker restart 후 actor state는 `volatile_worker_actor_state_rejoin_required_v1` 정책으로 현재 slice에서 제외되고, recovery contract는 parent route convergence와 client rejoin/reseed다. internal MicroK8s merge path는 read-only `cargo xt k8s merge-activation-smoke` 기본값과, 승인 시 `--allow-activation --with-failure --allow-scale --with-restart --allow-rollout-restart --with-soak`로 publish/failure/restart/load-soak report를 쓰는 guarded path가 준비됐지만, 실제 internal evidence는 아직 남아 있다.
-- 2026-05-03 read-only internal merge readiness run은 현재 `v2026.05.2` live topology에서 mutation 전에 `plan.status=no_merge_candidate`, `plan.preview.source=assignment_listing_zero_metrics`, `activation_mutated=false`, `merge_plan_ready=false`를 기록했고, `cargo xt k8s merge-activation-report-check --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 --report .dev/reports/internal-microk8s-merge-activation-smoke-latest.json`이 blocked report를 수락했다. 이는 helper path 확인용 negative evidence이며 merge completion evidence는 아니다.
-- Policy-gated planner mutation local slice로 `cargo xt planner-activation`, `cargo xt dev planner-mutation-smoke`, 그리고 `cargo xt dev activation-live-planner-mutation-smoke`를 추가했다. 기본 실행은 `blocked_by_policy` report만 남기고 assignment mutation을 하지 않으며, `--allow-mutation --policy-id operator_approved_planner_mutation_v1`가 함께 있을 때만 selected split/merge plan을 제출한다. Local smoke는 policy 없는 merge planner mutation이 no-op으로 남는지, 승인된 policy id에서만 parent route publish/Gateway convergence가 되는지 검증한다. Live metrics split planner smoke는 Worker `/metrics`에서 selected split candidate를 만들고, default no-op report `.dev/reports/planner-activation-live-blocked-latest.json` 뒤 승인된 policy id에서만 child route publish/Gateway convergence가 되는지 `.dev/reports/planner-activation-latest.json`로 검증하며, local report checker는 `--require-planner-live-metrics`로 이 source를 확인한다. Internal planner mutation policy report는 `cargo xt k8s planner-activation-report --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`와 `cargo xt k8s planner-activation-report-check --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`로 read-only ArgoCD/image evidence까지 합성해 통과했다. 이는 live-metrics internal ready plan이나 P6 image rollout gate를 대체하지 않는다.
-- Canonical multi-depth split activation local evidence는 `cargo xt dev multi-depth-activation-smoke`, `multi-depth-activation-failure-smoke`, `multi-depth-activation-restart-smoke`, `multi-depth-activation-soak`과 각 report checker로 success/failure/restart/load-soak까지 닫혔다. Canonical merge same-Worker evidence는 `cargo xt dev canonical-merge-activation-smoke`, `canonical-merge-activation-failure-smoke`, `canonical-merge-activation-restart-smoke`, `canonical-merge-activation-soak`과 각 report checker로 success/failure/restart/load-soak까지 닫혔다. Internal MicroK8s multi-depth evidence와 canonical merge internal evidence는 아직 남아 있다.
-- 2026-05-03 read-only internal multi-depth readiness run은 현재 `v2026.05.2` live topology에서 mutation 전에 `plan.status=blocked`, `reason=canonical multi-depth parent is not currently assigned`, `activation_mutated=false`, `multi_depth_plan_ready=false`를 기록했고, `cargo xt k8s multi-depth-activation-report-check --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 --report .dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json`이 blocked report를 수락했다. 이는 helper path 확인용 negative evidence이며 multi-depth completion evidence는 아니다.
-- P6+ 전체 완료 판정은 `cargo xt p6-completion-audit --json`로 확인한다. 현재 `.dev/reports` 기준 출력은 P5 split baseline과 internal planner mutation policy report를 통과시키지만 `complete=false`로 실패하며, internal restart/live-metrics/GitOps rollout/merge/multi-depth evidence가 남은 gate로 보고된다. Planner mutation gate는 단순 파일 존재가 아니라 `cargo xt k8s planner-activation-report`가 작성하고 `cargo xt k8s planner-activation-report-check`가 검증하는 schema로 default-off blocked report, policy-approved published report, ArgoCD/image evidence, no automatic mutation observation을 검증한다.
-- GitOps rollout gate도 별도 report schema로 검증한다. 승인된 rollout 뒤에는 `cargo xt p6-rollout-report --image <new-tag> --rollout-revision <git-sha> --cleanup-revision <git-sha> --image-published --gitops-rollout-approved --post-smoke-default-off-cleanup --manual-activation-default-off --preview-fixture-removed`로 `.dev/reports/p6-gitops-rollout-latest.json`에 P6 image publish, runtime deployment image match, GitOps rollout/cleanup revision, ArgoCD `Synced / Healthy`, default-off cleanup을 기록하고 `cargo xt p6-rollout-report-check --expected-image <new-tag>`를 통과시켜야 한다.
-- Internal merge/multi-depth report checker도 full evidence flags를 갖는다. Read-only readiness는 각각 `cargo xt k8s merge-activation-report-check --require-ready-plan`와 `cargo xt k8s multi-depth-activation-report-check --require-ready-plan`로 확인하고, 승인된 publish report가 생긴 뒤에는 `--require-published --require-failure --require-restart --require-soak` 조합으로 publish/failure/restart/load-soak evidence를 검증한다.
+- V0 through P5 are complete through handover replay ownership, stable Gateway
+  sessions, AOI precision, observability, packaging samples, request latency
+  correlation, default-off manual split activation, planner-to-operator
+  evidence, controlled internal MicroK8s split smoke, and P5 rollback policy.
+- P6+ is complete as of the `v2026.05.3` internal rollout. The final gate is
+  `cargo xt p6-completion-audit --json`, which currently reports
+  `complete=true` with no findings against `.dev/reports`.
+- P6 internal evidence covers PVC-backed persistent assignment state,
+  live-metrics planner-to-operator evidence, split publish/failure/restart
+  recovery, runtime merge publish/failure/restart/soak, canonical multi-depth
+  publish/failure/restart/soak, P6 GitOps rollout evidence, and post-smoke
+  default-off cleanup.
+- The live Tessera GitOps cleanup revision returned Orchestrator activation to
+  default-off, restored the standard assignment state path, removed smoke
+  preview fixtures, and left ArgoCD `tessera` `Synced / Healthy`.
+- P6 completion audit details remain in `docs/p6-completion-audit.md`. The next
+  active design boundary is `docs/p7-operation-loop.md`.
 
 ## Next
 
-- 다음 milestone은 P6 persistent restart recovery의 internal MicroK8s evidence run이다. 새 image를 publish하고, PVC-backed Orchestrator state storage를 승인된 GitOps rollout로 적용한 뒤, controlled smoke에서 Orchestrator restart recovery, Gateway route convergence, Worker assignment refresh, AOI resync, report verifier를 실제 cluster evidence로 닫는다.
-- 승인 전 실행 순서와 approval boundary는 `docs/p6-internal-rollout-runbook.md`를 따른다. 이 문서는 남은 14개 P6 gate를 split restart/live-metrics, merge, canonical multi-depth, GitOps rollout evidence로 묶고, read-only preflight와 mutating smoke-window commands를 분리한다.
-- 그 다음 범위는 live metrics plan의 internal MicroK8s evidence, merge activation internal publish/failure/restart/soak evidence, multi-depth internal publish/failure/restart/soak evidence 순서의 별도 decision gate로 유지한다.
-- multi-depth split의 encoding decision은 `docs/multi-depth-cellid-decision.md`에 둔다. canonical key는 leaf-resolution `cx/cy` + `depth` + `sub=0`이고, 현재 `depth=1/sub=0..3` shape는 shallow legacy alias로 남긴다. 첫 local canonical success path는 `cargo xt dev multi-depth-activation-smoke`와 전용 report checker로 닫는다.
-- 실행 기록과 후속 boundary는 `docs/p6-completion-audit.md`, `docs/p6-durable-split-state.md`, `docs/multi-depth-cellid-decision.md`, `docs/todo-p4-next-milestones.md`, `docs/p5-completion-audit.md`, `docs/internal-microk8s-activation-smoke.md`를 기준으로 본다.
+The next milestone is P7: Closed-Loop, Policy-Gated Dynamic Cell Operations.
+
+P7 should not start by enabling autonomous mutations. The first implementation
+track is a durable, auditable operation loop:
+
+1. Record planner proposals from live Worker metrics and current assignment
+   state without mutation.
+2. Persist operation records with proposal, approval, execution, observation,
+   recovery/backout, and audit states.
+3. Require explicit policy, approval, cooldown, and budget gates before any
+   executor submits split or merge activation.
+4. Keep all mutating automation default-off or policy-gated, with no automatic
+   rollback unless a future policy explicitly changes that contract.
+5. Verify each runtime-affecting slice with local/dev smoke first, then image
+   publish, k8s GitOps rollout, ArgoCD `Synced / Healthy`, internal MicroK8s
+   success/failure/restart/soak smoke, default-off cleanup, and verifier
+   reports.
+
+Recommended first slices:
+
+1. `docs: open p7 operation loop` - establish the P7 checklist, completion
+   criteria, and commit/push/smoke cadence.
+2. `feat: add dynamic operation ledger` - add durable operation record types and
+   persistence without planner or activation mutation.
+3. `feat: record planner proposals` - turn live metrics and assignment listing
+   candidates into mutation-free operation proposals.
+4. `feat: gate approved operation execution` - require policy id, operator
+   approval, cooldown, and budget checks before executing a proposal.
+5. `test: verify closed-loop recovery evidence` - add local/dev smoke and
+   report checks for proposal-to-execution-to-recovery flow.
+6. `chore: roll out p7 operation loop internally` - publish image, promote via
+   GitOps, run controlled smoke, clean up default-off state, and record rollout
+   evidence.
+
