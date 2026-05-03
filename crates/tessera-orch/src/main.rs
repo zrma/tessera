@@ -302,6 +302,24 @@ struct OperationApprovalRequest {
     budget_key: String,
 }
 
+#[derive(Debug, Serialize)]
+struct OperationExecutionWriteResponse {
+    schema: String,
+    operation_id: String,
+    status: &'static str,
+    assignments_changed: bool,
+    mutation_attempted: bool,
+    mutation_allowed: bool,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct OperationExecutionRequest {
+    operation_id: String,
+    expected_proposal_hash: String,
+    policy_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct OperationProposalWorker {
     worker_id: String,
@@ -1322,6 +1340,43 @@ fn approval_matches_request(
         && approval.budget_key == request.budget_key
 }
 
+fn execution_block_reason(
+    record: &OperationRecord,
+    supplied_policy_id: Option<&str>,
+    now_unix_secs: u64,
+) -> String {
+    let Some(approval) = record.approval.as_ref() else {
+        return "operation is not approved".to_string();
+    };
+    if approval.expected_proposal_hash != record.proposal.proposal_hash {
+        return "approval proposal hash no longer matches proposal".to_string();
+    }
+    if approval.allowed_kind != record.kind {
+        return "approval allowed kind no longer matches operation kind".to_string();
+    }
+    if approval.expires_unix_secs <= now_unix_secs {
+        return "approval is expired".to_string();
+    }
+    match supplied_policy_id {
+        Some(policy_id) if policy_id == approval.policy_id => {}
+        Some(policy_id) => {
+            return format!(
+                "supplied policy_id={policy_id} does not match approved policy_id={}",
+                approval.policy_id
+            );
+        }
+        None => return "execution policy_id is required".to_string(),
+    }
+    if approval.cooldown_key.trim().is_empty() {
+        return "approval cooldown_key is empty".to_string();
+    }
+    if approval.budget_key.trim().is_empty() {
+        return "approval budget_key is empty".to_string();
+    }
+    "executor mutation is default-off; dry-run records blocked_by_policy without assignment mutation"
+        .to_string()
+}
+
 fn listing_with_runtime(
     config: &Config,
     assignments: &AssignmentMap,
@@ -2260,9 +2315,12 @@ impl OrchestratorService {
                 request.operation_id
             ));
         }
-        if record.status != OperationStatus::Proposed {
+        if !matches!(
+            record.status,
+            OperationStatus::Proposed | OperationStatus::BlockedByPolicy
+        ) {
             return Err(format!(
-                "operation_id={} is not in proposed status",
+                "operation_id={} is not in proposed or blocked_by_policy status",
                 request.operation_id
             ));
         }
@@ -2296,6 +2354,69 @@ impl OrchestratorService {
             assignments_changed: false,
             expected_proposal_hash: request.expected_proposal_hash,
             expires_unix_secs,
+        })
+    }
+
+    async fn dry_run_execute_operation(
+        &self,
+        request: OperationExecutionRequest,
+        now: SystemTime,
+    ) -> Result<OperationExecutionWriteResponse, String> {
+        let Some(path) = self.operation_ledger_path.as_ref() else {
+            return Err(
+                "operation ledger persistence is disabled; set TESSERA_ORCH_OPERATION_LEDGER_PATH"
+                    .to_string(),
+            );
+        };
+        let now_unix_secs = unix_timestamp_secs(now);
+        let mut ledger = self.operation_ledger.write().await;
+        let mut next_ledger = ledger.clone();
+        let Some(record) = next_ledger
+            .records
+            .iter_mut()
+            .find(|record| record.operation_id == request.operation_id)
+        else {
+            return Err(format!("operation_id={} not found", request.operation_id));
+        };
+        if record.proposal.proposal_hash != request.expected_proposal_hash {
+            return Err(format!(
+                "operation_id={} expected_proposal_hash does not match proposal_hash",
+                request.operation_id
+            ));
+        }
+
+        let reason = execution_block_reason(record, request.policy_id.as_deref(), now_unix_secs);
+        let already_recorded = record
+            .phases
+            .iter()
+            .any(|phase| phase.name == "execution_blocked_by_policy" && phase.reason == reason);
+        if !already_recorded {
+            record.status = OperationStatus::BlockedByPolicy;
+            record.updated_unix_secs = now_unix_secs;
+            record.phases.push(OperationPhase {
+                name: "execution_blocked_by_policy".to_string(),
+                state: OperationPhaseState::Failed,
+                unix_secs: now_unix_secs,
+                reason: reason.clone(),
+            });
+            write_operation_ledger_file(path.as_path(), &next_ledger).map_err(|err| {
+                format!("persist operation ledger to {}: {err:#}", path.display())
+            })?;
+            *ledger = next_ledger;
+        }
+
+        Ok(OperationExecutionWriteResponse {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            operation_id: request.operation_id,
+            status: if already_recorded {
+                "already_blocked_by_policy"
+            } else {
+                "blocked_by_policy"
+            },
+            assignments_changed: false,
+            mutation_attempted: false,
+            mutation_allowed: false,
+            reason,
         })
     }
 
@@ -3437,6 +3558,16 @@ fn parse_operation_approval_request(query: &str) -> Result<OperationApprovalRequ
     })
 }
 
+fn parse_operation_execution_request(query: &str) -> Result<OperationExecutionRequest, String> {
+    let params = parse_query_params(query)?;
+    Ok(OperationExecutionRequest {
+        operation_id: required_query_param(&params, "operation_id")?.to_string(),
+        expected_proposal_hash: required_query_param(&params, "expected_proposal_hash")?
+            .to_string(),
+        policy_id: params.get("policy_id").cloned(),
+    })
+}
+
 fn parse_query_params(query: &str) -> Result<HashMap<String, String>, String> {
     let mut params = HashMap::new();
     if query.trim().is_empty() {
@@ -4150,6 +4281,39 @@ async fn handle_prometheus_metrics_request(
             },
             Err(reason) => {
                 let body = format!("operation approval request invalid: {reason}\n");
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    &body,
+                )
+                .await?;
+            }
+        }
+    } else if method == "POST" && path == "/operations/executions" {
+        match parse_operation_execution_request(query) {
+            Ok(request) => match service
+                .dry_run_execute_operation(request, SystemTime::now())
+                .await
+            {
+                Ok(response) => {
+                    let body = serde_json::to_string_pretty(&response)
+                        .context("serialize operation execution write response")?;
+                    write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
+                }
+                Err(reason) => {
+                    let status = if reason.contains("TESSERA_ORCH_OPERATION_LEDGER_PATH") {
+                        "409 Conflict"
+                    } else {
+                        "400 Bad Request"
+                    };
+                    let body = format!("operation execution unavailable: {reason}\n");
+                    write_http_response(&mut stream, status, "text/plain; charset=utf-8", &body)
+                        .await?;
+                }
+            },
+            Err(reason) => {
+                let body = format!("operation execution request invalid: {reason}\n");
                 write_http_response(
                     &mut stream,
                     "400 Bad Request",
@@ -6563,6 +6727,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operation_ledger_execution_blocks_unapproved_operation_without_assignment_mutation() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-execution-unapproved");
+        let record = sample_operation_record("execute-unapproved-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let before = service.listing().await;
+
+        let response = service
+            .dry_run_execute_operation(
+                OperationExecutionRequest {
+                    operation_id: "execute-unapproved-op".to_string(),
+                    expected_proposal_hash: proposal_hash,
+                    policy_id: None,
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(500),
+            )
+            .await
+            .expect("dry-run execution");
+        let after = service.listing().await;
+
+        assert_eq!(response.status, "blocked_by_policy");
+        assert_eq!(response.reason, "operation is not approved");
+        assert!(!response.assignments_changed);
+        assert!(!response.mutation_attempted);
+        assert!(!response.mutation_allowed);
+        assert_eq!(before, after);
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        let record = &loaded.records[0];
+        assert_eq!(record.status, OperationStatus::BlockedByPolicy);
+        assert!(
+            record
+                .phases
+                .iter()
+                .any(|phase| phase.name == "execution_blocked_by_policy")
+        );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_execution_blocks_default_off_after_approval_idempotently() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-execution-approved");
+        let mut record = sample_operation_record("execute-approved-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        record.status = OperationStatus::Approved;
+        record.approval = Some(OperationApproval {
+            policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+            approver: "operator".to_string(),
+            allowed_kind: DynamicOperationKind::Split,
+            approved_unix_secs: 400,
+            expires_unix_secs: 1000,
+            expected_proposal_hash: proposal_hash.clone(),
+            cooldown_key: "world-0".to_string(),
+            budget_key: "dynamic-ops-daily".to_string(),
+        });
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let request = OperationExecutionRequest {
+            operation_id: "execute-approved-op".to_string(),
+            expected_proposal_hash: proposal_hash,
+            policy_id: Some("operator_approved_dynamic_operation_v1".to_string()),
+        };
+
+        let response = service
+            .dry_run_execute_operation(
+                request.clone(),
+                UNIX_EPOCH + std::time::Duration::from_secs(500),
+            )
+            .await
+            .expect("dry-run execution");
+        let repeat = service
+            .dry_run_execute_operation(request, UNIX_EPOCH + std::time::Duration::from_secs(501))
+            .await
+            .expect("repeat dry-run execution");
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+
+        assert_eq!(response.status, "blocked_by_policy");
+        assert_eq!(repeat.status, "already_blocked_by_policy");
+        assert!(response.reason.contains("default-off"));
+        assert_eq!(loaded.records[0].status, OperationStatus::BlockedByPolicy);
+        assert_eq!(
+            loaded.records[0]
+                .phases
+                .iter()
+                .filter(|phase| phase.name == "execution_blocked_by_policy")
+                .count(),
+            1
+        );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_approval_can_follow_blocked_execution_attempt() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-approve-after-block");
+        let record = sample_operation_record("approve-after-block-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+
+        service
+            .dry_run_execute_operation(
+                OperationExecutionRequest {
+                    operation_id: "approve-after-block-op".to_string(),
+                    expected_proposal_hash: proposal_hash.clone(),
+                    policy_id: None,
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(500),
+            )
+            .await
+            .expect("block execution");
+        let approved = service
+            .approve_operation(
+                OperationApprovalRequest {
+                    operation_id: "approve-after-block-op".to_string(),
+                    policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+                    approver: "operator".to_string(),
+                    expected_proposal_hash: proposal_hash,
+                    ttl_secs: 600,
+                    cooldown_key: "world-0".to_string(),
+                    budget_key: "dynamic-ops-daily".to_string(),
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(501),
+            )
+            .await
+            .expect("approval after block");
+
+        assert_eq!(approved.status, "approved");
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::Approved);
+        assert!(loaded.records[0].approval.is_some());
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
     async fn operation_ledger_proposal_recording_requires_persistence_path() {
         let service = OrchestratorService::new(two_worker_handover_config());
         let err = service
@@ -7741,6 +8078,59 @@ mod tests {
         let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
         assert_eq!(loaded.records[0].status, OperationStatus::Approved);
         assert!(loaded.records[0].approval.is_some());
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_records_blocked_execution() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http-execution");
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![sample_operation_record("http-execute-op")],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind execution listener");
+        let addr = listener.local_addr().expect("execution listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept execution request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle execution request");
+        });
+
+        let request = b"POST /operations/executions?operation_id=http-execute-op&expected_proposal_hash=proposal-hash-1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut client = TcpStream::connect(addr).await.expect("connect executions");
+        client
+            .write_all(request)
+            .await
+            .expect("write execution request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read execution response");
+        server.await.expect("execution server task");
+
+        let response = String::from_utf8(response).expect("utf8 execution response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains(r#""status": "blocked_by_policy""#));
+        assert!(response.contains(r#""assignments_changed": false"#));
+        assert!(response.contains(r#""mutation_attempted": false"#));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::BlockedByPolicy);
         let _ = fs::remove_file(ledger_path);
     }
 }

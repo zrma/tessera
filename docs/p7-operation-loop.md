@@ -96,7 +96,11 @@ Each slice should be self-contained:
    approves an existing proposal only when the supplied proposal hash still
    matches and still leaves execution mutation disabled.
 5. **Executor dry run**: report blocked execution by default and approved
-   execution only under explicit policy.
+   execution only under explicit policy. The first surface is
+   `POST /operations/executions?...`, which evaluates proposal hash,
+   approval, policy, TTL, cooldown, and budget metadata but records only a
+   durable `blocked_by_policy` phase/status while runtime mutation remains
+   default-off.
 6. **Closed-loop smoke**: verify proposal-to-approval-to-execution locally for
    split, merge, and canonical multi-depth paths.
 7. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
