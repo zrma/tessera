@@ -26,6 +26,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - Harness만 확인: `cargo xt harness`
 - 전체 테스트: `cargo test`
 - P6+ completion gate 확인: `cargo xt p6-completion-audit` (모든 internal P6+ evidence가 닫히기 전에는 실패해야 함)
+- P6 internal rollout 승인/runbook: `docs/p6-internal-rollout-runbook.md`
 - 실행 예시:
   - `cargo run -p tessera-gateway`
   - `cargo run -p tessera-worker`
