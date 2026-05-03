@@ -249,9 +249,29 @@ the fresh state/ledger paths. After cleanup, ArgoCD returned to
 `Synced / Healthy`, Gateway parent Ping still returned `Pong { ts: 123 }`,
 `GET /operations` retained the completed operation record, and
 `GET /split-merge/preview` reported `assignment_listing_zero_metrics` with zero
-plans. Internal failure/recovery helper support is now implemented, but the live
-failure/recovery report, restart report, and completion-audit evidence remain
-follow-up gates until a controlled smoke window records them.
+plans.
+
+The same day, failure/recovery was recorded in a second controlled window. k8s
+revision `4db4487efda3a50c0eef1739a5bdcaccc85d7d85` reopened the four-sibling
+topology with fresh failure state/ledger paths and manual mutation flags.
+`cargo xt k8s operation-smoke --allow-execution --with-failure --allow-scale`
+completed operation `p7-merge-w0-cx0-cy0-d0-s0-1586936fe8a4`, and
+`cargo xt k8s operation-report-check --require-published-execution
+--require-recovery-required` validated
+`.dev/reports/internal-microk8s-p7-operation-failure-smoke-latest.json`. The
+report records approved execution, owner Worker scale-down detection,
+`status=recovery_required`, one recovery-required ledger record, operator
+scale-up recovery, and no automatic rollback observation.
+
+Cleanup revision `b0307901cb037492a8dbb57084170a1c56c8bd6e` removed the manual
+execution flag, split/merge activation flag, and preview fixture again while
+keeping the failure state/ledger paths. After cleanup, ArgoCD returned to
+`Synced / Healthy`, live Orchestrator env contained only the non-mutating
+config/state/ledger paths, Gateway parent Ping returned `Pong { ts: 123 }`,
+`GET /operations` retained one `recovery_required` record, and
+`GET /split-merge/preview` again reported `assignment_listing_zero_metrics` with
+zero plans. Internal restart and completion-audit evidence remain follow-up
+gates.
 
 Current internal operation helper:
 
