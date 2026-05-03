@@ -9131,12 +9131,16 @@ fn p6_completion_findings(report_dir: &Path) -> Vec<P6CompletionFinding> {
                 None,
                 &[],
             ) {
+                let evidence =
+                    p6_live_metrics_readiness_evidence(report_dir).unwrap_or_else(|| {
+                        format!(
+                            "{} failed --require-live-metrics-plan: {err}",
+                            internal_split_path.display()
+                        )
+                    });
                 findings.push(P6CompletionFinding {
                     gate: "p6_internal_live_metrics_plan",
-                    evidence: format!(
-                        "{} failed --require-live-metrics-plan: {err}",
-                        internal_split_path.display()
-                    ),
+                    evidence,
                     missing: "internal ready split plan sourced from live Worker metrics"
                         .to_string(),
                 });
@@ -9403,6 +9407,29 @@ fn p6_restart_preflight_evidence(report_dir: &Path) -> Option<String> {
         ));
     }
     None
+}
+
+fn p6_live_metrics_readiness_evidence(report_dir: &Path) -> Option<String> {
+    let path = report_dir.join("internal-microk8s-live-metrics-readiness-negative.json");
+    let report = read_json_report(&path).ok()?;
+    if validate_internal_k8s_activation_report(&report, false, false, false, false, None, &[])
+        .is_err()
+    {
+        return None;
+    }
+    let stage = json_str(&report, &["stage"]).ok()?;
+    let status = json_str(&report, &["plan", "status"]).ok()?;
+    if status == "ready" {
+        return None;
+    }
+    let source = json_str(&report, &["plan", "preview", "source"]).ok()?;
+    if !source.starts_with("live_worker_metrics:") {
+        return None;
+    }
+    Some(format!(
+        "{} recognized as negative live-metrics readiness: stage={stage}, plan.status={status}, activation_mutated=false, plan.preview.source starts with live_worker_metrics",
+        path.display()
+    ))
 }
 
 fn bool_gate_set_complete(report: &serde_json::Value, paths: &[&[&str]]) -> bool {
@@ -16109,6 +16136,27 @@ demo_count 4
         )
         .expect("write restart preflight report");
 
+        let live_metrics_readiness = serde_json::json!({
+            "schema": "tessera.internal_microk8s_activation_smoke.v1",
+            "stage": "blocked_before_activation",
+            "activation_mutated": false,
+            "preflight_errors": [],
+            "plan": {
+                "activation_mutated": false,
+                "preview": {
+                    "source": "live_worker_metrics:worker-a=127.0.0.1:5603",
+                    "plan_count": 0
+                },
+                "status": "no_split_candidate"
+            }
+        });
+        fs::write(
+            dir.join("internal-microk8s-live-metrics-readiness-negative.json"),
+            serde_json::to_string_pretty(&live_metrics_readiness)
+                .expect("serialize live metrics readiness report"),
+        )
+        .expect("write live metrics readiness report");
+
         let merge = serde_json::json!({
             "schema": "tessera.internal_microk8s_merge_activation_smoke.v1",
             "stage": "blocked_before_activation",
@@ -16191,6 +16239,13 @@ demo_count 4
                 && finding
                     .evidence
                     .contains("TESSERA_ORCH_ASSIGNMENT_STATE_PATH")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p6_internal_live_metrics_plan"
+                && finding
+                    .evidence
+                    .contains("internal-microk8s-live-metrics-readiness-negative.json")
+                && finding.evidence.contains("no_split_candidate")
         }));
         assert!(
             findings

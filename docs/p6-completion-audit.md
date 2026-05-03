@@ -54,10 +54,11 @@ validated by `cargo xt p6-rollout-report-check`. The checker expects
 `.dev/reports/p6-gitops-rollout-latest.json` to record a non-P5 P6 image,
 matching runtime deployment images, approved GitOps rollout revision, ArgoCD
 `Synced / Healthy`, and post-smoke default-off cleanup.
-When a verified restart-readiness preflight report exists, the completion audit
-uses it as the `p6_internal_restart_recovery` evidence string so the current
-PVC-backed state storage blocker is visible without hiding the missing approved
-restart recovery report.
+When verified restart or live-metrics readiness reports exist, the completion
+audit uses them as the `p6_internal_restart_recovery` and
+`p6_internal_live_metrics_plan` evidence strings so the current PVC-backed state
+storage and `no_split_candidate` blockers are visible without hiding the missing
+approved restart recovery and ready live-metrics reports.
 
 | Gate | Current evidence | Status | Missing before completion |
 | --- | --- | --- | --- |
