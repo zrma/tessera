@@ -53,9 +53,10 @@ track is a durable, auditable operation loop:
 
 Recommended next slices:
 
-1. `test: add p7 execution observation smoke` - after a published operation,
-   record route convergence, Worker refresh, AOI/latency/close-counter evidence,
-   and transition from `observing` toward completion.
+1. Done: `test: add p7 execution observation smoke` - local full-stack smoke
+   records route convergence, Worker refresh, stable-session traffic,
+   latency/close-counter evidence, and transitions a published same-Worker merge
+   operation from `observing` to `completed`.
 2. `test: add p7 execution recovery smoke` - inject owner/target outage after an
    approved execution, record `recovery_required`, verify no automatic rollback,
    and prove operator-visible recovery.

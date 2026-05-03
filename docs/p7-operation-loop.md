@@ -74,7 +74,8 @@ This validates the first proposal -> approval -> default-off blocked execution
 artifact. It is not a replacement for runtime execution, observation,
 recovery, internal rollout, or final P7 completion audit evidence.
 Approved execution ledgers use the same checker with
-`--require-published-execution`.
+`--require-published-execution`; completed observation ledgers add
+`--require-completed-observation`.
 
 Current local closed-loop smoke:
 
@@ -110,8 +111,28 @@ published execution for an approved same-Worker merge operation, verifies that a
 repeat execution returns `already_published` without another mutation, and
 writes `.dev/reports/p7-operation-execution-smoke-latest.json` plus
 `.dev/reports/p7-operation-execution-ledger-latest.json`. Split runtime
-execution, canonical multi-depth runtime execution, observation, recovery,
-restart, soak, and internal MicroK8s evidence remain explicit follow-up gates.
+execution and canonical multi-depth runtime execution remain default-off.
+
+Current observation smoke:
+
+```sh
+cargo xt dev p7-operation-observation-smoke
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/reports/p7-operation-observation-ledger-latest.json \
+  --require-approval \
+  --require-published-execution \
+  --require-completed-observation
+```
+
+This starts a full local dev stack, records proposal -> approval -> published
+execution through the P7 HTTP endpoints, then proves Gateway route convergence,
+Worker parent actor refresh, stable-session parent traffic, latency metrics, and
+clean close counters before calling `POST /operations/observations`. The ledger
+ends with `status=completed` and a succeeded `observation_completed` phase in
+`.dev/reports/p7-operation-observation-ledger-latest.json`; the smoke report is
+`.dev/reports/p7-operation-observation-smoke-latest.json`. Recovery, restart,
+soak, and internal MicroK8s observation evidence remain explicit follow-up
+gates.
 
 Current internal rollout baseline:
 
@@ -194,7 +215,11 @@ Each slice should be self-contained:
    operation can publish once through the P7 executor and that duplicate execute
    calls are idempotent. The first repo-native smoke is
    `cargo xt dev p7-operation-execution-smoke`.
-8. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
+8. **Approved merge observation smoke**: verify that a published operation is
+   closed only after route convergence, Worker refresh, stable-session traffic,
+   latency metrics, and clean close counters are recorded. The first repo-native
+   smoke is `cargo xt dev p7-operation-observation-smoke`.
+9. **Internal rollout**: repeat the controlled image/GitOps/smoke/cleanup flow
    and add the P7 audit gate.
 
 ## Guardrails
