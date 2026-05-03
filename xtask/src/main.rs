@@ -731,6 +731,99 @@ enum K8sSub {
         #[arg(long = "expect-preflight-error")]
         expect_preflight_errors: Vec<String>,
     },
+    /// Build a port-forwarded internal P7 operation plan and optionally run guarded execution
+    OperationSmoke {
+        /// Kubernetes namespace that contains the Tessera runtime
+        #[arg(long, default_value = "tessera")]
+        namespace: String,
+        /// Optional kube context. If unset, the current context is used.
+        #[arg(long)]
+        context: Option<String>,
+        /// Orchestrator service name
+        #[arg(long, default_value = "tessera-orch")]
+        orch_service: String,
+        /// Orchestrator deployment name used for image preflight
+        #[arg(long, default_value = "tessera-orch")]
+        orch_deploy: String,
+        /// Gateway service name
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_service: String,
+        /// Gateway deployment name used for image preflight
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_deploy: String,
+        /// Worker deployment expected to own the merge operation
+        #[arg(long, default_value = "tessera-worker")]
+        owner_worker_deploy: String,
+        /// Worker service used for parent actor metrics
+        #[arg(long, default_value = "tessera-worker")]
+        owner_worker_service: String,
+        /// Worker id expected to own the merge operation
+        #[arg(long, default_value = "worker-a")]
+        owner_worker_id: String,
+        /// ArgoCD Application namespace used for Synced/Healthy preflight
+        #[arg(long, default_value = "argocd")]
+        argocd_namespace: String,
+        /// ArgoCD Application name used for Synced/Healthy preflight
+        #[arg(long, default_value = "tessera")]
+        argocd_app: String,
+        /// Skip the ArgoCD Application Synced/Healthy preflight
+        #[arg(long, default_value_t = false)]
+        skip_argocd_check: bool,
+        /// Expected runtime image for all recorded Tessera deployments
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Local Orchestrator gRPC port for kubectl port-forward
+        #[arg(long, default_value_t = 6000)]
+        local_orch_port: u16,
+        /// Local Orchestrator metrics/operation port for kubectl port-forward
+        #[arg(long, default_value_t = 6100)]
+        local_orch_metrics_port: u16,
+        /// Local Gateway TCP port for kubectl port-forward when --allow-execution is set
+        #[arg(long, default_value_t = 4000)]
+        local_gateway_port: u16,
+        /// Local Gateway metrics/ready port for kubectl port-forward when --allow-execution is set
+        #[arg(long, default_value_t = 4100)]
+        local_gateway_metrics_port: u16,
+        /// Local owner Worker metrics port for kubectl port-forward when --allow-execution is set
+        #[arg(long, default_value_t = 5100)]
+        local_owner_worker_metrics_port: u16,
+        /// Approve and execute the selected P7 merge operation
+        #[arg(long, default_value_t = false)]
+        allow_execution: bool,
+        /// Run parent-route load/soak traffic before closing the observation
+        #[arg(long, default_value_t = false)]
+        with_soak: bool,
+        /// Parent-route soak iterations per actor when --with-soak is set
+        #[arg(long, default_value_t = 16)]
+        soak_iterations: u32,
+        /// Sleep between parent-route soak iterations
+        #[arg(long, default_value_t = 10)]
+        soak_sleep_ms: u64,
+        /// Output JSON path. Defaults to .dev/reports/guarded-kubernetes-p7-operation-smoke-latest.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Validate an internal P7 operation smoke report JSON
+    OperationReportCheck {
+        /// Report JSON path. Defaults to .dev/reports/guarded-kubernetes-p7-operation-smoke-latest.json
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Require approved internal operation execution evidence
+        #[arg(long, default_value_t = false)]
+        require_published_execution: bool,
+        /// Require completed observation evidence after execution
+        #[arg(long, default_value_t = false)]
+        require_completed_observation: bool,
+        /// Require internal parent-route soak evidence
+        #[arg(long, default_value_t = false)]
+        require_soak: bool,
+        /// Require all recorded deployment images to match this image
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Require a blocked/preflight report to contain this substring in preflight_errors[]
+        #[arg(long = "expect-preflight-error")]
+        expect_preflight_errors: Vec<String>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1455,6 +1548,72 @@ fn main() -> Result<()> {
                     require_published,
                     require_failure,
                     require_restart,
+                    require_soak,
+                },
+                expected_image.as_deref(),
+                &expect_preflight_errors,
+            )?,
+            K8sSub::OperationSmoke {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                owner_worker_deploy,
+                owner_worker_service,
+                owner_worker_id,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_owner_worker_metrics_port,
+                allow_execution,
+                with_soak,
+                soak_iterations,
+                soak_sleep_ms,
+                out,
+            } => run_k8s_operation_smoke(K8sOperationSmokeOptions {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                owner_worker_deploy,
+                owner_worker_service,
+                owner_worker_id,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_owner_worker_metrics_port,
+                allow_execution,
+                with_soak,
+                soak_iterations,
+                soak_sleep_ms,
+                out,
+            })?,
+            K8sSub::OperationReportCheck {
+                report,
+                require_published_execution,
+                require_completed_observation,
+                require_soak,
+                expected_image,
+                expect_preflight_errors,
+            } => run_k8s_operation_report_check(
+                report.as_deref(),
+                InternalP7OperationRequirements {
+                    require_published_execution,
+                    require_completed_observation,
                     require_soak,
                 },
                 expected_image.as_deref(),
@@ -9034,6 +9193,645 @@ fn run_k8s_merge_activation_smoke(options: K8sMergeActivationSmokeOptions) -> Re
     Ok(())
 }
 
+#[derive(Debug)]
+struct K8sOperationSmokeOptions {
+    namespace: String,
+    context: Option<String>,
+    orch_service: String,
+    orch_deploy: String,
+    gateway_service: String,
+    gateway_deploy: String,
+    owner_worker_deploy: String,
+    owner_worker_service: String,
+    owner_worker_id: String,
+    argocd_namespace: String,
+    argocd_app: String,
+    skip_argocd_check: bool,
+    expected_image: Option<String>,
+    local_orch_port: u16,
+    local_orch_metrics_port: u16,
+    local_gateway_port: u16,
+    local_gateway_metrics_port: u16,
+    local_owner_worker_metrics_port: u16,
+    allow_execution: bool,
+    with_soak: bool,
+    soak_iterations: u32,
+    soak_sleep_ms: u64,
+    out: Option<PathBuf>,
+}
+
+fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
+    if options.with_soak && !options.allow_execution {
+        bail!("internal k8s P7 operation soak needs a published execution; pass --allow-execution");
+    }
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let preflight_result = k8s_operation_preflight(&context, &options);
+    let preflight = preflight_result.preflight;
+    if !preflight_result.errors.is_empty() {
+        let reason = format!(
+            "internal k8s P7 operation preflight failed: {}",
+            preflight_result.errors.join("; ")
+        );
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                expected_image: options.expected_image.as_deref(),
+                stage: "blocked_before_proposal",
+                reason: &reason,
+                preflight_errors: &preflight_result.errors,
+                operation: None,
+                proposal_response: None,
+                approval_response: None,
+                execution_response: None,
+                observation_response: None,
+                ledger_snapshot: None,
+                ledger_summary: None,
+                orchestrator: None,
+                gateway: None,
+                worker: None,
+                soak: None,
+                completion: InternalK8sOperationCompletion::default(),
+            },
+            options.out.as_deref(),
+        )?;
+        bail!(
+            "{reason}; internal P7 operation report={}",
+            report_path.display()
+        );
+    }
+    if let Some(expected_image) = options.expected_image.as_deref()
+        && let Err(err) =
+            validate_k8s_deployment_images(&preflight.deployment_images, expected_image)
+    {
+        let reason = err.to_string();
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                expected_image: options.expected_image.as_deref(),
+                stage: "blocked_before_proposal",
+                reason: &reason,
+                preflight_errors: &[],
+                operation: None,
+                proposal_response: None,
+                approval_response: None,
+                execution_response: None,
+                observation_response: None,
+                ledger_snapshot: None,
+                ledger_summary: None,
+                orchestrator: None,
+                gateway: None,
+                worker: None,
+                soak: None,
+                completion: InternalK8sOperationCompletion::default(),
+            },
+            options.out.as_deref(),
+        )?;
+        bail!(
+            "{reason}; internal P7 operation report={}",
+            report_path.display()
+        );
+    }
+
+    let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_orch_metrics_addr = format!("127.0.0.1:{}", options.local_orch_metrics_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
+    let local_owner_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_owner_worker_metrics_port);
+    let mut forwards = ManagedK8sPortForwards::default();
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.orch_service,
+        "p7-operation-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    if options.allow_execution {
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.gateway_service,
+            "p7-operation-gateway",
+            &[
+                (options.local_gateway_port, 4000),
+                (options.local_gateway_metrics_port, 4100),
+            ],
+        )?;
+        forwards.spawn(
+            &context,
+            &options.namespace,
+            &options.owner_worker_service,
+            "p7-operation-owner-worker",
+            &[(options.local_owner_worker_metrics_port, 5100)],
+        )?;
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let orch_endpoint = grpc_endpoint(&local_orch_addr);
+    let (before_health, before_listing) = match runtime
+        .block_on(wait_for_orchestrator_registered(&orch_endpoint, 1))
+        .and_then(|_| runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint)))
+    {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let reason = format!("internal P7 operation Orchestrator readiness failed: {err:#}");
+            let report_path = write_internal_k8s_operation_report(
+                InternalK8sOperationReport {
+                    context: &context,
+                    namespace: &options.namespace,
+                    orch_service: &options.orch_service,
+                    gateway_service: &options.gateway_service,
+                    owner_worker_deploy: &options.owner_worker_deploy,
+                    owner_worker_service: &options.owner_worker_service,
+                    owner_worker_id: &options.owner_worker_id,
+                    argocd_namespace: &options.argocd_namespace,
+                    argocd_app: &options.argocd_app,
+                    argocd_status: preflight.argocd_status.as_ref(),
+                    deployment_images: &preflight.deployment_images,
+                    expected_image: options.expected_image.as_deref(),
+                    stage: "blocked_before_proposal",
+                    reason: &reason,
+                    preflight_errors: std::slice::from_ref(&reason),
+                    operation: None,
+                    proposal_response: None,
+                    approval_response: None,
+                    execution_response: None,
+                    observation_response: None,
+                    ledger_snapshot: None,
+                    ledger_summary: None,
+                    orchestrator: None,
+                    gateway: None,
+                    worker: None,
+                    soak: None,
+                    completion: InternalK8sOperationCompletion::default(),
+                },
+                options.out.as_deref(),
+            )?;
+            bail!(
+                "{reason}; internal P7 operation report={}",
+                report_path.display()
+            );
+        }
+    };
+    let mut orchestrator_evidence = InternalK8sOperationOrchestratorEvidence {
+        grpc_addr: local_orch_addr.clone(),
+        metrics_addr: local_orch_metrics_addr.clone(),
+        registered_workers_before: before_health.registered_workers,
+        registered_workers_after: None,
+        assignment_listing_before: assignment_listing_summary_json(&before_listing)?,
+        assignment_listing_after: None,
+    };
+
+    let mut gateway_evidence = None;
+    let mut child0_session = None;
+    if options.allow_execution {
+        assert_http_status_endpoint(
+            "internal P7 operation gateway readiness",
+            &local_gateway_metrics_addr,
+            "/ready",
+            "200 OK",
+        )?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+        let gateway_metrics_before = assert_metrics_endpoint_body_until(
+            "internal P7 operation gateway before",
+            &local_gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+        let gateway_routes_before =
+            prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+        let actor_a = EntityId(8_701);
+        let actor_b = EntityId(8_702);
+        child0_session = Some(open_gateway_join_until_snapshot(
+            &local_gateway_addr,
+            activation_child_cell(0),
+            actor_a,
+            Position { x: 4.0, y: 4.0 },
+        )?);
+        let _child3_session = open_gateway_join_until_snapshot(
+            &local_gateway_addr,
+            activation_child_cell(3),
+            actor_b,
+            Position { x: 24.0, y: 24.0 },
+        )?;
+        gateway_evidence = Some(InternalK8sOperationGatewayEvidence {
+            addr: local_gateway_addr.clone(),
+            metrics_addr: local_gateway_metrics_addr.clone(),
+            routes_before: Some(gateway_routes_before),
+            routes_after: None,
+            ping_roundtrips: None,
+            join_roundtrips: None,
+            move_roundtrips: None,
+            close_before: Some(gateway_close_before),
+            close_after: None,
+        });
+    }
+
+    let proposal_response = http_json_post(
+        "internal P7 operation proposal",
+        &local_orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+    let proposal_snapshot = http_json_get(
+        "internal P7 operation ledger",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let selection = select_internal_p7_merge_operation(&proposal_response, &proposal_snapshot);
+    let (operation, proposal_record) = match selection {
+        Ok(selection) => selection,
+        Err(err) => {
+            let reason = err.to_string();
+            let summary =
+                validate_p7_operation_ledger(&proposal_snapshot, false, false, false, false, false)
+                    .ok();
+            let report_path = write_internal_k8s_operation_report(
+                InternalK8sOperationReport {
+                    context: &context,
+                    namespace: &options.namespace,
+                    orch_service: &options.orch_service,
+                    gateway_service: &options.gateway_service,
+                    owner_worker_deploy: &options.owner_worker_deploy,
+                    owner_worker_service: &options.owner_worker_service,
+                    owner_worker_id: &options.owner_worker_id,
+                    argocd_namespace: &options.argocd_namespace,
+                    argocd_app: &options.argocd_app,
+                    argocd_status: preflight.argocd_status.as_ref(),
+                    deployment_images: &preflight.deployment_images,
+                    expected_image: options.expected_image.as_deref(),
+                    stage: "blocked_before_execution",
+                    reason: &reason,
+                    preflight_errors: &[],
+                    operation: None,
+                    proposal_response: Some(&proposal_response),
+                    approval_response: None,
+                    execution_response: None,
+                    observation_response: None,
+                    ledger_snapshot: Some(&proposal_snapshot),
+                    ledger_summary: summary,
+                    orchestrator: Some(&orchestrator_evidence),
+                    gateway: gateway_evidence.as_ref(),
+                    worker: None,
+                    soak: None,
+                    completion: InternalK8sOperationCompletion::default(),
+                },
+                options.out.as_deref(),
+            )?;
+            bail!(
+                "{reason}; internal P7 operation report={}",
+                report_path.display()
+            );
+        }
+    };
+    if operation.owner_worker_id != options.owner_worker_id {
+        bail!(
+            "internal P7 operation owner {} did not match --owner-worker-id {}",
+            operation.owner_worker_id,
+            options.owner_worker_id
+        );
+    }
+    validate_p7_operation_record(proposal_record)?;
+    let proposal_summary =
+        validate_p7_operation_ledger(&proposal_snapshot, false, false, false, false, false)?;
+    if !options.allow_execution {
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                expected_image: options.expected_image.as_deref(),
+                stage: "planned_without_execution",
+                reason: "P7 merge operation proposal is recorded; helper stopped before approval/execution because --allow-execution was not provided",
+                preflight_errors: &[],
+                operation: Some(&operation),
+                proposal_response: Some(&proposal_response),
+                approval_response: None,
+                execution_response: None,
+                observation_response: None,
+                ledger_snapshot: Some(&proposal_snapshot),
+                ledger_summary: Some(proposal_summary),
+                orchestrator: Some(&orchestrator_evidence),
+                gateway: gateway_evidence.as_ref(),
+                worker: None,
+                soak: None,
+                completion: InternalK8sOperationCompletion {
+                    operation_recorded: true,
+                    ..InternalK8sOperationCompletion::default()
+                },
+            },
+            options.out.as_deref(),
+        )?;
+        println!(
+            "internal P7 operation smoke stopped before mutation; operation={} report={}",
+            operation.operation_id,
+            report_path.display()
+        );
+        return Ok(());
+    }
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "internal P7 operation approval",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={}&policy_id={policy_id}&approver=internal-p7-operation-smoke&expected_proposal_hash={}&ttl_secs=600&cooldown_key=internal-p7-operation-smoke&budget_key=internal-p7-operation-smoke",
+            operation.operation_id, operation.proposal_hash
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+    assert_json_bool_eq(&approval_response, &["assignments_changed"], false)?;
+
+    let execution_response = http_json_post(
+        "internal P7 operation execution",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={}&expected_proposal_hash={}&policy_id={policy_id}",
+            operation.operation_id, operation.proposal_hash
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+    runtime.block_on(wait_for_split_listing(
+        &orch_endpoint,
+        &[(operation.parent, operation.owner_worker_id.as_str())],
+    ))?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+    assert_gateway_ping_until(&local_gateway_addr, operation.parent, 17_001)?;
+    let mut child0_session = child0_session
+        .ok_or_else(|| anyhow::anyhow!("internal P7 operation child0 session was not opened"))?;
+    let _move_observed = request_move_until_delta(
+        &mut child0_session,
+        operation.parent,
+        EntityId(8_701),
+        1.0,
+        1.0,
+        "internal P7 operation parent move",
+    )?;
+
+    let mut soak_evidence = None;
+    if options.with_soak {
+        let stats = run_parent_activation_soak_loop(
+            &local_gateway_addr,
+            operation.parent,
+            options.soak_iterations,
+            Duration::from_millis(options.soak_sleep_ms),
+        )?;
+        let min_total = u64::from(options.soak_iterations) * 4;
+        if stats.pings_ok < min_total || stats.moves_ok < min_total {
+            bail!(
+                "internal P7 operation soak expected at least {min_total} pings/moves, got pings={} moves={}",
+                stats.pings_ok,
+                stats.moves_ok
+            );
+        }
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &[(operation.parent, operation.owner_worker_id.as_str())],
+        ))?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+        soak_evidence = Some(InternalK8sOperationSoakEvidence {
+            iterations: options.soak_iterations,
+            sleep_ms: options.soak_sleep_ms,
+            pings_ok: stats.pings_ok,
+            moves_ok: stats.moves_ok,
+            expected_actor_requests: min_total,
+        });
+    }
+
+    let _parent_probe_session = open_gateway_join_until_snapshot(
+        &local_gateway_addr,
+        operation.parent,
+        EntityId(8_703),
+        Position { x: 16.0, y: 16.0 },
+    )?;
+    let worker_parent_metric = worker_cell_actor_count_metric(operation.parent);
+    let worker_metrics = assert_metrics_endpoint_body_until(
+        "internal P7 operation owner worker",
+        &local_owner_worker_metrics_addr,
+        &[
+            "tessera_worker_cell_actor_count",
+            "tessera_worker_accepted_connections_total",
+        ],
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P7 operation owner worker",
+        &worker_metrics,
+        worker_parent_metric.as_str(),
+        1.0,
+    )?;
+    let worker_parent_actor_count =
+        prometheus_sample_value(&worker_metrics, worker_parent_metric.as_str())?;
+
+    let gateway_metrics_after = assert_metrics_endpoint_body_until(
+        "internal P7 operation gateway after",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_routes_after =
+        prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_routes")?;
+    let expected_ping_roundtrips = if let Some(soak) = soak_evidence.as_ref() {
+        soak.expected_actor_requests as f64
+    } else {
+        1.0
+    };
+    let expected_move_roundtrips = if let Some(soak) = soak_evidence.as_ref() {
+        soak.expected_actor_requests as f64
+    } else {
+        1.0
+    };
+    assert_prometheus_sample_at_least(
+        "internal P7 operation gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        expected_ping_roundtrips,
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P7 operation gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+        3.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P7 operation gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        expected_move_roundtrips,
+    )?;
+    let gateway_close_after = gateway_close_counters_from_metrics(&gateway_metrics_after)?;
+    let gateway_close_before = gateway_evidence
+        .as_ref()
+        .and_then(|gateway| gateway.close_before)
+        .ok_or_else(|| anyhow::anyhow!("internal P7 operation missing gateway close baseline"))?;
+    assert_gateway_close_counters_not_increased(
+        "internal P7 operation gateway",
+        gateway_close_before,
+        gateway_close_after,
+    )?;
+    let ping_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )?;
+    let join_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+    )?;
+    let move_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+    )?;
+    if let Some(gateway) = gateway_evidence.as_mut() {
+        gateway.routes_after = Some(gateway_routes_after);
+        gateway.ping_roundtrips = Some(ping_roundtrips);
+        gateway.join_roundtrips = Some(join_roundtrips);
+        gateway.move_roundtrips = Some(move_roundtrips);
+        gateway.close_after = Some(gateway_close_after);
+    }
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    orchestrator_evidence.registered_workers_after = Some(after_listing.workers.len() as u64);
+    orchestrator_evidence.assignment_listing_after =
+        Some(assignment_listing_summary_json(&after_listing)?);
+
+    let route_converged = (gateway_routes_after - 1.0).abs() < f64::EPSILON;
+    let worker_refreshed = worker_parent_actor_count >= 1.0;
+    let traffic_confirmed =
+        ping_roundtrips >= expected_ping_roundtrips && move_roundtrips >= expected_move_roundtrips;
+    let counters_clean = gateway_close_before == gateway_close_after;
+    if !(route_converged && worker_refreshed && traffic_confirmed && counters_clean) {
+        bail!(
+            "internal P7 operation evidence incomplete: route_converged={route_converged} worker_refreshed={worker_refreshed} traffic_confirmed={traffic_confirmed} counters_clean={counters_clean}"
+        );
+    }
+
+    let observation_response = http_json_post(
+        "internal P7 operation observation",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={}&expected_proposal_hash={}&observer=internal-p7-operation-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true",
+            operation.operation_id, operation.proposal_hash
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "completed")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+    assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
+
+    let completed_snapshot = http_json_get(
+        "internal P7 operation ledger",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let completed_summary =
+        validate_p7_operation_ledger(&completed_snapshot, true, false, true, true, false)?;
+    let completed_record = find_p7_operation_record(&completed_snapshot, &operation.operation_id)?;
+    validate_p7_completed_observation(completed_record)?;
+    let worker_evidence = InternalK8sOperationWorkerEvidence {
+        worker_id: options.owner_worker_id.clone(),
+        metrics_addr: local_owner_worker_metrics_addr,
+        parent_actor_count: worker_parent_actor_count,
+    };
+    let completion = InternalK8sOperationCompletion {
+        operation_recorded: true,
+        approval_recorded: true,
+        execution_published: true,
+        route_converged,
+        worker_refreshed,
+        traffic_confirmed,
+        gateway_close_counters_clean: counters_clean,
+        observation_completed: true,
+        load_soak_ran: options.with_soak,
+    };
+    let report_path = write_internal_k8s_operation_report(
+        InternalK8sOperationReport {
+            context: &context,
+            namespace: &options.namespace,
+            orch_service: &options.orch_service,
+            gateway_service: &options.gateway_service,
+            owner_worker_deploy: &options.owner_worker_deploy,
+            owner_worker_service: &options.owner_worker_service,
+            owner_worker_id: &options.owner_worker_id,
+            argocd_namespace: &options.argocd_namespace,
+            argocd_app: &options.argocd_app,
+            argocd_status: preflight.argocd_status.as_ref(),
+            deployment_images: &preflight.deployment_images,
+            expected_image: options.expected_image.as_deref(),
+            stage: "completed",
+            reason: "P7 merge operation executed through guarded internal helper and observation completed",
+            preflight_errors: &[],
+            operation: Some(&operation),
+            proposal_response: Some(&proposal_response),
+            approval_response: Some(&approval_response),
+            execution_response: Some(&execution_response),
+            observation_response: Some(&observation_response),
+            ledger_snapshot: Some(&completed_snapshot),
+            ledger_summary: Some(completed_summary),
+            orchestrator: Some(&orchestrator_evidence),
+            gateway: gateway_evidence.as_ref(),
+            worker: Some(&worker_evidence),
+            soak: soak_evidence.as_ref(),
+            completion,
+        },
+        options.out.as_deref(),
+    )?;
+    println!(
+        "internal P7 operation smoke completed: operation={}{} report={}",
+        operation.operation_id,
+        if options.with_soak {
+            ", soak verified"
+        } else {
+            ""
+        },
+        report_path.display()
+    );
+    Ok(())
+}
+
 fn resolve_kube_context(context: Option<&str>) -> Result<String> {
     if let Some(context) = context {
         if context.trim().is_empty() {
@@ -9177,6 +9975,99 @@ struct K8sMultiDepthActivationPreflight {
 struct K8sMultiDepthActivationPreflightResult {
     preflight: K8sMultiDepthActivationPreflight,
     errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct K8sOperationPreflight {
+    argocd_status: Option<ArgoCdAppStatus>,
+    deployment_images: Vec<K8sDeploymentImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct K8sOperationPreflightResult {
+    preflight: K8sOperationPreflight,
+    errors: Vec<String>,
+}
+
+fn k8s_operation_preflight(
+    context: &str,
+    options: &K8sOperationSmokeOptions,
+) -> K8sOperationPreflightResult {
+    let mut errors = Vec::new();
+    let argocd_status = if options.skip_argocd_check {
+        None
+    } else {
+        match kubectl_argocd_app_status(context, &options.argocd_namespace, &options.argocd_app) {
+            Ok(status) => {
+                if let Err(err) = validate_argocd_app_ready(&status) {
+                    errors.push(err.to_string());
+                }
+                Some(status)
+            }
+            Err(err) => {
+                errors.push(format!(
+                    "ArgoCD application status preflight failed: {err:#}"
+                ));
+                None
+            }
+        }
+    };
+    let (deployment_images, deployment_errors) =
+        collect_k8s_operation_deployment_images(context, options);
+    errors.extend(deployment_errors);
+    for resource in [
+        format!("svc/{}", options.orch_service),
+        format!("svc/{}", options.gateway_service),
+        format!("deploy/{}", options.owner_worker_deploy),
+    ] {
+        if let Err(err) = kubectl_resource_name(context, &options.namespace, &resource) {
+            errors.push(format!(
+                "required resource {resource} is not ready: {err:#}"
+            ));
+        }
+    }
+    if options.allow_execution {
+        let resource = format!("svc/{}", options.owner_worker_service);
+        if let Err(err) = kubectl_resource_name(context, &options.namespace, &resource) {
+            errors.push(format!(
+                "required resource {resource} is not ready: {err:#}"
+            ));
+        }
+    }
+    K8sOperationPreflightResult {
+        preflight: K8sOperationPreflight {
+            argocd_status,
+            deployment_images,
+        },
+        errors,
+    }
+}
+
+fn collect_k8s_operation_deployment_images(
+    context: &str,
+    options: &K8sOperationSmokeOptions,
+) -> (Vec<K8sDeploymentImage>, Vec<String>) {
+    let deployments = [
+        ("orchestrator", options.orch_deploy.as_str()),
+        ("gateway", options.gateway_deploy.as_str()),
+        ("owner_worker", options.owner_worker_deploy.as_str()),
+    ];
+
+    let mut images = Vec::new();
+    let mut errors = Vec::new();
+    for (role, deployment) in deployments {
+        match kubectl_deploy_first_container_image(context, &options.namespace, deployment)
+            .with_context(|| format!("read image for deployment {deployment}"))
+        {
+            Ok(image) => images.push(K8sDeploymentImage {
+                role,
+                deployment: deployment.to_string(),
+                image,
+            }),
+            Err(err) => errors.push(format!("{role}={deployment}: {err:#}")),
+        }
+    }
+    (images, errors)
 }
 
 fn k8s_multi_depth_activation_preflight(
@@ -10104,6 +10995,85 @@ struct InternalK8sMultiDepthActivationReport<'a> {
     completion: InternalK8sMultiDepthCompletion,
 }
 
+struct InternalK8sOperationReport<'a> {
+    context: &'a str,
+    namespace: &'a str,
+    orch_service: &'a str,
+    gateway_service: &'a str,
+    owner_worker_deploy: &'a str,
+    owner_worker_service: &'a str,
+    owner_worker_id: &'a str,
+    argocd_namespace: &'a str,
+    argocd_app: &'a str,
+    argocd_status: Option<&'a ArgoCdAppStatus>,
+    deployment_images: &'a [K8sDeploymentImage],
+    expected_image: Option<&'a str>,
+    stage: &'a str,
+    reason: &'a str,
+    preflight_errors: &'a [String],
+    operation: Option<&'a InternalK8sOperationSelection>,
+    proposal_response: Option<&'a serde_json::Value>,
+    approval_response: Option<&'a serde_json::Value>,
+    execution_response: Option<&'a serde_json::Value>,
+    observation_response: Option<&'a serde_json::Value>,
+    ledger_snapshot: Option<&'a serde_json::Value>,
+    ledger_summary: Option<P7OperationLedgerSummary>,
+    orchestrator: Option<&'a InternalK8sOperationOrchestratorEvidence>,
+    gateway: Option<&'a InternalK8sOperationGatewayEvidence>,
+    worker: Option<&'a InternalK8sOperationWorkerEvidence>,
+    soak: Option<&'a InternalK8sOperationSoakEvidence>,
+    completion: InternalK8sOperationCompletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalK8sOperationSelection {
+    operation_id: String,
+    kind: String,
+    proposal_hash: String,
+    parent: CellId,
+    owner_worker_id: String,
+    policy_id: &'static str,
+}
+
+#[derive(Debug)]
+struct InternalK8sOperationOrchestratorEvidence {
+    grpc_addr: String,
+    metrics_addr: String,
+    registered_workers_before: u64,
+    registered_workers_after: Option<u64>,
+    assignment_listing_before: serde_json::Value,
+    assignment_listing_after: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct InternalK8sOperationGatewayEvidence {
+    addr: String,
+    metrics_addr: String,
+    routes_before: Option<f64>,
+    routes_after: Option<f64>,
+    ping_roundtrips: Option<f64>,
+    join_roundtrips: Option<f64>,
+    move_roundtrips: Option<f64>,
+    close_before: Option<GatewayCloseCounters>,
+    close_after: Option<GatewayCloseCounters>,
+}
+
+#[derive(Debug)]
+struct InternalK8sOperationWorkerEvidence {
+    worker_id: String,
+    metrics_addr: String,
+    parent_actor_count: f64,
+}
+
+#[derive(Debug)]
+struct InternalK8sOperationSoakEvidence {
+    iterations: u32,
+    sleep_ms: u64,
+    pings_ok: u64,
+    moves_ok: u64,
+    expected_actor_requests: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct InternalK8sMergeCompletion {
     activation_mutated: bool,
@@ -10112,6 +11082,19 @@ struct InternalK8sMergeCompletion {
     post_publish_failure_smoke_ran: bool,
     owner_worker_restart_recovered_convergence: bool,
     orchestrator_restart_smoke_ran: bool,
+    load_soak_ran: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InternalK8sOperationCompletion {
+    operation_recorded: bool,
+    approval_recorded: bool,
+    execution_published: bool,
+    route_converged: bool,
+    worker_refreshed: bool,
+    traffic_confirmed: bool,
+    gateway_close_counters_clean: bool,
+    observation_completed: bool,
     load_soak_ran: bool,
 }
 
@@ -10659,6 +11642,255 @@ fn default_internal_k8s_multi_depth_activation_smoke_path() -> PathBuf {
         .join("guarded-kubernetes-multi-depth-activation-smoke-latest.json")
 }
 
+fn default_internal_k8s_operation_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("guarded-kubernetes-p7-operation-smoke-latest.json")
+}
+
+fn select_internal_p7_merge_operation<'a>(
+    proposal_response: &serde_json::Value,
+    ledger_snapshot: &'a serde_json::Value,
+) -> Result<(InternalK8sOperationSelection, &'a serde_json::Value)> {
+    let operation_ids = json_array(proposal_response, &["operation_ids"])?;
+    if operation_ids.is_empty() {
+        bail!("internal P7 operation proposal response has no operation_ids");
+    }
+    for operation_id in operation_ids {
+        let Some(operation_id) = operation_id.as_str() else {
+            continue;
+        };
+        let record = find_p7_operation_record(ledger_snapshot, operation_id)?;
+        let kind = json_str(record, &["kind"])?;
+        if kind != "merge" {
+            continue;
+        }
+        let proposal_hash = json_str(record, &["proposal", "proposal_hash"])?.to_string();
+        let parent = json_cell_id(record, &["proposal", "parent"])?;
+        let targets = json_array(record, &["proposal", "targets"])?;
+        let owner_worker_id = targets
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("internal P7 merge operation has no proposal targets"))
+            .and_then(|target| json_str(target, &["worker_id"]).map(str::to_string))?;
+        return Ok((
+            InternalK8sOperationSelection {
+                operation_id: operation_id.to_string(),
+                kind: kind.to_string(),
+                proposal_hash,
+                parent,
+                owner_worker_id,
+                policy_id: "operator_approved_dynamic_operation_v1",
+            },
+            record,
+        ));
+    }
+    bail!("internal P7 operation proposal response did not include an executable merge operation")
+}
+
+fn write_internal_k8s_operation_report(
+    input: InternalK8sOperationReport<'_>,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let report_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_operation_smoke_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let completion = input.completion;
+    let mut remaining_uncovered = Vec::new();
+    if !completion.operation_recorded {
+        remaining_uncovered.push("guarded_kubernetes_operation_proposal_smoke");
+    }
+    if !completion.execution_published {
+        remaining_uncovered.push("guarded_kubernetes_operation_execution_smoke");
+    }
+    if !completion.observation_completed {
+        remaining_uncovered.push("guarded_kubernetes_operation_observation_smoke");
+    }
+    if !completion.load_soak_ran {
+        remaining_uncovered.push("guarded_kubernetes_operation_soak_smoke");
+    }
+    remaining_uncovered.push("guarded_kubernetes_operation_failure_recovery_smoke");
+    remaining_uncovered.push("guarded_kubernetes_operation_restart_smoke");
+    remaining_uncovered.push("p7_completion_audit");
+
+    let report = serde_json::json!({
+        "schema": "tessera.guarded_kubernetes_p7_operation_smoke.v1",
+        "unix_ts": unix_timestamp_secs(),
+        "stage": input.stage,
+        "operation_mode": "policy_gated_manual",
+        "execution_mutated": completion.execution_published,
+        "execution_allowed": completion.execution_published,
+        "reason": input.reason,
+        "preflight_errors": input.preflight_errors,
+        "cluster": {
+            "context": input.context,
+            "namespace": input.namespace,
+            "orchestrator_service": input.orch_service,
+            "gateway_service": input.gateway_service,
+            "owner_worker_deployment": input.owner_worker_deploy,
+            "owner_worker_service": input.owner_worker_service,
+            "owner_worker_id": input.owner_worker_id,
+            "argocd": argocd_status_json(
+                input.argocd_namespace,
+                input.argocd_app,
+                input.argocd_status
+            ),
+            "expected_image": input.expected_image,
+            "deployment_images": k8s_deployment_images_json(input.deployment_images)
+        },
+        "operation": internal_k8s_operation_selection_json(input.operation),
+        "orchestrator": internal_k8s_operation_orchestrator_json(input.orchestrator),
+        "gateway": internal_k8s_operation_gateway_json(input.gateway),
+        "worker": internal_k8s_operation_worker_json(input.worker),
+        "soak": internal_k8s_operation_soak_json(input.soak),
+        "ledger": internal_k8s_operation_ledger_json(input.ledger_snapshot, input.ledger_summary),
+        "responses": {
+            "proposal": input.proposal_response,
+            "approval": input.approval_response,
+            "execution": input.execution_response,
+            "observation": input.observation_response
+        },
+        "checks": {
+            "operation_recorded": completion.operation_recorded,
+            "approval_recorded": completion.approval_recorded,
+            "execution_published": completion.execution_published,
+            "route_converged": completion.route_converged,
+            "worker_refreshed": completion.worker_refreshed,
+            "traffic_confirmed": completion.traffic_confirmed,
+            "gateway_close_counters_clean": completion.gateway_close_counters_clean,
+            "observation_completed": completion.observation_completed,
+            "load_soak_ran": completion.load_soak_ran,
+            "automatic_rollback_observed": false
+        },
+        "remaining_uncovered": remaining_uncovered
+    });
+    let body = format!("{}\n", serde_json::to_string_pretty(&report)?);
+    let stamped_name = input
+        .operation
+        .map(|operation| operation.operation_id.as_str())
+        .unwrap_or_else(|| {
+            if input.stage == "blocked_before_proposal" {
+                "internal-p7-operation-blocked-before-proposal"
+            } else {
+                "internal-p7-operation-blocked"
+            }
+        });
+    let stamped = report_path.with_file_name(format!("{stamped_name}.json"));
+    fs::write(&stamped, &body)?;
+    fs::write(&report_path, body)?;
+    Ok(report_path)
+}
+
+fn internal_k8s_operation_selection_json(
+    operation: Option<&InternalK8sOperationSelection>,
+) -> serde_json::Value {
+    let Some(operation) = operation else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "operation_id": operation.operation_id.as_str(),
+        "kind": operation.kind.as_str(),
+        "proposal_hash": operation.proposal_hash.as_str(),
+        "parent": operation.parent,
+        "owner_worker_id": operation.owner_worker_id.as_str(),
+        "policy_id": operation.policy_id
+    })
+}
+
+fn internal_k8s_operation_orchestrator_json(
+    evidence: Option<&InternalK8sOperationOrchestratorEvidence>,
+) -> serde_json::Value {
+    let Some(evidence) = evidence else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "grpc_addr": evidence.grpc_addr.as_str(),
+        "metrics_addr": evidence.metrics_addr.as_str(),
+        "registered_workers_before": evidence.registered_workers_before,
+        "registered_workers_after": evidence.registered_workers_after,
+        "assignment_listing_before": evidence.assignment_listing_before,
+        "assignment_listing_after": evidence.assignment_listing_after
+    })
+}
+
+fn internal_k8s_operation_gateway_json(
+    evidence: Option<&InternalK8sOperationGatewayEvidence>,
+) -> serde_json::Value {
+    let Some(evidence) = evidence else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "addr": evidence.addr.as_str(),
+        "metrics_addr": evidence.metrics_addr.as_str(),
+        "routes_before": evidence.routes_before,
+        "routes_after": evidence.routes_after,
+        "ping_roundtrips": evidence.ping_roundtrips,
+        "join_roundtrips": evidence.join_roundtrips,
+        "move_roundtrips": evidence.move_roundtrips,
+        "close_counters": {
+            "before": evidence.close_before.map(gateway_close_counters_json),
+            "after": evidence.close_after.map(gateway_close_counters_json)
+        }
+    })
+}
+
+fn internal_k8s_operation_worker_json(
+    evidence: Option<&InternalK8sOperationWorkerEvidence>,
+) -> serde_json::Value {
+    let Some(evidence) = evidence else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "worker_id": evidence.worker_id.as_str(),
+        "metrics_addr": evidence.metrics_addr.as_str(),
+        "parent_actor_count": evidence.parent_actor_count
+    })
+}
+
+fn internal_k8s_operation_soak_json(
+    evidence: Option<&InternalK8sOperationSoakEvidence>,
+) -> serde_json::Value {
+    let Some(evidence) = evidence else {
+        return serde_json::json!({
+            "ran": false
+        });
+    };
+    serde_json::json!({
+        "ran": true,
+        "iterations": evidence.iterations,
+        "sleep_ms": evidence.sleep_ms,
+        "pings_ok": evidence.pings_ok,
+        "moves_ok": evidence.moves_ok,
+        "expected_actor_requests": evidence.expected_actor_requests
+    })
+}
+
+fn internal_k8s_operation_ledger_json(
+    snapshot: Option<&serde_json::Value>,
+    summary: Option<P7OperationLedgerSummary>,
+) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::Value::Null;
+    };
+    let summary = summary.map(|summary| {
+        serde_json::json!({
+            "records": summary.records,
+            "proposal_records": summary.proposal_records,
+            "approval_records": summary.approval_records,
+            "blocked_execution_records": summary.blocked_execution_records,
+            "published_execution_records": summary.published_execution_records,
+            "completed_observation_records": summary.completed_observation_records,
+            "recovery_required_records": summary.recovery_required_records
+        })
+    });
+    serde_json::json!({
+        "summary": summary,
+        "snapshot": snapshot
+    })
+}
+
 #[derive(Debug)]
 struct K8sPlannerActivationReportOptions {
     namespace: String,
@@ -10887,6 +12119,13 @@ struct InternalCompletionRequirements {
     require_soak: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct InternalP7OperationRequirements {
+    require_published_execution: bool,
+    require_completed_observation: bool,
+    require_soak: bool,
+}
+
 fn run_k8s_merge_activation_report_check(
     report: Option<&Path>,
     require_ready_plan: bool,
@@ -10916,6 +12155,32 @@ fn run_k8s_merge_activation_report_check(
     )?;
     println!(
         "internal k8s merge activation report is valid: {}",
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn run_k8s_operation_report_check(
+    report: Option<&Path>,
+    requirements: InternalP7OperationRequirements,
+    expected_image: Option<&str>,
+    expect_preflight_errors: &[String],
+) -> Result<()> {
+    let report_path = report
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_operation_smoke_path);
+    let body = fs::read_to_string(&report_path)
+        .with_context(|| format!("read P7 operation report {}", report_path.display()))?;
+    let report: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse P7 operation report {}", report_path.display()))?;
+    validate_internal_k8s_operation_report(
+        &report,
+        requirements,
+        expected_image,
+        expect_preflight_errors,
+    )?;
+    println!(
+        "internal k8s P7 operation report is valid: {}",
         report_path.display()
     );
     Ok(())
@@ -13722,6 +14987,145 @@ fn validate_internal_k8s_multi_depth_activation_report(
             );
         }
         assert_remaining_uncovered_absent(report, "guarded_kubernetes_multi_depth_ready_plan")?;
+    }
+    Ok(())
+}
+
+fn validate_internal_k8s_operation_report(
+    report: &serde_json::Value,
+    requirements: InternalP7OperationRequirements,
+    expected_image: Option<&str>,
+    expect_preflight_errors: &[String],
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.guarded_kubernetes_p7_operation_smoke.v1",
+    )?;
+    let stage = json_str(report, &["stage"])?;
+    match stage {
+        "blocked_before_proposal"
+        | "blocked_before_execution"
+        | "planned_without_execution"
+        | "completed" => {}
+        other => bail!("internal P7 operation report has unknown stage `{other}`"),
+    }
+    assert_json_bool_eq(report, &["checks", "automatic_rollback_observed"], false)?;
+    assert_report_deployment_roles(report, &["orchestrator", "gateway", "owner_worker"])?;
+    if !expect_preflight_errors.is_empty() {
+        assert_preflight_errors_contain(report, expect_preflight_errors)?;
+    }
+    if let Some(expected_image) = expected_image {
+        assert_report_images_match(report, expected_image)?;
+    }
+    if stage == "completed" {
+        assert_json_bool_eq(report, &["execution_mutated"], true)?;
+        assert_json_bool_eq(report, &["execution_allowed"], true)?;
+    } else {
+        assert_json_bool_eq(report, &["execution_mutated"], false)?;
+        assert_json_bool_eq(report, &["execution_allowed"], false)?;
+        assert_json_bool_eq(report, &["checks", "execution_published"], false)?;
+        assert_json_bool_eq(report, &["checks", "observation_completed"], false)?;
+        assert_json_bool_eq(report, &["checks", "load_soak_ran"], false)?;
+    }
+
+    if stage == "planned_without_execution" || stage == "completed" {
+        assert_json_str_eq(report, &["operation", "kind"], "merge")?;
+        assert_json_str_eq(
+            report,
+            &["operation", "policy_id"],
+            "operator_approved_dynamic_operation_v1",
+        )?;
+        let operation_id = json_str(report, &["operation", "operation_id"])?;
+        if operation_id.trim().is_empty() {
+            bail!("internal P7 operation report has empty operation_id");
+        }
+        let proposal_hash = json_str(report, &["operation", "proposal_hash"])?;
+        if proposal_hash.trim().is_empty() {
+            bail!("internal P7 operation report has empty proposal_hash");
+        }
+        let owner = json_str(report, &["operation", "owner_worker_id"])?;
+        if owner.trim().is_empty() {
+            bail!("internal P7 operation report has empty owner_worker_id");
+        }
+        json_cell_id(report, &["operation", "parent"])?;
+        assert_json_bool_eq(report, &["checks", "operation_recorded"], true)?;
+        assert_json_bool_eq(
+            report,
+            &["responses", "proposal", "assignments_changed"],
+            false,
+        )?;
+        let ledger = json_field(report, &["ledger", "snapshot"])?;
+        validate_p7_operation_ledger(ledger, false, false, false, false, false)?;
+        assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_proposal_smoke")?;
+    }
+
+    if requirements.require_published_execution || requirements.require_completed_observation {
+        assert_json_str_eq(report, &["stage"], "completed")?;
+        assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
+        assert_json_bool_eq(report, &["checks", "execution_published"], true)?;
+        assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+        assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+        assert_json_bool_eq(
+            report,
+            &["responses", "execution", "assignments_changed"],
+            true,
+        )?;
+        assert_json_bool_eq(
+            report,
+            &["responses", "execution", "mutation_attempted"],
+            true,
+        )?;
+        assert_json_bool_eq(
+            report,
+            &["responses", "execution", "mutation_allowed"],
+            true,
+        )?;
+        let ledger = json_field(report, &["ledger", "snapshot"])?;
+        validate_p7_operation_ledger(ledger, true, false, true, false, false)?;
+        assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_execution_smoke")?;
+    }
+
+    if requirements.require_completed_observation {
+        assert_json_bool_eq(report, &["checks", "route_converged"], true)?;
+        assert_json_bool_eq(report, &["checks", "worker_refreshed"], true)?;
+        assert_json_bool_eq(report, &["checks", "traffic_confirmed"], true)?;
+        assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], true)?;
+        assert_json_bool_eq(report, &["checks", "observation_completed"], true)?;
+        assert_json_str_eq(report, &["responses", "observation", "status"], "completed")?;
+        assert_json_bool_eq(
+            report,
+            &["responses", "observation", "observation_accepted"],
+            true,
+        )?;
+        assert_json_number_at_least(report, &["gateway", "routes_after"], 1.0)?;
+        assert_json_number_at_least(report, &["gateway", "ping_roundtrips"], 1.0)?;
+        assert_json_number_at_least(report, &["gateway", "join_roundtrips"], 3.0)?;
+        assert_json_number_at_least(report, &["gateway", "move_roundtrips"], 1.0)?;
+        assert_json_number_at_least(report, &["worker", "parent_actor_count"], 1.0)?;
+        let ledger = json_field(report, &["ledger", "snapshot"])?;
+        validate_p7_operation_ledger(ledger, true, false, true, true, false)?;
+        assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_observation_smoke")?;
+    }
+
+    if requirements.require_soak {
+        assert_json_bool_eq(report, &["checks", "load_soak_ran"], true)?;
+        assert_json_bool_eq(report, &["soak", "ran"], true)?;
+        assert_json_number_at_least(report, &["soak", "iterations"], 1.0)?;
+        let expected_actor_requests = json_f64(report, &["soak", "expected_actor_requests"])?;
+        assert_json_number_at_least(report, &["soak", "pings_ok"], expected_actor_requests)?;
+        assert_json_number_at_least(report, &["soak", "moves_ok"], expected_actor_requests)?;
+        assert_json_number_at_least(
+            report,
+            &["gateway", "ping_roundtrips"],
+            expected_actor_requests,
+        )?;
+        assert_json_number_at_least(
+            report,
+            &["gateway", "move_roundtrips"],
+            expected_actor_requests,
+        )?;
+        assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_soak_smoke")?;
     }
     Ok(())
 }
@@ -19477,6 +20881,173 @@ mod tests {
 
         validate_p7_operation_soak_smoke_report(&report, 16)
             .expect("valid P7 operation soak smoke report");
+    }
+
+    #[test]
+    fn internal_k8s_p7_operation_report_check_accepts_completed_soak_evidence() {
+        let ledger = serde_json::json!({
+            "schema": "tessera.orch.operation_ledger.v1",
+            "records": [
+                {
+                    "operation_id": "p7-merge-1",
+                    "kind": "merge",
+                    "status": "completed",
+                    "created_unix_secs": 100,
+                    "updated_unix_secs": 130,
+                    "proposal": {
+                        "source": "split_merge_preview:test",
+                        "proposal_hash": "fnv1a64:abc",
+                        "parent": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                        "targets": [
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0}, "worker_id": "worker-a"}
+                        ],
+                        "preconditions": ["operator approval required"],
+                        "submission_command": "cargo xt merge-activation --operation-id p7-merge-1"
+                    },
+                    "approval": {
+                        "policy_id": "operator_approved_dynamic_operation_v1",
+                        "approver": "operator",
+                        "allowed_kind": "merge",
+                        "approved_unix_secs": 110,
+                        "expires_unix_secs": 710,
+                        "expected_proposal_hash": "fnv1a64:abc",
+                        "cooldown_key": "world-0",
+                        "budget_key": "daily"
+                    },
+                    "phases": [
+                        {"name": "proposal_recorded", "state": "succeeded", "unix_secs": 100, "reason": "proposal persisted"},
+                        {"name": "approval_recorded", "state": "succeeded", "unix_secs": 110, "reason": "approval persisted"},
+                        {"name": "execution_started", "state": "succeeded", "unix_secs": 120, "reason": "operation execution passed policy gates"},
+                        {"name": "execution_published", "state": "succeeded", "unix_secs": 121, "reason": "merge activation published"},
+                        {"name": "observation_completed", "state": "succeeded", "unix_secs": 130, "reason": "observer=internal confirmed route_converged, worker_refreshed, traffic_confirmed, counters_clean"}
+                    ]
+                }
+            ]
+        });
+        let report = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_p7_operation_smoke.v1",
+            "unix_ts": 130,
+            "stage": "completed",
+            "operation_mode": "policy_gated_manual",
+            "execution_mutated": true,
+            "execution_allowed": true,
+            "reason": "complete",
+            "preflight_errors": [],
+            "cluster": {
+                "context": "example-cluster",
+                "namespace": "tessera",
+                "orchestrator_service": "tessera-orch",
+                "gateway_service": "tessera-gateway",
+                "owner_worker_deployment": "tessera-worker",
+                "owner_worker_service": "tessera-worker",
+                "owner_worker_id": "worker-a",
+                "argocd": {"checked": true, "sync": "Synced", "health": "Healthy"},
+                "expected_image": "repo/tessera:v1",
+                "deployment_images": [
+                    {"role": "orchestrator", "deployment": "tessera-orch", "image": "repo/tessera:v1"},
+                    {"role": "gateway", "deployment": "tessera-gateway", "image": "repo/tessera:v1"},
+                    {"role": "owner_worker", "deployment": "tessera-worker", "image": "repo/tessera:v1"}
+                ]
+            },
+            "operation": {
+                "operation_id": "p7-merge-1",
+                "kind": "merge",
+                "proposal_hash": "fnv1a64:abc",
+                "parent": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                "owner_worker_id": "worker-a",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6000",
+                "metrics_addr": "127.0.0.1:6100",
+                "registered_workers_before": 2,
+                "registered_workers_after": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after": {"workers": [], "handovers": 0}
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4000",
+                "metrics_addr": "127.0.0.1:4100",
+                "routes_before": 4,
+                "routes_after": 1,
+                "ping_roundtrips": 64,
+                "join_roundtrips": 4,
+                "move_roundtrips": 64,
+                "close_counters": {
+                    "before": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0},
+                    "after": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0}
+                }
+            },
+            "worker": {
+                "worker_id": "worker-a",
+                "metrics_addr": "127.0.0.1:5100",
+                "parent_actor_count": 1
+            },
+            "soak": {
+                "ran": true,
+                "iterations": 16,
+                "sleep_ms": 10,
+                "pings_ok": 64,
+                "moves_ok": 64,
+                "expected_actor_requests": 64
+            },
+            "ledger": {
+                "summary": {
+                    "records": 1,
+                    "proposal_records": 1,
+                    "approval_records": 1,
+                    "blocked_execution_records": 0,
+                    "published_execution_records": 1,
+                    "completed_observation_records": 1,
+                    "recovery_required_records": 0
+                },
+                "snapshot": ledger
+            },
+            "responses": {
+                "proposal": {"assignments_changed": false, "operation_ids": ["p7-merge-1"]},
+                "approval": {"status": "approved", "assignments_changed": false},
+                "execution": {
+                    "status": "published",
+                    "assignments_changed": true,
+                    "mutation_attempted": true,
+                    "mutation_allowed": true
+                },
+                "observation": {
+                    "status": "completed",
+                    "assignments_changed": false,
+                    "observation_accepted": true
+                }
+            },
+            "checks": {
+                "operation_recorded": true,
+                "approval_recorded": true,
+                "execution_published": true,
+                "route_converged": true,
+                "worker_refreshed": true,
+                "traffic_confirmed": true,
+                "gateway_close_counters_clean": true,
+                "observation_completed": true,
+                "load_soak_ran": true,
+                "automatic_rollback_observed": false
+            },
+            "remaining_uncovered": [
+                "guarded_kubernetes_operation_failure_recovery_smoke",
+                "guarded_kubernetes_operation_restart_smoke",
+                "p7_completion_audit"
+            ]
+        });
+
+        validate_internal_k8s_operation_report(
+            &report,
+            InternalP7OperationRequirements {
+                require_published_execution: true,
+                require_completed_observation: true,
+                require_soak: true,
+            },
+            Some("repo/tessera:v1"),
+            &[],
+        )
+        .expect("valid internal P7 operation smoke report");
     }
 
     #[test]
