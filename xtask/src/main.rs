@@ -7709,12 +7709,33 @@ fn kubectl_deploy_pods(context: &str, namespace: &str, deploy: &str) -> Result<u
     let output = command_stdout(&mut cmd)?;
     let document: serde_json::Value =
         serde_json::from_str(&output).context("parse Kubernetes PodList JSON")?;
+    active_kubernetes_pod_count(&document)
+}
+
+fn active_kubernetes_pod_count(document: &serde_json::Value) -> Result<u32> {
     let items = document
         .get("items")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("PodList JSON is missing items[]"))?;
-    u32::try_from(items.len())
-        .map_err(|err| anyhow::anyhow!("pod count for deployment {deploy} overflowed u32: {err}"))
+    let active = items
+        .iter()
+        .filter(|pod| kubernetes_pod_counts_as_active(pod))
+        .count();
+    u32::try_from(active).map_err(|err| anyhow::anyhow!("active pod count overflowed u32: {err}"))
+}
+
+fn kubernetes_pod_counts_as_active(pod: &serde_json::Value) -> bool {
+    let terminating = pod
+        .pointer("/metadata/deletionTimestamp")
+        .is_some_and(|value| !value.is_null());
+    if terminating {
+        return false;
+    }
+    !matches!(
+        pod.pointer("/status/phase")
+            .and_then(serde_json::Value::as_str),
+        Some("Failed" | "Succeeded")
+    )
 }
 
 fn wait_for_kubectl_deploy_pods(
@@ -15752,6 +15773,31 @@ demo_count 4
         assert_eq!(parse_kubectl_replicas("3", 0).expect("replicas"), 3);
         let err = parse_kubectl_replicas("nope", 0).expect_err("invalid replicas should fail");
         assert!(err.to_string().contains("invalid Kubernetes replica value"));
+    }
+
+    #[test]
+    fn active_kubernetes_pod_count_ignores_finished_and_terminating_pods() {
+        let pods = serde_json::json!({
+            "items": [
+                {"metadata": {"name": "running"}, "status": {"phase": "Running"}},
+                {"metadata": {"name": "pending"}, "status": {"phase": "Pending"}},
+                {"metadata": {"name": "failed"}, "status": {"phase": "Failed"}},
+                {"metadata": {"name": "succeeded"}, "status": {"phase": "Succeeded"}},
+                {
+                    "metadata": {
+                        "name": "terminating",
+                        "deletionTimestamp": "2026-05-03T13:40:00Z"
+                    },
+                    "status": {"phase": "Running"}
+                },
+                {"metadata": {"name": "unknown"}, "status": {}}
+            ]
+        });
+
+        assert_eq!(
+            active_kubernetes_pod_count(&pods).expect("active pod count"),
+            3
+        );
     }
 
     #[test]
