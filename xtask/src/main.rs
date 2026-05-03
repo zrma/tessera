@@ -793,6 +793,12 @@ enum K8sSub {
         /// Run parent-route load/soak traffic before closing the observation
         #[arg(long, default_value_t = false)]
         with_soak: bool,
+        /// Scale the owner Worker down after publishing and require recovery_required observation evidence
+        #[arg(long, default_value_t = false)]
+        with_failure: bool,
+        /// Allow the smoke helper to scale the owner Worker deployment for --with-failure
+        #[arg(long, default_value_t = false)]
+        allow_scale: bool,
         /// Parent-route soak iterations per actor when --with-soak is set
         #[arg(long, default_value_t = 16)]
         soak_iterations: u32,
@@ -817,6 +823,9 @@ enum K8sSub {
         /// Require internal parent-route soak evidence
         #[arg(long, default_value_t = false)]
         require_soak: bool,
+        /// Require owner Worker outage and recovery_required operation evidence
+        #[arg(long, default_value_t = false)]
+        require_recovery_required: bool,
         /// Require all recorded deployment images to match this image
         #[arg(long)]
         expected_image: Option<String>,
@@ -1574,6 +1583,8 @@ fn main() -> Result<()> {
                 local_owner_worker_metrics_port,
                 allow_execution,
                 with_soak,
+                with_failure,
+                allow_scale,
                 soak_iterations,
                 soak_sleep_ms,
                 out,
@@ -1598,6 +1609,8 @@ fn main() -> Result<()> {
                 local_owner_worker_metrics_port,
                 allow_execution,
                 with_soak,
+                with_failure,
+                allow_scale,
                 soak_iterations,
                 soak_sleep_ms,
                 out,
@@ -1607,6 +1620,7 @@ fn main() -> Result<()> {
                 require_published_execution,
                 require_completed_observation,
                 require_soak,
+                require_recovery_required,
                 expected_image,
                 expect_preflight_errors,
             } => run_k8s_operation_report_check(
@@ -1615,6 +1629,7 @@ fn main() -> Result<()> {
                     require_published_execution,
                     require_completed_observation,
                     require_soak,
+                    require_recovery_required,
                 },
                 expected_image.as_deref(),
                 &expect_preflight_errors,
@@ -9215,6 +9230,8 @@ struct K8sOperationSmokeOptions {
     local_owner_worker_metrics_port: u16,
     allow_execution: bool,
     with_soak: bool,
+    with_failure: bool,
+    allow_scale: bool,
     soak_iterations: u32,
     soak_sleep_ms: u64,
     out: Option<PathBuf>,
@@ -9223,6 +9240,21 @@ struct K8sOperationSmokeOptions {
 fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
     if options.with_soak && !options.allow_execution {
         bail!("internal k8s P7 operation soak needs a published execution; pass --allow-execution");
+    }
+    if options.with_failure && !options.allow_execution {
+        bail!(
+            "internal k8s P7 operation failure/recovery needs a published execution; pass --allow-execution"
+        );
+    }
+    if options.with_failure && !options.allow_scale {
+        bail!(
+            "internal k8s P7 operation failure/recovery scales the owner Worker; pass --allow-scale"
+        );
+    }
+    if options.with_failure && options.with_soak {
+        bail!(
+            "internal k8s P7 operation --with-failure and --with-soak are separate evidence gates; run them separately"
+        );
     }
     let context = resolve_kube_context(options.context.as_deref())?;
     let preflight_result = k8s_operation_preflight(&context, &options);
@@ -9260,6 +9292,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 gateway: None,
                 worker: None,
                 soak: None,
+                failure: None,
                 completion: InternalK8sOperationCompletion::default(),
             },
             options.out.as_deref(),
@@ -9302,6 +9335,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 gateway: None,
                 worker: None,
                 soak: None,
+                failure: None,
                 completion: InternalK8sOperationCompletion::default(),
             },
             options.out.as_deref(),
@@ -9386,6 +9420,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                     gateway: None,
                     worker: None,
                     soak: None,
+                    failure: None,
                     completion: InternalK8sOperationCompletion::default(),
                 },
                 options.out.as_deref(),
@@ -9502,6 +9537,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                     gateway: gateway_evidence.as_ref(),
                     worker: None,
                     soak: None,
+                    failure: None,
                     completion: InternalK8sOperationCompletion::default(),
                 },
                 options.out.as_deref(),
@@ -9551,6 +9587,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
                 gateway: gateway_evidence.as_ref(),
                 worker: None,
                 soak: None,
+                failure: None,
                 completion: InternalK8sOperationCompletion {
                     operation_recorded: true,
                     ..InternalK8sOperationCompletion::default()
@@ -9607,6 +9644,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         1.0,
         "internal P7 operation parent move",
     )?;
+    drop(child0_session);
 
     let mut soak_evidence = None;
     if options.with_soak {
@@ -9661,6 +9699,11 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
     )?;
     let worker_parent_actor_count =
         prometheus_sample_value(&worker_metrics, worker_parent_metric.as_str())?;
+    let worker_evidence = InternalK8sOperationWorkerEvidence {
+        worker_id: options.owner_worker_id.clone(),
+        metrics_addr: local_owner_worker_metrics_addr.clone(),
+        parent_actor_count: worker_parent_actor_count,
+    };
 
     let gateway_metrics_after = assert_metrics_endpoint_body_until(
         "internal P7 operation gateway after",
@@ -9750,6 +9793,206 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         );
     }
 
+    if options.with_failure {
+        let original_replicas = kubectl_deploy_spec_replicas(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+        )?;
+        if original_replicas == 0 {
+            bail!(
+                "owner Worker deployment {} already has 0 replicas; cannot run P7 operation failure/recovery smoke",
+                options.owner_worker_deploy
+            );
+        }
+        kubectl_scale_deploy(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            0,
+        )?;
+        let mut restore = K8sScaleRestore::new(
+            context.clone(),
+            options.namespace.clone(),
+            options.owner_worker_deploy.clone(),
+            original_replicas,
+        );
+        wait_for_kubectl_deploy_available_replicas(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            0,
+        )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.owner_worker_service,
+            0,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_pods(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            0,
+            Duration::from_secs(120),
+        )?;
+        let failure_error = match assert_gateway_ping_until(
+            &local_gateway_addr,
+            operation.parent,
+            17_002,
+        ) {
+            Ok(()) => bail!(
+                "internal P7 operation failure/recovery smoke expected parent Ping to fail while owner Worker was down"
+            ),
+            Err(err) => err.to_string(),
+        };
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &[(operation.parent, operation.owner_worker_id.as_str())],
+        ))?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+        let gateway_metrics_after_failure = assert_metrics_endpoint_body_until(
+            "internal P7 operation gateway after owner failure",
+            &local_gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_routes_after_failure =
+            prometheus_sample_value(&gateway_metrics_after_failure, "tessera_gateway_routes")?;
+        let gateway_close_after_failure =
+            gateway_close_counters_from_metrics(&gateway_metrics_after_failure)?;
+
+        let observation_response = http_json_post(
+            "internal P7 operation failed observation",
+            &local_orch_metrics_addr,
+            &format!(
+                "/operations/observations?operation_id={}&expected_proposal_hash={}&observer=internal-p7-operation-failure-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=false&counters_clean=false",
+                operation.operation_id, operation.proposal_hash
+            ),
+        )?;
+        assert_json_str_eq(&observation_response, &["status"], "recovery_required")?;
+        assert_json_bool_eq(&observation_response, &["observation_accepted"], false)?;
+
+        kubectl_scale_deploy(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            original_replicas,
+        )?;
+        restore.disarm();
+        kubectl_rollout_status(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            Duration::from_secs(120),
+        )?;
+        wait_for_kubectl_deploy_available_replicas(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            original_replicas,
+        )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.owner_worker_service,
+            original_replicas,
+            Duration::from_secs(120),
+        )?;
+        assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+        assert_gateway_ping_until(&local_gateway_addr, operation.parent, 17_003)?;
+        let gateway_metrics_after_recovery = assert_metrics_endpoint_body_until(
+            "internal P7 operation gateway after owner recovery",
+            &local_gateway_metrics_addr,
+            &["tessera_gateway_routes"],
+        )?;
+        let gateway_routes_after_recovery =
+            prometheus_sample_value(&gateway_metrics_after_recovery, "tessera_gateway_routes")?;
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        orchestrator_evidence.registered_workers_after = Some(after_listing.workers.len() as u64);
+        orchestrator_evidence.assignment_listing_after =
+            Some(assignment_listing_summary_json(&after_listing)?);
+
+        let recovery_snapshot = http_json_get(
+            "internal P7 operation ledger",
+            &local_orch_metrics_addr,
+            "/operations",
+        )?;
+        let recovery_summary =
+            validate_p7_operation_ledger(&recovery_snapshot, true, false, true, false, true)?;
+        let recovery_record =
+            find_p7_operation_record(&recovery_snapshot, &operation.operation_id)?;
+        validate_p7_recovery_required(recovery_record)?;
+        let failure_evidence = InternalK8sOperationFailureEvidence {
+            owner_worker_deploy: options.owner_worker_deploy.clone(),
+            original_replicas,
+            failure_error,
+            routes_after_failure: Some(gateway_routes_after_failure),
+            routes_after_recovery: Some(gateway_routes_after_recovery),
+            close_after_failure: Some(gateway_close_after_failure),
+        };
+        let completion = InternalK8sOperationCompletion {
+            operation_recorded: true,
+            approval_recorded: true,
+            execution_published: true,
+            route_converged,
+            worker_refreshed,
+            traffic_confirmed: false,
+            gateway_close_counters_clean: false,
+            observation_completed: false,
+            owner_outage_detected: true,
+            observation_recovery_required: true,
+            operator_recovery_confirmed: true,
+            ledger_recovery_required: true,
+            load_soak_ran: false,
+        };
+        let report_path = write_internal_k8s_operation_report(
+            InternalK8sOperationReport {
+                context: &context,
+                namespace: &options.namespace,
+                orch_service: &options.orch_service,
+                gateway_service: &options.gateway_service,
+                owner_worker_deploy: &options.owner_worker_deploy,
+                owner_worker_service: &options.owner_worker_service,
+                owner_worker_id: &options.owner_worker_id,
+                argocd_namespace: &options.argocd_namespace,
+                argocd_app: &options.argocd_app,
+                argocd_status: preflight.argocd_status.as_ref(),
+                deployment_images: &preflight.deployment_images,
+                expected_image: options.expected_image.as_deref(),
+                stage: "recovery_required",
+                reason: "P7 merge operation owner outage was observed as recovery_required and operator-scaled Worker recovery restored parent traffic",
+                preflight_errors: &[],
+                operation: Some(&operation),
+                proposal_response: Some(&proposal_response),
+                approval_response: Some(&approval_response),
+                execution_response: Some(&execution_response),
+                observation_response: Some(&observation_response),
+                ledger_snapshot: Some(&recovery_snapshot),
+                ledger_summary: Some(recovery_summary),
+                orchestrator: Some(&orchestrator_evidence),
+                gateway: gateway_evidence.as_ref(),
+                worker: Some(&worker_evidence),
+                soak: None,
+                failure: Some(&failure_evidence),
+                completion,
+            },
+            options.out.as_deref(),
+        )?;
+        println!(
+            "internal P7 operation failure/recovery smoke completed: operation={} report={}",
+            operation.operation_id,
+            report_path.display()
+        );
+        return Ok(());
+    }
+
     let observation_response = http_json_post(
         "internal P7 operation observation",
         &local_orch_metrics_addr,
@@ -9771,11 +10014,6 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         validate_p7_operation_ledger(&completed_snapshot, true, false, true, true, false)?;
     let completed_record = find_p7_operation_record(&completed_snapshot, &operation.operation_id)?;
     validate_p7_completed_observation(completed_record)?;
-    let worker_evidence = InternalK8sOperationWorkerEvidence {
-        worker_id: options.owner_worker_id.clone(),
-        metrics_addr: local_owner_worker_metrics_addr,
-        parent_actor_count: worker_parent_actor_count,
-    };
     let completion = InternalK8sOperationCompletion {
         operation_recorded: true,
         approval_recorded: true,
@@ -9785,6 +10023,10 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
         traffic_confirmed,
         gateway_close_counters_clean: counters_clean,
         observation_completed: true,
+        owner_outage_detected: false,
+        observation_recovery_required: false,
+        operator_recovery_confirmed: false,
+        ledger_recovery_required: false,
         load_soak_ran: options.with_soak,
     };
     let report_path = write_internal_k8s_operation_report(
@@ -9815,6 +10057,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
             gateway: gateway_evidence.as_ref(),
             worker: Some(&worker_evidence),
             soak: soak_evidence.as_ref(),
+            failure: None,
             completion,
         },
         options.out.as_deref(),
@@ -11022,6 +11265,7 @@ struct InternalK8sOperationReport<'a> {
     gateway: Option<&'a InternalK8sOperationGatewayEvidence>,
     worker: Option<&'a InternalK8sOperationWorkerEvidence>,
     soak: Option<&'a InternalK8sOperationSoakEvidence>,
+    failure: Option<&'a InternalK8sOperationFailureEvidence>,
     completion: InternalK8sOperationCompletion,
 }
 
@@ -11074,6 +11318,16 @@ struct InternalK8sOperationSoakEvidence {
     expected_actor_requests: u64,
 }
 
+#[derive(Debug)]
+struct InternalK8sOperationFailureEvidence {
+    owner_worker_deploy: String,
+    original_replicas: u32,
+    failure_error: String,
+    routes_after_failure: Option<f64>,
+    routes_after_recovery: Option<f64>,
+    close_after_failure: Option<GatewayCloseCounters>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct InternalK8sMergeCompletion {
     activation_mutated: bool,
@@ -11095,6 +11349,10 @@ struct InternalK8sOperationCompletion {
     traffic_confirmed: bool,
     gateway_close_counters_clean: bool,
     observation_completed: bool,
+    owner_outage_detected: bool,
+    observation_recovery_required: bool,
+    operator_recovery_confirmed: bool,
+    ledger_recovery_required: bool,
     load_soak_ran: bool,
 }
 
@@ -11711,7 +11969,9 @@ fn write_internal_k8s_operation_report(
     if !completion.load_soak_ran {
         remaining_uncovered.push("guarded_kubernetes_operation_soak_smoke");
     }
-    remaining_uncovered.push("guarded_kubernetes_operation_failure_recovery_smoke");
+    if !completion.observation_recovery_required {
+        remaining_uncovered.push("guarded_kubernetes_operation_failure_recovery_smoke");
+    }
     remaining_uncovered.push("guarded_kubernetes_operation_restart_smoke");
     remaining_uncovered.push("p7_completion_audit");
 
@@ -11745,6 +12005,7 @@ fn write_internal_k8s_operation_report(
         "gateway": internal_k8s_operation_gateway_json(input.gateway),
         "worker": internal_k8s_operation_worker_json(input.worker),
         "soak": internal_k8s_operation_soak_json(input.soak),
+        "failure": internal_k8s_operation_failure_json(input.failure),
         "ledger": internal_k8s_operation_ledger_json(input.ledger_snapshot, input.ledger_summary),
         "responses": {
             "proposal": input.proposal_response,
@@ -11761,6 +12022,10 @@ fn write_internal_k8s_operation_report(
             "traffic_confirmed": completion.traffic_confirmed,
             "gateway_close_counters_clean": completion.gateway_close_counters_clean,
             "observation_completed": completion.observation_completed,
+            "owner_outage_detected": completion.owner_outage_detected,
+            "observation_recovery_required": completion.observation_recovery_required,
+            "operator_recovery_confirmed": completion.operator_recovery_confirmed,
+            "ledger_recovery_required": completion.ledger_recovery_required,
             "load_soak_ran": completion.load_soak_ran,
             "automatic_rollback_observed": false
         },
@@ -11864,6 +12129,27 @@ fn internal_k8s_operation_soak_json(
         "pings_ok": evidence.pings_ok,
         "moves_ok": evidence.moves_ok,
         "expected_actor_requests": evidence.expected_actor_requests
+    })
+}
+
+fn internal_k8s_operation_failure_json(
+    evidence: Option<&InternalK8sOperationFailureEvidence>,
+) -> serde_json::Value {
+    let Some(evidence) = evidence else {
+        return serde_json::json!({
+            "ran": false
+        });
+    };
+    serde_json::json!({
+        "ran": true,
+        "owner_worker_deployment": evidence.owner_worker_deploy.as_str(),
+        "original_replicas": evidence.original_replicas,
+        "failure_error": evidence.failure_error.as_str(),
+        "routes_after_failure": evidence.routes_after_failure,
+        "routes_after_recovery": evidence.routes_after_recovery,
+        "close_counters": {
+            "after_failure": evidence.close_after_failure.map(gateway_close_counters_json)
+        }
     })
 }
 
@@ -12124,6 +12410,7 @@ struct InternalP7OperationRequirements {
     require_published_execution: bool,
     require_completed_observation: bool,
     require_soak: bool,
+    require_recovery_required: bool,
 }
 
 fn run_k8s_merge_activation_report_check(
@@ -15007,6 +15294,7 @@ fn validate_internal_k8s_operation_report(
         "blocked_before_proposal"
         | "blocked_before_execution"
         | "planned_without_execution"
+        | "recovery_required"
         | "completed" => {}
         other => bail!("internal P7 operation report has unknown stage `{other}`"),
     }
@@ -15018,7 +15306,7 @@ fn validate_internal_k8s_operation_report(
     if let Some(expected_image) = expected_image {
         assert_report_images_match(report, expected_image)?;
     }
-    if stage == "completed" {
+    if stage == "completed" || stage == "recovery_required" {
         assert_json_bool_eq(report, &["execution_mutated"], true)?;
         assert_json_bool_eq(report, &["execution_allowed"], true)?;
     } else {
@@ -15029,7 +15317,8 @@ fn validate_internal_k8s_operation_report(
         assert_json_bool_eq(report, &["checks", "load_soak_ran"], false)?;
     }
 
-    if stage == "planned_without_execution" || stage == "completed" {
+    if stage == "planned_without_execution" || stage == "completed" || stage == "recovery_required"
+    {
         assert_json_str_eq(report, &["operation", "kind"], "merge")?;
         assert_json_str_eq(
             report,
@@ -15060,8 +15349,20 @@ fn validate_internal_k8s_operation_report(
         assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_proposal_smoke")?;
     }
 
-    if requirements.require_published_execution || requirements.require_completed_observation {
-        assert_json_str_eq(report, &["stage"], "completed")?;
+    if requirements.require_published_execution
+        || requirements.require_completed_observation
+        || requirements.require_soak
+        || requirements.require_recovery_required
+    {
+        if requirements.require_completed_observation || requirements.require_soak {
+            assert_json_str_eq(report, &["stage"], "completed")?;
+        } else if requirements.require_recovery_required {
+            assert_json_str_eq(report, &["stage"], "recovery_required")?;
+        } else if stage != "completed" && stage != "recovery_required" {
+            bail!(
+                "internal P7 operation report must be completed or recovery_required for published execution evidence, got `{stage}`"
+            );
+        }
         assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
         assert_json_bool_eq(report, &["checks", "execution_published"], true)?;
         assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
@@ -15126,6 +15427,41 @@ fn validate_internal_k8s_operation_report(
             expected_actor_requests,
         )?;
         assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_soak_smoke")?;
+    }
+    if requirements.require_recovery_required {
+        assert_json_bool_eq(report, &["checks", "route_converged"], true)?;
+        assert_json_bool_eq(report, &["checks", "worker_refreshed"], true)?;
+        assert_json_bool_eq(report, &["checks", "traffic_confirmed"], false)?;
+        assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], false)?;
+        assert_json_bool_eq(report, &["checks", "observation_completed"], false)?;
+        assert_json_bool_eq(report, &["checks", "owner_outage_detected"], true)?;
+        assert_json_bool_eq(report, &["checks", "observation_recovery_required"], true)?;
+        assert_json_bool_eq(report, &["checks", "operator_recovery_confirmed"], true)?;
+        assert_json_bool_eq(report, &["checks", "ledger_recovery_required"], true)?;
+        assert_json_bool_eq(report, &["failure", "ran"], true)?;
+        let failure_error = json_str(report, &["failure", "failure_error"])?;
+        if failure_error.trim().is_empty() {
+            bail!("internal P7 operation recovery report has empty failure_error");
+        }
+        assert_json_number_at_least(report, &["failure", "original_replicas"], 1.0)?;
+        assert_json_number_at_least(report, &["failure", "routes_after_failure"], 1.0)?;
+        assert_json_number_at_least(report, &["failure", "routes_after_recovery"], 1.0)?;
+        assert_json_str_eq(
+            report,
+            &["responses", "observation", "status"],
+            "recovery_required",
+        )?;
+        assert_json_bool_eq(
+            report,
+            &["responses", "observation", "observation_accepted"],
+            false,
+        )?;
+        let ledger = json_field(report, &["ledger", "snapshot"])?;
+        validate_p7_operation_ledger(ledger, true, false, true, false, true)?;
+        assert_remaining_uncovered_absent(
+            report,
+            "guarded_kubernetes_operation_failure_recovery_smoke",
+        )?;
     }
     Ok(())
 }
@@ -21043,11 +21379,189 @@ mod tests {
                 require_published_execution: true,
                 require_completed_observation: true,
                 require_soak: true,
+                require_recovery_required: false,
             },
             Some("repo/tessera:v1"),
             &[],
         )
         .expect("valid internal P7 operation smoke report");
+    }
+
+    #[test]
+    fn internal_k8s_p7_operation_report_check_accepts_recovery_required_evidence() {
+        let ledger = serde_json::json!({
+            "schema": "tessera.orch.operation_ledger.v1",
+            "records": [
+                {
+                    "operation_id": "p7-merge-recovery-1",
+                    "kind": "merge",
+                    "status": "recovery_required",
+                    "created_unix_secs": 100,
+                    "updated_unix_secs": 140,
+                    "proposal": {
+                        "source": "split_merge_preview:test",
+                        "proposal_hash": "fnv1a64:def",
+                        "parent": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                        "targets": [
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0}, "worker_id": "worker-a"}
+                        ],
+                        "preconditions": ["operator approval required"],
+                        "submission_command": "cargo xt merge-activation --operation-id p7-merge-recovery-1"
+                    },
+                    "approval": {
+                        "policy_id": "operator_approved_dynamic_operation_v1",
+                        "approver": "operator",
+                        "allowed_kind": "merge",
+                        "approved_unix_secs": 110,
+                        "expires_unix_secs": 710,
+                        "expected_proposal_hash": "fnv1a64:def",
+                        "cooldown_key": "world-0",
+                        "budget_key": "daily"
+                    },
+                    "phases": [
+                        {"name": "proposal_recorded", "state": "succeeded", "unix_secs": 100, "reason": "proposal persisted"},
+                        {"name": "approval_recorded", "state": "succeeded", "unix_secs": 110, "reason": "approval persisted"},
+                        {"name": "execution_started", "state": "succeeded", "unix_secs": 120, "reason": "operation execution passed policy gates"},
+                        {"name": "execution_published", "state": "succeeded", "unix_secs": 121, "reason": "merge activation published"},
+                        {"name": "observation_failed", "state": "failed", "unix_secs": 140, "reason": "observer=internal reported traffic_confirmed=false counters_clean=false"}
+                    ]
+                }
+            ]
+        });
+        let report = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_p7_operation_smoke.v1",
+            "unix_ts": 140,
+            "stage": "recovery_required",
+            "operation_mode": "policy_gated_manual",
+            "execution_mutated": true,
+            "execution_allowed": true,
+            "reason": "owner outage",
+            "preflight_errors": [],
+            "cluster": {
+                "context": "example-cluster",
+                "namespace": "tessera",
+                "orchestrator_service": "tessera-orch",
+                "gateway_service": "tessera-gateway",
+                "owner_worker_deployment": "tessera-worker",
+                "owner_worker_service": "tessera-worker",
+                "owner_worker_id": "worker-a",
+                "argocd": {"checked": true, "sync": "Synced", "health": "Healthy"},
+                "expected_image": "repo/tessera:v1",
+                "deployment_images": [
+                    {"role": "orchestrator", "deployment": "tessera-orch", "image": "repo/tessera:v1"},
+                    {"role": "gateway", "deployment": "tessera-gateway", "image": "repo/tessera:v1"},
+                    {"role": "owner_worker", "deployment": "tessera-worker", "image": "repo/tessera:v1"}
+                ]
+            },
+            "operation": {
+                "operation_id": "p7-merge-recovery-1",
+                "kind": "merge",
+                "proposal_hash": "fnv1a64:def",
+                "parent": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                "owner_worker_id": "worker-a",
+                "policy_id": "operator_approved_dynamic_operation_v1"
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6000",
+                "metrics_addr": "127.0.0.1:6100",
+                "registered_workers_before": 2,
+                "registered_workers_after": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after": {"workers": [], "handovers": 0}
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4000",
+                "metrics_addr": "127.0.0.1:4100",
+                "routes_before": 4,
+                "routes_after": 1,
+                "ping_roundtrips": 1,
+                "join_roundtrips": 3,
+                "move_roundtrips": 1,
+                "close_counters": {
+                    "before": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0},
+                    "after": {"no_route": 0, "upstream_retry_exhausted": 0, "ambiguous_upstream": 0}
+                }
+            },
+            "worker": {
+                "worker_id": "worker-a",
+                "metrics_addr": "127.0.0.1:5100",
+                "parent_actor_count": 1
+            },
+            "soak": {"ran": false},
+            "failure": {
+                "ran": true,
+                "owner_worker_deployment": "tessera-worker",
+                "original_replicas": 1,
+                "failure_error": "connection refused while owner worker was down",
+                "routes_after_failure": 1,
+                "routes_after_recovery": 1,
+                "close_counters": {
+                    "after_failure": {"no_route": 0, "upstream_retry_exhausted": 1, "ambiguous_upstream": 0}
+                }
+            },
+            "ledger": {
+                "summary": {
+                    "records": 1,
+                    "proposal_records": 1,
+                    "approval_records": 1,
+                    "blocked_execution_records": 0,
+                    "published_execution_records": 1,
+                    "completed_observation_records": 0,
+                    "recovery_required_records": 1
+                },
+                "snapshot": ledger
+            },
+            "responses": {
+                "proposal": {"assignments_changed": false, "operation_ids": ["p7-merge-recovery-1"]},
+                "approval": {"status": "approved", "assignments_changed": false},
+                "execution": {
+                    "status": "published",
+                    "assignments_changed": true,
+                    "mutation_attempted": true,
+                    "mutation_allowed": true
+                },
+                "observation": {
+                    "status": "recovery_required",
+                    "assignments_changed": false,
+                    "observation_accepted": false
+                }
+            },
+            "checks": {
+                "operation_recorded": true,
+                "approval_recorded": true,
+                "execution_published": true,
+                "route_converged": true,
+                "worker_refreshed": true,
+                "traffic_confirmed": false,
+                "gateway_close_counters_clean": false,
+                "observation_completed": false,
+                "owner_outage_detected": true,
+                "observation_recovery_required": true,
+                "operator_recovery_confirmed": true,
+                "ledger_recovery_required": true,
+                "load_soak_ran": false,
+                "automatic_rollback_observed": false
+            },
+            "remaining_uncovered": [
+                "guarded_kubernetes_operation_observation_smoke",
+                "guarded_kubernetes_operation_soak_smoke",
+                "guarded_kubernetes_operation_restart_smoke",
+                "p7_completion_audit"
+            ]
+        });
+
+        validate_internal_k8s_operation_report(
+            &report,
+            InternalP7OperationRequirements {
+                require_published_execution: true,
+                require_completed_observation: false,
+                require_soak: false,
+                require_recovery_required: true,
+            },
+            Some("repo/tessera:v1"),
+            &[],
+        )
+        .expect("valid internal P7 operation recovery report");
     }
 
     #[test]
