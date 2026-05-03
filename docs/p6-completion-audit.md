@@ -65,7 +65,7 @@ matching runtime deployment images, approved GitOps rollout revision, ArgoCD
 | Canonical multi-depth split | Local success/failure/restart/soak smokes and report checks pass for canonical explicit child cells | Local complete | Internal ready plan, publish, failure/recovery, restart, and load/soak |
 | Internal multi-depth readiness | `.dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json` has `stage=blocked_before_activation`, `activation_mutated=false`, `plan.status=blocked`, `reason=canonical multi-depth parent is not currently assigned`, `multi_depth_plan_ready=false`, and `remaining_uncovered` includes ready-plan/publish/failure/restart/soak | Helper exercised, not complete | A controlled topology with the canonical parent assigned, then approved publish/failure/restart/soak gate |
 | Rollback/backout policy | P5 split reports use `operator_recovery_no_automatic_merge_rollback_v1`; merge reports use `operator_controlled_manual_merge_v1`; owner Worker actor recovery is scoped by `volatile_worker_actor_state_rejoin_required_v1` | Local/P5 covered | Internal P6 merge and multi-depth reports must carry the same no-automatic-rollback/backout policy evidence |
-| GitOps rollout evidence | P5 `v2026.05.2` publish, controlled smoke GitOps revision, ArgoCD `Synced / Healthy`, and cleanup revision are documented; no `.dev/reports/p6-gitops-rollout-latest.json` report exists yet | Complete for P5 only | P6 image publish, approved GitOps rollout, ArgoCD state, runtime deployment image match, smoke report, `cargo xt p6-rollout-report --image <new-tag> ...`, `cargo xt p6-rollout-report-check --expected-image <new-tag>`, and default-off cleanup for each mutating internal gate |
+| GitOps rollout evidence | P5 `v2026.05.2` publish, controlled smoke GitOps revision, ArgoCD `Synced / Healthy`, and cleanup revision are documented. A read-only `.dev/reports/p6-gitops-rollout-latest.json` draft now records live `v2026.05.2` deployment images and ArgoCD health, but `cargo xt p6-rollout-report-check` rejects it because it still references the P5 image and lacks approval/cleanup assertions | Complete for P5 only | P6 image publish, approved GitOps rollout, ArgoCD state, runtime deployment image match, smoke report, `cargo xt p6-rollout-report --image <new-tag> ...`, `cargo xt p6-rollout-report-check --expected-image <new-tag>`, and default-off cleanup for each mutating internal gate |
 
 ## Prompt-to-Artifact Checklist
 
@@ -423,9 +423,14 @@ p6-completion-audit --json` then returned nonzero as expected with
 internal restart recovery, internal live-metrics split plan, P6 GitOps rollout
 image, P6 GitOps rollout evidence report, internal merge
 ready-plan/publish/failure/restart/load-soak, internal multi-depth
-ready-plan/publish/failure/restart/load-soak. The GitOps rollout evidence
-finding is based on the absence or failure of
-`.dev/reports/p6-gitops-rollout-latest.json` against the rollout report schema.
+ready-plan/publish/failure/restart/load-soak. `cargo xt p6-rollout-report
+--context microk8s-ts --namespace tessera --image
+harbor.1day1coding.com/1day1coding/tessera:v2026.05.2` also wrote a read-only
+rollout draft, and `cargo xt p6-rollout-report-check --expected-image
+harbor.1day1coding.com/1day1coding/tessera:v2026.05.2` correctly rejected it
+with `P6 rollout report still references the P5 image tag v2026.05.2`. The
+GitOps rollout evidence finding is now based on that verifier failure against
+`.dev/reports/p6-gitops-rollout-latest.json`.
 This is the correct current state; it is not a completion declaration.
 
 ## Audit Result
