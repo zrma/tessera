@@ -9108,12 +9108,15 @@ fn p6_completion_findings(report_dir: &Path) -> Vec<P6CompletionFinding> {
                 None,
                 &[],
             ) {
-                findings.push(P6CompletionFinding {
-                    gate: "p6_internal_restart_recovery",
-                    evidence: format!(
+                let evidence = p6_restart_preflight_evidence(report_dir).unwrap_or_else(|| {
+                    format!(
                         "{} failed --require-restart: {err}",
                         internal_split_path.display()
-                    ),
+                    )
+                });
+                findings.push(P6CompletionFinding {
+                    gate: "p6_internal_restart_recovery",
+                    evidence,
                     missing:
                         "approved internal restart recovery report from PVC-backed assignment state"
                             .to_string(),
@@ -9363,6 +9366,43 @@ fn p6_completion_findings(report_dir: &Path) -> Vec<P6CompletionFinding> {
     }
 
     findings
+}
+
+fn p6_restart_preflight_evidence(report_dir: &Path) -> Option<String> {
+    let expected_errors = [ORCH_ASSIGNMENT_STATE_ENV.to_string()];
+    for report_name in [
+        "guarded-kubernetes-restart-readiness-preflight.json",
+        "guarded-kubernetes-restart-readiness-negative.json",
+    ] {
+        let path = report_dir.join(report_name);
+        let Ok(report) = read_json_report(&path) else {
+            continue;
+        };
+        if validate_internal_k8s_activation_report(
+            &report,
+            false,
+            false,
+            false,
+            false,
+            None,
+            &expected_errors,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let stage = json_str(&report, &["stage"]).unwrap_or("<unknown>");
+        let storage_configured =
+            json_bool(&report, &["checks", "assignment_state_storage_configured"])
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+        return Some(format!(
+            "{} accepted as negative restart preflight: stage={stage}, activation_mutated=false, assignment_state_storage_configured={storage_configured}, expected preflight error contains {}",
+            path.display(),
+            ORCH_ASSIGNMENT_STATE_ENV
+        ));
+    }
+    None
 }
 
 fn bool_gate_set_complete(report: &serde_json::Value, paths: &[&[&str]]) -> bool {
@@ -16051,6 +16091,24 @@ demo_count 4
         )
         .expect("write split report");
 
+        let restart_preflight = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_activation_smoke.v1",
+            "stage": "blocked_before_plan",
+            "activation_mutated": false,
+            "preflight_errors": [
+                "orchestrator deployment is missing env TESSERA_ORCH_ASSIGNMENT_STATE_PATH"
+            ],
+            "checks": {
+                "assignment_state_storage_configured": false
+            }
+        });
+        fs::write(
+            dir.join("guarded-kubernetes-restart-readiness-preflight.json"),
+            serde_json::to_string_pretty(&restart_preflight)
+                .expect("serialize restart preflight report"),
+        )
+        .expect("write restart preflight report");
+
         let merge = serde_json::json!({
             "schema": "tessera.guarded_kubernetes_merge_activation_smoke.v1",
             "stage": "blocked_before_activation",
@@ -16125,11 +16183,15 @@ demo_count 4
         .expect("write multi-depth report");
 
         let findings = p6_completion_findings(&dir);
-        assert!(
-            findings
-                .iter()
-                .any(|finding| finding.gate == "p6_internal_restart_recovery")
-        );
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p6_internal_restart_recovery"
+                && finding
+                    .evidence
+                    .contains("guarded-kubernetes-restart-readiness-preflight.json")
+                && finding
+                    .evidence
+                    .contains("TESSERA_ORCH_ASSIGNMENT_STATE_PATH")
+        }));
         assert!(
             findings
                 .iter()
