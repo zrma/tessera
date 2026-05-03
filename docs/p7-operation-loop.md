@@ -59,7 +59,19 @@ P7 is complete only when all of these are true:
 | Failure and recovery | operation phase updates for target/owner outage | smoke report records failure detection, no automatic rollback, operator recovery, and final convergence |
 | Observation | metrics/report fields for route count, AOI frames, latency, close counters | verifier rejects missing route convergence, Worker refresh, AOI, or counter evidence |
 | Internal rollout | k8s GitOps smoke window runbook | image publish, GitOps rollout rev, cleanup rev, ArgoCD `Synced / Healthy`, default-off cleanup report |
-| Completion audit | `cargo xt p7-completion-audit` or equivalent | audit returns `complete=true` only after every P7 gate is backed by real evidence |
+| Completion audit | `cargo xt p7-completion-audit --json` | audit returns `complete=true` only after every P7 operation-loop gate is backed by real evidence |
+
+Current completion audit:
+
+```sh
+cargo xt p7-completion-audit --json
+```
+
+As of the `v2026.05.5` internal operation-loop evidence set, this returns
+`complete=true` with an empty `findings` list. It aggregates the local
+default-off/execution/observation/recovery/restart/soak reports, the GitOps
+rollout/default-off cleanup report, and the three internal MicroK8s operation
+reports for execution+soak, failure/recovery, and restart recovery.
 
 Current ledger verifier:
 

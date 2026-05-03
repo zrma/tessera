@@ -66,5 +66,5 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `v2026.05.5` internal controlled windows have passed approved execution,
   completed observation, parent-route soak, owner Worker failure/recovery,
   Orchestrator restart recovery, and post-smoke default-off cleanup; completion
-  audit remains the open P7 gate.
+  audit is now covered by `cargo xt p7-completion-audit --json`.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

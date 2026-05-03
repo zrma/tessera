@@ -80,7 +80,7 @@ Recommended next slices:
 7. Done: `test: add internal p7 operation restart smoke` - record PVC-backed
    assignment state, Orchestrator rollout restart recovery, completed
    post-restart observation, and post-smoke default-off cleanup.
-8. `test: add p7 completion audit` - aggregate local, internal, rollout,
+8. Done: `test: add p7 completion audit` - aggregate local, internal, rollout,
    cleanup, observation, recovery, restart, and soak evidence and fail until all
    P7 gates are backed by real artifacts.
 9. `feat: extend p7 executor beyond same-worker merge` - only after the

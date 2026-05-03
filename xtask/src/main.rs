@@ -53,6 +53,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit P7 operation-loop completion gates from report JSON
+    P7CompletionAudit {
+        /// Directory that contains smoke/report JSON files
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
     P7OperationLedgerCheck {
         /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
@@ -1102,6 +1111,7 @@ fn main() -> Result<()> {
         Cmd::Check => check()?,
         Cmd::Harness => harness()?,
         Cmd::P6CompletionAudit { report_dir, json } => run_p6_completion_audit(&report_dir, json)?,
+        Cmd::P7CompletionAudit { report_dir, json } => run_p7_completion_audit(&report_dir, json)?,
         Cmd::P7OperationLedgerCheck {
             ledger,
             require_approval,
@@ -14373,6 +14383,379 @@ fn p6_completion_findings(report_dir: &Path) -> Vec<P6CompletionFinding> {
     findings
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P7CompletionFinding {
+    gate: &'static str,
+    evidence: String,
+    missing: String,
+}
+
+fn run_p7_completion_audit(report_dir: &Path, json: bool) -> Result<()> {
+    let findings = p7_completion_findings(report_dir);
+    if json {
+        let body = serde_json::json!({
+            "schema": "tessera.p7_completion_audit.v1",
+            "complete": findings.is_empty(),
+            "report_dir": report_dir.display().to_string(),
+            "findings": findings.iter().map(|finding| {
+                serde_json::json!({
+                    "gate": finding.gate,
+                    "evidence": finding.evidence,
+                    "missing": finding.missing
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if findings.is_empty() {
+        println!(
+            "P7 completion audit passed: all required operation-loop report gates are covered in {}",
+            report_dir.display()
+        );
+    } else {
+        println!(
+            "P7 completion audit incomplete: {} missing gate(s) in {}",
+            findings.len(),
+            report_dir.display()
+        );
+        for finding in &findings {
+            println!(
+                "- {}: evidence={} missing={}",
+                finding.gate, finding.evidence, finding.missing
+            );
+        }
+    }
+    if !findings.is_empty() {
+        bail!(
+            "P7 completion audit is incomplete: {} missing gate(s)",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+fn p7_completion_findings(report_dir: &Path) -> Vec<P7CompletionFinding> {
+    let mut findings = Vec::new();
+
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_default_off_operation_loop",
+        "p7-operation-loop-smoke-latest.json",
+        "local split/merge/canonical multi-depth proposal, approval, and default-off blocked execution smoke",
+        validate_p7_operation_loop_smoke_report,
+    );
+    push_p7_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_default_off_operation_ledger",
+        "p7-operation-loop-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: true,
+            require_published_execution: false,
+            require_completed_observation: false,
+            require_recovery_required: false,
+        },
+        "local operation ledger with proposal, approval, and default-off blocked execution evidence",
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_approved_execution",
+        "p7-operation-execution-smoke-latest.json",
+        "local approved same-Worker merge execution and idempotent repeat execution smoke",
+        validate_p7_operation_execution_smoke_report,
+    );
+    push_p7_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_approved_execution_ledger",
+        "p7-operation-execution-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: false,
+            require_recovery_required: false,
+        },
+        "local operation ledger with approved published execution evidence",
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_completed_observation",
+        "p7-operation-observation-smoke-latest.json",
+        "local observation completion smoke with route, Worker, traffic, and close-counter evidence",
+        validate_p7_operation_observation_smoke_report,
+    );
+    push_p7_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_completed_observation_ledger",
+        "p7-operation-observation-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_recovery_required: false,
+        },
+        "local operation ledger with completed observation evidence",
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_recovery_required",
+        "p7-operation-recovery-smoke-latest.json",
+        "local owner-outage recovery-required smoke with no automatic rollback and operator recovery",
+        validate_p7_operation_recovery_smoke_report,
+    );
+    push_p7_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_recovery_required_ledger",
+        "p7-operation-recovery-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: false,
+            require_recovery_required: true,
+        },
+        "local operation ledger with recovery-required evidence",
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_restart_recovery",
+        "p7-operation-restart-smoke-latest.json",
+        "local Orchestrator restart smoke with persisted assignment state, ledger recovery, and completed post-restart observation",
+        validate_p7_operation_restart_smoke_report,
+    );
+    push_p7_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_restart_recovery_ledger",
+        "p7-operation-restart-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_recovery_required: false,
+        },
+        "local operation ledger with completed post-restart observation evidence",
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_load_soak",
+        "p7-operation-soak-smoke-latest.json",
+        "local post-execution parent-route load/soak smoke with clean counters",
+        |report| validate_p7_operation_soak_smoke_report(report, 16),
+    );
+    push_p7_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p7_local_load_soak_ledger",
+        "p7-operation-soak-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_recovery_required: false,
+        },
+        "local operation ledger with completed post-soak observation evidence",
+    );
+
+    let rollout_image = p7_gitops_rollout_image(report_dir, &mut findings);
+    let expected_image = rollout_image.as_deref();
+
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_internal_execution_observation_soak",
+        "internal-microk8s-p7-operation-smoke-latest.json",
+        "internal MicroK8s approved execution, completed observation, and parent-route soak report",
+        |report| {
+            validate_internal_k8s_operation_report(
+                report,
+                InternalP7OperationRequirements {
+                    require_published_execution: true,
+                    require_completed_observation: true,
+                    require_soak: true,
+                    require_recovery_required: false,
+                    require_restart: false,
+                },
+                expected_image,
+                &[],
+            )
+        },
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_internal_failure_recovery",
+        "internal-microk8s-p7-operation-failure-smoke-latest.json",
+        "internal MicroK8s owner Worker failure, recovery-required ledger, and operator recovery report",
+        |report| {
+            validate_internal_k8s_operation_report(
+                report,
+                InternalP7OperationRequirements {
+                    require_published_execution: true,
+                    require_completed_observation: false,
+                    require_soak: false,
+                    require_recovery_required: true,
+                    require_restart: false,
+                },
+                expected_image,
+                &[],
+            )
+        },
+    );
+    push_p7_json_gate(
+        &mut findings,
+        report_dir,
+        "p7_internal_restart_recovery",
+        "internal-microk8s-p7-operation-restart-smoke-latest.json",
+        "internal MicroK8s PVC-backed Orchestrator restart recovery and completed observation report",
+        |report| {
+            validate_internal_k8s_operation_report(
+                report,
+                InternalP7OperationRequirements {
+                    require_published_execution: true,
+                    require_completed_observation: false,
+                    require_soak: false,
+                    require_recovery_required: false,
+                    require_restart: true,
+                },
+                expected_image,
+                &[],
+            )
+        },
+    );
+
+    findings
+}
+
+#[derive(Debug, Clone, Copy)]
+struct P7LedgerRequirements {
+    require_approval: bool,
+    require_blocked_execution: bool,
+    require_published_execution: bool,
+    require_completed_observation: bool,
+    require_recovery_required: bool,
+}
+
+fn p7_gitops_rollout_image(
+    report_dir: &Path,
+    findings: &mut Vec<P7CompletionFinding>,
+) -> Option<String> {
+    let path = report_dir.join("p6-gitops-rollout-latest.json");
+    let report = match read_json_report(&path) {
+        Ok(report) => report,
+        Err(err) => {
+            findings.push(P7CompletionFinding {
+                gate: "p7_internal_gitops_rollout_default_off",
+                evidence: format!("{} unavailable: {err}", path.display()),
+                missing: "P7 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+            });
+            return None;
+        }
+    };
+    if let Err(err) = validate_p6_gitops_rollout_report(&report, None) {
+        findings.push(P7CompletionFinding {
+            gate: "p7_internal_gitops_rollout_default_off",
+            evidence: format!("{} failed verifier: {err}", path.display()),
+            missing: "P7 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+        });
+        return None;
+    }
+    match json_str(&report, &["image", "name"]) {
+        Ok(image) if !image.trim().is_empty() => Some(image.to_string()),
+        Ok(_) => {
+            findings.push(P7CompletionFinding {
+                gate: "p7_internal_gitops_rollout_default_off",
+                evidence: format!("{} has empty image.name", path.display()),
+                missing: "P7 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+        Err(err) => {
+            findings.push(P7CompletionFinding {
+                gate: "p7_internal_gitops_rollout_default_off",
+                evidence: format!("{} missing image.name: {err}", path.display()),
+                missing: "P7 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn push_p7_json_gate<F>(
+    findings: &mut Vec<P7CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    report_name: &str,
+    missing: &str,
+    validate: F,
+) where
+    F: FnOnce(&serde_json::Value) -> Result<()>,
+{
+    let path = report_dir.join(report_name);
+    match read_json_report(&path) {
+        Ok(report) => {
+            if let Err(err) = validate(&report) {
+                findings.push(P7CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P7CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
+fn push_p7_ledger_gate(
+    findings: &mut Vec<P7CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    ledger_name: &str,
+    requirements: P7LedgerRequirements,
+    missing: &str,
+) {
+    let path = report_dir.join(ledger_name);
+    match read_json_report(&path) {
+        Ok(ledger) => {
+            if let Err(err) = validate_p7_operation_ledger(
+                &ledger,
+                requirements.require_approval,
+                requirements.require_blocked_execution,
+                requirements.require_published_execution,
+                requirements.require_completed_observation,
+                requirements.require_recovery_required,
+            ) {
+                findings.push(P7CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed ledger verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P7CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
 fn p6_restart_preflight_evidence(report_dir: &Path) -> Option<String> {
     let expected_errors = [ORCH_ASSIGNMENT_STATE_ENV.to_string()];
     for report_name in [
@@ -22910,6 +23293,37 @@ demo_count 4
                 .iter()
                 .any(|finding| finding.gate == "p6_internal_multi_depth_completion_schema")
         );
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
+    fn p7_completion_audit_reports_missing_operation_gates() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p7-audit-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let findings = p7_completion_findings(&dir);
+
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p7_local_default_off_operation_loop"
+                && finding.missing.contains("default-off blocked execution")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p7_internal_gitops_rollout_default_off"
+                && finding.missing.contains("GitOps rollout")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p7_internal_restart_recovery"
+                && finding.missing.contains("restart recovery")
+        }));
 
         fs::remove_dir_all(&dir).expect("remove temp report dir");
     }
