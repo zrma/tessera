@@ -152,6 +152,7 @@ Cell-based world orchestration for real-time servers in Rust.
   - `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH` 기본 unset (`TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`이 unset일 때 dry-run 입력 snapshot 파일 경로)
   - `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` 기본 unset/disabled (`manual`로 설정한 경우에만 `SubmitSplitActivation`/`SubmitMergeActivation` gRPC가 replay/publish activation을 수행)
   - `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` 기본 unset/disabled (설정 시 Orchestrator가 handover/split publish 후 assignment map을 JSON으로 atomic write하고 재시작 시 config 초기 assignment 대신 저장된 assignment state를 로드)
+  - `TESSERA_ORCH_OPERATION_LEDGER_PATH` 기본 unset/disabled (설정 시 P7 operation ledger JSON을 초기화/로드하고 Orchestrator metrics HTTP endpoint의 `GET /operations`에서 read-only snapshot을 노출)
   - `RUST_LOG` 기본 `info`
 - 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADVERTISE_ADDR`(설정 시) 또는 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
 - 오케스트레이터 실행: `cargo run -p tessera-orch` (기본 `TESSERA_ORCH_ADDR=127.0.0.1:6000`)
@@ -217,6 +218,7 @@ Cell-based world orchestration for real-time servers in Rust.
 - 로그 확인: `cargo xt dev logs --target all --follow`
 - Orchestrator metrics 확인: `TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch` 후 `curl http://127.0.0.1:6100/metrics`
 - Split/merge dry-run preview 확인: `curl http://127.0.0.1:6100/split-merge/preview`
+- P7 operation ledger 확인: `TESSERA_ORCH_OPERATION_LEDGER_PATH=.dev/operation-ledger.json TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch` 후 `curl http://127.0.0.1:6100/operations`
 - Gateway metrics/readiness 확인: `TESSERA_GW_METRICS_ADDR=127.0.0.1:4100 cargo run -p tessera-gateway` 후 `curl http://127.0.0.1:4100/metrics`, `curl http://127.0.0.1:4100/ready`
 - Worker metrics 확인: `TESSERA_WORKER_METRICS_ADDR=127.0.0.1:5100 cargo run -p tessera-worker` 후 `curl http://127.0.0.1:5100/metrics`
 - clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정

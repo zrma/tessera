@@ -78,10 +78,12 @@ Each slice should be self-contained:
 ## Initial Implementation Order
 
 1. **Operation record model**: define durable proposal and execution records
-   without changing runtime behavior.
-2. **Ledger persistence**: store and reload operation records across
-   Orchestrator restart, using the repo's existing conservative persistence
-   style before introducing heavier storage.
+   without changing runtime behavior. The initial opt-in surface is
+   `TESSERA_ORCH_OPERATION_LEDGER_PATH` plus the read-only Orchestrator
+   `GET /operations` endpoint.
+2. **Ledger append/update path**: let Orchestrator-owned proposal and phase
+   writes persist durable records across restart, using the repo's existing
+   conservative persistence style before introducing heavier storage.
 3. **Proposal writer**: convert live metrics split candidates and assignment
    listing merge candidates into durable proposals.
 4. **Approval gate**: add explicit approval records with TTL, policy id,
@@ -103,4 +105,3 @@ Each slice should be self-contained:
   operation-specific smoke report.
 - Keep docs, verifier contracts, and GitOps cleanup state synchronized with the
   actual code and reports.
-
