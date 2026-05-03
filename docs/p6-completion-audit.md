@@ -35,13 +35,15 @@ covers the explicit internal MicroK8s gate.
 for this matrix. It intentionally returns nonzero until all required internal
 P6+ evidence reports are present and passing. The current report set passes the
 historical P5 split baseline but still fails P6+ completion with missing
-restart, live-metrics, GitOps rollout, merge, multi-depth, and planner mutation
-gates. The planner mutation gate is validated with the same internal report
-schema as `cargo xt k8s planner-activation-report-check`: one default-off
-blocked planner report, one policy-approved published planner report,
-ArgoCD/image evidence, and no automatic mutation observation.
-`cargo xt k8s planner-activation-report` composes that internal evidence file
-from the local blocked/published planner reports and read-only cluster state.
+restart, live-metrics, GitOps rollout, merge, and multi-depth gates. The
+planner mutation gate is validated with the same internal report schema as
+`cargo xt k8s planner-activation-report-check`: one default-off blocked
+planner report, one policy-approved published planner report, ArgoCD/image
+evidence, and no automatic mutation observation. `cargo xt k8s
+planner-activation-report` composes that internal evidence file from the local
+blocked/published planner reports and read-only cluster state. The current
+planner report passes for the live `v2026.05.2` deployment image; this does not
+replace the separate P6 image/GitOps rollout evidence gate.
 The merge and canonical multi-depth gates use the same report checkers as the
 operator commands: `--require-ready-plan` for non-mutating readiness and
 `--require-published --require-failure --require-restart --require-soak` for
@@ -405,18 +407,24 @@ cargo test -p xtask internal_planner_activation
 cargo xt p6-completion-audit --json
 ```
 
-The targeted `xtask` tests passed. `cargo xt p6-completion-audit --json`
-returned nonzero as expected with `complete=false` and 15 missing P6+ gates:
+The targeted `xtask` tests passed. `cargo xt k8s
+planner-activation-report --context microk8s-ts --namespace tessera
+--expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2`
+composed
+`.dev/reports/internal-microk8s-planner-activation-latest.json` from the local
+default-off/policy-approved planner reports and read-only ArgoCD/deployment
+image evidence. `cargo xt k8s planner-activation-report-check --expected-image
+harbor.1day1coding.com/1day1coding/tessera:v2026.05.2` passed with
+`default_off_blocked=true`, `policy_approved_published=true`,
+`activation_mutated_only_after_policy=true`,
+`automatic_mutation_observed=false`, and `remaining_uncovered=[]`. `cargo xt
+p6-completion-audit --json` then returned nonzero as expected with
+`complete=false` and 14 missing P6+ gates:
 internal restart recovery, internal live-metrics split plan, P6 GitOps rollout
 image, P6 GitOps rollout evidence report, internal merge
 ready-plan/publish/failure/restart/load-soak, internal multi-depth
-ready-plan/publish/failure/restart/load-soak, and internal planner mutation
-policy evidence. The planner mutation finding is based on the absence or
-failure of `.dev/reports/internal-microk8s-planner-activation-latest.json`
-  against the internal planner report schema, not a raw existence check. The
-  report can be composed after approved planner mutation evidence with
-  `cargo xt k8s planner-activation-report --expected-image <new-tag>`. The
-  GitOps rollout evidence finding is likewise based on the absence or failure of
+ready-plan/publish/failure/restart/load-soak. The GitOps rollout evidence
+finding is based on the absence or failure of
 `.dev/reports/p6-gitops-rollout-latest.json` against the rollout report schema.
 This is the correct current state; it is not a completion declaration.
 
@@ -428,11 +436,11 @@ cross-Worker merge replay, same-Worker merge failure, same-Worker merge restart,
 same-Worker merge soak, and canonical explicit-child local split
 success/failure/restart/soak lanes, plus local policy-gated planner mutation
 for preview-backed merge and live-metrics-backed split. It also closes the
-canonical merge sibling detection and local success/failure/restart/soak smoke
-gap. The read-only internal merge and canonical multi-depth
-helper/report-check paths have now been exercised against live `v2026.05.2`,
-but only as blocked negative readiness evidence.
-Completion still requires approved internal MicroK8s P6 evidence, planner
-mutation internal evidence, canonical merge internal evidence, merge
-publish/failure/restart/soak internal evidence, and multi-depth
-publish/failure/restart/soak internal evidence.
+read-only internal planner mutation policy report, canonical merge sibling
+detection, and local success/failure/restart/soak smoke gap. The read-only
+internal merge and canonical multi-depth helper/report-check paths have now
+been exercised against live `v2026.05.2`, but only as blocked negative
+readiness evidence.
+Completion still requires approved internal MicroK8s P6 evidence, canonical
+merge internal evidence, merge publish/failure/restart/soak internal evidence,
+and multi-depth publish/failure/restart/soak internal evidence.
