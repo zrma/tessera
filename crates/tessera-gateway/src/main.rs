@@ -2110,6 +2110,16 @@ mod tests {
         }
     }
 
+    fn cell_to_assignment(cell: &CellId) -> Assignment {
+        Assignment {
+            world: cell.world,
+            cx: cell.cx,
+            cy: cell.cy,
+            depth: cell.depth.into(),
+            sub: cell.sub.into(),
+        }
+    }
+
     #[test]
     fn gateway_prometheus_metrics_text_uses_snapshot_values() {
         let metrics = GatewayMetricsSnapshot {
@@ -2446,6 +2456,49 @@ mod tests {
                 sub,
             };
             let route = routing.lookup(&child).await.expect("child route");
+            assert_eq!(route.worker_id, "worker-b");
+            assert_eq!(route.addr, "127.0.0.1:5002");
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_split_listing_replaces_parent_route_with_exact_child_routes() {
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = parent.canonical_children().expect("canonical children");
+        let child_assignments = children.iter().map(cell_to_assignment).collect::<Vec<_>>();
+        let mut initial_routes = HashMap::new();
+        initial_routes.insert(
+            CellKey(parent),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: "127.0.0.1:5001".to_string(),
+            },
+        );
+        let routing = RoutingTable::new(initial_routes);
+        let listing = AssignmentListing {
+            workers: vec![
+                AssignmentBundle {
+                    worker_id: "worker-a".to_string(),
+                    addr: "127.0.0.1:5001".to_string(),
+                    cells: Vec::new(),
+                },
+                AssignmentBundle {
+                    worker_id: "worker-b".to_string(),
+                    addr: "127.0.0.1:5002".to_string(),
+                    cells: child_assignments,
+                },
+            ],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_listing_update(&routing, listing)
+                .await
+                .expect("apply canonical split listing")
+        );
+        assert!(routing.lookup(&parent).await.is_none());
+        for child in children {
+            let route = routing.lookup(&child).await.expect("canonical child route");
             assert_eq!(route.worker_id, "worker-b");
             assert_eq!(route.addr, "127.0.0.1:5002");
         }

@@ -9,9 +9,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tessera_core::{
-    ActorState, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope, HandoverReplayMove,
-    HandoverReplayOwner, MAX_FRAME_LEN, Position, ServerEnvelope, ServerMsg, SplitReplayTarget,
-    Tick, WorkerRelayMsg, encode_frame, try_decode_frame,
+    ActorState, CellChildFamilyKind, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope,
+    HandoverReplayMove, HandoverReplayOwner, MAX_FRAME_LEN, MergeReplayTarget, Position,
+    ServerEnvelope, ServerMsg, SplitReplayTarget, Tick, WorkerRelayMsg, encode_frame,
+    try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -58,6 +59,8 @@ struct WorkerMetricsCounters {
 
 #[derive(Debug, PartialEq, Eq)]
 struct WorkerMetricsSnapshot {
+    cell_actor_counts: Vec<WorkerCellMetric>,
+    cell_pending_moves: Vec<WorkerCellMetric>,
     client_subscribers: u64,
     relay_subscribers: u64,
     remote_interest_clients: u64,
@@ -75,6 +78,12 @@ struct WorkerMetricsSnapshot {
     remote_relay_connect_failures: u64,
     remote_relay_frames_sent: u64,
     remote_relay_frames_received: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerCellMetric {
+    cell: CellId,
+    value: u64,
 }
 
 type RelayOutboundMsg = (CellId, Option<u32>, WorkerRelayMsg);
@@ -741,6 +750,11 @@ impl SharedState {
         }
     }
 
+    async fn clear_prepared_cells(&self, cells: &HashSet<CellId>) {
+        let mut prepared = self.prepared_split_replays.lock().await;
+        prepared.retain(|(_, cell)| !cells.contains(cell));
+    }
+
     async fn split_replay_prepared(&self, operation_id: &str, cell: CellId) -> bool {
         let prepared = self.prepared_split_replays.lock().await;
         prepared.contains(&(operation_id.to_string(), cell))
@@ -1346,7 +1360,11 @@ impl SharedState {
             | WorkerRelayMsg::SplitReplayPrepare { .. }
             | WorkerRelayMsg::SplitReplayRequest { .. }
             | WorkerRelayMsg::SplitReplayAbort { .. }
-            | WorkerRelayMsg::SplitReplayAck { .. } => {}
+            | WorkerRelayMsg::SplitReplayAck { .. }
+            | WorkerRelayMsg::MergeReplayPrepare { .. }
+            | WorkerRelayMsg::MergeReplayRequest { .. }
+            | WorkerRelayMsg::MergeReplayAbort { .. }
+            | WorkerRelayMsg::MergeReplayAck { .. } => {}
         }
     }
 
@@ -1364,7 +1382,11 @@ impl SharedState {
             | WorkerRelayMsg::SplitReplayPrepare { .. }
             | WorkerRelayMsg::SplitReplayRequest { .. }
             | WorkerRelayMsg::SplitReplayAbort { .. }
-            | WorkerRelayMsg::SplitReplayAck { .. } => return,
+            | WorkerRelayMsg::SplitReplayAck { .. }
+            | WorkerRelayMsg::MergeReplayPrepare { .. }
+            | WorkerRelayMsg::MergeReplayRequest { .. }
+            | WorkerRelayMsg::MergeReplayAbort { .. }
+            | WorkerRelayMsg::MergeReplayAck { .. } => return,
         };
 
         let subscribers = self.remote_interest_subscribers(env_in.cell).await;
@@ -1560,6 +1582,134 @@ impl SharedState {
         self.prune_client_roots(cells).await;
     }
 
+    async fn coalesce_merge_children(&self, parent: CellId, children: &[CellId]) -> usize {
+        let child_set = children.iter().copied().collect::<HashSet<_>>();
+        let mut removed_by_child: HashMap<CellId, Vec<EntityId>> = HashMap::new();
+        let mut moved_actors = 0_usize;
+
+        {
+            let mut actors = self.actors.lock().await;
+            let mut parent_actors = actors.remove(&parent).unwrap_or_default();
+            for child in children {
+                let Some(child_actors) = actors.remove(child) else {
+                    continue;
+                };
+                let removed = child_actors.keys().copied().collect::<Vec<_>>();
+                for (actor, pos) in child_actors {
+                    if parent_actors.insert(actor, pos).is_some() {
+                        warn!(
+                            target: "worker",
+                            parent = ?parent,
+                            child = ?child,
+                            actor = actor.0,
+                            "merge coalesce replaced duplicate actor id in parent cell"
+                        );
+                    }
+                    moved_actors += 1;
+                }
+                if !removed.is_empty() {
+                    removed_by_child.insert(*child, removed);
+                }
+            }
+            if parent_actors.is_empty() {
+                actors.remove(&parent);
+            } else {
+                actors.insert(parent, parent_actors);
+            }
+        }
+
+        {
+            let mut owners = self.owners.lock().await;
+            let mut parent_owners = owners.remove(&parent).unwrap_or_default();
+            for child in children {
+                if let Some(child_owners) = owners.remove(child) {
+                    for (actor, owner_session) in child_owners {
+                        parent_owners.insert(actor, owner_session);
+                    }
+                }
+            }
+            if !parent_owners.is_empty() {
+                owners.insert(parent, parent_owners);
+            }
+        }
+
+        {
+            let mut pending = self.pending_moves.lock().await;
+            let mut parent_pending = pending.remove(&parent).unwrap_or_default();
+            for child in children {
+                if let Some(child_pending) = pending.remove(child) {
+                    parent_pending.extend(child_pending);
+                }
+            }
+            if !parent_pending.is_empty() {
+                pending.insert(parent, parent_pending);
+            }
+        }
+
+        {
+            let mut buffered = self.buffered_moves.lock().await;
+            let mut parent_buffered = buffered.remove(&parent).unwrap_or_default();
+            for child in children {
+                if let Some(mut child_buffered) = buffered.remove(child) {
+                    parent_buffered.append(&mut child_buffered);
+                }
+            }
+            if !parent_buffered.is_empty() {
+                buffered.insert(parent, parent_buffered);
+            }
+        }
+
+        {
+            let mut claims = self.handover_replay_claims.lock().await;
+            let moved_claims = claims
+                .iter()
+                .filter_map(|(cell, actor)| child_set.contains(cell).then_some(*actor))
+                .collect::<Vec<_>>();
+            claims.retain(|(cell, _)| !child_set.contains(cell));
+            claims.extend(moved_claims.into_iter().map(|actor| (parent, actor)));
+        }
+
+        {
+            let mut sessions = self.client_sessions.lock().await;
+            for session in sessions.values_mut() {
+                let mut mapped_roots = HashSet::with_capacity(session.root_actors.len());
+                for (cell, actor) in session.root_actors.drain() {
+                    if child_set.contains(&cell) {
+                        mapped_roots.insert((parent, actor));
+                    } else {
+                        mapped_roots.insert((cell, actor));
+                    }
+                }
+                session.root_actors = mapped_roots;
+            }
+        }
+
+        for (child, actors) in removed_by_child {
+            let relay_actors = actors.clone();
+            self.broadcast(
+                child,
+                ServerMsg::Despawn {
+                    cell: child,
+                    actors,
+                },
+                None,
+                None,
+            )
+            .await;
+            self.broadcast_relay(
+                child,
+                WorkerRelayMsg::Despawn {
+                    cell: child,
+                    actors: relay_actors,
+                },
+                None,
+            )
+            .await;
+        }
+
+        moved_actors
+    }
+
     async fn claim_owner(&self, cell: CellId, actor: EntityId, client_id: u64) -> ClaimOutcome {
         let mut owners = self.owners.lock().await;
         let entry = owners.entry(cell).or_default();
@@ -1623,6 +1773,24 @@ impl SharedState {
     }
 
     async fn metrics_snapshot(&self) -> WorkerMetricsSnapshot {
+        let cell_actor_counts = {
+            let actors = self.actors.lock().await;
+            sorted_cell_metrics(
+                actors
+                    .iter()
+                    .map(|(cell, cell_actors)| (*cell, cell_actors.len() as u64))
+                    .collect(),
+            )
+        };
+        let cell_pending_moves = {
+            let pending_moves = self.pending_moves.lock().await;
+            sorted_cell_metrics(
+                pending_moves
+                    .iter()
+                    .map(|(cell, moves)| (*cell, moves.len() as u64))
+                    .collect(),
+            )
+        };
         let client_subscribers = {
             let subscribers = self.subscribers.lock().await;
             subscribers.values().map(Vec::len).sum::<usize>() as u64
@@ -1642,6 +1810,8 @@ impl SharedState {
         let remote_actor_cache_cells = self.remote_actor_cache.lock().await.len() as u64;
 
         WorkerMetricsSnapshot {
+            cell_actor_counts,
+            cell_pending_moves,
             client_subscribers,
             relay_subscribers,
             remote_interest_clients,
@@ -1676,6 +1846,14 @@ impl SharedState {
                 .load(Ordering::Relaxed),
         }
     }
+}
+
+fn sorted_cell_metrics(mut values: Vec<(CellId, u64)>) -> Vec<WorkerCellMetric> {
+    values.sort_by_key(|(cell, _)| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+    values
+        .into_iter()
+        .map(|(cell, value)| WorkerCellMetric { cell, value })
+        .collect()
 }
 
 impl Default for SharedState {
@@ -1779,6 +1957,7 @@ async fn main() -> Result<()> {
         state.clone(),
         owned_cells.clone(),
         worker_id.clone(),
+        advertise_addr.clone(),
     ));
 
     if used_fallback {
@@ -1934,10 +2113,19 @@ async fn peer_routes_refresh_loop(
     state: Arc<SharedState>,
     owned_cells: Arc<RwLock<HashSet<CellId>>>,
     worker_id: String,
+    advertise_addr: String,
 ) {
     let mut ticker = time::interval(assignment_retry_interval());
     loop {
         ticker.tick().await;
+        if let Err(e) = fetch_assignments(&worker_id, &advertise_addr).await {
+            warn!(
+                target: "worker",
+                worker_id = worker_id.as_str(),
+                error = ?e,
+                "failed to refresh worker registration; keeping existing ownership until listing refresh"
+            );
+        }
         match fetch_assignment_listing().await {
             Ok(listing) => {
                 if let Err(e) =
@@ -1974,20 +2162,27 @@ async fn apply_peer_routes_update(
     let policies = handover_policies_from_listing(&listing, worker_id)?;
     let route_count = routes.len();
     let updated_owned_count = updated_owned_cells.len();
-    let (owned_changed, removed_owned_cells) = {
+    let (owned_changed, removed_owned_cells, added_owned_cells) = {
         let mut guard = owned_cells.write().await;
         let removed = guard
             .difference(&updated_owned_cells)
+            .copied()
+            .collect::<HashSet<_>>();
+        let added = updated_owned_cells
+            .difference(&guard)
             .copied()
             .collect::<HashSet<_>>();
         let changed = *guard != updated_owned_cells;
         if changed {
             *guard = updated_owned_cells;
         }
-        (changed, removed)
+        (changed, removed, added)
     };
     let routes_changed = state.update_peer_routes(routes).await;
     let (policies_changed, released_policies) = state.update_handover_policies(policies).await;
+    if !added_owned_cells.is_empty() {
+        state.clear_prepared_cells(&added_owned_cells).await;
+    }
 
     let removed_owned_count = removed_owned_cells.len();
     let needs_release_handling = !released_policies.is_empty();
@@ -2004,8 +2199,27 @@ async fn apply_peer_routes_update(
         handle_released_handover_buffers(state, owned_snapshot, released_policies).await;
     }
 
-    if !removed_owned_cells.is_empty() {
-        state.drop_cells(&removed_owned_cells).await;
+    let merge_coalesces = same_worker_merge_coalesces(&removed_owned_cells, &added_owned_cells);
+    let mut coalesced_children = HashSet::new();
+    for (parent, children) in &merge_coalesces {
+        let moved_actors = state.coalesce_merge_children(*parent, children).await;
+        coalesced_children.extend(children.iter().copied());
+        info!(
+            target: "worker",
+            worker_id,
+            parent = ?parent,
+            children = ?children,
+            moved_actors,
+            "coalesced same-worker merge assignment into parent cell"
+        );
+    }
+
+    let cells_to_drop = removed_owned_cells
+        .difference(&coalesced_children)
+        .copied()
+        .collect::<HashSet<_>>();
+    if !cells_to_drop.is_empty() {
+        state.drop_cells(&cells_to_drop).await;
         state.sync_remote_peer_sessions().await;
     }
 
@@ -2040,6 +2254,56 @@ async fn apply_peer_routes_update(
     }
 
     Ok(routes_changed || policies_changed || owned_changed)
+}
+
+fn same_worker_merge_coalesces(
+    removed_owned_cells: &HashSet<CellId>,
+    added_owned_cells: &HashSet<CellId>,
+) -> Vec<(CellId, Vec<CellId>)> {
+    let mut coalesces = Vec::new();
+    let mut parents = added_owned_cells
+        .iter()
+        .filter(|cell| cell.sub == 0)
+        .copied()
+        .collect::<Vec<_>>();
+    parents.sort_by_key(|cell| (cell.world, cell.cy, cell.cx, cell.depth, cell.sub));
+
+    for parent in parents {
+        for children in merge_child_family_candidates(parent) {
+            let removed_children = children
+                .into_iter()
+                .filter(|child| removed_owned_cells.contains(child))
+                .collect::<Vec<_>>();
+            if !removed_children.is_empty() {
+                coalesces.push((parent, removed_children));
+                break;
+            }
+        }
+    }
+    coalesces
+}
+
+#[cfg(test)]
+fn merge_child_cells(parent: CellId) -> Vec<CellId> {
+    merge_child_family_candidates(parent)
+        .into_iter()
+        .next()
+        .map(Vec::from)
+        .unwrap_or_default()
+}
+
+fn merge_child_family_candidates(parent: CellId) -> Vec<[CellId; 4]> {
+    let mut families = Vec::new();
+    if let Some(children) = parent.legacy_shallow_children() {
+        families.push(children);
+    }
+    if parent.depth > 0
+        && let Some(children) = parent.canonical_children()
+        && !families.iter().any(|existing| existing == &children)
+    {
+        families.push(children);
+    }
+    families
 }
 
 fn owned_cells_from_listing(
@@ -2420,6 +2684,15 @@ struct SplitReplayBatch {
     owners: Vec<HandoverReplayOwner>,
 }
 
+#[derive(Debug)]
+struct MergeReplayOutcome {
+    operation_id: String,
+    parent: CellId,
+    source_cell: Option<CellId>,
+    accepted: bool,
+    reason: String,
+}
+
 async fn handle_split_replay_request(
     state: &Arc<SharedState>,
     owned_cells: &HashSet<CellId>,
@@ -2492,15 +2765,166 @@ async fn handle_split_replay_request(
     }
 }
 
+async fn handle_merge_replay_request(
+    state: &Arc<SharedState>,
+    owned_cells: &HashSet<CellId>,
+    operation_id: String,
+    target: MergeReplayTarget,
+) -> MergeReplayOutcome {
+    if !owned_cells.contains(&target.source_cell) {
+        return MergeReplayOutcome {
+            operation_id,
+            parent: target.parent,
+            source_cell: Some(target.source_cell),
+            accepted: false,
+            reason: "merge replay source cell is not owned by this worker".to_string(),
+        };
+    }
+    if target.parent == target.source_cell {
+        return MergeReplayOutcome {
+            operation_id,
+            parent: target.parent,
+            source_cell: Some(target.source_cell),
+            accepted: false,
+            reason: "merge replay source cell must differ from parent".to_string(),
+        };
+    }
+
+    state
+        .register_split_replay_plan(operation_id.clone(), target.source_cell, Vec::new())
+        .await;
+
+    let actors = state.actor_snapshot(target.source_cell).await;
+    let owners = state
+        .handover_owner_manifest(target.source_cell, &actors)
+        .await;
+    let buffered_moves = state.drain_buffered_moves(target.source_cell).await;
+    let mut replay_moves = Vec::with_capacity(buffered_moves.len());
+    let mut replay_failures = Vec::with_capacity(buffered_moves.len());
+
+    for buffered in buffered_moves {
+        replay_failures.push((
+            buffered.subscriber.clone(),
+            buffered.epoch,
+            buffered.request_id,
+        ));
+        if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
+            let _ = state.take_split_replay_plan(target.source_cell).await;
+            let _ = enqueue_error(
+                &buffered.subscriber.tx,
+                target.source_cell,
+                buffered.epoch,
+                buffered.request_id,
+                "merge_replay_move_expired",
+                "move rejected: merge replay move buffer entry expired",
+            );
+            return MergeReplayOutcome {
+                operation_id,
+                parent: target.parent,
+                source_cell: Some(target.source_cell),
+                accepted: false,
+                reason: "merge replay buffered move expired before publish".to_string(),
+            };
+        }
+        if !delta_is_finite(buffered.dx, buffered.dy) {
+            let _ = state.take_split_replay_plan(target.source_cell).await;
+            let _ = enqueue_error(
+                &buffered.subscriber.tx,
+                target.source_cell,
+                buffered.epoch,
+                buffered.request_id,
+                "merge_replay_invalid_delta",
+                "move rejected: merge replay delta is invalid",
+            );
+            return MergeReplayOutcome {
+                operation_id,
+                parent: target.parent,
+                source_cell: Some(target.source_cell),
+                accepted: false,
+                reason: "merge replay buffered move contains invalid delta".to_string(),
+            };
+        }
+        replay_moves.push(HandoverReplayMove {
+            actor: buffered.actor,
+            dx: buffered.dx,
+            dy: buffered.dy,
+            epoch: buffered.epoch,
+        });
+    }
+
+    if actors.is_empty() && replay_moves.is_empty() {
+        return MergeReplayOutcome {
+            operation_id,
+            parent: target.parent,
+            source_cell: Some(target.source_cell),
+            accepted: true,
+            reason: "merge replay source cell had no runtime state".to_string(),
+        };
+    }
+
+    let replay_operation_id = merge_replay_operation_key(&operation_id, target.source_cell);
+    let route = PeerRoute {
+        worker_id: target.target_worker_id.clone(),
+        addr: target.target_addr.clone(),
+    };
+    match send_handover_replay_with_retry(
+        state,
+        &route,
+        &replay_operation_id,
+        target.parent,
+        actors,
+        owners,
+        replay_moves,
+    )
+    .await
+    {
+        Ok(()) => MergeReplayOutcome {
+            operation_id,
+            parent: target.parent,
+            source_cell: Some(target.source_cell),
+            accepted: true,
+            reason: "merge replay applied to parent target".to_string(),
+        },
+        Err(e) => {
+            let _ = state.take_split_replay_plan(target.source_cell).await;
+            reject_replay_moves_unavailable(
+                target.source_cell,
+                &replay_failures,
+                "merge_replay_send_failed",
+            )
+            .await;
+            MergeReplayOutcome {
+                operation_id,
+                parent: target.parent,
+                source_cell: Some(target.source_cell),
+                accepted: false,
+                reason: format!(
+                    "merge replay failed for source {:?}: {e}",
+                    target.source_cell
+                ),
+            }
+        }
+    }
+}
+
 async fn build_split_replay_batches(
     state: &Arc<SharedState>,
     parent: CellId,
     children: &[SplitReplayTarget],
 ) -> Result<Vec<SplitReplayBatch>, String> {
-    let child_by_sub = children
+    let child_cells = children.iter().map(|child| child.cell).collect::<Vec<_>>();
+    let family_kind = parent.child_family_kind(&child_cells).ok_or_else(|| {
+        "split replay children must form exactly one legacy shallow or canonical leaf-coordinate family"
+            .to_string()
+    })?;
+    let child_by_cell = children
         .iter()
-        .map(|child| (child.cell.sub, child))
+        .map(|child| (child.cell, child))
         .collect::<HashMap<_, _>>();
+    if child_by_cell.len() != children.len() {
+        return Err("split replay children contain duplicate cell targets".to_string());
+    }
+
     let mut positions = {
         let actors = state.actors.lock().await;
         actors.get(&parent).cloned().unwrap_or_default()
@@ -2574,11 +2998,11 @@ async fn build_split_replay_batches(
     let mut actors_by_child: HashMap<CellId, Vec<ActorState>> = HashMap::new();
     let mut owners_by_child: HashMap<CellId, Vec<HandoverReplayOwner>> = HashMap::new();
     for (actor, pos) in positions {
-        let child = split_child_for_position(parent, pos, state.aoi_cell_span_units);
-        let Some(target) = child_by_sub.get(&child.sub) else {
+        let child = split_child_for_position(parent, pos, state.aoi_cell_span_units, family_kind);
+        let Some(target) = child_by_cell.get(&child) else {
             return Err(format!(
-                "split replay child sub={} is not targeted",
-                child.sub
+                "split replay child world={},cx={},cy={},depth={},sub={} is not targeted",
+                child.world, child.cx, child.cy, child.depth, child.sub
             ));
         };
         let actor_state = ActorState { id: actor, pos };
@@ -2616,22 +3040,28 @@ async fn build_split_replay_batches(
     Ok(batches)
 }
 
-fn split_child_for_position(parent: CellId, pos: Position, cell_span_units: f32) -> CellId {
+fn split_child_for_position(
+    parent: CellId,
+    pos: Position,
+    cell_span_units: f32,
+    family_kind: CellChildFamilyKind,
+) -> CellId {
     let midpoint = cell_span_units / 2.0;
     let right = pos.x >= midpoint;
     let upper = pos.y >= midpoint;
-    let sub = match (right, upper) {
+    let quadrant = match (right, upper) {
         (false, false) => 0,
         (true, false) => 1,
         (false, true) => 2,
         (true, true) => 3,
     };
-    CellId {
-        world: parent.world,
-        cx: parent.cx,
-        cy: parent.cy,
-        depth: 1,
-        sub,
+    match family_kind {
+        CellChildFamilyKind::LegacyShallow => parent
+            .legacy_shallow_child(quadrant)
+            .expect("legacy split replay family requires depth=0/sub=0 parent"),
+        CellChildFamilyKind::CanonicalLeaf => parent
+            .canonical_child(quadrant)
+            .expect("canonical split replay family requires canonical parent"),
     }
 }
 
@@ -2960,6 +3390,20 @@ async fn write_http_response(
 
 fn format_worker_prometheus_metrics(metrics: &WorkerMetricsSnapshot) -> String {
     let mut out = String::new();
+    push_prometheus_cell_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_cell_actor_count",
+        "Current actor count per local worker-owned cell.",
+        &metrics.cell_actor_counts,
+    );
+    push_prometheus_cell_metric(
+        &mut out,
+        "gauge",
+        "tessera_worker_cell_pending_move_count",
+        "Current pending move broadcast count per local worker-owned cell.",
+        &metrics.cell_pending_moves,
+    );
     push_prometheus_metric(
         &mut out,
         "gauge",
@@ -3080,6 +3524,41 @@ fn format_worker_prometheus_metrics(metrics: &WorkerMetricsSnapshot) -> String {
         metrics.remote_relay_frames_received,
     );
     out
+}
+
+fn push_prometheus_cell_metric(
+    out: &mut String,
+    metric_type: &str,
+    name: &str,
+    help: &str,
+    samples: &[WorkerCellMetric],
+) {
+    out.push_str("# HELP ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(help);
+    out.push('\n');
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(metric_type);
+    out.push('\n');
+    for sample in samples {
+        out.push_str(name);
+        out.push_str("{world=\"");
+        out.push_str(&sample.cell.world.to_string());
+        out.push_str("\",cx=\"");
+        out.push_str(&sample.cell.cx.to_string());
+        out.push_str("\",cy=\"");
+        out.push_str(&sample.cell.cy.to_string());
+        out.push_str("\",depth=\"");
+        out.push_str(&sample.cell.depth.to_string());
+        out.push_str("\",sub=\"");
+        out.push_str(&sample.cell.sub.to_string());
+        out.push_str("\"} ");
+        out.push_str(&sample.value.to_string());
+        out.push('\n');
+    }
 }
 
 fn push_prometheus_metric(out: &mut String, metric_type: &str, name: &str, help: &str, value: u64) {
@@ -4539,7 +5018,82 @@ async fn handle_worker_relay_inner(
                     },
                 ));
             }
-            WorkerRelayMsg::HandoverReplayAck { .. } | WorkerRelayMsg::SplitReplayAck { .. } => {
+            WorkerRelayMsg::MergeReplayPrepare {
+                operation_id,
+                parent,
+            } => {
+                state.prepare_split_replay(&operation_id, &[parent]).await;
+                let _ = tx.try_send((
+                    parent,
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::MergeReplayAck {
+                        operation_id,
+                        parent,
+                        source_cell: None,
+                        accepted: true,
+                        reason: "merge replay parent prepared".to_string(),
+                    },
+                ));
+            }
+            WorkerRelayMsg::MergeReplayRequest {
+                operation_id,
+                target,
+            } => {
+                let owned_guard = owned_cells.read().await.clone();
+                let outcome =
+                    handle_merge_replay_request(&state, &owned_guard, operation_id, target).await;
+                let _ = tx.try_send((
+                    outcome.source_cell.unwrap_or(outcome.parent),
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::MergeReplayAck {
+                        operation_id: outcome.operation_id,
+                        parent: outcome.parent,
+                        source_cell: outcome.source_cell,
+                        accepted: outcome.accepted,
+                        reason: outcome.reason,
+                    },
+                ));
+            }
+            WorkerRelayMsg::MergeReplayAbort {
+                operation_id,
+                parent,
+                source_cell,
+            } => {
+                state
+                    .clear_prepared_split_replay(&operation_id, &[parent])
+                    .await;
+                if let Some(source_cell) = source_cell {
+                    let _ = state.take_split_replay_plan(source_cell).await;
+                }
+                let owned_snapshot = owned_cells.read().await.clone();
+                if let Some(source_cell) = source_cell
+                    && owned_snapshot.contains(&source_cell)
+                {
+                    flush_buffered_moves_for_cells(
+                        &state,
+                        &owned_snapshot,
+                        HashSet::from([source_cell]),
+                    )
+                    .await;
+                }
+                if !owned_snapshot.contains(&parent) {
+                    state.drop_cells(&HashSet::from([parent])).await;
+                }
+                let _ = tx.try_send((
+                    source_cell.unwrap_or(parent),
+                    Some(env_in.epoch),
+                    WorkerRelayMsg::MergeReplayAck {
+                        operation_id,
+                        parent,
+                        source_cell,
+                        accepted: true,
+                        reason: "merge replay aborted".to_string(),
+                    },
+                ));
+            }
+            WorkerRelayMsg::HandoverReplayAck { .. }
+            | WorkerRelayMsg::SplitReplayAck { .. }
+            | WorkerRelayMsg::MergeReplayAck { .. } => {
                 warn!(
                     target: "worker",
                     %peer,
@@ -4580,6 +5134,18 @@ fn handover_replay_key(operation_id: &str, cell: CellId) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}",
         operation_id, cell.world, cell.cx, cell.cy, cell.depth, cell.sub
+    )
+}
+
+fn merge_replay_operation_key(operation_id: &str, source_cell: CellId) -> String {
+    format!(
+        "{}:merge-source:{}:{}:{}:{}:{}",
+        operation_id,
+        source_cell.world,
+        source_cell.cx,
+        source_cell.cy,
+        source_cell.depth,
+        source_cell.sub
     )
 }
 
@@ -5255,6 +5821,16 @@ mod tests {
         }
     }
 
+    fn cell_to_assignment(cell: &CellId) -> Assignment {
+        Assignment {
+            world: cell.world,
+            cx: cell.cx,
+            cy: cell.cy,
+            depth: cell.depth.into(),
+            sub: cell.sub.into(),
+        }
+    }
+
     fn spawn_test_tick_loop(state: Arc<SharedState>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut tick = Tick(0);
@@ -5292,6 +5868,14 @@ mod tests {
     #[test]
     fn worker_prometheus_metrics_text_uses_snapshot_values() {
         let metrics = WorkerMetricsSnapshot {
+            cell_actor_counts: vec![WorkerCellMetric {
+                cell: CellId::grid(0, 0, 0),
+                value: 101,
+            }],
+            cell_pending_moves: vec![WorkerCellMetric {
+                cell: CellId::grid(0, 0, 0),
+                value: 2,
+            }],
             client_subscribers: 2,
             relay_subscribers: 3,
             remote_interest_clients: 5,
@@ -5312,6 +5896,17 @@ mod tests {
         };
 
         let text = format_worker_prometheus_metrics(&metrics);
+        assert!(text.contains("# TYPE tessera_worker_cell_actor_count gauge\n"));
+        assert!(
+            text.contains(
+                "tessera_worker_cell_actor_count{world=\"0\",cx=\"0\",cy=\"0\",depth=\"0\",sub=\"0\"} 101\n"
+            )
+        );
+        assert!(
+            text.contains(
+                "tessera_worker_cell_pending_move_count{world=\"0\",cx=\"0\",cy=\"0\",depth=\"0\",sub=\"0\"} 2\n"
+            )
+        );
         assert!(text.contains("# TYPE tessera_worker_relay_subscribers gauge\n"));
         assert!(text.contains("tessera_worker_relay_subscribers 3\n"));
         assert!(text.contains("# TYPE tessera_worker_remote_relay_connects_total counter\n"));
@@ -5561,6 +6156,28 @@ mod tests {
                 east_parent_child2,
                 north_parent_child1,
             ])
+        );
+    }
+
+    #[test]
+    fn desired_aoi_cells_for_canonical_depth_reaches_leaf_neighbors() {
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let [child0, child1, child2, child3] =
+            parent.canonical_children().expect("canonical children");
+        let east = CellId::leaf(0, child3.cx + 1, child3.cy, child3.depth);
+        let north = CellId::leaf(0, child3.cx, child3.cy + 1, child3.depth);
+        let owned_cells = HashSet::from([child0, child1, child2, child3, east, north]);
+        let root_positions = vec![(child3, Position { x: 16.0, y: 16.0 })];
+
+        assert_eq!(
+            desired_aoi_cells(
+                &root_positions,
+                &owned_cells,
+                1,
+                DEFAULT_AOI_CELL_SPAN_UNITS,
+                None,
+            ),
+            HashSet::from([child0, child1, child2, child3, east, north])
         );
     }
 
@@ -6017,6 +6634,252 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_refreshes_owned_cells_after_canonical_split_publish() {
+        let state = Arc::new(SharedState::default());
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = parent.canonical_children().expect("canonical children");
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([parent])));
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(parent)
+                .or_default()
+                .insert(EntityId(9), Position { x: 1.0, y: 2.0 });
+        }
+
+        let (watcher_tx, _watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(53, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(parent, &watcher).await;
+        state
+            .upsert_client_root(&watcher, parent, EntityId(9), 17)
+            .await;
+
+        let listing = AssignmentListing {
+            workers: vec![tessera_proto::orch::v1::AssignmentBundle {
+                worker_id: "worker-a".into(),
+                addr: "127.0.0.1:5001".into(),
+                cells: children.iter().map(cell_to_assignment).collect(),
+            }],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+                .await
+                .expect("apply canonical split publish listing")
+        );
+
+        assert_eq!(
+            owned_cells.read().await.clone(),
+            children.iter().copied().collect::<HashSet<_>>()
+        );
+        assert!(!state.actors.lock().await.contains_key(&parent));
+        assert!(
+            state
+                .client_subscribed_cells(watcher.client_id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            state
+                .remote_interest_cells(watcher.client_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_coalesces_same_worker_merge_without_dropping_actors() {
+        let state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let children = merge_child_cells(parent);
+        let owned_cells = Arc::new(RwLock::new(
+            children.iter().copied().collect::<HashSet<_>>(),
+        ));
+        let actor_a = EntityId(41);
+        let actor_b = EntityId(42);
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(children[0])
+                .or_default()
+                .insert(actor_a, Position { x: 1.0, y: 2.0 });
+            actors
+                .entry(children[3])
+                .or_default()
+                .insert(actor_b, Position { x: 20.0, y: 24.0 });
+        }
+        assert_eq!(
+            state.claim_owner(children[0], actor_a, 410).await,
+            ClaimOutcome::GrantedNew
+        );
+        assert_eq!(
+            state.claim_owner(children[3], actor_b, 420).await,
+            ClaimOutcome::GrantedNew
+        );
+        state
+            .enqueue_move_broadcast(children[0], actor_a, 410, 21)
+            .await;
+
+        let (watcher_tx, mut watcher_rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (watcher_disconnect_tx, _watcher_disconnect_rx) = watch::channel(());
+        let watcher = test_subscriber(410, watcher_tx, &watcher_disconnect_tx);
+        state.subscribe(children[0], &watcher).await;
+        state
+            .upsert_client_root(&watcher, children[0], actor_a, 21)
+            .await;
+
+        let listing = AssignmentListing {
+            workers: vec![tessera_proto::orch::v1::AssignmentBundle {
+                worker_id: "worker-a".into(),
+                addr: "127.0.0.1:5001".into(),
+                cells: vec![Assignment {
+                    world: parent.world,
+                    cx: parent.cx,
+                    cy: parent.cy,
+                    depth: parent.depth as u32,
+                    sub: parent.sub as u32,
+                }],
+            }],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+                .await
+                .expect("apply merge publish listing")
+        );
+
+        assert_eq!(owned_cells.read().await.clone(), HashSet::from([parent]));
+        {
+            let actors = state.actors.lock().await;
+            let parent_actors = actors.get(&parent).expect("coalesced parent actors");
+            assert_eq!(
+                parent_actors.get(&actor_a),
+                Some(&Position { x: 1.0, y: 2.0 })
+            );
+            assert_eq!(
+                parent_actors.get(&actor_b),
+                Some(&Position { x: 20.0, y: 24.0 })
+            );
+            for child in &children {
+                assert!(!actors.contains_key(child));
+            }
+        }
+        assert_eq!(state.owner_for(&parent, &actor_a).await, Some(410));
+        assert_eq!(state.owner_for(&parent, &actor_b).await, Some(420));
+        assert_eq!(state.owner_for(&children[0], &actor_a).await, None);
+        assert_eq!(
+            state.client_root_actors(watcher.client_id).await,
+            HashSet::from([(parent, actor_a)])
+        );
+        assert_eq!(
+            state.client_subscribed_cells(watcher.client_id).await,
+            HashSet::from([parent])
+        );
+
+        let mut saw_child_despawn = false;
+        let mut saw_parent_snapshot = false;
+        while let Ok(msg) = watcher_rx.try_recv() {
+            match msg.payload {
+                ServerMsg::Despawn { cell, actors } if cell == children[0] => {
+                    saw_child_despawn = actors.contains(&actor_a);
+                }
+                ServerMsg::Snapshot { cell, actors } if cell == parent => {
+                    saw_parent_snapshot = actors.iter().any(|actor| actor.id == actor_a);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_child_despawn);
+        assert!(saw_parent_snapshot);
+    }
+
+    #[test]
+    fn same_worker_merge_coalesces_detects_canonical_children() {
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = parent.canonical_children().expect("canonical children");
+        let removed = children.into_iter().collect::<HashSet<_>>();
+        let added = HashSet::from([parent]);
+
+        let coalesces = same_worker_merge_coalesces(&removed, &added);
+
+        assert_eq!(coalesces, vec![(parent, children.to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn apply_peer_routes_update_coalesces_local_merge_subset_into_staged_parent() {
+        let state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let children = merge_child_cells(parent);
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([children[0], children[1]])));
+        let local_actor = EntityId(51);
+        let replayed_actor = EntityId(52);
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(children[0])
+                .or_default()
+                .insert(local_actor, Position { x: 2.0, y: 3.0 });
+            actors
+                .entry(parent)
+                .or_default()
+                .insert(replayed_actor, Position { x: 24.0, y: 24.0 });
+        }
+        assert_eq!(
+            state.claim_owner(children[0], local_actor, 510).await,
+            ClaimOutcome::GrantedNew
+        );
+        {
+            let mut owners = state.owners.lock().await;
+            owners
+                .entry(parent)
+                .or_default()
+                .insert(replayed_actor, 520);
+        }
+
+        let listing = AssignmentListing {
+            workers: vec![tessera_proto::orch::v1::AssignmentBundle {
+                worker_id: "worker-a".into(),
+                addr: "127.0.0.1:5001".into(),
+                cells: vec![Assignment {
+                    world: parent.world,
+                    cx: parent.cx,
+                    cy: parent.cy,
+                    depth: parent.depth as u32,
+                    sub: parent.sub as u32,
+                }],
+            }],
+            handovers: vec![],
+        };
+
+        assert!(
+            apply_peer_routes_update(&state, &owned_cells, "worker-a", listing)
+                .await
+                .expect("apply cross-worker merge publish listing")
+        );
+
+        assert_eq!(owned_cells.read().await.clone(), HashSet::from([parent]));
+        {
+            let actors = state.actors.lock().await;
+            let parent_actors = actors.get(&parent).expect("parent actors");
+            assert_eq!(
+                parent_actors.get(&local_actor),
+                Some(&Position { x: 2.0, y: 3.0 })
+            );
+            assert_eq!(
+                parent_actors.get(&replayed_actor),
+                Some(&Position { x: 24.0, y: 24.0 })
+            );
+            assert!(!actors.contains_key(&children[0]));
+            assert!(!actors.contains_key(&children[1]));
+        }
+        assert_eq!(state.owner_for(&parent, &local_actor).await, Some(510));
+        assert_eq!(state.owner_for(&parent, &replayed_actor).await, Some(520));
     }
 
     #[tokio::test]
@@ -6515,6 +7378,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_replay_request_accepts_owned_empty_source_cell() {
+        let source_state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let source_cell = merge_child_cells(parent)[3];
+        let source_owned_cells = HashSet::from([source_cell]);
+
+        let outcome = handle_merge_replay_request(
+            &source_state,
+            &source_owned_cells,
+            "merge-op".to_string(),
+            MergeReplayTarget {
+                parent,
+                source_cell,
+                target_worker_id: "worker-a".to_string(),
+                target_addr: "127.0.0.1:1".to_string(),
+            },
+        )
+        .await;
+
+        assert!(outcome.accepted, "{}", outcome.reason);
+        assert_eq!(outcome.parent, parent);
+        assert_eq!(outcome.source_cell, Some(source_cell));
+        assert!(outcome.reason.contains("no runtime state"));
+    }
+
+    #[tokio::test]
     async fn split_replay_partitions_parent_snapshot_and_buffered_moves_to_children() {
         let source_state = Arc::new(SharedState::with_runtime_config(
             0,
@@ -6655,6 +7544,112 @@ mod tests {
         assert_eq!(target_state.owner_for(&child3, &actor_b).await, Some(502));
         assert!(source_state.drain_buffered_moves(parent).await.is_empty());
         server.await.expect("target server task");
+    }
+
+    #[tokio::test]
+    async fn split_replay_partitions_canonical_children_by_exact_cell() {
+        let source_state = Arc::new(SharedState::with_runtime_config(
+            0,
+            DEFAULT_AOI_CELL_SPAN_UNITS,
+            None,
+            None,
+            DEFAULT_AOI_MAX_CELLS,
+            4,
+            Duration::from_secs(1),
+        ));
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = parent.canonical_children().expect("canonical children");
+
+        let actor_a = EntityId(10);
+        let actor_b = EntityId(11);
+        {
+            let mut actors = source_state.actors.lock().await;
+            let parent_actors = actors.entry(parent).or_default();
+            parent_actors.insert(actor_a, Position { x: 4.0, y: 4.0 });
+            parent_actors.insert(actor_b, Position { x: 20.0, y: 20.0 });
+        }
+        assert_eq!(
+            source_state.claim_owner(parent, actor_a, 501).await,
+            ClaimOutcome::GrantedNew
+        );
+        assert_eq!(
+            source_state.claim_owner(parent, actor_b, 502).await,
+            ClaimOutcome::GrantedNew
+        );
+
+        let (tx, _rx) = channel(OUTBOUND_CHANNEL_CAPACITY);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(());
+        let subscriber = test_subscriber(501, tx, &disconnect_tx);
+        source_state
+            .buffer_client_move(
+                parent,
+                BufferedMove {
+                    subscriber,
+                    connection_epoch: Arc::new(AtomicU32::new(10)),
+                    peer: "127.0.0.1:9999".parse().unwrap(),
+                    client_id: 501,
+                    owner_id: 501,
+                    actor: actor_a,
+                    dx: 20.0,
+                    dy: 0.0,
+                    epoch: 12,
+                    request_id: None,
+                    buffered_at: Instant::now(),
+                },
+            )
+            .await
+            .expect("buffer split move");
+
+        let targets = [children[3], children[1], children[0], children[2]]
+            .iter()
+            .map(|cell| SplitReplayTarget {
+                cell: *cell,
+                target_worker_id: "worker-b".to_string(),
+                target_addr: "127.0.0.1:5002".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let batches = build_split_replay_batches(&source_state, parent, &targets)
+            .await
+            .expect("build canonical split replay batches");
+        let child1_batch = batches
+            .iter()
+            .find(|batch| batch.cell == children[1])
+            .expect("child1 batch");
+        let child3_batch = batches
+            .iter()
+            .find(|batch| batch.cell == children[3])
+            .expect("child3 batch");
+
+        assert_eq!(
+            child1_batch.actors,
+            vec![ActorState {
+                id: actor_a,
+                pos: Position { x: 24.0, y: 4.0 },
+            }]
+        );
+        assert_eq!(
+            child1_batch.owners,
+            vec![HandoverReplayOwner {
+                actor: actor_a,
+                owner_session: 501,
+            }]
+        );
+        assert_eq!(
+            child3_batch.actors,
+            vec![ActorState {
+                id: actor_b,
+                pos: Position { x: 20.0, y: 20.0 },
+            }]
+        );
+        assert_eq!(
+            child3_batch.owners,
+            vec![HandoverReplayOwner {
+                actor: actor_b,
+                owner_session: 502,
+            }]
+        );
+        assert!(source_state.drain_buffered_moves(parent).await.is_empty());
     }
 
     #[tokio::test]
