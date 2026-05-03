@@ -39,6 +39,7 @@ message GetMetricsRequest {}
 message SplitChildTarget {
   uint32 sub = 1;
   string target_worker_id = 2;
+  Assignment cell = 3;
 }
 
 message StagedSplitChildAssignment {
@@ -67,6 +68,29 @@ message SplitActivationResponse {
   string reason = 3;
   string source_worker_id = 4;
   repeated StagedSplitChildAssignment staged_children = 5;
+  bool assignments_changed = 6;
+}
+
+message MergeActivationRequest {
+  string operation_id = 1;
+  Assignment parent = 2;
+  string owner_worker_id = 3;
+}
+
+enum MergeActivationState {
+  MERGE_ACTIVATION_STATE_UNSPECIFIED = 0;
+  MERGE_ACTIVATION_STATE_DISABLED = 1;
+  MERGE_ACTIVATION_STATE_REJECTED = 2;
+  MERGE_ACTIVATION_STATE_PUBLISHED = 3;
+  MERGE_ACTIVATION_STATE_FAILED = 4;
+}
+
+message MergeActivationResponse {
+  bool accepted = 1;
+  MergeActivationState state = 2;
+  string reason = 3;
+  string owner_worker_id = 4;
+  repeated Assignment merged_children = 5;
   bool assignments_changed = 6;
 }
 
@@ -172,4 +196,5 @@ service Orchestrator {
   rpc GetMetrics(GetMetricsRequest) returns (OrchestratorMetrics);
   rpc SubmitHandoverCommand(HandoverCommandRequest) returns (HandoverCommandResponse);
   rpc SubmitSplitActivation(SplitActivationRequest) returns (SplitActivationResponse);
+  rpc SubmitMergeActivation(MergeActivationRequest) returns (MergeActivationResponse);
 }

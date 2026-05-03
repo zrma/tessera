@@ -34,6 +34,12 @@ pub struct CellId {
     pub sub: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellChildFamilyKind {
+    CanonicalLeaf,
+    LegacyShallow,
+}
+
 impl CellId {
     pub fn root(world: u32) -> Self {
         Self {
@@ -54,6 +60,120 @@ impl CellId {
             sub: 0,
         }
     }
+
+    pub fn leaf(world: u32, cx: i32, cy: i32, depth: u8) -> Self {
+        Self {
+            world,
+            cx,
+            cy,
+            depth,
+            sub: 0,
+        }
+    }
+
+    pub fn is_canonical_leaf(self) -> bool {
+        self.sub == 0
+    }
+
+    pub fn canonical_child(self, quadrant: u8) -> Option<Self> {
+        if !self.is_canonical_leaf() || quadrant > 3 {
+            return None;
+        }
+        let depth = self.depth.checked_add(1)?;
+        let qx = i32::from(quadrant & 1);
+        let qy = i32::from((quadrant >> 1) & 1);
+        Some(Self::leaf(
+            self.world,
+            self.cx.checked_mul(2)?.checked_add(qx)?,
+            self.cy.checked_mul(2)?.checked_add(qy)?,
+            depth,
+        ))
+    }
+
+    pub fn canonical_parent(self) -> Option<Self> {
+        if self.depth == 0 || !self.is_canonical_leaf() {
+            return None;
+        }
+        Some(Self::leaf(
+            self.world,
+            self.cx.div_euclid(2),
+            self.cy.div_euclid(2),
+            self.depth - 1,
+        ))
+    }
+
+    pub fn canonical_quadrant(self) -> Option<u8> {
+        if self.depth == 0 || !self.is_canonical_leaf() {
+            return None;
+        }
+        let qx = self.cx.rem_euclid(2) as u8;
+        let qy = self.cy.rem_euclid(2) as u8;
+        Some(qx + (qy << 1))
+    }
+
+    pub fn canonical_siblings(self) -> Option<[Self; 4]> {
+        let parent = self.canonical_parent()?;
+        Some([
+            parent.canonical_child(0)?,
+            parent.canonical_child(1)?,
+            parent.canonical_child(2)?,
+            parent.canonical_child(3)?,
+        ])
+    }
+
+    pub fn canonical_children(self) -> Option<[Self; 4]> {
+        Some([
+            self.canonical_child(0)?,
+            self.canonical_child(1)?,
+            self.canonical_child(2)?,
+            self.canonical_child(3)?,
+        ])
+    }
+
+    pub fn legacy_shallow_child(self, sub: u8) -> Option<Self> {
+        if self.depth != 0 || self.sub != 0 || sub > 3 {
+            return None;
+        }
+        Some(Self {
+            world: self.world,
+            cx: self.cx,
+            cy: self.cy,
+            depth: 1,
+            sub,
+        })
+    }
+
+    pub fn legacy_shallow_children(self) -> Option<[Self; 4]> {
+        Some([
+            self.legacy_shallow_child(0)?,
+            self.legacy_shallow_child(1)?,
+            self.legacy_shallow_child(2)?,
+            self.legacy_shallow_child(3)?,
+        ])
+    }
+
+    pub fn child_family_kind(self, children: &[Self]) -> Option<CellChildFamilyKind> {
+        if self
+            .legacy_shallow_children()
+            .is_some_and(|expected| cell_set_eq(children, &expected))
+        {
+            return Some(CellChildFamilyKind::LegacyShallow);
+        }
+        if self
+            .canonical_children()
+            .is_some_and(|expected| cell_set_eq(children, &expected))
+        {
+            return Some(CellChildFamilyKind::CanonicalLeaf);
+        }
+        None
+    }
+}
+
+fn cell_set_eq(actual: &[CellId], expected: &[CellId; 4]) -> bool {
+    actual.len() == expected.len()
+        && expected
+            .iter()
+            .all(|needle| actual.iter().filter(|actual| *actual == needle).count() == 1)
 }
 
 // ---------- Messages (V0) ----------
@@ -81,6 +201,14 @@ pub struct HandoverReplayOwner {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SplitReplayTarget {
     pub cell: CellId,
+    pub target_worker_id: String,
+    pub target_addr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeReplayTarget {
+    pub parent: CellId,
+    pub source_cell: CellId,
     pub target_worker_id: String,
     pub target_addr: String,
 }
@@ -171,6 +299,26 @@ pub enum WorkerRelayMsg {
         accepted: bool,
         reason: String,
         children: Vec<CellId>,
+    },
+    MergeReplayPrepare {
+        operation_id: String,
+        parent: CellId,
+    },
+    MergeReplayRequest {
+        operation_id: String,
+        target: MergeReplayTarget,
+    },
+    MergeReplayAbort {
+        operation_id: String,
+        parent: CellId,
+        source_cell: Option<CellId>,
+    },
+    MergeReplayAck {
+        operation_id: String,
+        parent: CellId,
+        source_cell: Option<CellId>,
+        accepted: bool,
+        reason: String,
     },
 }
 
@@ -287,6 +435,106 @@ mod tests {
         assert_eq!(c1.world, 2);
         assert_eq!(c1.cx, -3);
         assert_eq!(c1.cy, 5);
+    }
+
+    #[test]
+    fn canonical_leaf_children_use_leaf_resolution_coordinates() {
+        let parent = CellId::leaf(7, -2, 3, 2);
+        assert_eq!(parent.canonical_child(0), Some(CellId::leaf(7, -4, 6, 3)));
+        assert_eq!(parent.canonical_child(1), Some(CellId::leaf(7, -3, 6, 3)));
+        assert_eq!(parent.canonical_child(2), Some(CellId::leaf(7, -4, 7, 3)));
+        assert_eq!(parent.canonical_child(3), Some(CellId::leaf(7, -3, 7, 3)));
+        assert_eq!(parent.canonical_child(4), None);
+    }
+
+    #[test]
+    fn canonical_leaf_parent_and_quadrant_are_coordinate_derived() {
+        let child = CellId::leaf(3, -3, 7, 3);
+        assert_eq!(child.canonical_parent(), Some(CellId::leaf(3, -2, 3, 2)));
+        assert_eq!(child.canonical_quadrant(), Some(3));
+        assert_eq!(
+            child.canonical_siblings(),
+            Some([
+                CellId::leaf(3, -4, 6, 3),
+                CellId::leaf(3, -3, 6, 3),
+                CellId::leaf(3, -4, 7, 3),
+                CellId::leaf(3, -3, 7, 3),
+            ])
+        );
+    }
+
+    #[test]
+    fn child_family_kind_classifies_legacy_shallow_family() {
+        let parent = CellId::grid(0, 4, -2);
+        let children = [
+            parent.legacy_shallow_child(2).expect("legacy child"),
+            parent.legacy_shallow_child(0).expect("legacy child"),
+            parent.legacy_shallow_child(3).expect("legacy child"),
+            parent.legacy_shallow_child(1).expect("legacy child"),
+        ];
+
+        assert_eq!(
+            parent.child_family_kind(&children),
+            Some(CellChildFamilyKind::LegacyShallow)
+        );
+    }
+
+    #[test]
+    fn child_family_kind_classifies_canonical_leaf_family() {
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = [
+            parent.canonical_child(3).expect("canonical child"),
+            parent.canonical_child(1).expect("canonical child"),
+            parent.canonical_child(0).expect("canonical child"),
+            parent.canonical_child(2).expect("canonical child"),
+        ];
+
+        assert_eq!(
+            parent.child_family_kind(&children),
+            Some(CellChildFamilyKind::CanonicalLeaf)
+        );
+    }
+
+    #[test]
+    fn child_family_kind_rejects_mixed_or_duplicate_family() {
+        let parent = CellId::grid(0, 0, 0);
+        let mixed = [
+            parent.legacy_shallow_child(0).expect("legacy child"),
+            parent.legacy_shallow_child(1).expect("legacy child"),
+            parent.canonical_child(2).expect("canonical child"),
+            parent.canonical_child(3).expect("canonical child"),
+        ];
+        assert_eq!(parent.child_family_kind(&mixed), None);
+
+        let duplicate = [
+            parent.legacy_shallow_child(0).expect("legacy child"),
+            parent.legacy_shallow_child(0).expect("legacy child"),
+            parent.legacy_shallow_child(2).expect("legacy child"),
+            parent.legacy_shallow_child(3).expect("legacy child"),
+        ];
+        assert_eq!(parent.child_family_kind(&duplicate), None);
+        assert_eq!(parent.child_family_kind(&duplicate[..3]), None);
+    }
+
+    #[test]
+    fn canonical_helpers_reject_legacy_sub_only_cells() {
+        let parent = CellId::grid(0, 0, 0);
+        let legacy = parent.legacy_shallow_child(2).expect("legacy child");
+        assert_eq!(
+            legacy,
+            CellId {
+                world: 0,
+                cx: 0,
+                cy: 0,
+                depth: 1,
+                sub: 2,
+            }
+        );
+        assert_eq!(legacy.canonical_parent(), None);
+        assert_eq!(legacy.canonical_child(0), None);
+        assert_eq!(legacy.canonical_quadrant(), None);
+        assert_eq!(parent.legacy_shallow_child(4), None);
+        assert_eq!(legacy.legacy_shallow_child(0), None);
     }
 
     #[test]
@@ -485,6 +733,57 @@ mod tests {
                 accepted: true,
                 reason: "split replay applied".to_string(),
                 children: vec![child],
+            },
+        };
+        let b = encode_frame(&ack);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<WorkerRelayMsg> =
+            try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(ack, decoded);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn frame_roundtrip_merge_replay_request_and_ack() {
+        let parent = CellId::grid(0, 1, 0);
+        let source_cell = CellId {
+            world: 0,
+            cx: 1,
+            cy: 0,
+            depth: 1,
+            sub: 2,
+        };
+        let env = Envelope {
+            cell: source_cell,
+            seq: 5,
+            epoch: 13,
+            payload: WorkerRelayMsg::MergeReplayRequest {
+                operation_id: "merge-1".to_string(),
+                target: MergeReplayTarget {
+                    parent,
+                    source_cell,
+                    target_worker_id: "worker-a".to_string(),
+                    target_addr: "127.0.0.1:5001".to_string(),
+                },
+            },
+        };
+        let b = encode_frame(&env);
+        let mut buf = BytesMut::from(&b[..]);
+        let decoded: Envelope<WorkerRelayMsg> =
+            try_decode_frame(&mut buf).expect("decode").expect("frame");
+        assert_eq!(env, decoded);
+        assert_eq!(buf.len(), 0);
+
+        let ack = Envelope {
+            cell: source_cell,
+            seq: 6,
+            epoch: 13,
+            payload: WorkerRelayMsg::MergeReplayAck {
+                operation_id: "merge-1".to_string(),
+                parent,
+                source_cell: Some(source_cell),
+                accepted: true,
+                reason: "merge replay applied".to_string(),
             },
         };
         let b = encode_frame(&ack);
