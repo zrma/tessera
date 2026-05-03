@@ -272,9 +272,11 @@ Remaining implementation outside the current slice:
    publish/failure/restart/soak evidence after the read-only readiness report
    passes against the rollout candidate.
 5. Keep unapproved planner mutation disabled. The explicit local policy gate
-   exists for preview-backed merge and live-metrics-backed split; internal
-   planner mutation evidence still requires a separate approved rollout gate
-   after live metrics/internal plan evidence is available.
+   exists for preview-backed merge and live-metrics-backed split, and the
+   read-only internal planner report now records the default-off block plus
+   policy-approved local publish against live ArgoCD/image evidence. A future
+   live-metrics-specific planner report should still be rerun after the new
+   image/internal live plan evidence is available.
 
 Internal MicroK8s activation preflight on 2026-05-02:
 
