@@ -91,7 +91,10 @@ Each slice should be self-contained:
    proposal hashes, target cells, worker roles, preconditions, and submission
    commands.
 4. **Approval gate**: add explicit approval records with TTL, policy id,
-   expected proposal hash, cooldown, and budget constraints.
+   expected proposal hash, cooldown, budget constraints, and allowed mutation
+   kind. The first write surface is `POST /operations/approvals?...`; it
+   approves an existing proposal only when the supplied proposal hash still
+   matches and still leaves execution mutation disabled.
 5. **Executor dry run**: report blocked execution by default and approved
    execution only under explicit policy.
 6. **Closed-loop smoke**: verify proposal-to-approval-to-execution locally for

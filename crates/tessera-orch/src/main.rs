@@ -229,6 +229,7 @@ struct OperationTarget {
 struct OperationApproval {
     policy_id: String,
     approver: String,
+    allowed_kind: DynamicOperationKind,
     approved_unix_secs: u64,
     expires_unix_secs: u64,
     expected_proposal_hash: String,
@@ -278,6 +279,27 @@ struct OperationProposalSkip {
     kind: String,
     cell: CellId,
     reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationApprovalWriteResponse {
+    schema: String,
+    operation_id: String,
+    status: &'static str,
+    assignments_changed: bool,
+    expected_proposal_hash: String,
+    expires_unix_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct OperationApprovalRequest {
+    operation_id: String,
+    policy_id: String,
+    approver: String,
+    expected_proposal_hash: String,
+    ttl_secs: u64,
+    cooldown_key: String,
+    budget_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -717,7 +739,7 @@ fn validate_operation_ledger(ledger: &OperationLedgerFile) -> Result<()> {
         }
         validate_operation_proposal(operation_id, &record.proposal)?;
         if let Some(approval) = &record.approval {
-            validate_operation_approval(operation_id, &record.proposal, approval)?;
+            validate_operation_approval(operation_id, record.kind, &record.proposal, approval)?;
         }
         for phase in &record.phases {
             validate_operation_phase(operation_id, phase)?;
@@ -767,6 +789,7 @@ fn validate_operation_proposal(operation_id: &str, proposal: &OperationProposal)
 
 fn validate_operation_approval(
     operation_id: &str,
+    kind: DynamicOperationKind,
     proposal: &OperationProposal,
     approval: &OperationApproval,
 ) -> Result<()> {
@@ -783,6 +806,11 @@ fn validate_operation_approval(
     if approval.expires_unix_secs <= approval.approved_unix_secs {
         return Err(anyhow!(
             "operation ledger operation_id={operation_id} approval must expire after approval time"
+        ));
+    }
+    if approval.allowed_kind != kind {
+        return Err(anyhow!(
+            "operation ledger operation_id={operation_id} approval.allowed_kind must match operation kind"
         ));
     }
     if approval.expected_proposal_hash != proposal.proposal_hash {
@@ -1281,6 +1309,17 @@ fn dynamic_operation_kind_slug(kind: DynamicOperationKind) -> &'static str {
         DynamicOperationKind::Merge => "merge",
         DynamicOperationKind::MultiDepthSplit => "multi-depth-split",
     }
+}
+
+fn approval_matches_request(
+    approval: &OperationApproval,
+    request: &OperationApprovalRequest,
+) -> bool {
+    approval.policy_id == request.policy_id
+        && approval.approver == request.approver
+        && approval.expected_proposal_hash == request.expected_proposal_hash
+        && approval.cooldown_key == request.cooldown_key
+        && approval.budget_key == request.budget_key
 }
 
 fn listing_with_runtime(
@@ -2169,6 +2208,95 @@ impl OrchestratorService {
             *ledger = next_ledger;
         }
         Ok((operation_ids, recorded_count, already_recorded_count))
+    }
+
+    async fn approve_operation(
+        &self,
+        request: OperationApprovalRequest,
+        now: SystemTime,
+    ) -> Result<OperationApprovalWriteResponse, String> {
+        let Some(path) = self.operation_ledger_path.as_ref() else {
+            return Err(
+                "operation ledger persistence is disabled; set TESSERA_ORCH_OPERATION_LEDGER_PATH"
+                    .to_string(),
+            );
+        };
+        if request.ttl_secs == 0 {
+            return Err("approval ttl_secs must be greater than zero".to_string());
+        }
+        let now_unix_secs = unix_timestamp_secs(now);
+        let expires_unix_secs = now_unix_secs
+            .checked_add(request.ttl_secs)
+            .ok_or_else(|| "approval ttl_secs overflows expires_unix_secs".to_string())?;
+
+        let mut ledger = self.operation_ledger.write().await;
+        let mut next_ledger = ledger.clone();
+        let Some(record) = next_ledger
+            .records
+            .iter_mut()
+            .find(|record| record.operation_id == request.operation_id)
+        else {
+            return Err(format!("operation_id={} not found", request.operation_id));
+        };
+        if record.proposal.proposal_hash != request.expected_proposal_hash {
+            return Err(format!(
+                "operation_id={} expected_proposal_hash does not match proposal_hash",
+                request.operation_id
+            ));
+        }
+        if let Some(existing) = &record.approval {
+            if approval_matches_request(existing, &request) {
+                return Ok(OperationApprovalWriteResponse {
+                    schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                    operation_id: request.operation_id,
+                    status: "already_approved",
+                    assignments_changed: false,
+                    expected_proposal_hash: existing.expected_proposal_hash.clone(),
+                    expires_unix_secs: existing.expires_unix_secs,
+                });
+            }
+            return Err(format!(
+                "operation_id={} already has a different approval record",
+                request.operation_id
+            ));
+        }
+        if record.status != OperationStatus::Proposed {
+            return Err(format!(
+                "operation_id={} is not in proposed status",
+                request.operation_id
+            ));
+        }
+
+        record.status = OperationStatus::Approved;
+        record.updated_unix_secs = now_unix_secs;
+        record.approval = Some(OperationApproval {
+            policy_id: request.policy_id,
+            approver: request.approver,
+            allowed_kind: record.kind,
+            approved_unix_secs: now_unix_secs,
+            expires_unix_secs,
+            expected_proposal_hash: request.expected_proposal_hash.clone(),
+            cooldown_key: request.cooldown_key,
+            budget_key: request.budget_key,
+        });
+        record.phases.push(OperationPhase {
+            name: "approval_recorded".to_string(),
+            state: OperationPhaseState::Succeeded,
+            unix_secs: now_unix_secs,
+            reason: "operator approval persisted without assignment mutation".to_string(),
+        });
+        write_operation_ledger_file(path.as_path(), &next_ledger)
+            .map_err(|err| format!("persist operation ledger to {}: {err:#}", path.display()))?;
+        *ledger = next_ledger;
+
+        Ok(OperationApprovalWriteResponse {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            operation_id: request.operation_id,
+            status: "approved",
+            assignments_changed: false,
+            expected_proposal_hash: request.expected_proposal_hash,
+            expires_unix_secs,
+        })
     }
 
     fn persist_assignment_map(&self, assignments: &AssignmentMap) -> Result<(), String> {
@@ -3292,6 +3420,61 @@ fn parse_split_merge_preview_snapshot(
     Ok((source.to_string(), snapshot))
 }
 
+fn parse_operation_approval_request(query: &str) -> Result<OperationApprovalRequest, String> {
+    let params = parse_query_params(query)?;
+    let ttl_secs = required_query_param(&params, "ttl_secs")?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid ttl_secs: {err}"))?;
+    Ok(OperationApprovalRequest {
+        operation_id: required_query_param(&params, "operation_id")?.to_string(),
+        policy_id: required_query_param(&params, "policy_id")?.to_string(),
+        approver: required_query_param(&params, "approver")?.to_string(),
+        expected_proposal_hash: required_query_param(&params, "expected_proposal_hash")?
+            .to_string(),
+        ttl_secs,
+        cooldown_key: required_query_param(&params, "cooldown_key")?.to_string(),
+        budget_key: required_query_param(&params, "budget_key")?.to_string(),
+    })
+}
+
+fn parse_query_params(query: &str) -> Result<HashMap<String, String>, String> {
+    let mut params = HashMap::new();
+    if query.trim().is_empty() {
+        return Ok(params);
+    }
+    for part in query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!(
+                "invalid query parameter `{part}`; expected key=value"
+            ));
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(format!(
+                "invalid query parameter `{part}`; key and value are required"
+            ));
+        }
+        if params.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!("duplicate query parameter `{key}`"));
+        }
+    }
+    Ok(params)
+}
+
+fn required_query_param<'a>(
+    params: &'a HashMap<String, String>,
+    key: &str,
+) -> Result<&'a str, String> {
+    params
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing query parameter `{key}`"))
+}
+
 struct ParsedSplitActivation {
     operation_id: String,
     parent: CellId,
@@ -3893,7 +4076,7 @@ async fn handle_prometheus_metrics_request(
         .split_whitespace();
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
-    let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
 
     if method == "GET" && path == "/metrics" {
         let snapshot = service.metrics_snapshot().await;
@@ -3944,6 +4127,36 @@ async fn handle_prometheus_metrics_request(
                 let body = format!("operation proposal recording unavailable: {reason}\n");
                 write_http_response(&mut stream, status, "text/plain; charset=utf-8", &body)
                     .await?;
+            }
+        }
+    } else if method == "POST" && path == "/operations/approvals" {
+        match parse_operation_approval_request(query) {
+            Ok(request) => match service.approve_operation(request, SystemTime::now()).await {
+                Ok(response) => {
+                    let body = serde_json::to_string_pretty(&response)
+                        .context("serialize operation approval write response")?;
+                    write_http_response(&mut stream, "200 OK", "application/json", &body).await?;
+                }
+                Err(reason) => {
+                    let status = if reason.contains("TESSERA_ORCH_OPERATION_LEDGER_PATH") {
+                        "409 Conflict"
+                    } else {
+                        "400 Bad Request"
+                    };
+                    let body = format!("operation approval unavailable: {reason}\n");
+                    write_http_response(&mut stream, status, "text/plain; charset=utf-8", &body)
+                        .await?;
+                }
+            },
+            Err(reason) => {
+                let body = format!("operation approval request invalid: {reason}\n");
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain; charset=utf-8",
+                    &body,
+                )
+                .await?;
             }
         }
     } else {
@@ -6040,6 +6253,7 @@ mod tests {
         record.approval = Some(OperationApproval {
             policy_id: "operator_approved_dynamic_operation_v1".to_string(),
             approver: "operator".to_string(),
+            allowed_kind: DynamicOperationKind::Split,
             approved_unix_secs: 100,
             expires_unix_secs: 200,
             expected_proposal_hash: "other-hash".to_string(),
@@ -6053,6 +6267,29 @@ mod tests {
 
         let err = validate_operation_ledger(&ledger).expect_err("mismatched hash should fail");
         assert!(err.to_string().contains("expected_proposal_hash"));
+    }
+
+    #[test]
+    fn operation_ledger_rejects_mismatched_approval_kind() {
+        let mut record = sample_operation_record("wrong-kind-op");
+        record.status = OperationStatus::Approved;
+        record.approval = Some(OperationApproval {
+            policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+            approver: "operator".to_string(),
+            allowed_kind: DynamicOperationKind::Merge,
+            approved_unix_secs: 100,
+            expires_unix_secs: 200,
+            expected_proposal_hash: "proposal-hash-1".to_string(),
+            cooldown_key: "world-0".to_string(),
+            budget_key: "dynamic-ops-daily".to_string(),
+        });
+        let ledger = OperationLedgerFile {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: vec![record],
+        };
+
+        let err = validate_operation_ledger(&ledger).expect_err("mismatched kind should fail");
+        assert!(err.to_string().contains("approval.allowed_kind"));
     }
 
     #[tokio::test]
@@ -6209,6 +6446,119 @@ mod tests {
                 .submission_command
                 .contains("cargo xt merge-activation")
         );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_approves_existing_proposal_without_assignment_mutation() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-approval");
+        let record = sample_operation_record("approve-op");
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let before = service.listing().await;
+        let request = OperationApprovalRequest {
+            operation_id: "approve-op".to_string(),
+            policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+            approver: "operator".to_string(),
+            expected_proposal_hash: proposal_hash.clone(),
+            ttl_secs: 600,
+            cooldown_key: "world-0".to_string(),
+            budget_key: "dynamic-ops-daily".to_string(),
+        };
+
+        let response = service
+            .approve_operation(
+                request.clone(),
+                UNIX_EPOCH + std::time::Duration::from_secs(400),
+            )
+            .await
+            .expect("approve operation");
+        let after = service.listing().await;
+
+        assert_eq!(response.status, "approved");
+        assert!(!response.assignments_changed);
+        assert_eq!(response.expires_unix_secs, 1000);
+        assert_eq!(before, after);
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        let approved = &loaded.records[0];
+        assert_eq!(approved.status, OperationStatus::Approved);
+        let approval = approved.approval.as_ref().expect("approval record");
+        assert_eq!(approval.allowed_kind, DynamicOperationKind::Split);
+        assert_eq!(approval.expected_proposal_hash, proposal_hash);
+        assert!(
+            approved
+                .phases
+                .iter()
+                .any(|phase| phase.name == "approval_recorded")
+        );
+
+        let repeat = service
+            .approve_operation(request, UNIX_EPOCH + std::time::Duration::from_secs(401))
+            .await
+            .expect("repeat approval");
+        assert_eq!(repeat.status, "already_approved");
+        let loaded_after_repeat =
+            load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(
+            loaded_after_repeat.records[0].phases.len(),
+            approved.phases.len()
+        );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_approval_rejects_stale_proposal_hash() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-stale-approval");
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![sample_operation_record("stale-approval-op")],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+
+        let err = service
+            .approve_operation(
+                OperationApprovalRequest {
+                    operation_id: "stale-approval-op".to_string(),
+                    policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+                    approver: "operator".to_string(),
+                    expected_proposal_hash: "stale-hash".to_string(),
+                    ttl_secs: 600,
+                    cooldown_key: "world-0".to_string(),
+                    budget_key: "dynamic-ops-daily".to_string(),
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(400),
+            )
+            .await
+            .expect_err("stale hash should fail");
+
+        assert!(err.contains("expected_proposal_hash"));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::Proposed);
+        assert!(loaded.records[0].approval.is_none());
         let _ = fs::remove_file(ledger_path);
     }
 
@@ -7338,6 +7688,59 @@ mod tests {
         assert!(response.contains(r#""recorded_count": 0"#));
         let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
         assert!(loaded.records.is_empty());
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_records_approval() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http-approval");
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![sample_operation_record("http-approve-op")],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind approval listener");
+        let addr = listener.local_addr().expect("approval listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept approval request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle approval request");
+        });
+
+        let request = b"POST /operations/approvals?operation_id=http-approve-op&policy_id=operator_approved_dynamic_operation_v1&approver=operator&expected_proposal_hash=proposal-hash-1&ttl_secs=600&cooldown_key=world-0&budget_key=dynamic-ops-daily HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut client = TcpStream::connect(addr).await.expect("connect approvals");
+        client
+            .write_all(request)
+            .await
+            .expect("write approval request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read approval response");
+        server.await.expect("approval server task");
+
+        let response = String::from_utf8(response).expect("utf8 approval response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains(r#""status": "approved""#));
+        assert!(response.contains(r#""assignments_changed": false"#));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::Approved);
+        assert!(loaded.records[0].approval.is_some());
         let _ = fs::remove_file(ledger_path);
     }
 }
