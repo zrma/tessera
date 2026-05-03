@@ -2244,8 +2244,6 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
     let orch_addr = "127.0.0.1:6310";
     let orch_metrics_addr = "127.0.0.1:6311";
     let orch_endpoint = format!("http://{orch_addr}");
-    let worker_a_addr = "127.0.0.1:5311";
-    let worker_b_addr = "127.0.0.1:5312";
     let root = workspace_root();
     let (_dev, logs, pids) = dev_dirs();
     let report_dir = root.join(".dev/reports");
@@ -2263,52 +2261,172 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
 
     let orchestrator_bin = root.join("target/debug/tessera-orch");
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-    let orch_config_json = format!(
-        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+
+    let cases = p7_operation_loop_smoke_cases();
+    let mut case_reports = Vec::with_capacity(cases.len());
+    for case in &cases {
+        let case_report = run_p7_operation_loop_smoke_case(
+            &root,
+            &logs,
+            &pids,
+            &orchestrator_bin,
+            rust_log.as_str(),
+            orch_addr,
+            orch_metrics_addr,
+            orch_endpoint.as_str(),
+            &ledger_path,
+            ledger_path_raw.as_str(),
+            case,
+        )?;
+        case_reports.push(case_report);
+    }
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, true)?;
+    if ledger_summary.records < cases.len()
+        || ledger_summary.approval_records < cases.len()
+        || ledger_summary.blocked_execution_records < cases.len()
+    {
+        bail!(
+            "P7 operation loop smoke expected at least {} complete operation records; got records={}, approvals={}, blocked={}",
+            cases.len(),
+            ledger_summary.records,
+            ledger_summary.approval_records,
+            ledger_summary.blocked_execution_records
+        );
+    }
+
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_loop_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "blocked_execution_records": ledger_summary.blocked_execution_records
+        },
+        "cases": case_reports,
+        "checks": {
+            "split_operation_loop_smoke": true,
+            "merge_operation_loop_smoke": true,
+            "multi_depth_operation_loop_smoke": true,
+            "proposal_approval_default_off_execution": true,
+            "ledger_check_passed": true
+        },
+        "remaining_uncovered": [
+            "approved_runtime_execution",
+            "operation_observation",
+            "failure_recovery",
+            "restart_recovery",
+            "soak",
+            "guarded_kubernetes_operation_loop_smoke",
+            "p7_completion_audit"
+        ]
+    });
+    validate_p7_operation_loop_smoke_report(&report)?;
+    let report_path = write_p7_operation_loop_smoke_report(&report)?;
+
+    println!(
+        "P7 operation loop smoke: split/merge/multi-depth proposal -> approval -> default-off execution blocks succeeded, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
     );
-    let split_merge_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    Ok(())
+}
+
+struct P7OperationLoopSmokeCase {
+    name: &'static str,
+    expected_kind: &'static str,
+    orch_config_json: String,
+    preview_json: &'static str,
+    registrations: Vec<(&'static str, &'static str)>,
+}
+
+fn p7_operation_loop_smoke_cases() -> Vec<P7OperationLoopSmokeCase> {
+    let worker_a_addr = "127.0.0.1:5311";
+    let worker_b_addr = "127.0.0.1:5312";
+    let split_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let merge_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":0},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":1},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":2},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"},{"cell":{"world":0,"cx":0,"cy":0,"depth":1,"sub":3},"actor_count":0,"move_queue_pressure":0,"tick_stage_micros":0,"relay_fanout":0,"handover_failures":0,"low_pressure_windows":5,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let multi_depth_preview_json = r#"{"cells":[{"cell":{"world":0,"cx":-2,"cy":3,"depth":2,"sub":0},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let registrations = vec![("worker-a", worker_a_addr), ("worker-b", worker_b_addr)];
+    vec![
+        P7OperationLoopSmokeCase {
+            name: "split",
+            expected_kind: "split",
+            orch_config_json: format!(
+                r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+            ),
+            preview_json: split_preview_json,
+            registrations: registrations.clone(),
+        },
+        P7OperationLoopSmokeCase {
+            name: "merge",
+            expected_kind: "merge",
+            orch_config_json: format!(
+                r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":0}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":1}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":2}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":3}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+            ),
+            preview_json: merge_preview_json,
+            registrations: registrations.clone(),
+        },
+        P7OperationLoopSmokeCase {
+            name: "multi_depth_split",
+            expected_kind: "multi_depth_split",
+            orch_config_json: format!(
+                r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":-2,"cy":3,"depth":2,"sub":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+            ),
+            preview_json: multi_depth_preview_json,
+            registrations,
+        },
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_p7_operation_loop_smoke_case(
+    root: &Path,
+    logs: &Path,
+    pids: &Path,
+    orchestrator_bin: &Path,
+    rust_log: &str,
+    orch_addr: &str,
+    orch_metrics_addr: &str,
+    orch_endpoint: &str,
+    ledger_path: &Path,
+    ledger_path_raw: &str,
+    case: &P7OperationLoopSmokeCase,
+) -> Result<serde_json::Value> {
     let orch_envs = [
-        ("RUST_LOG", rust_log.as_str()),
+        ("RUST_LOG", rust_log),
         ("TESSERA_ORCH_ADDR", orch_addr),
         ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
-        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
-        (
-            "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON",
-            split_merge_preview_json,
-        ),
-        (
-            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
-            ledger_path_raw.as_str(),
-        ),
+        ("TESSERA_ORCH_CONFIG_JSON", case.orch_config_json.as_str()),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", case.preview_json),
+        ("TESSERA_ORCH_OPERATION_LEDGER_PATH", ledger_path_raw),
     ];
 
     let mut stack = ManagedDevStack::default();
     stack.spawn(
-        &root,
-        &logs,
-        &pids,
+        root,
+        logs,
+        pids,
         DevProcessSpec {
             name: "p7-operation-loop-orch",
-            bin: &orchestrator_bin,
+            bin: orchestrator_bin,
             ready_addr: orch_addr,
             envs: &orch_envs,
         },
     )?;
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(register_orchestrator_worker(
-        &orch_endpoint,
-        "worker-a",
-        worker_a_addr,
+    for (worker_id, addr) in &case.registrations {
+        runtime.block_on(register_orchestrator_worker(orch_endpoint, worker_id, addr))?;
+    }
+    runtime.block_on(wait_for_orchestrator_registered(
+        orch_endpoint,
+        case.registrations.len() as u64,
     ))?;
-    runtime.block_on(register_orchestrator_worker(
-        &orch_endpoint,
-        "worker-b",
-        worker_b_addr,
-    ))?;
-    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
     let (before_health, before_listing) =
-        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        runtime.block_on(fetch_orch_health_and_listing(orch_endpoint))?;
 
     let proposal_response = http_json_post(
         "P7 operation proposal",
@@ -2333,6 +2451,14 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
     let proposal_snapshot = http_json_get("P7 operation ledger", orch_metrics_addr, "/operations")?;
     let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
     let operation_kind = json_str(proposal_record, &["kind"])?.to_string();
+    if operation_kind != case.expected_kind {
+        bail!(
+            "P7 operation loop smoke case {} expected kind {}, got {}",
+            case.name,
+            case.expected_kind,
+            operation_kind
+        );
+    }
     let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
 
     let policy_id = "operator_approved_dynamic_operation_v1";
@@ -2365,21 +2491,22 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
     assert_json_bool_eq(&execution_response, &["mutation_allowed"], false)?;
 
     let (_after_health, after_listing) =
-        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        runtime.block_on(fetch_orch_health_and_listing(orch_endpoint))?;
     let assignments_unchanged = before_listing == after_listing;
     if !assignments_unchanged {
-        bail!("P7 operation loop smoke changed Orchestrator assignments");
+        bail!(
+            "P7 operation loop smoke case {} changed Orchestrator assignments",
+            case.name
+        );
     }
 
-    let ledger = read_json_report(&ledger_path)?;
-    let ledger_summary = validate_p7_operation_ledger(&ledger, true, true)?;
+    let ledger = read_json_report(ledger_path)?;
     let final_record = find_p7_operation_record(&ledger, &operation_id)?;
     validate_p7_operation_approval(final_record)?;
     validate_p7_blocked_execution(final_record)?;
 
-    let report = serde_json::json!({
-        "schema": "tessera.p7_operation_loop_smoke.v1",
-        "unix_secs": unix_timestamp_secs(),
+    Ok(serde_json::json!({
+        "case": case.name,
         "operation": {
             "operation_id": operation_id.as_str(),
             "kind": operation_kind.as_str(),
@@ -2392,13 +2519,6 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
             "registered_workers": before_health.registered_workers,
             "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
             "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
-        },
-        "ledger": {
-            "path": ledger_path_raw.as_str(),
-            "records": ledger_summary.records,
-            "proposal_records": ledger_summary.proposal_records,
-            "approval_records": ledger_summary.approval_records,
-            "blocked_execution_records": ledger_summary.blocked_execution_records
         },
         "responses": {
             "proposal": proposal_response,
@@ -2413,28 +2533,8 @@ fn dev_p7_operation_loop_smoke() -> Result<()> {
             "mutation_attempted": false,
             "mutation_allowed": false,
             "ledger_check_passed": true
-        },
-        "remaining_uncovered": [
-            "merge_operation_loop_smoke",
-            "multi_depth_operation_loop_smoke",
-            "approved_runtime_execution",
-            "operation_observation",
-            "failure_recovery",
-            "restart_recovery",
-            "soak",
-            "guarded_kubernetes_operation_loop_smoke",
-            "p7_completion_audit"
-        ]
-    });
-    validate_p7_operation_loop_smoke_report(&report)?;
-    let report_path = write_p7_operation_loop_smoke_report(&report, &operation_id)?;
-
-    println!(
-        "P7 operation loop smoke: proposal -> approval -> default-off execution block succeeded, report={}, ledger={}",
-        report_path.display(),
-        ledger_path.display()
-    );
-    Ok(())
+        }
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9269,14 +9369,14 @@ fn run_p7_operation_ledger_check(
     Ok(())
 }
 
-fn write_p7_operation_loop_smoke_report(
-    report: &serde_json::Value,
-    operation_id: &str,
-) -> Result<PathBuf> {
+fn write_p7_operation_loop_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
     let report_dir = workspace_root().join(".dev/reports");
     fs::create_dir_all(&report_dir)?;
     let body = format!("{}\n", serde_json::to_string_pretty(report)?);
-    let stamped = report_dir.join(format!("{operation_id}-operation-loop-smoke.json"));
+    let stamped = report_dir.join(format!(
+        "p7-operation-loop-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
     fs::write(&stamped, &body)?;
     let latest = default_p7_operation_loop_smoke_path();
     fs::write(&latest, body)?;
@@ -9425,64 +9525,83 @@ fn validate_p7_operation_approval(record: &serde_json::Value) -> Result<()> {
 
 fn validate_p7_operation_loop_smoke_report(report: &serde_json::Value) -> Result<()> {
     assert_json_str_eq(report, &["schema"], "tessera.p7_operation_loop_smoke.v1")?;
-    let operation_id = json_str(report, &["operation", "operation_id"])?;
-    if operation_id.trim().is_empty() {
-        bail!("P7 operation loop smoke report has empty operation.operation_id");
-    }
-    let proposal_hash = json_str(report, &["operation", "proposal_hash"])?;
-    if proposal_hash.trim().is_empty() {
-        bail!("P7 operation loop smoke report has empty operation.proposal_hash");
-    }
-    assert_json_str_eq(report, &["operation", "kind"], "split")?;
-    assert_json_str_eq(
-        report,
-        &["operation", "policy_id"],
-        "operator_approved_dynamic_operation_v1",
-    )?;
     let ledger_path = json_str(report, &["ledger", "path"])?;
     if ledger_path.trim().is_empty() {
         bail!("P7 operation loop smoke report has empty ledger.path");
     }
-    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
-    assert_json_number_at_least(report, &["ledger", "proposal_records"], 1.0)?;
-    assert_json_number_at_least(report, &["ledger", "approval_records"], 1.0)?;
-    assert_json_number_at_least(report, &["ledger", "blocked_execution_records"], 1.0)?;
-    assert_json_bool_eq(report, &["checks", "proposal_recorded"], true)?;
-    assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
-    assert_json_bool_eq(report, &["checks", "execution_blocked_by_policy"], true)?;
-    assert_json_bool_eq(report, &["checks", "assignments_unchanged"], true)?;
-    assert_json_bool_eq(report, &["checks", "mutation_attempted"], false)?;
-    assert_json_bool_eq(report, &["checks", "mutation_allowed"], false)?;
+    assert_json_number_at_least(report, &["ledger", "records"], 3.0)?;
+    assert_json_number_at_least(report, &["ledger", "proposal_records"], 3.0)?;
+    assert_json_number_at_least(report, &["ledger", "approval_records"], 3.0)?;
+    assert_json_number_at_least(report, &["ledger", "blocked_execution_records"], 3.0)?;
+    assert_json_bool_eq(report, &["checks", "split_operation_loop_smoke"], true)?;
+    assert_json_bool_eq(report, &["checks", "merge_operation_loop_smoke"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "multi_depth_operation_loop_smoke"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "proposal_approval_default_off_execution"],
+        true,
+    )?;
     assert_json_bool_eq(report, &["checks", "ledger_check_passed"], true)?;
-    assert_json_bool_eq(
-        report,
-        &["responses", "proposal", "assignments_changed"],
-        false,
-    )?;
-    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
-    assert_json_bool_eq(
-        report,
-        &["responses", "approval", "assignments_changed"],
-        false,
-    )?;
-    assert_json_bool_eq(
-        report,
-        &["responses", "execution", "assignments_changed"],
-        false,
-    )?;
-    assert_json_bool_eq(
-        report,
-        &["responses", "execution", "mutation_attempted"],
-        false,
-    )?;
-    assert_json_bool_eq(
-        report,
-        &["responses", "execution", "mutation_allowed"],
-        false,
-    )?;
-    let status = json_str(report, &["responses", "execution", "status"])?;
-    if !matches!(status, "blocked_by_policy" | "already_blocked_by_policy") {
-        bail!("P7 operation loop smoke report has unexpected execution status `{status}`");
+
+    let cases = json_array(report, &["cases"])?;
+    for expected_kind in ["split", "merge", "multi_depth_split"] {
+        let Some(case) = cases.iter().find(|case| {
+            json_str(case, &["operation", "kind"]).is_ok_and(|kind| kind == expected_kind)
+        }) else {
+            bail!("P7 operation loop smoke report missing case kind `{expected_kind}`");
+        };
+        let operation_id = json_str(case, &["operation", "operation_id"])?;
+        if operation_id.trim().is_empty() {
+            bail!("P7 operation loop smoke report has empty operation_id for {expected_kind}");
+        }
+        let proposal_hash = json_str(case, &["operation", "proposal_hash"])?;
+        if proposal_hash.trim().is_empty() {
+            bail!("P7 operation loop smoke report has empty proposal_hash for {expected_kind}");
+        }
+        assert_json_str_eq(
+            case,
+            &["operation", "policy_id"],
+            "operator_approved_dynamic_operation_v1",
+        )?;
+        assert_json_bool_eq(case, &["checks", "proposal_recorded"], true)?;
+        assert_json_bool_eq(case, &["checks", "approval_recorded"], true)?;
+        assert_json_bool_eq(case, &["checks", "execution_blocked_by_policy"], true)?;
+        assert_json_bool_eq(case, &["checks", "assignments_unchanged"], true)?;
+        assert_json_bool_eq(case, &["checks", "mutation_attempted"], false)?;
+        assert_json_bool_eq(case, &["checks", "mutation_allowed"], false)?;
+        assert_json_bool_eq(case, &["checks", "ledger_check_passed"], true)?;
+        assert_json_bool_eq(
+            case,
+            &["responses", "proposal", "assignments_changed"],
+            false,
+        )?;
+        assert_json_str_eq(case, &["responses", "approval", "status"], "approved")?;
+        assert_json_bool_eq(
+            case,
+            &["responses", "approval", "assignments_changed"],
+            false,
+        )?;
+        assert_json_bool_eq(
+            case,
+            &["responses", "execution", "assignments_changed"],
+            false,
+        )?;
+        assert_json_bool_eq(
+            case,
+            &["responses", "execution", "mutation_attempted"],
+            false,
+        )?;
+        assert_json_bool_eq(case, &["responses", "execution", "mutation_allowed"], false)?;
+        let status = json_str(case, &["responses", "execution", "status"])?;
+        if !matches!(status, "blocked_by_policy" | "already_blocked_by_policy") {
+            bail!(
+                "P7 operation loop smoke report case {expected_kind} has unexpected execution status `{status}`"
+            );
+        }
     }
     assert_remaining_uncovered_contains(report, "guarded_kubernetes_operation_loop_smoke")?;
     Ok(())
@@ -16413,56 +16532,73 @@ mod tests {
     }
 
     #[test]
-    fn p7_operation_loop_smoke_report_accepts_default_off_split_evidence() {
+    fn p7_operation_loop_smoke_report_accepts_default_off_path_evidence() {
+        let case = |kind: &str| {
+            serde_json::json!({
+                "case": kind,
+                "operation": {
+                    "operation_id": format!("p7-{kind}-1"),
+                    "kind": kind,
+                    "proposal_hash": "fnv1a64:abc",
+                    "policy_id": "operator_approved_dynamic_operation_v1"
+                },
+                "orchestrator": {
+                    "grpc_addr": "127.0.0.1:6310",
+                    "metrics_addr": "127.0.0.1:6311",
+                    "registered_workers": 2,
+                    "assignment_listing_before": {"workers": [], "handovers": 0},
+                    "assignment_listing_after": {"workers": [], "handovers": 0}
+                },
+                "responses": {
+                    "proposal": {
+                        "assignments_changed": false,
+                        "planned_count": 1,
+                        "recorded_count": 1,
+                        "already_recorded_count": 0,
+                        "operation_ids": [format!("p7-{kind}-1")]
+                    },
+                    "approval": {
+                        "status": "approved",
+                        "assignments_changed": false
+                    },
+                    "execution": {
+                        "status": "blocked_by_policy",
+                        "assignments_changed": false,
+                        "mutation_attempted": false,
+                        "mutation_allowed": false
+                    }
+                },
+                "checks": {
+                    "proposal_recorded": true,
+                    "approval_recorded": true,
+                    "execution_blocked_by_policy": true,
+                    "assignments_unchanged": true,
+                    "mutation_attempted": false,
+                    "mutation_allowed": false,
+                    "ledger_check_passed": true
+                }
+            })
+        };
         let report = serde_json::json!({
             "schema": "tessera.p7_operation_loop_smoke.v1",
             "unix_secs": 120,
-            "operation": {
-                "operation_id": "p7-split-1",
-                "kind": "split",
-                "proposal_hash": "fnv1a64:abc",
-                "policy_id": "operator_approved_dynamic_operation_v1"
-            },
-            "orchestrator": {
-                "grpc_addr": "127.0.0.1:6310",
-                "metrics_addr": "127.0.0.1:6311",
-                "registered_workers": 2,
-                "assignment_listing_before": {"workers": [], "handovers": 0},
-                "assignment_listing_after": {"workers": [], "handovers": 0}
-            },
             "ledger": {
                 "path": ".dev/reports/p7-operation-loop-ledger-latest.json",
-                "records": 1,
-                "proposal_records": 1,
-                "approval_records": 1,
-                "blocked_execution_records": 1
+                "records": 3,
+                "proposal_records": 3,
+                "approval_records": 3,
+                "blocked_execution_records": 3
             },
-            "responses": {
-                "proposal": {
-                    "assignments_changed": false,
-                    "planned_count": 1,
-                    "recorded_count": 1,
-                    "already_recorded_count": 0,
-                    "operation_ids": ["p7-split-1"]
-                },
-                "approval": {
-                    "status": "approved",
-                    "assignments_changed": false
-                },
-                "execution": {
-                    "status": "blocked_by_policy",
-                    "assignments_changed": false,
-                    "mutation_attempted": false,
-                    "mutation_allowed": false
-                }
-            },
+            "cases": [
+                case("split"),
+                case("merge"),
+                case("multi_depth_split")
+            ],
             "checks": {
-                "proposal_recorded": true,
-                "approval_recorded": true,
-                "execution_blocked_by_policy": true,
-                "assignments_unchanged": true,
-                "mutation_attempted": false,
-                "mutation_allowed": false,
+                "split_operation_loop_smoke": true,
+                "merge_operation_loop_smoke": true,
+                "multi_depth_operation_loop_smoke": true,
+                "proposal_approval_default_off_execution": true,
                 "ledger_check_passed": true
             },
             "remaining_uncovered": [
