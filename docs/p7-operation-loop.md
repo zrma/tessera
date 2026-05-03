@@ -249,8 +249,9 @@ the fresh state/ledger paths. After cleanup, ArgoCD returned to
 `Synced / Healthy`, Gateway parent Ping still returned `Pong { ts: 123 }`,
 `GET /operations` retained the completed operation record, and
 `GET /split-merge/preview` reported `assignment_listing_zero_metrics` with zero
-plans. Internal failure/recovery, restart, and completion-audit evidence remain
-follow-up gates.
+plans. Internal failure/recovery helper support is now implemented, but the live
+failure/recovery report, restart report, and completion-audit evidence remain
+follow-up gates until a controlled smoke window records them.
 
 Current internal operation helper:
 
@@ -267,11 +268,24 @@ cargo xt k8s operation-smoke \
   --allow-execution \
   --with-soak
 
+cargo xt k8s operation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-execution \
+  --with-failure \
+  --allow-scale
+
 cargo xt k8s operation-report-check \
   --expected-image <new-tag> \
   --require-published-execution \
   --require-completed-observation \
   --require-soak
+
+cargo xt k8s operation-report-check \
+  --expected-image <new-tag> \
+  --require-published-execution \
+  --require-recovery-required
 ```
 
 The default helper is read-only: it port-forwards the Orchestrator operation
@@ -282,7 +296,12 @@ ArgoCD/image/ledger evidence. The approved helper additionally port-forwards
 Gateway and owner Worker metrics, writes approval and execution records,
 verifies parent-route convergence, Worker parent refresh, traffic and close
 counters, optionally runs parent-route soak, and closes the operation via
-`POST /operations/observations`.
+`POST /operations/observations`. The failure helper is a separate evidence gate:
+after approved publish and pre-failure parent traffic, it scales the owner
+Worker deployment to zero, records parent Ping failure and a
+`recovery_required` observation, scales the deployment back to its original
+replica count, and requires fresh parent Ping recovery without automatic
+rollback.
 
 Because P7 operation ids are deterministic from proposal content, the approved
 internal smoke window should use a fresh operation ledger path in the GitOps

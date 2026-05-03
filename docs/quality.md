@@ -53,10 +53,14 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `cargo xt k8s operation-smoke` records internal MicroK8s proposal evidence by
   default and can run approved execution/observation/soak when
   `--allow-execution --with-soak` is used during a controlled smoke window.
+  It also supports a separate guarded failure/recovery gate with
+  `--allow-execution --with-failure --allow-scale`, which scales the owner
+  Worker down, records `recovery_required`, scales it back up, and verifies
+  parent-route recovery.
   `cargo xt k8s operation-report-check` validates the resulting operation
   ledger, parent route convergence, Worker refresh, traffic, close counters,
-  and soak evidence. The `v2026.05.5` internal controlled window has passed
-  approved execution, completed observation, parent-route soak, and default-off
-  cleanup; failure/recovery, restart, and completion audit remain separate P7
-  gates.
+  soak evidence, and recovery-required evidence. The `v2026.05.5` internal
+  controlled window has passed approved execution, completed observation,
+  parent-route soak, and default-off cleanup; live failure/recovery, restart,
+  and completion audit reports remain separate P7 gates.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
