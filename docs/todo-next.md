@@ -27,7 +27,8 @@ Last reviewed: 2026-05-04
   approved legacy split observation completion, approved legacy split
   target-outage recovery-required handling, approved legacy split Orchestrator
   restart recovery, approved legacy split load/soak observation completion,
-  local merge observation completion, and local recovery-required owner-outage
+  approved canonical multi-depth split execution success/idempotency, local
+  merge observation completion, and local recovery-required owner-outage
   handling, plus Orchestrator restart recovery for the published operation
   ledger and assignment state, and local load/soak observation completion.
   `v2026.05.5` has been published and promoted
@@ -101,6 +102,11 @@ Recommended next slices:
    persisted child assignments survive, then close observation after restart.
 13. Done: `test: add p7 split operation soak smoke` - extend the split path
    through sustained child Ping/Move traffic before internal rollout.
-14. `feat: extend p7 executor to canonical multi-depth operations` - after the
-   split local gates, add canonical explicit-child operation execution
-   and its local/internal evidence chain.
+14. Done: `feat: extend p7 executor to canonical multi-depth operations` -
+   approved canonical explicit-child operation execution now publishes child
+   assignments once, removes the canonical parent assignment, proves Gateway
+   child route convergence, stable-session child Move, remote AOI resync, and
+   repeat execution idempotency.
+15. `test: add p7 multi-depth operation observation smoke` - close the canonical
+   multi-depth operation path with completed observation evidence before moving
+   to failure/restart/soak and internal MicroK8s rollout.

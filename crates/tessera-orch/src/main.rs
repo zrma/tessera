@@ -1369,9 +1369,11 @@ fn operation_activation_request(
         )
     })?;
     match record.kind {
-        DynamicOperationKind::Split => Ok(OperationActivationRequest::Split(
-            split_activation_request_for_operation(record, parent)?,
-        )),
+        DynamicOperationKind::Split | DynamicOperationKind::MultiDepthSplit => {
+            Ok(OperationActivationRequest::Split(
+                split_activation_request_for_operation(record, parent)?,
+            ))
+        }
         DynamicOperationKind::Merge => {
             let owner_worker_id = merge_owner_for_operation(record)?;
             Ok(OperationActivationRequest::Merge(MergeActivationRequest {
@@ -1380,11 +1382,6 @@ fn operation_activation_request(
                 owner_worker_id,
             }))
         }
-        DynamicOperationKind::MultiDepthSplit => Err(format!(
-            "operation_id={} {} runtime execution remains disabled until canonical multi-depth operation evidence is added",
-            record.operation_id,
-            dynamic_operation_kind_slug(record.kind)
-        )),
     }
 }
 
@@ -1392,16 +1389,37 @@ fn split_activation_request_for_operation(
     record: &OperationRecord,
     parent: CellId,
 ) -> Result<SplitActivationRequest, String> {
-    let expected_children = parent.legacy_shallow_children().ok_or_else(|| {
-        format!(
-            "operation_id={} split execution requires a depth=0/sub=0 parent; got depth={},sub={}",
-            record.operation_id, parent.depth, parent.sub
-        )
-    })?;
+    let (expected_children, explicit_child_cells) = match record.kind {
+        DynamicOperationKind::Split => (
+            parent.legacy_shallow_children().ok_or_else(|| {
+                format!(
+                    "operation_id={} split execution requires a depth=0/sub=0 parent; got depth={},sub={}",
+                    record.operation_id, parent.depth, parent.sub
+                )
+            })?,
+            false,
+        ),
+        DynamicOperationKind::MultiDepthSplit => (
+            parent.canonical_children().ok_or_else(|| {
+                format!(
+                    "operation_id={} multi-depth split execution requires a canonical parent; got depth={},sub={}",
+                    record.operation_id, parent.depth, parent.sub
+                )
+            })?,
+            true,
+        ),
+        DynamicOperationKind::Merge => {
+            return Err(format!(
+                "operation_id={} merge execution cannot build a split activation request",
+                record.operation_id
+            ));
+        }
+    };
     if record.proposal.targets.len() != 4 {
         return Err(format!(
-            "operation_id={} split execution requires exactly four targets",
-            record.operation_id
+            "operation_id={} {} execution requires exactly four targets",
+            record.operation_id,
+            dynamic_operation_kind_slug(record.kind)
         ));
     }
 
@@ -1414,20 +1432,32 @@ fn split_activation_request_for_operation(
             .find(|target| target.cell == expected_child)
         else {
             return Err(format!(
-                "operation_id={} split execution is missing child target depth={},sub={}",
-                record.operation_id, expected_child.depth, expected_child.sub
+                "operation_id={} {} execution is missing child target world={},cx={},cy={},depth={},sub={}",
+                record.operation_id,
+                dynamic_operation_kind_slug(record.kind),
+                expected_child.world,
+                expected_child.cx,
+                expected_child.cy,
+                expected_child.depth,
+                expected_child.sub
             ));
         };
         if target.worker_id.trim().is_empty() {
             return Err(format!(
-                "operation_id={} split execution has empty target worker for child sub={}",
-                record.operation_id, expected_child.sub
+                "operation_id={} {} execution has empty target worker for child world={},cx={},cy={},depth={},sub={}",
+                record.operation_id,
+                dynamic_operation_kind_slug(record.kind),
+                expected_child.world,
+                expected_child.cx,
+                expected_child.cy,
+                expected_child.depth,
+                expected_child.sub
             ));
         }
         targets.push(SplitChildTarget {
             sub: u32::from(expected_child.sub),
             target_worker_id: target.worker_id.clone(),
-            cell: None,
+            cell: explicit_child_cells.then(|| cell_to_assignment(&expected_child)),
         });
     }
 
@@ -2625,7 +2655,9 @@ impl OrchestratorService {
                     .or_else(|| {
                         (!matches!(
                             record.kind,
-                            DynamicOperationKind::Merge | DynamicOperationKind::Split
+                            DynamicOperationKind::Merge
+                                | DynamicOperationKind::Split
+                                | DynamicOperationKind::MultiDepthSplit
                         ))
                         .then(|| operation_execution_kind_disabled_reason(record.kind))
                     });
@@ -7729,12 +7761,62 @@ mod tests {
         assert_eq!(request.targets[1].target_worker_id, "worker-b");
     }
 
+    #[test]
+    fn operation_activation_request_builds_canonical_multi_depth_split_activation_request() {
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = parent.canonical_children().expect("canonical children");
+        let mut record = sample_operation_record("execute-multi-depth-manual-op");
+        record.kind = DynamicOperationKind::MultiDepthSplit;
+        record.proposal.parent = Some(parent);
+        record.proposal.targets = children
+            .iter()
+            .enumerate()
+            .map(|(idx, child)| OperationTarget {
+                cell: *child,
+                worker_id: if idx % 2 == 0 { "worker-a" } else { "worker-b" }.to_string(),
+            })
+            .collect();
+
+        let request =
+            operation_activation_request(&record).expect("build multi-depth activation request");
+        let OperationActivationRequest::Split(request) = request else {
+            panic!("expected split activation request");
+        };
+
+        assert_eq!(request.operation_id, "execute-multi-depth-manual-op");
+        assert_eq!(
+            assignment_to_cell_ref(request.parent.as_ref().expect("request parent"))
+                .expect("parse request parent"),
+            parent
+        );
+        assert_eq!(request.targets.len(), 4);
+        for (expected_child, target) in children.iter().zip(&request.targets) {
+            assert_eq!(target.cell, Some(cell_to_assignment(expected_child)));
+            assert_eq!(target.sub, u32::from(expected_child.sub));
+        }
+        assert_eq!(request.targets[1].target_worker_id, "worker-b");
+    }
+
     #[tokio::test]
-    async fn operation_ledger_execution_keeps_multi_depth_runtime_default_off_in_manual_mode() {
+    async fn operation_ledger_execution_publishes_approved_multi_depth_split_in_manual_mode() {
         let ledger_path =
             unique_assignment_state_path("operation-ledger-execution-multi-depth-manual");
-        let mut record = sample_operation_record("execute-split-manual-op");
+        let parent = CellId::leaf(0, -2, 3, 2);
+        let children = parent.canonical_children().expect("canonical children");
+        let operation_id = "execute-multi-depth-manual-op";
+        let mut record = sample_operation_record(operation_id);
         record.kind = DynamicOperationKind::MultiDepthSplit;
+        record.proposal.parent = Some(parent);
+        record.proposal.targets = children
+            .iter()
+            .map(|child| OperationTarget {
+                cell: *child,
+                worker_id: "worker-b".to_string(),
+            })
+            .collect();
+        record.proposal.submission_command =
+            "cargo xt split-activation --operation-id execute-multi-depth-manual-op --target-cell ..."
+                .to_string();
         let proposal_hash = record.proposal.proposal_hash.clone();
         record.status = OperationStatus::Approved;
         record.approval = Some(OperationApproval {
@@ -7756,45 +7838,68 @@ mod tests {
         )
         .expect("write operation ledger");
         let service = OrchestratorService::try_new_with_persistence_and_operation_execution(
-            two_worker_handover_config(),
+            two_worker_canonical_split_config(parent),
             SplitActivationMode::Manual,
             OperationExecutionMode::Manual,
             None,
             Some(ledger_path.clone()),
         )
         .expect("construct manual operation execution service");
-        let before = service.listing().await;
+        let source_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind source relay");
+        let source_addr = source_listener.local_addr().expect("source addr");
+        let target_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target relay");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let source_server = spawn_split_replay_ack_server(source_listener, 1);
+        let target_server = spawn_split_replay_ack_server(target_listener, 1);
+        register_worker_for_test(&service, "worker-a", &source_addr.to_string()).await;
+        register_worker_for_test(&service, "worker-b", &target_addr.to_string()).await;
 
         let response = service
             .execute_operation(
                 OperationExecutionRequest {
-                    operation_id: "execute-split-manual-op".to_string(),
+                    operation_id: operation_id.to_string(),
                     expected_proposal_hash: proposal_hash,
                     policy_id: Some("operator_approved_dynamic_operation_v1".to_string()),
                 },
                 UNIX_EPOCH + std::time::Duration::from_secs(500),
             )
             .await
-            .expect("execute approved split operation");
-        let after = service.listing().await;
+            .expect("execute approved multi-depth split operation");
+        source_server.await.expect("source server");
+        target_server.await.expect("target server");
+
+        let listing = service.listing().await;
         let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
 
-        assert_eq!(response.status, "blocked_by_policy");
-        assert!(
-            response
-                .reason
-                .contains("multi-depth-split runtime execution")
-        );
-        assert!(!response.assignments_changed);
-        assert!(!response.mutation_attempted);
-        assert!(!response.mutation_allowed);
-        assert_eq!(before, after);
-        assert_eq!(loaded.records[0].status, OperationStatus::BlockedByPolicy);
+        assert_eq!(response.status, "published");
+        assert!(response.assignments_changed);
+        assert!(response.mutation_attempted);
+        assert!(response.mutation_allowed);
+        assert_eq!(loaded.records[0].status, OperationStatus::Observing);
         assert!(
             loaded.records[0]
                 .phases
                 .iter()
-                .any(|phase| phase.name == "execution_blocked_by_policy")
+                .any(|phase| phase.name == "execution_published")
+        );
+        let source = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-a")
+            .expect("source listing");
+        assert!(source.cells.is_empty());
+        let target = listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-b")
+            .expect("target listing");
+        assert_eq!(
+            target.cells,
+            children.iter().map(cell_to_assignment).collect::<Vec<_>>()
         );
         let _ = fs::remove_file(ledger_path);
     }
