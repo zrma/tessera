@@ -911,6 +911,8 @@ enum DevSub {
     P7OperationExecutionSmoke,
     /// Start a full dev stack and prove approved P7 split execution publishes once
     P7OperationSplitExecutionSmoke,
+    /// Start a full dev stack and prove approved P7 canonical multi-depth execution publishes once
+    P7OperationMultiDepthExecutionSmoke,
     /// Start a full dev stack and close an approved P7 split execution with observation evidence
     P7OperationSplitObservationSmoke,
     /// Start a full dev stack and prove an approved P7 split observation records target recovery
@@ -1709,6 +1711,9 @@ fn main() -> Result<()> {
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
+            DevSub::P7OperationMultiDepthExecutionSmoke => {
+                dev_p7_operation_multi_depth_execution_smoke()?
+            }
             DevSub::P7OperationSplitObservationSmoke => dev_p7_operation_split_observation_smoke()?,
             DevSub::P7OperationSplitRecoverySmoke => dev_p7_operation_split_recovery_smoke()?,
             DevSub::P7OperationSplitRestartSmoke => dev_p7_operation_split_restart_smoke()?,
@@ -3222,6 +3227,458 @@ fn dev_p7_operation_split_execution_smoke() -> Result<()> {
 
     println!(
         "P7 split operation execution smoke: approved split operation published once and repeat execution was idempotent, report={}, ledger={}",
+        report_path.display(),
+        ledger_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p7_operation_multi_depth_execution_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4420";
+    let gateway_metrics_addr = "127.0.0.1:4421";
+    let worker_a_addr = "127.0.0.1:5421";
+    let worker_b_addr = "127.0.0.1:5422";
+    let worker_a_metrics_addr = "127.0.0.1:5423";
+    let worker_b_metrics_addr = "127.0.0.1:5424";
+    let orch_addr = "127.0.0.1:6420";
+    let orch_metrics_addr = "127.0.0.1:6421";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let ledger_path = report_dir.join("p7-operation-multi-depth-execution-ledger-latest.json");
+    let _ = fs::remove_file(&ledger_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let parent = multi_depth_activation_parent();
+    let children = parent
+        .canonical_children()
+        .ok_or_else(|| anyhow::anyhow!("P7 multi-depth operation parent must be canonical"))?;
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":{},"cx":{},"cy":{},"depth":{},"sub":{}}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#,
+        parent.world, parent.cx, parent.cy, parent.depth, parent.sub
+    );
+    let multi_depth_preview_json = format!(
+        r#"{{"cells":[{{"cell":{{"world":{},"cx":{},"cy":{},"depth":{},"sub":{}}},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}}]}}"#,
+        parent.world, parent.cx, parent.cy, parent.depth, parent.sub
+    );
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+        (
+            "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON",
+            multi_depth_preview_json.as_str(),
+        ),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+        ("TESSERA_ORCH_OPERATION_EXECUTION", "manual"),
+        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-execution-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-execution-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-execution-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p7-operation-multi-depth-execution-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    assert_http_status_endpoint(
+        "P7 multi-depth operation gateway readiness",
+        gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+
+    let actor = EntityId(7_701);
+    let mut session = GatewaySession::connect(gateway_addr)?;
+    let joined = session.request(
+        parent,
+        ClientMsg::Join {
+            actor,
+            pos: Position { x: 24.0, y: 24.0 },
+        },
+    )?;
+    assert_snapshot_contains(
+        "P7 multi-depth operation parent join",
+        joined,
+        parent,
+        actor,
+    )?;
+
+    let proposal_response = http_json_post(
+        "P7 multi-depth operation proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    let operation_id = json_array(&proposal_response, &["operation_ids"])?
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("P7 multi-depth operation proposal response has no operation id")
+        })?
+        .to_string();
+    let proposal_snapshot = http_json_get(
+        "P7 multi-depth operation ledger",
+        orch_metrics_addr,
+        "/operations",
+    )?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "multi_depth_split")?;
+    let proposal_parent = json_cell_id(proposal_record, &["proposal", "parent"])?;
+    if proposal_parent != parent {
+        bail!(
+            "P7 multi-depth operation expected parent {:?}, got {:?}",
+            parent,
+            proposal_parent
+        );
+    }
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+    let expected_targets = vec![
+        (children[0], "worker-a".to_string()),
+        (children[1], "worker-b".to_string()),
+        (children[2], "worker-a".to_string()),
+        (children[3], "worker-b".to_string()),
+    ];
+    let mut proposal_targets = Vec::new();
+    for target in json_array(proposal_record, &["proposal", "targets"])? {
+        proposal_targets.push((
+            json_cell_id(target, &["cell"])?,
+            json_str(target, &["worker_id"])?.to_string(),
+        ));
+    }
+    proposal_targets.sort_by_key(|(cell, worker_id)| {
+        (
+            cell.world,
+            cell.cy,
+            cell.cx,
+            cell.depth,
+            cell.sub,
+            worker_id.clone(),
+        )
+    });
+    if proposal_targets != expected_targets {
+        bail!(
+            "P7 multi-depth operation expected proposal targets {:?}, got {:?}",
+            expected_targets,
+            proposal_targets
+        );
+    }
+
+    let policy_id = "operator_approved_dynamic_operation_v1";
+    let approval_response = http_json_post(
+        "P7 multi-depth operation approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p7-multi-depth-execution-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p7-multi-depth-execution-smoke&budget_key=p7-multi-depth-execution-smoke"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+    let execution_response = http_json_post(
+        "P7 multi-depth operation execution",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+    let repeat_execution_response = http_json_post(
+        "P7 multi-depth operation execution repeat",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&repeat_execution_response, &["status"], "already_published")?;
+    assert_json_bool_eq(&repeat_execution_response, &["assignments_changed"], false)?;
+    assert_json_bool_eq(&repeat_execution_response, &["mutation_attempted"], false)?;
+
+    let expected_listing = expected_targets
+        .iter()
+        .map(|(cell, worker_id)| (*cell, worker_id.as_str()))
+        .collect::<Vec<_>>();
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let parent_owners = listing_cell_owners(&after_listing, parent)?;
+    if !parent_owners.is_empty() {
+        bail!(
+            "P7 multi-depth operation execution left canonical parent assigned: {parent_owners:?}"
+        );
+    }
+    for (child, worker_id) in &expected_targets {
+        let owners = listing_cell_owners(&after_listing, *child)?;
+        if owners != vec![worker_id.clone()] {
+            bail!(
+                "P7 multi-depth operation execution expected child {:?} owner {}, got {:?}",
+                child,
+                worker_id,
+                owners
+            );
+        }
+    }
+    assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+    let convergence_probe = probe_multi_depth_convergence(gateway_addr, &expected_listing, 9_700);
+    convergence_probe.assert_success()?;
+
+    let remote_aoi_actor = EntityId(7_702);
+    let _remote_aoi_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        children[2],
+        remote_aoi_actor,
+        Position { x: 8.0, y: 24.0 },
+    )?;
+    let (moved, remote_aoi_snapshot) = request_move_until_delta_and_snapshot(
+        &mut session,
+        children[3],
+        actor,
+        children[2],
+        remote_aoi_actor,
+    )?;
+    assert_delta_contains(
+        "P7 multi-depth operation moved replayed actor",
+        moved,
+        children[3],
+        actor,
+    )?;
+    assert_snapshot_contains(
+        "P7 multi-depth operation AOI resync snapshot",
+        remote_aoi_snapshot,
+        children[2],
+        remote_aoi_actor,
+    )?;
+
+    let gateway_metrics = assert_metrics_endpoint_body(
+        "P7 multi-depth operation gateway",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_upstream_route_change_reconnects_total",
+        ],
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation gateway",
+        &gateway_metrics,
+        "tessera_gateway_routes",
+        4.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation gateway",
+        &gateway_metrics,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        4.0,
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation gateway",
+        &gateway_metrics,
+        "tessera_gateway_upstream_route_change_reconnects_total",
+        1.0,
+    )?;
+    let gateway_routes = prometheus_sample_value(&gateway_metrics, "tessera_gateway_routes")?;
+    let gateway_ping_roundtrips = prometheus_sample_value(
+        &gateway_metrics,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )?;
+    let gateway_route_change_reconnects = prometheus_sample_value(
+        &gateway_metrics,
+        "tessera_gateway_upstream_route_change_reconnects_total",
+    )?;
+
+    let worker_b_metrics = assert_metrics_endpoint_body(
+        "P7 multi-depth operation worker-b",
+        worker_b_metrics_addr,
+        &[
+            "tessera_worker_relay_connections_total",
+            "tessera_worker_accepted_connections_total",
+        ],
+    )?;
+    assert_prometheus_sample_at_least(
+        "P7 multi-depth operation worker-b",
+        &worker_b_metrics,
+        "tessera_worker_relay_connections_total",
+        1.0,
+    )?;
+    let worker_b_relay_connections =
+        prometheus_sample_value(&worker_b_metrics, "tessera_worker_relay_connections_total")?;
+
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false, false)?;
+    let record = find_p7_operation_record(&ledger, &operation_id)?;
+    validate_p7_published_execution(record)?;
+    let report_children = expected_targets
+        .iter()
+        .map(|(cell, worker_id)| {
+            serde_json::json!({
+                "cell": cell_id_json(*cell),
+                "worker_id": worker_id.as_str()
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "schema": "tessera.p7_operation_multi_depth_execution_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "multi_depth_split",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id,
+            "parent": cell_id_json(parent),
+            "children": report_children
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers": before_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "gateway": {
+            "addr": gateway_addr,
+            "metrics_addr": gateway_metrics_addr,
+            "routes_after": gateway_routes,
+            "ping_roundtrips": gateway_ping_roundtrips,
+            "route_change_reconnects": gateway_route_change_reconnects
+        },
+        "worker": {
+            "worker_a_addr": worker_a_addr,
+            "worker_a_metrics_addr": worker_a_metrics_addr,
+            "worker_b_addr": worker_b_addr,
+            "worker_b_metrics_addr": worker_b_metrics_addr,
+            "worker_b_relay_connections": worker_b_relay_connections
+        },
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "repeat_execution": repeat_execution_response
+        },
+        "checks": {
+            "multi_depth_execution_published": true,
+            "canonical_child_assignments_published": true,
+            "canonical_parent_assignment_removed": true,
+            "gateway_child_routes_converged": true,
+            "stable_session_child_move_succeeded": true,
+            "remote_aoi_resynced": true,
+            "repeat_execution_idempotent": true,
+            "ledger_execution_published": true
+        },
+        "remaining_uncovered": [
+            "multi_depth_operation_observation",
+            "multi_depth_operation_failure_recovery",
+            "multi_depth_operation_restart_recovery",
+            "multi_depth_operation_soak",
+            "guarded_kubernetes_multi_depth_operation_execution_smoke"
+        ]
+    });
+    validate_p7_operation_multi_depth_execution_smoke_report(&report)?;
+    let report_path = write_p7_operation_multi_depth_execution_smoke_report(&report)?;
+
+    println!(
+        "P7 multi-depth operation execution smoke: approved canonical split operation published once, Gateway converged to canonical child routes, and repeat execution was idempotent, report={}, ledger={}",
         report_path.display(),
         ledger_path.display()
     );
@@ -14975,6 +15432,12 @@ fn default_p7_operation_observation_smoke_path() -> PathBuf {
         .join("p7-operation-observation-smoke-latest.json")
 }
 
+fn default_p7_operation_multi_depth_execution_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p7-operation-multi-depth-execution-smoke-latest.json")
+}
+
 fn default_p7_operation_split_observation_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -15109,6 +15572,22 @@ fn write_p7_operation_split_execution_smoke_report(report: &serde_json::Value) -
     ));
     fs::write(&stamped, &body)?;
     let latest = report_dir.join("p7-operation-split-execution-smoke-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p7_operation_multi_depth_execution_smoke_report(
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p7-operation-multi-depth-execution-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p7_operation_multi_depth_execution_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -15599,6 +16078,123 @@ fn validate_p7_operation_split_execution_smoke_report(report: &serde_json::Value
     assert_json_bool_eq(report, &["checks", "repeat_execution_idempotent"], true)?;
     assert_json_bool_eq(report, &["checks", "ledger_execution_published"], true)?;
     assert_remaining_uncovered_contains(report, "split_operation_observation")?;
+    Ok(())
+}
+
+fn validate_p7_operation_multi_depth_execution_smoke_report(
+    report: &serde_json::Value,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.p7_operation_multi_depth_execution_smoke.v1",
+    )?;
+    assert_json_str_eq(report, &["operation", "kind"], "multi_depth_split")?;
+    assert_json_str_eq(
+        report,
+        &["operation", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    let parent = json_cell_id(report, &["operation", "parent"])?;
+    if parent.depth == 0 || parent.sub != 0 || !parent.is_canonical_leaf() {
+        bail!(
+            "P7 multi-depth operation report parent must be a non-root canonical leaf, got {:?}",
+            parent
+        );
+    }
+    let expected_children = parent
+        .canonical_children()
+        .ok_or_else(|| anyhow::anyhow!("P7 multi-depth report parent has no canonical children"))?;
+    assert_json_array_len(report, &["operation", "children"], 4)?;
+    let mut actual_children = Vec::new();
+    for child in json_array(report, &["operation", "children"])? {
+        let cell = json_cell_id(child, &["cell"])?;
+        let worker_id = json_str(child, &["worker_id"])?;
+        if worker_id.trim().is_empty() {
+            bail!("P7 multi-depth operation report has empty child worker_id");
+        }
+        actual_children.push(cell);
+    }
+    sort_cells(&mut actual_children);
+    let mut expected = expected_children.to_vec();
+    sort_cells(&mut expected);
+    if actual_children != expected {
+        bail!(
+            "P7 multi-depth operation report expected canonical children {:?}, got {:?}",
+            expected,
+            actual_children
+        );
+    }
+    let ledger_path = json_str(report, &["ledger", "path"])?;
+    if ledger_path.trim().is_empty() {
+        bail!("P7 multi-depth operation execution smoke report has empty ledger.path");
+    }
+    assert_json_number_at_least(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_at_least(report, &["gateway", "routes_after"], 4.0)?;
+    assert_json_number_at_least(report, &["gateway", "ping_roundtrips"], 4.0)?;
+    assert_json_number_at_least(report, &["gateway", "route_change_reconnects"], 1.0)?;
+    assert_json_number_at_least(report, &["worker", "worker_b_relay_connections"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_attempted"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_allowed"],
+        true,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "repeat_execution", "status"],
+        "already_published",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "repeat_execution", "assignments_changed"],
+        false,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "repeat_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_bool_eq(report, &["checks", "multi_depth_execution_published"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "canonical_child_assignments_published"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "canonical_parent_assignment_removed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "gateway_child_routes_converged"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "stable_session_child_move_succeeded"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "remote_aoi_resynced"], true)?;
+    assert_json_bool_eq(report, &["checks", "repeat_execution_idempotent"], true)?;
+    assert_json_bool_eq(report, &["checks", "ledger_execution_published"], true)?;
+    assert_remaining_uncovered_absent(report, "multi_depth_runtime_execution")?;
+    assert_remaining_uncovered_contains(report, "multi_depth_operation_observation")?;
+    assert_remaining_uncovered_contains(
+        report,
+        "guarded_kubernetes_multi_depth_operation_execution_smoke",
+    )?;
     Ok(())
 }
 
@@ -24086,6 +24682,100 @@ mod tests {
 
         validate_p7_operation_split_execution_smoke_report(&report)
             .expect("valid P7 split operation execution smoke report");
+    }
+
+    #[test]
+    fn p7_operation_multi_depth_execution_smoke_report_accepts_published_canonical_split_evidence()
+    {
+        let parent = multi_depth_activation_parent();
+        let children = parent.canonical_children().expect("canonical children");
+        let report = serde_json::json!({
+            "schema": "tessera.p7_operation_multi_depth_execution_smoke.v1",
+            "unix_secs": 120,
+            "operation": {
+                "operation_id": "p7-multi-depth-1",
+                "kind": "multi_depth_split",
+                "proposal_hash": "fnv1a64:abc",
+                "policy_id": "operator_approved_dynamic_operation_v1",
+                "parent": cell_id_json(parent),
+                "children": [
+                    {"cell": cell_id_json(children[0]), "worker_id": "worker-a"},
+                    {"cell": cell_id_json(children[1]), "worker_id": "worker-b"},
+                    {"cell": cell_id_json(children[2]), "worker_id": "worker-a"},
+                    {"cell": cell_id_json(children[3]), "worker_id": "worker-b"}
+                ]
+            },
+            "orchestrator": {
+                "grpc_addr": "127.0.0.1:6420",
+                "metrics_addr": "127.0.0.1:6421",
+                "registered_workers": 2,
+                "assignment_listing_before": {"workers": [], "handovers": 0},
+                "assignment_listing_after": {"workers": [], "handovers": 0}
+            },
+            "gateway": {
+                "addr": "127.0.0.1:4420",
+                "metrics_addr": "127.0.0.1:4421",
+                "routes_after": 4,
+                "ping_roundtrips": 4,
+                "route_change_reconnects": 1
+            },
+            "worker": {
+                "worker_a_addr": "127.0.0.1:5421",
+                "worker_a_metrics_addr": "127.0.0.1:5423",
+                "worker_b_addr": "127.0.0.1:5422",
+                "worker_b_metrics_addr": "127.0.0.1:5424",
+                "worker_b_relay_connections": 1
+            },
+            "ledger": {
+                "path": ".dev/reports/p7-operation-multi-depth-execution-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1
+            },
+            "responses": {
+                "proposal": {
+                    "assignments_changed": false,
+                    "planned_count": 1,
+                    "recorded_count": 1,
+                    "already_recorded_count": 0,
+                    "operation_ids": ["p7-multi-depth-1"]
+                },
+                "approval": {
+                    "status": "approved",
+                    "assignments_changed": false
+                },
+                "execution": {
+                    "status": "published",
+                    "assignments_changed": true,
+                    "mutation_attempted": true,
+                    "mutation_allowed": true
+                },
+                "repeat_execution": {
+                    "status": "already_published",
+                    "assignments_changed": false,
+                    "mutation_attempted": false,
+                    "mutation_allowed": true
+                }
+            },
+            "checks": {
+                "multi_depth_execution_published": true,
+                "canonical_child_assignments_published": true,
+                "canonical_parent_assignment_removed": true,
+                "gateway_child_routes_converged": true,
+                "stable_session_child_move_succeeded": true,
+                "remote_aoi_resynced": true,
+                "repeat_execution_idempotent": true,
+                "ledger_execution_published": true
+            },
+            "remaining_uncovered": [
+                "multi_depth_operation_observation",
+                "guarded_kubernetes_multi_depth_operation_execution_smoke"
+            ]
+        });
+
+        validate_p7_operation_multi_depth_execution_smoke_report(&report)
+            .expect("valid P7 multi-depth operation execution smoke report");
     }
 
     #[test]
