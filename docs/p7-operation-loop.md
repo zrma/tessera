@@ -61,6 +61,19 @@ P7 is complete only when all of these are true:
 | Internal rollout | k8s GitOps smoke window runbook | image publish, GitOps rollout rev, cleanup rev, ArgoCD `Synced / Healthy`, default-off cleanup report |
 | Completion audit | `cargo xt p7-completion-audit` or equivalent | audit returns `complete=true` only after every P7 gate is backed by real evidence |
 
+Current ledger verifier:
+
+```sh
+cargo xt p7-operation-ledger-check \
+  --ledger .dev/operation-ledger.json \
+  --require-approval \
+  --require-blocked-execution
+```
+
+This validates the first proposal -> approval -> default-off blocked execution
+artifact. It is not a replacement for runtime execution, observation,
+recovery, internal rollout, or final P7 completion audit evidence.
+
 ## Slice Cadence
 
 Each slice should be self-contained:

@@ -52,6 +52,21 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
+    P7OperationLedgerCheck {
+        /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+        /// Require at least one durable approval record
+        #[arg(long, default_value_t = false)]
+        require_approval: bool,
+        /// Require at least one blocked execution phase/status
+        #[arg(long, default_value_t = false)]
+        require_blocked_execution: bool,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P6 GitOps rollout evidence report JSON
     P6RolloutReportCheck {
         /// Report JSON path. Defaults to .dev/reports/p6-gitops-rollout-latest.json
@@ -941,6 +956,17 @@ fn main() -> Result<()> {
         Cmd::Check => check()?,
         Cmd::Harness => harness()?,
         Cmd::P6CompletionAudit { report_dir, json } => run_p6_completion_audit(&report_dir, json)?,
+        Cmd::P7OperationLedgerCheck {
+            ledger,
+            require_approval,
+            require_blocked_execution,
+            json,
+        } => run_p7_operation_ledger_check(
+            ledger.as_deref(),
+            require_approval,
+            require_blocked_execution,
+            json,
+        )?,
         Cmd::P6RolloutReportCheck {
             report,
             expected_image,
@@ -8993,6 +9019,206 @@ fn read_json_report(path: &Path) -> Result<serde_json::Value> {
     serde_json::from_str(&body).with_context(|| format!("parse report {}", path.display()))
 }
 
+fn default_p7_operation_ledger_path() -> PathBuf {
+    workspace_root().join(".dev/operation-ledger.json")
+}
+
+fn run_p7_operation_ledger_check(
+    ledger: Option<&Path>,
+    require_approval: bool,
+    require_blocked_execution: bool,
+    json: bool,
+) -> Result<()> {
+    let ledger_path = ledger
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_p7_operation_ledger_path);
+    let ledger = read_json_report(&ledger_path)?;
+    let summary =
+        validate_p7_operation_ledger(&ledger, require_approval, require_blocked_execution)
+            .with_context(|| format!("validate P7 operation ledger {}", ledger_path.display()))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "complete": true,
+                "schema": "tessera.p7_operation_ledger_check.v1",
+                "ledger": ledger_path,
+                "records": summary.records,
+                "proposal_records": summary.proposal_records,
+                "approval_records": summary.approval_records,
+                "blocked_execution_records": summary.blocked_execution_records
+            }))?
+        );
+    } else {
+        println!(
+            "P7 operation ledger ok: records={}, proposals={}, approvals={}, blocked_executions={} ({})",
+            summary.records,
+            summary.proposal_records,
+            summary.approval_records,
+            summary.blocked_execution_records,
+            ledger_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct P7OperationLedgerSummary {
+    records: usize,
+    proposal_records: usize,
+    approval_records: usize,
+    blocked_execution_records: usize,
+}
+
+fn validate_p7_operation_ledger(
+    ledger: &serde_json::Value,
+    require_approval: bool,
+    require_blocked_execution: bool,
+) -> Result<P7OperationLedgerSummary> {
+    let schema = json_str(ledger, &["schema"])?;
+    if schema != "tessera.orch.operation_ledger.v1" {
+        bail!("operation ledger schema must be tessera.orch.operation_ledger.v1; got {schema}");
+    }
+    let records = json_array(ledger, &["records"])?;
+    if records.is_empty() {
+        bail!("operation ledger must contain at least one record");
+    }
+
+    let mut proposal_records = 0_usize;
+    let mut approval_records = 0_usize;
+    let mut blocked_execution_records = 0_usize;
+    for record in records {
+        validate_p7_operation_record(record)?;
+        proposal_records += 1;
+        if validate_p7_operation_approval(record).is_ok() {
+            approval_records += 1;
+        }
+        if validate_p7_blocked_execution(record).is_ok() {
+            blocked_execution_records += 1;
+        }
+    }
+    if require_approval && approval_records == 0 {
+        bail!("operation ledger is missing required approval evidence");
+    }
+    if require_blocked_execution && blocked_execution_records == 0 {
+        bail!("operation ledger is missing required blocked execution evidence");
+    }
+
+    Ok(P7OperationLedgerSummary {
+        records: records.len(),
+        proposal_records,
+        approval_records,
+        blocked_execution_records,
+    })
+}
+
+fn validate_p7_operation_record(record: &serde_json::Value) -> Result<()> {
+    let operation_id = json_str(record, &["operation_id"])?;
+    if operation_id.trim().is_empty() {
+        bail!("operation record has empty operation_id");
+    }
+    let kind = json_str(record, &["kind"])?;
+    if !matches!(kind, "split" | "merge" | "multi_depth_split") {
+        bail!("operation_id={operation_id} has unknown kind={kind}");
+    }
+    let status = json_str(record, &["status"])?;
+    if !matches!(
+        status,
+        "proposed"
+            | "blocked_by_policy"
+            | "approved"
+            | "executing"
+            | "observing"
+            | "recovery_required"
+            | "completed"
+            | "failed"
+    ) {
+        bail!("operation_id={operation_id} has unknown status={status}");
+    }
+    let created = json_u64(record, &["created_unix_secs"])?;
+    let updated = json_u64(record, &["updated_unix_secs"])?;
+    if updated < created {
+        bail!("operation_id={operation_id} has updated_unix_secs before created_unix_secs");
+    }
+    let source = json_str(record, &["proposal", "source"])?;
+    if source.trim().is_empty() {
+        bail!("operation_id={operation_id} proposal.source is empty");
+    }
+    let proposal_hash = json_str(record, &["proposal", "proposal_hash"])?;
+    if proposal_hash.trim().is_empty() {
+        bail!("operation_id={operation_id} proposal.proposal_hash is empty");
+    }
+    let targets = json_array(record, &["proposal", "targets"])?;
+    if targets.is_empty() {
+        bail!("operation_id={operation_id} proposal.targets is empty");
+    }
+    let command = json_str(record, &["proposal", "submission_command"])?;
+    if command.trim().is_empty() {
+        bail!("operation_id={operation_id} proposal.submission_command is empty");
+    }
+    let phases = json_array(record, &["phases"])?;
+    if !phases.iter().any(|phase| {
+        json_str(phase, &["name"]).is_ok_and(|name| name == "proposal_recorded")
+            && json_str(phase, &["state"]).is_ok_and(|state| state == "succeeded")
+    }) {
+        bail!("operation_id={operation_id} is missing succeeded proposal_recorded phase");
+    }
+    Ok(())
+}
+
+fn validate_p7_operation_approval(record: &serde_json::Value) -> Result<()> {
+    let operation_id = json_str(record, &["operation_id"])?;
+    let kind = json_str(record, &["kind"])?;
+    let approval = json_field(record, &["approval"])?;
+    if approval.is_null() {
+        bail!("operation_id={operation_id} approval is null");
+    }
+    let policy_id = json_str(record, &["approval", "policy_id"])?;
+    let approver = json_str(record, &["approval", "approver"])?;
+    let allowed_kind = json_str(record, &["approval", "allowed_kind"])?;
+    let expected_hash = json_str(record, &["approval", "expected_proposal_hash"])?;
+    let proposal_hash = json_str(record, &["proposal", "proposal_hash"])?;
+    let approved = json_u64(record, &["approval", "approved_unix_secs"])?;
+    let expires = json_u64(record, &["approval", "expires_unix_secs"])?;
+    let cooldown_key = json_str(record, &["approval", "cooldown_key"])?;
+    let budget_key = json_str(record, &["approval", "budget_key"])?;
+    if policy_id.trim().is_empty() || approver.trim().is_empty() {
+        bail!("operation_id={operation_id} approval policy_id/approver must not be empty");
+    }
+    if allowed_kind != kind {
+        bail!("operation_id={operation_id} approval.allowed_kind does not match kind");
+    }
+    if expected_hash != proposal_hash {
+        bail!(
+            "operation_id={operation_id} approval expected_proposal_hash does not match proposal_hash"
+        );
+    }
+    if expires <= approved {
+        bail!("operation_id={operation_id} approval expires before approved time");
+    }
+    if cooldown_key.trim().is_empty() || budget_key.trim().is_empty() {
+        bail!("operation_id={operation_id} approval cooldown_key/budget_key must not be empty");
+    }
+    Ok(())
+}
+
+fn validate_p7_blocked_execution(record: &serde_json::Value) -> Result<()> {
+    let operation_id = json_str(record, &["operation_id"])?;
+    let status = json_str(record, &["status"])?;
+    if status != "blocked_by_policy" {
+        bail!("operation_id={operation_id} status is not blocked_by_policy");
+    }
+    let phases = json_array(record, &["phases"])?;
+    if !phases.iter().any(|phase| {
+        json_str(phase, &["name"]).is_ok_and(|name| name == "execution_blocked_by_policy")
+            && json_str(phase, &["state"]).is_ok_and(|state| state == "failed")
+            && json_str(phase, &["reason"]).is_ok_and(|reason| !reason.trim().is_empty())
+    }) {
+        bail!("operation_id={operation_id} is missing failed execution_blocked_by_policy phase");
+    }
+    Ok(())
+}
+
 fn default_p6_gitops_rollout_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -11519,6 +11745,12 @@ fn json_bool(value: &serde_json::Value, path: &[&str]) -> Result<bool> {
     json_field(value, path)?
         .as_bool()
         .ok_or_else(|| anyhow::anyhow!("report field {} is not a bool", path.join(".")))
+}
+
+fn json_u64(value: &serde_json::Value, path: &[&str]) -> Result<u64> {
+    json_field(value, path)?.as_u64().ok_or_else(|| {
+        anyhow::anyhow!("report field {} is not an unsigned integer", path.join("."))
+    })
 }
 
 fn json_f64(value: &serde_json::Value, path: &[&str]) -> Result<f64> {
@@ -15737,6 +15969,104 @@ mod tests {
         let err = assert_prometheus_response("demo", invalid, &["demo"])
             .expect_err("invalid metric value should fail");
         assert!(err.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn p7_operation_ledger_check_accepts_proposal_approval_and_blocked_execution() {
+        let ledger = serde_json::json!({
+            "schema": "tessera.orch.operation_ledger.v1",
+            "records": [
+                {
+                    "operation_id": "p7-split-1",
+                    "kind": "split",
+                    "status": "blocked_by_policy",
+                    "created_unix_secs": 100,
+                    "updated_unix_secs": 120,
+                    "proposal": {
+                        "source": "live_worker_metrics:test",
+                        "proposal_hash": "fnv1a64:abc",
+                        "parent": {"world": 0, "cx": 0, "cy": 0},
+                        "targets": [
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 1, "sub": 0}, "worker_id": "worker-a"},
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 1, "sub": 1}, "worker_id": "worker-b"}
+                        ],
+                        "preconditions": ["operator approval required"],
+                        "submission_command": "cargo xt split-activation --operation-id p7-split-1"
+                    },
+                    "approval": {
+                        "policy_id": "operator_approved_dynamic_operation_v1",
+                        "approver": "operator",
+                        "allowed_kind": "split",
+                        "approved_unix_secs": 110,
+                        "expires_unix_secs": 710,
+                        "expected_proposal_hash": "fnv1a64:abc",
+                        "cooldown_key": "world-0",
+                        "budget_key": "daily"
+                    },
+                    "phases": [
+                        {"name": "proposal_recorded", "state": "succeeded", "unix_secs": 100, "reason": "proposal persisted"},
+                        {"name": "approval_recorded", "state": "succeeded", "unix_secs": 110, "reason": "approval persisted"},
+                        {"name": "execution_blocked_by_policy", "state": "failed", "unix_secs": 120, "reason": "executor mutation is default-off"}
+                    ]
+                }
+            ]
+        });
+
+        let summary = validate_p7_operation_ledger(&ledger, true, true).expect("valid P7 ledger");
+
+        assert_eq!(
+            summary,
+            P7OperationLedgerSummary {
+                records: 1,
+                proposal_records: 1,
+                approval_records: 1,
+                blocked_execution_records: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn p7_operation_ledger_check_rejects_missing_blocked_execution() {
+        let ledger = serde_json::json!({
+            "schema": "tessera.orch.operation_ledger.v1",
+            "records": [
+                {
+                    "operation_id": "p7-split-1",
+                    "kind": "split",
+                    "status": "approved",
+                    "created_unix_secs": 100,
+                    "updated_unix_secs": 110,
+                    "proposal": {
+                        "source": "live_worker_metrics:test",
+                        "proposal_hash": "fnv1a64:abc",
+                        "parent": {"world": 0, "cx": 0, "cy": 0},
+                        "targets": [
+                            {"cell": {"world": 0, "cx": 0, "cy": 0, "depth": 1, "sub": 0}, "worker_id": "worker-a"}
+                        ],
+                        "preconditions": ["operator approval required"],
+                        "submission_command": "cargo xt split-activation --operation-id p7-split-1"
+                    },
+                    "approval": {
+                        "policy_id": "operator_approved_dynamic_operation_v1",
+                        "approver": "operator",
+                        "allowed_kind": "split",
+                        "approved_unix_secs": 110,
+                        "expires_unix_secs": 710,
+                        "expected_proposal_hash": "fnv1a64:abc",
+                        "cooldown_key": "world-0",
+                        "budget_key": "daily"
+                    },
+                    "phases": [
+                        {"name": "proposal_recorded", "state": "succeeded", "unix_secs": 100, "reason": "proposal persisted"}
+                    ]
+                }
+            ]
+        });
+
+        let err = validate_p7_operation_ledger(&ledger, true, true)
+            .expect_err("missing blocked execution should fail");
+
+        assert!(err.to_string().contains("blocked execution"));
     }
 
     #[test]
