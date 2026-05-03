@@ -9352,7 +9352,7 @@ fn run_k8s_operation_smoke(options: K8sOperationSmokeOptions) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let orch_endpoint = grpc_endpoint(&local_orch_addr);
     let (before_health, before_listing) = match runtime
-        .block_on(wait_for_orchestrator_registered(&orch_endpoint, 1))
+        .block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))
         .and_then(|_| runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint)))
     {
         Ok(snapshot) => snapshot,
