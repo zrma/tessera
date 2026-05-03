@@ -5883,6 +5883,13 @@ fn run_k8s_activation_smoke(options: K8sActivationSmokeOptions) -> Result<()> {
             &options.target_worker_deploy,
             0,
         )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.target_worker_service,
+            0,
+            Duration::from_secs(120),
+        )?;
         let observed_failure = probe_split_convergence(&local_gateway_addr, 12_100);
         let failure_assert = observed_failure.assert_failed_only(&expected_failed_subs);
         runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_listing))?;
@@ -5905,6 +5912,13 @@ fn run_k8s_activation_smoke(options: K8sActivationSmokeOptions) -> Result<()> {
             &options.namespace,
             &options.target_worker_deploy,
             original_replicas,
+        )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.target_worker_service,
+            original_replicas,
+            Duration::from_secs(120),
         )?;
         assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
         let observed_recovery = probe_split_convergence(&local_gateway_addr, 12_200);
@@ -6256,6 +6270,13 @@ fn run_k8s_multi_depth_activation_smoke(
             &options.target_worker_deploy,
             0,
         )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            0,
+            Duration::from_secs(120),
+        )?;
         let observed_failure =
             probe_multi_depth_convergence(&local_gateway_addr, &expected_listing, 13_200);
         let failure_assert = observed_failure.assert_failed_cells_only(&expected_failed_cells);
@@ -6279,6 +6300,13 @@ fn run_k8s_multi_depth_activation_smoke(
             &options.namespace,
             &options.target_worker_deploy,
             original_replicas,
+        )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.target_worker_deploy,
+            original_replicas,
+            Duration::from_secs(120),
         )?;
         assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
         let observed_recovery =
@@ -6686,6 +6714,13 @@ fn run_k8s_merge_activation_smoke(options: K8sMergeActivationSmokeOptions) -> Re
             &options.owner_worker_deploy,
             0,
         )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            0,
+            Duration::from_secs(120),
+        )?;
         if assert_gateway_ping_until(&local_gateway_addr, parent, 13_010).is_ok() {
             bail!(
                 "internal merge failure smoke expected parent Ping to fail while owner Worker was scaled down"
@@ -6713,6 +6748,13 @@ fn run_k8s_merge_activation_smoke(options: K8sMergeActivationSmokeOptions) -> Re
             &options.namespace,
             &options.owner_worker_deploy,
             original_replicas,
+        )?;
+        wait_for_kubectl_service_ready_endpoints(
+            &context,
+            &options.namespace,
+            &options.owner_worker_deploy,
+            original_replicas,
+            Duration::from_secs(120),
         )?;
         assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
         assert_gateway_ping_until(&local_gateway_addr, parent, 13_020)?;
@@ -7541,6 +7583,70 @@ fn wait_for_kubectl_deploy_available_replicas(
         if Instant::now() >= deadline {
             bail!(
                 "deployment {deploy} did not reach availableReplicas={expected} before timeout; last availableReplicas={available}"
+            );
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn kubectl_service_ready_endpoints(context: &str, namespace: &str, service: &str) -> Result<u32> {
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args([
+        "get",
+        "endpointslice",
+        "-l",
+        &format!("kubernetes.io/service-name={service}"),
+        "-o",
+        "json",
+    ]);
+    let output = command_stdout(&mut cmd)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parse Kubernetes EndpointSlice JSON")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("EndpointSlice list JSON is missing items[]"))?;
+    let mut ready = 0_u32;
+    for item in items {
+        let Some(endpoints) = item.get("endpoints").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for endpoint in endpoints {
+            let conditions = endpoint
+                .get("conditions")
+                .and_then(serde_json::Value::as_object);
+            let is_ready = conditions
+                .and_then(|conditions| conditions.get("ready"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let terminating = conditions
+                .and_then(|conditions| conditions.get("terminating"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if is_ready && !terminating {
+                ready += 1;
+            }
+        }
+    }
+    Ok(ready)
+}
+
+fn wait_for_kubectl_service_ready_endpoints(
+    context: &str,
+    namespace: &str,
+    service: &str,
+    expected: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ready = kubectl_service_ready_endpoints(context, namespace, service)?;
+        if ready == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "service {service} did not reach ready EndpointSlice endpoints={expected} before timeout; last ready endpoints={ready}"
             );
         }
         thread::sleep(Duration::from_secs(1));
