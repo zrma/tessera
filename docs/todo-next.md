@@ -24,9 +24,10 @@ Last reviewed: 2026-05-04
 - P7 initial local/dev slices are complete through durable proposal records,
   explicit approvals, default-off execution blocks, approved same-Worker merge
   execution idempotency, approved legacy split execution success/idempotency,
-  local observation completion, and local recovery-required owner-outage
-  handling, plus Orchestrator restart recovery for the published operation
-  ledger and assignment state, and local load/soak observation completion.
+  approved legacy split observation completion, local merge observation
+  completion, and local recovery-required owner-outage handling, plus
+  Orchestrator restart recovery for the published operation ledger and
+  assignment state, and local load/soak observation completion.
   `v2026.05.5` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
@@ -87,7 +88,7 @@ Recommended next slices:
 9. Done: `test: add p7 split operation execution smoke` - approved legacy split
    operation execution now publishes child assignments once, removes the parent
    assignment, and proves repeat execution is an idempotent no-op.
-10. `test: add p7 split operation observation smoke` - close the split
+10. Done: `test: add p7 split operation observation smoke` - close the split
    execution path with Gateway child route convergence, Worker child refresh,
    child traffic, metrics, and `completed` observation evidence.
 11. `test: add p7 split operation recovery/restart/soak smoke` - extend the
