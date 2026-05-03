@@ -4738,16 +4738,32 @@ async fn handle_prometheus_metrics_request(
     mut stream: TcpStream,
     service: OrchestratorService,
 ) -> Result<()> {
+    const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
     let mut buf = [0_u8; 1024];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .context("read prometheus metrics request")?;
-    if n == 0 {
+    let mut request_bytes = Vec::new();
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .await
+            .context("read prometheus metrics request")?;
+        if n == 0 {
+            break;
+        }
+        request_bytes.extend_from_slice(&buf[..n]);
+        if http_request_headers_complete(&request_bytes) {
+            break;
+        }
+        if request_bytes.len() > MAX_HTTP_HEADER_BYTES {
+            return Err(anyhow!(
+                "prometheus metrics request header exceeded {MAX_HTTP_HEADER_BYTES} bytes"
+            ));
+        }
+    }
+    if request_bytes.is_empty() {
         return Ok(());
     }
 
-    let request = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    let request = std::str::from_utf8(&request_bytes).unwrap_or_default();
     let mut parts = request
         .lines()
         .next()
@@ -4912,6 +4928,11 @@ async fn handle_prometheus_metrics_request(
     }
 
     Ok(())
+}
+
+fn http_request_headers_complete(request: &[u8]) -> bool {
+    request.windows(4).any(|window| window == b"\r\n\r\n")
+        || request.windows(2).any(|window| window == b"\n\n")
 }
 
 async fn write_http_response(
@@ -9244,6 +9265,69 @@ mod tests {
         assert!(response.contains(r#""status": "completed""#));
         assert!(response.contains(r#""observation_accepted": true"#));
         assert!(response.contains(r#""assignments_changed": false"#));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert_eq!(loaded.records[0].status, OperationStatus::Completed);
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_handles_fragmented_observation_request_line() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http-fragmented");
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![sample_observing_operation_record("http-fragmented-observe")],
+            },
+        )
+        .expect("write operation ledger");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fragmented observation listener");
+        let addr = listener
+            .local_addr()
+            .expect("fragmented observation listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept fragmented observation request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle fragmented observation request");
+        });
+
+        let request = b"POST /operations/observations?operation_id=http-fragmented-observe&expected_proposal_hash=proposal-hash-1&observer=http-test&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("connect fragmented observations");
+        client
+            .write_all(&request[..22])
+            .await
+            .expect("write fragmented observation request prefix");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        client
+            .write_all(&request[22..])
+            .await
+            .expect("write fragmented observation request suffix");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read fragmented observation response");
+        server.await.expect("fragmented observation server task");
+
+        let response = String::from_utf8(response).expect("utf8 fragmented observation response");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains(r#""status": "completed""#));
         let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
         assert_eq!(loaded.records[0].status, OperationStatus::Completed);
         let _ = fs::remove_file(ledger_path);
