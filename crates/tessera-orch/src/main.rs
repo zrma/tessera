@@ -21,7 +21,7 @@ use tessera_proto::orch::v1::{
     HandoverCommandResponse, HandoverFailurePolicy, HandoverState, HandoverStatus,
     HealthCheckRequest, ListAssignmentsRequest, MergeActivationRequest, MergeActivationResponse,
     MergeActivationState, OrchestratorHealth, OrchestratorMetrics, SplitActivationRequest,
-    SplitActivationResponse, SplitActivationState, StagedSplitChildAssignment,
+    SplitActivationResponse, SplitActivationState, SplitChildTarget, StagedSplitChildAssignment,
     WatchAssignmentsRequest, WorkerHealth, WorkerRegistration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1355,6 +1355,7 @@ fn merge_operation_submission_command(
 }
 
 enum OperationActivationRequest {
+    Split(SplitActivationRequest),
     Merge(MergeActivationRequest),
 }
 
@@ -1368,6 +1369,9 @@ fn operation_activation_request(
         )
     })?;
     match record.kind {
+        DynamicOperationKind::Split => Ok(OperationActivationRequest::Split(
+            split_activation_request_for_operation(record, parent)?,
+        )),
         DynamicOperationKind::Merge => {
             let owner_worker_id = merge_owner_for_operation(record)?;
             Ok(OperationActivationRequest::Merge(MergeActivationRequest {
@@ -1376,12 +1380,62 @@ fn operation_activation_request(
                 owner_worker_id,
             }))
         }
-        DynamicOperationKind::Split | DynamicOperationKind::MultiDepthSplit => Err(format!(
-            "operation_id={} {} runtime execution remains disabled in this slice",
+        DynamicOperationKind::MultiDepthSplit => Err(format!(
+            "operation_id={} {} runtime execution remains disabled until canonical multi-depth operation evidence is added",
             record.operation_id,
             dynamic_operation_kind_slug(record.kind)
         )),
     }
+}
+
+fn split_activation_request_for_operation(
+    record: &OperationRecord,
+    parent: CellId,
+) -> Result<SplitActivationRequest, String> {
+    let expected_children = parent.legacy_shallow_children().ok_or_else(|| {
+        format!(
+            "operation_id={} split execution requires a depth=0/sub=0 parent; got depth={},sub={}",
+            record.operation_id, parent.depth, parent.sub
+        )
+    })?;
+    if record.proposal.targets.len() != 4 {
+        return Err(format!(
+            "operation_id={} split execution requires exactly four targets",
+            record.operation_id
+        ));
+    }
+
+    let mut targets = Vec::with_capacity(4);
+    for expected_child in expected_children {
+        let Some(target) = record
+            .proposal
+            .targets
+            .iter()
+            .find(|target| target.cell == expected_child)
+        else {
+            return Err(format!(
+                "operation_id={} split execution is missing child target depth={},sub={}",
+                record.operation_id, expected_child.depth, expected_child.sub
+            ));
+        };
+        if target.worker_id.trim().is_empty() {
+            return Err(format!(
+                "operation_id={} split execution has empty target worker for child sub={}",
+                record.operation_id, expected_child.sub
+            ));
+        }
+        targets.push(SplitChildTarget {
+            sub: u32::from(expected_child.sub),
+            target_worker_id: target.worker_id.clone(),
+            cell: None,
+        });
+    }
+
+    Ok(SplitActivationRequest {
+        operation_id: record.operation_id.clone(),
+        parent: Some(cell_to_assignment(&parent)),
+        targets,
+    })
 }
 
 fn merge_owner_for_operation(record: &OperationRecord) -> Result<String, String> {
@@ -1508,7 +1562,7 @@ fn operation_observation_missing(request: &OperationObservationRequest) -> Vec<&
 
 fn operation_execution_kind_disabled_reason(kind: DynamicOperationKind) -> String {
     format!(
-        "{} runtime execution remains default-off; this slice supports approved same-Worker merge execution only",
+        "{} runtime execution remains default-off; this slice supports approved merge and legacy split execution only",
         dynamic_operation_kind_slug(kind)
     )
 }
@@ -2569,8 +2623,11 @@ impl OrchestratorService {
                             .then(split_merge_activation_disabled_reason)
                     })
                     .or_else(|| {
-                        (record.kind != DynamicOperationKind::Merge)
-                            .then(|| operation_execution_kind_disabled_reason(record.kind))
+                        (!matches!(
+                            record.kind,
+                            DynamicOperationKind::Merge | DynamicOperationKind::Split
+                        ))
+                        .then(|| operation_execution_kind_disabled_reason(record.kind))
                     });
             if let Some(reason) = block_reason {
                 let already_recorded = record.phases.iter().any(|phase| {
@@ -2809,6 +2866,26 @@ impl OrchestratorService {
         activation: OperationActivationRequest,
     ) -> OperationActivationResult {
         match activation {
+            OperationActivationRequest::Split(request) => {
+                match self.apply_split_activation(request).await {
+                    Ok(response) => {
+                        let state = SplitActivationState::try_from(response.state)
+                            .unwrap_or(SplitActivationState::Unspecified);
+                        OperationActivationResult {
+                            published: response.accepted
+                                && state == SplitActivationState::Published
+                                && response.assignments_changed,
+                            assignments_changed: response.assignments_changed,
+                            reason: response.reason,
+                        }
+                    }
+                    Err(status) => OperationActivationResult {
+                        published: false,
+                        assignments_changed: false,
+                        reason: status.to_string(),
+                    },
+                }
+            }
             OperationActivationRequest::Merge(request) => {
                 match self.apply_merge_activation(request).await {
                     Ok(response) => {
@@ -7621,16 +7698,49 @@ mod tests {
         let _ = fs::remove_file(ledger_path);
     }
 
-    #[tokio::test]
-    async fn operation_ledger_execution_keeps_split_runtime_default_off_in_manual_mode() {
-        let ledger_path = unique_assignment_state_path("operation-ledger-execution-split-manual");
+    #[test]
+    fn operation_activation_request_builds_legacy_split_activation_request() {
+        let parent = CellId::grid(0, 0, 0);
         let mut record = sample_operation_record("execute-split-manual-op");
+        record.proposal.targets = (0..4)
+            .map(|sub| OperationTarget {
+                cell: split_child_cell(parent, sub),
+                worker_id: if sub % 2 == 0 { "worker-a" } else { "worker-b" }.to_string(),
+            })
+            .collect();
+
+        let request =
+            operation_activation_request(&record).expect("build split activation request");
+        let OperationActivationRequest::Split(request) = request else {
+            panic!("expected split activation request");
+        };
+
+        assert_eq!(request.operation_id, "execute-split-manual-op");
+        assert_eq!(
+            assignment_to_cell_ref(request.parent.as_ref().expect("request parent"))
+                .expect("parse request parent"),
+            parent
+        );
+        assert_eq!(request.targets.len(), 4);
+        assert_eq!(request.targets[0].sub, 0);
+        assert_eq!(request.targets[0].target_worker_id, "worker-a");
+        assert!(request.targets[0].cell.is_none());
+        assert_eq!(request.targets[1].sub, 1);
+        assert_eq!(request.targets[1].target_worker_id, "worker-b");
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_execution_keeps_multi_depth_runtime_default_off_in_manual_mode() {
+        let ledger_path =
+            unique_assignment_state_path("operation-ledger-execution-multi-depth-manual");
+        let mut record = sample_operation_record("execute-split-manual-op");
+        record.kind = DynamicOperationKind::MultiDepthSplit;
         let proposal_hash = record.proposal.proposal_hash.clone();
         record.status = OperationStatus::Approved;
         record.approval = Some(OperationApproval {
             policy_id: "operator_approved_dynamic_operation_v1".to_string(),
             approver: "operator".to_string(),
-            allowed_kind: DynamicOperationKind::Split,
+            allowed_kind: DynamicOperationKind::MultiDepthSplit,
             approved_unix_secs: 400,
             expires_unix_secs: 1000,
             expected_proposal_hash: proposal_hash.clone(),
@@ -7670,7 +7780,11 @@ mod tests {
         let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
 
         assert_eq!(response.status, "blocked_by_policy");
-        assert!(response.reason.contains("split runtime execution"));
+        assert!(
+            response
+                .reason
+                .contains("multi-depth-split runtime execution")
+        );
         assert!(!response.assignments_changed);
         assert!(!response.mutation_attempted);
         assert!(!response.mutation_allowed);
