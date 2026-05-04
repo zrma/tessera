@@ -62,6 +62,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit P8 closed-loop cadence completion gates from report JSON
+    P8CompletionAudit {
+        /// Directory that contains smoke/report JSON files
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
     P7OperationLedgerCheck {
         /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
@@ -1223,6 +1232,7 @@ fn main() -> Result<()> {
         Cmd::Harness => harness()?,
         Cmd::P6CompletionAudit { report_dir, json } => run_p6_completion_audit(&report_dir, json)?,
         Cmd::P7CompletionAudit { report_dir, json } => run_p7_completion_audit(&report_dir, json)?,
+        Cmd::P8CompletionAudit { report_dir, json } => run_p8_completion_audit(&report_dir, json)?,
         Cmd::P7OperationLedgerCheck {
             ledger,
             require_approval,
@@ -23911,6 +23921,379 @@ fn push_p7_ledger_gate(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P8CompletionFinding {
+    gate: &'static str,
+    evidence: String,
+    missing: String,
+}
+
+fn run_p8_completion_audit(report_dir: &Path, json: bool) -> Result<()> {
+    let findings = p8_completion_findings(report_dir);
+    if json {
+        let body = serde_json::json!({
+            "schema": "tessera.p8_completion_audit.v1",
+            "complete": findings.is_empty(),
+            "report_dir": report_dir.display().to_string(),
+            "findings": findings.iter().map(|finding| {
+                serde_json::json!({
+                    "gate": finding.gate,
+                    "evidence": finding.evidence,
+                    "missing": finding.missing
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if findings.is_empty() {
+        println!(
+            "P8 completion audit passed: all required closed-loop cadence gates are covered in {}",
+            report_dir.display()
+        );
+    } else {
+        println!(
+            "P8 completion audit incomplete: {} missing gate(s) in {}",
+            findings.len(),
+            report_dir.display()
+        );
+        for finding in &findings {
+            println!(
+                "- {}: evidence={} missing={}",
+                finding.gate, finding.evidence, finding.missing
+            );
+        }
+    }
+    if !findings.is_empty() {
+        bail!(
+            "P8 completion audit is incomplete: {} missing gate(s)",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+fn p8_completion_findings(report_dir: &Path) -> Vec<P8CompletionFinding> {
+    let mut findings = Vec::new();
+
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_read_only_cadence",
+        "p8-cadence-plan-smoke-latest.json",
+        "local read-only cadence from repeated live Worker metrics and assignment snapshots",
+        validate_p8_cadence_plan_smoke_report,
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_candidate_kind_coverage",
+        "p8-cadence-plan-smoke-latest.json",
+        "live-evidence candidate batch covering split, merge, and canonical multi-depth candidates",
+        validate_p8_cadence_candidate_kind_coverage,
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_proposal_idempotency",
+        "p8-cadence-proposal-smoke-latest.json",
+        "idempotent durable proposal writes from cadence ticks",
+        validate_p8_cadence_proposal_smoke_report,
+    );
+    push_p8_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_proposal_ledger",
+        "p8-cadence-proposal-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: false,
+            require_blocked_execution: false,
+            require_published_execution: false,
+            require_completed_observation: false,
+            require_recovery_required: false,
+        },
+        "durable proposal ledger with stable operation id/hash evidence",
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_explicit_approval_default_off",
+        "p8-cadence-approval-smoke-latest.json",
+        "explicit durable approval plus missing/wrong-policy/default-off blocked execution evidence",
+        validate_p8_cadence_approval_smoke_report,
+    );
+    push_p8_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_approval_ledger",
+        "p8-cadence-approval-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: true,
+            require_published_execution: false,
+            require_completed_observation: false,
+            require_recovery_required: false,
+        },
+        "approval ledger with default-off blocked execution evidence",
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_cooldown_budget_concurrency_gates",
+        "p8-cadence-gate-smoke-latest.json",
+        "cooldown, budget, and concurrency gates blocked before any assignment mutation",
+        validate_p8_cadence_gate_smoke_report,
+    );
+    for (gate, ledger_name) in [
+        (
+            "p8_local_cooldown_gate_ledger",
+            "p8-cadence-gate-cooldown-ledger-latest.json",
+        ),
+        (
+            "p8_local_budget_gate_ledger",
+            "p8-cadence-gate-budget-ledger-latest.json",
+        ),
+        (
+            "p8_local_concurrency_gate_ledger",
+            "p8-cadence-gate-concurrency-ledger-latest.json",
+        ),
+        (
+            "p8_local_default_off_gate_ledger",
+            "p8-cadence-gate-allowed_default_off-ledger-latest.json",
+        ),
+    ] {
+        push_p8_ledger_gate(
+            &mut findings,
+            report_dir,
+            gate,
+            ledger_name,
+            P7LedgerRequirements {
+                require_approval: true,
+                require_blocked_execution: true,
+                require_published_execution: false,
+                require_completed_observation: false,
+                require_recovery_required: false,
+            },
+            "per-gate ledger with approved but blocked non-mutating execution evidence",
+        );
+    }
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_bounded_execution",
+        "p8-cadence-execution-smoke-latest.json",
+        "approved bounded cadence execution with idempotent repeat and completed observation",
+        validate_p8_cadence_execution_smoke_report,
+    );
+    push_p8_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_bounded_execution_ledger",
+        "p8-cadence-execution-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_recovery_required: false,
+        },
+        "bounded execution ledger with completed observation evidence",
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_failure_recovery",
+        "p8-cadence-recovery-smoke-latest.json",
+        "operator-visible failure/recovery without automatic rollback",
+        validate_p8_cadence_recovery_smoke_report,
+    );
+    push_p8_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_failure_recovery_ledger",
+        "p8-cadence-recovery-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: false,
+            require_recovery_required: true,
+        },
+        "recovery ledger with recovery-required observation evidence",
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_restart_recovery",
+        "p8-cadence-restart-smoke-latest.json",
+        "Orchestrator restart recovery with durable operation ledger and assignment state",
+        validate_p8_cadence_restart_smoke_report,
+    );
+    push_p8_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_restart_recovery_ledger",
+        "p8-cadence-restart-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_recovery_required: false,
+        },
+        "restart ledger with completed post-restart observation evidence",
+    );
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_child_route_soak",
+        "p8-cadence-soak-smoke-latest.json",
+        "child-route soak with route, Worker refresh, traffic, AOI, and clean-counter evidence",
+        validate_p8_cadence_soak_smoke_report,
+    );
+    push_p8_ledger_gate(
+        &mut findings,
+        report_dir,
+        "p8_local_child_route_soak_ledger",
+        "p8-cadence-soak-ledger-latest.json",
+        P7LedgerRequirements {
+            require_approval: true,
+            require_blocked_execution: false,
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_recovery_required: false,
+        },
+        "soak ledger with completed observation evidence",
+    );
+
+    let rollout_image = p8_gitops_rollout_image(report_dir, &mut findings);
+    let expected_image = rollout_image.as_deref();
+    push_p8_json_gate(
+        &mut findings,
+        report_dir,
+        "p8_internal_controlled_cadence_smoke",
+        "internal-microk8s-p8-cadence-smoke-latest.json",
+        "internal MicroK8s controlled P8 cadence smoke with live metrics, bounded execution, observation, soak, and default-off cleanup evidence",
+        |report| validate_internal_k8s_p8_cadence_smoke_report(report, expected_image),
+    );
+
+    findings
+}
+
+fn p8_gitops_rollout_image(
+    report_dir: &Path,
+    findings: &mut Vec<P8CompletionFinding>,
+) -> Option<String> {
+    let path = report_dir.join("p8-gitops-rollout-latest.json");
+    let report = match read_json_report(&path) {
+        Ok(report) => report,
+        Err(err) => {
+            findings.push(P8CompletionFinding {
+                gate: "p8_internal_gitops_rollout_default_off",
+                evidence: format!("{} unavailable: {err}", path.display()),
+                missing: "P8 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+            });
+            return None;
+        }
+    };
+    if let Err(err) = validate_p6_gitops_rollout_report(&report, None) {
+        findings.push(P8CompletionFinding {
+            gate: "p8_internal_gitops_rollout_default_off",
+            evidence: format!("{} failed verifier: {err}", path.display()),
+            missing: "P8 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+        });
+        return None;
+    }
+    match json_str(&report, &["image", "name"]) {
+        Ok(image) if image.ends_with(":v2026.05.6") => {
+            findings.push(P8CompletionFinding {
+                gate: "p8_internal_gitops_rollout_default_off",
+                evidence: format!("{} still references P7 image {}", path.display(), image),
+                missing: "new P8 runtime image promoted through GitOps".to_string(),
+            });
+            None
+        }
+        Ok(image) if !image.trim().is_empty() => Some(image.to_string()),
+        Ok(_) => {
+            findings.push(P8CompletionFinding {
+                gate: "p8_internal_gitops_rollout_default_off",
+                evidence: format!("{} has empty image.name", path.display()),
+                missing: "P8 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+        Err(err) => {
+            findings.push(P8CompletionFinding {
+                gate: "p8_internal_gitops_rollout_default_off",
+                evidence: format!("{} missing image.name: {err}", path.display()),
+                missing: "P8 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn push_p8_json_gate<F>(
+    findings: &mut Vec<P8CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    report_name: &str,
+    missing: &str,
+    validate: F,
+) where
+    F: FnOnce(&serde_json::Value) -> Result<()>,
+{
+    let path = report_dir.join(report_name);
+    match read_json_report(&path) {
+        Ok(report) => {
+            if let Err(err) = validate(&report) {
+                findings.push(P8CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P8CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
+fn push_p8_ledger_gate(
+    findings: &mut Vec<P8CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    ledger_name: &str,
+    requirements: P7LedgerRequirements,
+    missing: &str,
+) {
+    let path = report_dir.join(ledger_name);
+    match read_json_report(&path) {
+        Ok(ledger) => {
+            if let Err(err) = validate_p7_operation_ledger(
+                &ledger,
+                requirements.require_approval,
+                requirements.require_blocked_execution,
+                requirements.require_published_execution,
+                requirements.require_completed_observation,
+                requirements.require_recovery_required,
+            ) {
+                findings.push(P8CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed ledger verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P8CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
 fn p6_restart_preflight_evidence(report_dir: &Path) -> Option<String> {
     let expected_errors = [ORCH_ASSIGNMENT_STATE_ENV.to_string()];
     for report_name in [
@@ -24037,6 +24420,52 @@ fn validate_split_activation_live_metrics_plan_report(report: &serde_json::Value
     }
     assert_json_number_at_least(report, &["preview", "plan_count"], 1.0)?;
     assert_json_array_len(report, &["recommendation", "targets"], 4)?;
+    Ok(())
+}
+
+fn validate_p8_cadence_candidate_kind_coverage(report: &serde_json::Value) -> Result<()> {
+    validate_p8_cadence_plan_smoke_report(report)?;
+    let mut kinds = Vec::new();
+    if let Some(candidate_kinds) =
+        json_path(report, &["cadence", "candidate_kinds"]).and_then(|value| value.as_array())
+    {
+        for kind in candidate_kinds {
+            if let Some(kind) = kind.as_str() {
+                kinds.push(kind.to_string());
+            }
+        }
+    }
+    if let Ok(ticks) = json_array(report, &["ticks"]) {
+        for tick in ticks {
+            if let Ok(kind) = json_str(tick, &["candidate", "kind"]) {
+                kinds.push(kind.to_string());
+            }
+            if let Ok(kind) = json_str(tick, &["operation", "kind"]) {
+                kinds.push(kind.to_string());
+            }
+            if let Ok(candidate_key) = json_str(tick, &["candidate_key"]) {
+                if candidate_key.starts_with("split|") {
+                    kinds.push("split".to_string());
+                } else if candidate_key.starts_with("merge|") {
+                    kinds.push("merge".to_string());
+                } else if candidate_key.starts_with("multi_depth_split|")
+                    || candidate_key.starts_with("canonical_multi_depth_split|")
+                {
+                    kinds.push("multi_depth_split".to_string());
+                }
+            }
+        }
+    }
+    for required in ["split", "merge", "multi_depth_split"] {
+        if !kinds.iter().any(|kind| {
+            kind == required
+                || (required == "multi_depth_split" && kind == "canonical_multi_depth_split")
+        }) {
+            bail!(
+                "P8 cadence candidate batch missing required {required} candidate kind; observed={kinds:?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -26124,6 +26553,120 @@ fn validate_internal_k8s_multi_depth_completion_gates(
     if require_published && require_failure && require_restart && require_soak {
         assert_remaining_uncovered_empty(report)?;
     }
+    Ok(())
+}
+
+fn validate_internal_k8s_p8_cadence_smoke_report(
+    report: &serde_json::Value,
+    expected_image: Option<&str>,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.internal_microk8s_p8_cadence_smoke.v1",
+    )?;
+    assert_json_str_eq(report, &["stage"], "completed")?;
+    assert_json_bool_eq(report, &["cluster", "argocd", "checked"], true)?;
+    assert_json_str_eq(report, &["cluster", "argocd", "sync"], "Synced")?;
+    assert_json_str_eq(report, &["cluster", "argocd", "health"], "Healthy")?;
+    assert_report_deployment_roles(
+        report,
+        &["orchestrator", "gateway", "source_worker", "target_worker"],
+    )?;
+    assert_json_array_len(report, &["preflight_errors"], 0)?;
+    if let Some(expected_image) = expected_image {
+        assert_json_str_eq(report, &["cluster", "expected_image"], expected_image)?;
+        assert_report_images_match(report, expected_image)?;
+    }
+
+    assert_json_bool_eq(report, &["checks", "argocd_synced_healthy"], true)?;
+    assert_json_bool_eq(report, &["checks", "deployment_images_match"], true)?;
+    assert_json_bool_eq(report, &["checks", "live_metrics_materialized"], true)?;
+    assert_json_bool_eq(report, &["checks", "proposal_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "gate_policy_allowed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "bounded_operation_limit_respected"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "bounded_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "repeat_execution_idempotent"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "child_routes_converged_after_soak"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "worker_child_refresh_after_soak"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "child_traffic_confirmed_after_soak"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "observation_completed_after_soak"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "ledger_observation_completed"], true)?;
+    assert_json_bool_eq(report, &["checks", "post_smoke_default_off_cleanup"], true)?;
+    assert_json_bool_eq(report, &["cleanup", "manual_activation_default_off"], true)?;
+    assert_json_bool_eq(report, &["cleanup", "preview_fixture_removed"], true)?;
+    assert_json_number_eq(report, &["cadence", "bounded_operation_limit"], 1.0)?;
+    assert_json_number_at_least(report, &["live_metrics", "parent_actor_count"], 100.0)?;
+    assert_json_str_eq(report, &["operation", "kind"], "split")?;
+    assert_json_str_eq(
+        report,
+        &["approval", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    assert_json_str_eq(report, &["approval", "cooldown_key"], "p8-cadence-root-w0")?;
+    assert_json_str_eq(report, &["approval", "budget_key"], "p8-cadence-local")?;
+    assert_json_number_eq(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "completed_observation_records"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_attempted"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_allowed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "repeat_execution", "status"],
+        "already_published",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "repeat_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_str_eq(report, &["responses", "observation", "status"], "completed")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "observation", "observation_accepted"],
+        true,
+    )?;
+    assert_json_number_eq(report, &["gateway", "routes_before"], 1.0)?;
+    assert_json_number_eq(report, &["gateway", "routes_after_soak"], 4.0)?;
+    assert_json_number_at_least(report, &["gateway", "ping_roundtrips"], 64.0)?;
+    assert_json_number_at_least(report, &["gateway", "move_roundtrips"], 64.0)?;
+    assert_json_array_nonempty(report, &["probes", "pre_soak", "succeeded"])?;
+    assert_remaining_uncovered_absent(report, "internal_microk8s_p8_cadence_smoke")?;
     Ok(())
 }
 
@@ -34265,6 +34808,39 @@ demo_count 4
     }
 
     #[test]
+    fn p8_completion_audit_reports_missing_cadence_gates() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p8-audit-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let findings = p8_completion_findings(&dir);
+
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p8_local_read_only_cadence"
+                && finding.missing.contains("read-only cadence")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p8_internal_gitops_rollout_default_off"
+                && finding.missing.contains("GitOps rollout")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p8_internal_controlled_cadence_smoke"
+                && finding
+                    .missing
+                    .contains("internal MicroK8s controlled P8 cadence")
+        }));
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
     fn assignment_state_storage_requires_pvc_backed_mount() {
         let deploy = serde_json::json!({
             "spec": {
@@ -35029,6 +35605,158 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
         });
 
         validate_p8_cadence_soak_smoke_report(&report).expect("valid P8 cadence soak smoke report");
+    }
+
+    #[test]
+    fn p8_cadence_candidate_kind_coverage_requires_all_operation_kinds() {
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_plan_smoke.v1",
+            "cadence": {
+                "ticks": 1,
+                "candidate_kinds": ["split"]
+            },
+            "ticks": [
+                {
+                    "status": "ready",
+                    "candidate_key": "split|parent=w0:cx0:cy0:d0:s0|source=worker-a",
+                    "preview": {
+                        "source": "live_worker_metrics:worker-a=127.0.0.1:5303,worker-b=127.0.0.1:5304",
+                        "assignments_changed": false,
+                        "plan_count": 1
+                    },
+                    "candidate": {
+                        "kind": "split",
+                        "targets": [{}, {}, {}, {}]
+                    },
+                    "checks": {
+                        "ready_candidate": true,
+                        "live_metrics_source": true,
+                        "assignment_listing_unchanged": true,
+                        "execution_attempted": false,
+                        "assignments_changed": false
+                    }
+                }
+            ],
+            "checks": {
+                "read_only_cadence": true,
+                "all_ticks_ready": true,
+                "all_ticks_live_metrics_source": true,
+                "stable_candidate_key": true,
+                "assignments_unchanged": true,
+                "no_execution_attempted": true
+            }
+        });
+
+        let err = validate_p8_cadence_candidate_kind_coverage(&report)
+            .expect_err("split-only cadence does not satisfy full P8 candidate coverage");
+        assert!(err.to_string().contains("missing required merge"));
+
+        let mut complete = report;
+        complete["cadence"]["candidate_kinds"] =
+            serde_json::json!(["split", "merge", "multi_depth_split"]);
+        validate_p8_cadence_candidate_kind_coverage(&complete)
+            .expect("all candidate kinds satisfy P8 coverage");
+    }
+
+    #[test]
+    fn internal_k8s_p8_cadence_report_accepts_controlled_smoke_evidence() {
+        let report = serde_json::json!({
+            "schema": "tessera.internal_microk8s_p8_cadence_smoke.v1",
+            "stage": "completed",
+            "cluster": {
+                "expected_image": "repo/tessera:v2026.05.7",
+                "argocd": {
+                    "checked": true,
+                    "sync": "Synced",
+                    "health": "Healthy"
+                },
+                "deployment_images": [
+                    {"role": "orchestrator", "deployment": "tessera-orch", "image": "repo/tessera:v2026.05.7"},
+                    {"role": "gateway", "deployment": "tessera-gateway", "image": "repo/tessera:v2026.05.7"},
+                    {"role": "source_worker", "deployment": "tessera-worker", "image": "repo/tessera:v2026.05.7"},
+                    {"role": "target_worker", "deployment": "tessera-worker-b", "image": "repo/tessera:v2026.05.7"}
+                ]
+            },
+            "cadence": {
+                "bounded_operation_limit": 1
+            },
+            "operation": {
+                "kind": "split"
+            },
+            "live_metrics": {
+                "parent_actor_count": 105
+            },
+            "approval": {
+                "policy_id": "operator_approved_dynamic_operation_v1",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local"
+            },
+            "ledger": {
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "completed_observation_records": 1
+            },
+            "responses": {
+                "approval": {
+                    "status": "approved"
+                },
+                "execution": {
+                    "status": "published",
+                    "mutation_attempted": true,
+                    "mutation_allowed": true,
+                    "assignments_changed": true
+                },
+                "repeat_execution": {
+                    "status": "already_published",
+                    "mutation_attempted": false
+                },
+                "observation": {
+                    "status": "completed",
+                    "observation_accepted": true
+                }
+            },
+            "gateway": {
+                "routes_before": 1,
+                "routes_after_soak": 4,
+                "ping_roundtrips": 64,
+                "move_roundtrips": 64
+            },
+            "cleanup": {
+                "manual_activation_default_off": true,
+                "preview_fixture_removed": true
+            },
+            "checks": {
+                "argocd_synced_healthy": true,
+                "deployment_images_match": true,
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "gate_policy_allowed": true,
+                "bounded_operation_limit_respected": true,
+                "bounded_execution_published": true,
+                "repeat_execution_idempotent": true,
+                "child_routes_converged_after_soak": true,
+                "worker_child_refresh_after_soak": true,
+                "child_traffic_confirmed_after_soak": true,
+                "gateway_close_counters_clean": true,
+                "observation_completed_after_soak": true,
+                "ledger_observation_completed": true,
+                "post_smoke_default_off_cleanup": true
+            },
+            "probes": {
+                "pre_soak": {
+                    "succeeded": [0, 1, 2, 3],
+                    "failures": []
+                }
+            },
+            "preflight_errors": [],
+            "remaining_uncovered": []
+        });
+
+        validate_internal_k8s_p8_cadence_smoke_report(&report, Some("repo/tessera:v2026.05.7"))
+            .expect("valid internal P8 cadence report");
     }
 
     #[test]

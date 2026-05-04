@@ -174,8 +174,15 @@ Recommended P8 slices:
 9. Done: `test: add p8 cadence soak smoke` - extend the bounded cadence through
    sustained post-execution child traffic, remote AOI observation, Worker child
    refresh, completed observation, and clean Gateway close counters.
-10. `build: publish p8 cadence runtime image` - publish a new image only after
-   local P8 gates are green.
-11. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for
-   ArgoCD `Synced / Healthy`, run controlled internal cadence smoke, restore
-   default-off state, and verify a P8 completion audit.
+10. Done operationally: `build: publish p8 cadence runtime image` - published
+   the P8 cadence runtime image after local P8 gates were green and promoted the
+   tag through the k8s GitOps repo. The P8-specific rollout/default-off report
+   artifact is still required by the completion audit.
+11. Done: `test: add p8 completion audit` - `cargo xt
+   p8-completion-audit --json` now aggregates local cadence evidence and fails
+   until split/merge/canonical multi-depth candidate coverage, P8 GitOps
+   rollout/default-off report, and internal MicroK8s controlled cadence smoke
+   are covered.
+12. `test: add internal p8 cadence smoke` - wait for ArgoCD `Synced / Healthy`,
+   run controlled internal cadence smoke, restore default-off state, and close
+   the remaining P8 completion audit findings.

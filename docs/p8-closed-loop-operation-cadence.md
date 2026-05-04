@@ -1,6 +1,6 @@
 # P8 Closed-Loop Operation Cadence
 
-Last reviewed: 2026-05-04
+Last reviewed: 2026-05-05
 
 ## Objective
 
@@ -64,7 +64,18 @@ P8 is complete only when all of these are true:
 | Bounded execution | controlled cadence executor | approved window runs only the configured operation count and records idempotent state transitions |
 | Observation/recovery | report fields and checkers | completed/recovery-required reports include route, Worker, traffic, counter, restart, and soak evidence |
 | Internal rollout | k8s GitOps smoke window | image publish, rollout rev, cleanup rev, ArgoCD `Synced / Healthy`, live smoke, and default-off cleanup are verified |
-| Completion audit | `cargo xt p8-completion-audit --json` or equivalent | audit returns `complete=true` only after every P8 gate has real evidence |
+| Completion audit | `cargo xt p8-completion-audit --json` | audit returns `complete=true` only after every P8 gate has real evidence |
+
+Current completion audit:
+
+```sh
+cargo xt p8-completion-audit --json
+```
+
+As of 2026-05-05 this is intentionally incomplete. It must stay
+`complete=false` until the audit findings for split/merge/canonical multi-depth
+candidate coverage, the P8 GitOps rollout/default-off report, and the internal
+MicroK8s controlled cadence smoke have concrete evidence.
 
 ## Initial Implementation Order
 
@@ -114,8 +125,9 @@ P8 is complete only when all of these are true:
 9. **Internal controlled cadence smoke**: run the approved bounded cadence
    against MicroK8s, record report checker evidence, then clean up mutating
    flags and preview fixtures to default-off.
-10. **Completion audit**: add the P8 audit gate and map every criterion to
-    concrete local, internal, cleanup, and CI evidence.
+10. **Completion audit**: `cargo xt p8-completion-audit --json` maps every
+    criterion to concrete local, internal, cleanup, and CI evidence and fails
+    until the remaining runtime gates are closed.
 
 ## Guardrails
 

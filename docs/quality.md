@@ -117,5 +117,8 @@ This document is the repo-local quality map for agents. It keeps the expected au
   p8-cadence-soak-smoke`, which keeps the bounded cadence path under sustained
   post-execution Ping/Move traffic and records route convergence, Worker child
   refresh, remote AOI frames, clean close counters, and completed observation.
-  Internal rollout and P8 completion audit remain future P8 slices.
+  `cargo xt p8-completion-audit --json` now aggregates the P8 local cadence
+  evidence and is expected to fail until split/merge/canonical multi-depth
+  candidate coverage, the P8 GitOps rollout/default-off report, and the
+  internal controlled cadence smoke are covered.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
