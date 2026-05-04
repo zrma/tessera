@@ -106,6 +106,9 @@ This document is the repo-local quality map for agents. It keeps the expected au
   manual execution window only after durable approval/gate metadata, publishes
   one live-metrics split operation, proves repeat execution idempotency, and
   closes observation with Gateway route, Worker refresh, traffic, and close
-  counter evidence. Failure/restart/soak, internal rollout, and P8 completion
-  audit remain future P8 slices.
+  counter evidence. Failure/recovery evidence is covered by `cargo xt dev
+  p8-cadence-recovery-smoke`, which publishes the same bounded cadence path,
+  injects a target Worker outage, records `recovery_required` without automatic
+  rollback, and verifies operator Worker restart recovery. Restart/soak,
+  internal rollout, and P8 completion audit remain future P8 slices.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

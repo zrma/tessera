@@ -98,8 +98,11 @@ P8 is complete only when all of these are true:
    and proves repeated execution is idempotent. Evidence is
    `.dev/reports/p8-cadence-execution-smoke-latest.json` plus
    `.dev/reports/p8-cadence-execution-ledger-latest.json`.
-7. **Failure/restart/soak cadence evidence**: extend the bounded cadence through
-   recovery-required, Orchestrator restart, and soak reports.
+7. **Failure/restart/soak cadence evidence**: `cargo xt dev
+   p8-cadence-recovery-smoke` extends the bounded cadence through a target
+   Worker outage, records `recovery_required`, and proves operator-visible
+   Worker restart recovery without automatic rollback. The remaining local
+   follow-ups are Orchestrator restart and soak reports.
 8. **Image and GitOps rollout**: publish a new runtime image, promote through
    the k8s GitOps repo, wait for ArgoCD `Synced / Healthy`, and verify image
    match.

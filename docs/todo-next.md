@@ -163,10 +163,16 @@ Recommended P8 slices:
    p8-cadence-execution-smoke` executes one approved bounded local operation
    set from live Worker metrics, observes it to completion, and proves duplicate
    execution remains idempotent.
-7. `test: add p8 cadence failure restart soak smokes` - extend the bounded
-   cadence through recovery-required, Orchestrator restart, and soak evidence.
-8. `build: publish p8 cadence runtime image` - publish a new image only after
+7. Done: `test: add p8 cadence recovery smoke` - `cargo xt dev
+   p8-cadence-recovery-smoke` extends the bounded cadence through
+   recovery-required target Worker outage evidence and operator-visible Worker
+   restart recovery without automatic rollback.
+8. `test: add p8 cadence restart smoke` - prove the approved bounded cadence
+   ledger and published assignments survive Orchestrator restart.
+9. `test: add p8 cadence soak smoke` - extend the bounded cadence through
+   sustained post-execution child traffic and clean counters.
+10. `build: publish p8 cadence runtime image` - publish a new image only after
    local P8 gates are green.
-9. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for
+11. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for
    ArgoCD `Synced / Healthy`, run controlled internal cadence smoke, restore
    default-off state, and verify a P8 completion audit.

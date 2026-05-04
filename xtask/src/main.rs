@@ -958,6 +958,12 @@ enum DevSub {
         #[arg(long, default_value_t = 105)]
         actors: u32,
     },
+    /// Start a two-worker dev stack and prove P8 cadence target outage recovery evidence
+    P8CadenceRecoverySmoke {
+        /// Number of actors to join on the parent cell before bounded execution
+        #[arg(long, default_value_t = 105)]
+        actors: u32,
+    },
     /// Start an Orchestrator-only dev stack and prove the P7 proposal/approval/default-off execution loop
     P7OperationLoopSmoke,
     /// Start an Orchestrator-only dev stack and prove approved P7 merge execution publishes once
@@ -1799,6 +1805,7 @@ fn main() -> Result<()> {
             DevSub::P8CadenceApprovalSmoke { actors } => dev_p8_cadence_approval_smoke(actors)?,
             DevSub::P8CadenceGateSmoke => dev_p8_cadence_gate_smoke()?,
             DevSub::P8CadenceExecutionSmoke { actors } => dev_p8_cadence_execution_smoke(actors)?,
+            DevSub::P8CadenceRecoverySmoke { actors } => dev_p8_cadence_recovery_smoke(actors)?,
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
@@ -2578,6 +2585,9 @@ enum ActivationSmokeMode {
     P8CadenceExecution {
         actors: u32,
     },
+    P8CadenceRecovery {
+        actors: u32,
+    },
     MergePlan,
     PlannerMutation,
     MergeActivation,
@@ -2678,6 +2688,13 @@ fn dev_p8_cadence_execution_smoke(actors: u32) -> Result<()> {
         bail!("P8 cadence execution smoke requires --actors >= 100 for default planner thresholds");
     }
     dev_activation_smoke_inner(ActivationSmokeMode::P8CadenceExecution { actors })
+}
+
+fn dev_p8_cadence_recovery_smoke(actors: u32) -> Result<()> {
+    if actors < 100 {
+        bail!("P8 cadence recovery smoke requires --actors >= 100 for default planner thresholds");
+    }
+    dev_activation_smoke_inner(ActivationSmokeMode::P8CadenceRecovery { actors })
 }
 
 fn dev_p8_cadence_gate_smoke() -> Result<()> {
@@ -10159,6 +10176,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
     let p8_operation_prefix = match mode {
         ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval",
         ActivationSmokeMode::P8CadenceExecution { .. } => "p8-cadence-execution",
+        ActivationSmokeMode::P8CadenceRecovery { .. } => "p8-cadence-recovery",
         _ => "p8-cadence-proposal",
     };
     let p8_proposal_preview_path = root
@@ -10178,6 +10196,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::P8CadenceProposal { .. }
             | ActivationSmokeMode::P8CadenceApproval { .. }
             | ActivationSmokeMode::P8CadenceExecution { .. }
+            | ActivationSmokeMode::P8CadenceRecovery { .. }
     ) {
         if let Some(parent) = p8_proposal_preview_path.parent() {
             fs::create_dir_all(parent)?;
@@ -10283,6 +10302,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::P8CadenceProposal { .. }
             | ActivationSmokeMode::P8CadenceApproval { .. }
             | ActivationSmokeMode::P8CadenceExecution { .. }
+            | ActivationSmokeMode::P8CadenceRecovery { .. }
     ) {
         orch_envs.push((
             "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH",
@@ -10293,7 +10313,11 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             p8_proposal_ledger_path_raw.as_str(),
         ));
     }
-    if matches!(mode, ActivationSmokeMode::P8CadenceExecution { .. }) {
+    if matches!(
+        mode,
+        ActivationSmokeMode::P8CadenceExecution { .. }
+            | ActivationSmokeMode::P8CadenceRecovery { .. }
+    ) {
         orch_envs.push(("TESSERA_ORCH_OPERATION_EXECUTION", "manual"));
         orch_envs.push(("TESSERA_ORCH_OPERATION_BUDGET_LIMITS", "p8-cadence-local=1"));
         orch_envs.push(("TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY", "1"));
@@ -12487,6 +12511,311 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         );
         return Ok(());
     }
+    if let ActivationSmokeMode::P8CadenceRecovery { actors } = mode {
+        let parent = CellId::grid(0, 0, 0);
+        let actor_child3 = EntityId(8_602);
+        let _child3_session = open_gateway_join_until_snapshot(
+            gateway_addr,
+            parent,
+            actor_child3,
+            activation_soak_position(3),
+        )?;
+        let mut filler_session = GatewaySession::connect(gateway_addr)?;
+        for idx in 1..actors {
+            let actor = EntityId(8_700 + u64::from(idx));
+            let joined = filler_session.request(
+                parent,
+                ClientMsg::Join {
+                    actor,
+                    pos: activation_soak_position((idx % 4) as u8),
+                },
+            )?;
+            assert_snapshot_contains("P8 cadence recovery parent join", joined, parent, actor)?;
+        }
+
+        let parent_metric = worker_cell_actor_count_metric(parent);
+        let actor_count_after_join = assert_prometheus_sample_at_least_until(
+            "P8 cadence recovery worker-a",
+            worker_a_metrics_addr,
+            parent_metric.as_str(),
+            f64::from(actors),
+        )?;
+        assert_metrics_endpoint_body_until(
+            "P8 cadence recovery worker-b",
+            worker_b_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+        let gateway_metrics_before = assert_metrics_endpoint_body_until(
+            "P8 cadence recovery gateway before",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+
+        let live_metrics = vec![
+            format!("worker-a={worker_a_metrics_addr}"),
+            format!("worker-b={worker_b_metrics_addr}"),
+        ];
+        let live_metrics_endpoints = parse_live_worker_metrics_endpoints(&live_metrics)?;
+        let live_policy = LiveMetricsPlanPolicy::default();
+        let (before_health, before_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let snapshots = live_metrics_endpoints
+            .iter()
+            .map(fetch_live_worker_metrics_snapshot)
+            .collect::<Result<Vec<_>>>()?;
+        let source_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.worker_id == "worker-a")
+            .ok_or_else(|| anyhow::anyhow!("P8 cadence recovery missing worker-a metrics"))?;
+        let live_parent_actor_count = *source_snapshot.actor_counts.get(&parent).unwrap_or(&0);
+        if live_parent_actor_count < u64::from(actors) {
+            bail!(
+                "P8 cadence recovery expected at least {actors} live parent actors, got {live_parent_actor_count}"
+            );
+        }
+        let live_parent_pending_moves = *source_snapshot.pending_moves.get(&parent).unwrap_or(&0);
+        let preview_snapshot =
+            build_p8_cadence_operation_metrics_snapshot(&before_listing, &snapshots, live_policy)?;
+        fs::write(
+            &p8_proposal_preview_path,
+            format!("{}\n", serde_json::to_string_pretty(&preview_snapshot)?),
+        )
+        .with_context(|| {
+            format!(
+                "write P8 cadence recovery preview {}",
+                p8_proposal_preview_path.display()
+            )
+        })?;
+
+        let proposal_response = http_json_post(
+            "P8 cadence recovery proposal",
+            orch_metrics_addr,
+            "/operations/proposals",
+        )?;
+        assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+        assert_json_number_at_least(&proposal_response, &["planned_count"], 1.0)?;
+        assert_json_number_eq(&proposal_response, &["recorded_count"], 1.0)?;
+        let operation_id = p8_cadence_operation_ids(&proposal_response)?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("P8 cadence recovery proposal has no operation id"))?;
+        let proposal_snapshot = http_json_get(
+            "P8 cadence recovery ledger",
+            orch_metrics_addr,
+            "/operations",
+        )?;
+        let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+        assert_json_str_eq(proposal_record, &["kind"], "split")?;
+        let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+        let policy_id = "operator_approved_dynamic_operation_v1";
+
+        let approval_response = http_json_post(
+            "P8 cadence recovery approval",
+            orch_metrics_addr,
+            &format!(
+                "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p8-cadence-recovery-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p8-cadence-root-w0&budget_key=p8-cadence-local"
+            ),
+        )?;
+        assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+        let execution_response = http_json_post(
+            "P8 cadence recovery execution",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+            ),
+        )?;
+        assert_json_str_eq(&execution_response, &["status"], "published")?;
+        assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+        assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+        assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+        let expected_children = [
+            (activation_child_cell(0), "worker-a"),
+            (activation_child_cell(1), "worker-b"),
+            (activation_child_cell(2), "worker-a"),
+            (activation_child_cell(3), "worker-b"),
+        ];
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+        let success_probe = probe_split_convergence(gateway_addr, 9_300);
+        success_probe.assert_success()?;
+
+        stack.terminate_named("activation-worker-b")?;
+        let failure_probe = probe_split_convergence(gateway_addr, 9_310);
+        failure_probe.assert_failed_only(&[1, 3])?;
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+        let gateway_metrics_after_failure = assert_metrics_endpoint_body_until(
+            "P8 cadence recovery gateway after failure",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_close_after_failure =
+            gateway_close_counters_from_metrics(&gateway_metrics_after_failure)?;
+
+        let observation_response = http_json_post(
+            "P8 cadence failed observation",
+            orch_metrics_addr,
+            &format!(
+                "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=p8-cadence-recovery-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=false&counters_clean=false"
+            ),
+        )?;
+        assert_json_str_eq(&observation_response, &["status"], "recovery_required")?;
+        assert_json_bool_eq(&observation_response, &["observation_accepted"], false)?;
+
+        stack.spawn(
+            &root,
+            &logs,
+            &pids,
+            DevProcessSpec {
+                name: "activation-worker-b",
+                bin: &worker_bin,
+                ready_addr: worker_b_addr,
+                envs: &[
+                    ("RUST_LOG", rust_log.as_str()),
+                    ("TESSERA_WORKER_ID", "worker-b"),
+                    ("TESSERA_WORKER_ADDR", worker_b_addr),
+                    ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                    ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+                    ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                    ("TESSERA_ORCH_ADDR", orch_addr),
+                ],
+            },
+        )?;
+        runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+        let recovery_probe = probe_split_convergence(gateway_addr, 9_320);
+        recovery_probe.assert_success()?;
+        let gateway_metrics_after_recovery = assert_metrics_endpoint_body_until(
+            "P8 cadence recovery gateway after recovery",
+            gateway_metrics_addr,
+            &["tessera_gateway_routes"],
+        )?;
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+        let ledger = read_json_report(&p8_proposal_ledger_path)?;
+        let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, false, true)?;
+        let operation_record = find_p7_operation_record(&ledger, &operation_id)?;
+        validate_p7_recovery_required(operation_record)?;
+
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_recovery_smoke.v1",
+            "unix_secs": unix_timestamp_secs(),
+            "cadence": {
+                "actors": actors,
+                "planner": "operation_proposals_from_live_metrics_snapshot",
+                "bounded_operation_limit": 1,
+                "operation_id": operation_id.as_str()
+            },
+            "operation": {
+                "operation_id": operation_id.as_str(),
+                "kind": "split",
+                "proposal_hash": proposal_hash.as_str(),
+                "policy_id": policy_id
+            },
+            "live_metrics": {
+                "sources": live_metrics,
+                "parent_actor_count": live_parent_actor_count,
+                "parent_pending_moves": live_parent_pending_moves,
+                "actor_count_after_join": actor_count_after_join
+            },
+            "approval": {
+                "policy_id": policy_id,
+                "approver": "p8-cadence-recovery-smoke",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local",
+                "proposal_hash": proposal_hash.as_str()
+            },
+            "gate_policy": {
+                "budget_limits": {"p8-cadence-local": 1},
+                "max_in_flight_per_budget_key": 1
+            },
+            "preview_snapshot": {
+                "path": p8_proposal_preview_path_raw.as_str()
+            },
+            "orchestrator": {
+                "grpc_addr": orch_addr,
+                "metrics_addr": orch_metrics_addr,
+                "registered_workers": before_health.registered_workers,
+                "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+                "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+            },
+            "gateway": {
+                "addr": gateway_addr,
+                "metrics_addr": gateway_metrics_addr,
+                "close_counters": {
+                    "before": gateway_close_counters_json(gateway_close_before),
+                    "after_failure": gateway_close_counters_json(gateway_close_after_failure)
+                },
+                "routes_after_failure": prometheus_sample_value(&gateway_metrics_after_failure, "tessera_gateway_routes")?,
+                "routes_after_recovery": prometheus_sample_value(&gateway_metrics_after_recovery, "tessera_gateway_routes")?
+            },
+            "ledger": {
+                "path": p8_proposal_ledger_path_raw.as_str(),
+                "records": ledger_summary.records,
+                "proposal_records": ledger_summary.proposal_records,
+                "approval_records": ledger_summary.approval_records,
+                "published_execution_records": ledger_summary.published_execution_records,
+                "recovery_required_records": ledger_summary.recovery_required_records
+            },
+            "responses": {
+                "proposal": proposal_response,
+                "approval": approval_response,
+                "execution": execution_response,
+                "observation": observation_response
+            },
+            "failure": {
+                "target_worker_id": "worker-b",
+                "target_child_subs": [1, 3]
+            },
+            "probes": {
+                "success": split_convergence_probe_json(&success_probe),
+                "failure": split_convergence_probe_json(&failure_probe),
+                "recovery": split_convergence_probe_json(&recovery_probe)
+            },
+            "checks": {
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "gate_policy_allowed": true,
+                "bounded_operation_limit_respected": true,
+                "bounded_execution_published": true,
+                "target_outage_detected": true,
+                "observation_recovery_required": true,
+                "no_automatic_rollback": true,
+                "operator_recovery_confirmed": true,
+                "ledger_recovery_required": true
+            },
+            "remaining_uncovered": [
+                "p8_restart_recovery",
+                "p8_soak",
+                "internal_microk8s_p8_cadence_smoke",
+                "p8_completion_audit"
+            ]
+        });
+        validate_p8_cadence_recovery_smoke_report(&report)?;
+        let report_path = write_p8_cadence_recovery_smoke_report(&report)?;
+        println!(
+            "P8 cadence recovery smoke: live-metrics proposal was approved, bounded execution published once, target outage recorded recovery_required, and operator Worker restart restored child traffic, report={}, ledger={}",
+            report_path.display(),
+            p8_proposal_ledger_path.display()
+        );
+        return Ok(());
+    }
 
     let parent = CellId::grid(0, 0, 0);
     let actor = EntityId(if mode == ActivationSmokeMode::LiveMetricsActivation {
@@ -12513,6 +12842,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::P8CadenceProposal { .. } => "p8-cadence-proposal-smoke",
         ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval-smoke",
         ActivationSmokeMode::P8CadenceExecution { .. } => "p8-cadence-execution-smoke",
+        ActivationSmokeMode::P8CadenceRecovery { .. } => "p8-cadence-recovery-smoke",
         ActivationSmokeMode::MergePlan => "merge-plan-smoke",
         ActivationSmokeMode::PlannerMutation => "planner-mutation-smoke",
         ActivationSmokeMode::MergeActivation => "merge-activation-smoke",
@@ -19664,6 +19994,12 @@ fn default_p8_cadence_execution_smoke_path() -> PathBuf {
         .join("p8-cadence-execution-smoke-latest.json")
 }
 
+fn default_p8_cadence_recovery_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p8-cadence-recovery-smoke-latest.json")
+}
+
 fn default_p7_operation_loop_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -19888,6 +20224,20 @@ fn write_p8_cadence_execution_smoke_report(report: &serde_json::Value) -> Result
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p8_cadence_execution_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p8_cadence_recovery_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p8-cadence-recovery-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p8_cadence_recovery_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -23113,6 +23463,79 @@ fn validate_p8_cadence_execution_smoke_report(report: &serde_json::Value) -> Res
     assert_json_number_at_least(report, &["gateway", "move_roundtrips"], 1.0)?;
     assert_json_number_at_least(report, &["worker", "worker_a_child_actor_count"], 1.0)?;
     assert_json_number_at_least(report, &["worker", "worker_b_child_actor_count"], 1.0)?;
+    Ok(())
+}
+
+fn validate_p8_cadence_recovery_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p8_cadence_recovery_smoke.v1")?;
+    assert_json_bool_eq(report, &["checks", "live_metrics_materialized"], true)?;
+    assert_json_bool_eq(report, &["checks", "proposal_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "gate_policy_allowed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "bounded_operation_limit_respected"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "bounded_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "target_outage_detected"], true)?;
+    assert_json_bool_eq(report, &["checks", "observation_recovery_required"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_automatic_rollback"], true)?;
+    assert_json_bool_eq(report, &["checks", "operator_recovery_confirmed"], true)?;
+    assert_json_bool_eq(report, &["checks", "ledger_recovery_required"], true)?;
+    assert_json_number_eq(report, &["cadence", "bounded_operation_limit"], 1.0)?;
+    assert_json_number_at_least(report, &["live_metrics", "parent_actor_count"], 100.0)?;
+    assert_json_str_eq(report, &["operation", "kind"], "split")?;
+    assert_json_str_eq(
+        report,
+        &["approval", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    assert_json_str_eq(report, &["approval", "cooldown_key"], "p8-cadence-root-w0")?;
+    assert_json_str_eq(report, &["approval", "budget_key"], "p8-cadence-local")?;
+    assert_json_number_eq(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "recovery_required_records"], 1.0)?;
+    assert_json_number_eq(report, &["responses", "proposal", "recorded_count"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_attempted"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_allowed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "observation", "status"],
+        "recovery_required",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "observation", "observation_accepted"],
+        false,
+    )?;
+    let failed_subs = failure_subs_from_report(report, &["probes", "failure", "failures"])?;
+    if failed_subs != vec![1, 3] {
+        bail!(
+            "P8 cadence recovery failure probe expected target child subs [1, 3], got {failed_subs:?}"
+        );
+    }
+    assert_json_array_nonempty(report, &["probes", "success", "succeeded"])?;
+    assert_json_array_nonempty(report, &["probes", "recovery", "succeeded"])?;
+    assert_json_number_at_least(report, &["gateway", "routes_after_failure"], 4.0)?;
+    assert_json_number_at_least(report, &["gateway", "routes_after_recovery"], 4.0)?;
     Ok(())
 }
 
@@ -33196,6 +33619,89 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
 
         validate_p8_cadence_execution_smoke_report(&report)
             .expect("valid P8 cadence execution smoke report");
+    }
+
+    #[test]
+    fn p8_cadence_recovery_smoke_report_accepts_target_recovery_evidence() {
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_recovery_smoke.v1",
+            "cadence": {
+                "bounded_operation_limit": 1
+            },
+            "operation": {
+                "kind": "split"
+            },
+            "live_metrics": {
+                "parent_actor_count": 105
+            },
+            "approval": {
+                "policy_id": "operator_approved_dynamic_operation_v1",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local"
+            },
+            "ledger": {
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "recovery_required_records": 1
+            },
+            "responses": {
+                "proposal": {
+                    "recorded_count": 1
+                },
+                "approval": {
+                    "status": "approved"
+                },
+                "execution": {
+                    "status": "published",
+                    "mutation_attempted": true,
+                    "mutation_allowed": true,
+                    "assignments_changed": true
+                },
+                "observation": {
+                    "status": "recovery_required",
+                    "observation_accepted": false
+                }
+            },
+            "gateway": {
+                "routes_after_failure": 4,
+                "routes_after_recovery": 4
+            },
+            "probes": {
+                "success": {
+                    "succeeded": [0, 1, 2, 3],
+                    "failures": []
+                },
+                "failure": {
+                    "succeeded": [0, 2],
+                    "failures": [
+                        {"sub": 1, "error": "upstream retry exhausted"},
+                        {"sub": 3, "error": "upstream retry exhausted"}
+                    ]
+                },
+                "recovery": {
+                    "succeeded": [0, 1, 2, 3],
+                    "failures": []
+                }
+            },
+            "checks": {
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "gate_policy_allowed": true,
+                "bounded_operation_limit_respected": true,
+                "bounded_execution_published": true,
+                "target_outage_detected": true,
+                "observation_recovery_required": true,
+                "no_automatic_rollback": true,
+                "operator_recovery_confirmed": true,
+                "ledger_recovery_required": true
+            }
+        });
+
+        validate_p8_cadence_recovery_smoke_report(&report)
+            .expect("valid P8 cadence recovery smoke report");
     }
 
     #[test]
