@@ -87,8 +87,11 @@ P8 is complete only when all of these are true:
    mutation-free. Evidence is
    `.dev/reports/p8-cadence-approval-smoke-latest.json` plus
    `.dev/reports/p8-cadence-approval-ledger-latest.json`.
-5. **Gate enforcement**: add cooldown, budget, and concurrency preflight
-   evidence for blocked and allowed paths.
+5. **Gate enforcement**: `cargo xt dev p8-cadence-gate-smoke` proves
+   cooldown, budget, and concurrency policy blocks run before any execution
+   window and before the default-off executor block. Evidence is
+   `.dev/reports/p8-cadence-gate-smoke-latest.json` plus per-case gate ledger
+   files.
 6. **Bounded local execution cadence**: run a small approved cadence window that
    executes one operation set, observes it, and proves repeated execution is
    idempotent.

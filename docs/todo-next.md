@@ -154,8 +154,11 @@ Recommended P8 slices:
    operator approval with policy/cooldown/budget keys, proves repeat approval is
    idempotent, and keeps unapproved/missing-policy/wrong-policy/default-off
    execution preflight mutation-free.
-5. `feat: add p8 cooldown budget concurrency gates` - enforce cooldown, budget,
-   and concurrency limits before any execution window.
+5. Done: `feat: add p8 cooldown budget concurrency gates` - Orchestrator
+   operation execution preflight now supports active cooldown keys,
+   per-budget-key limits, and max in-flight operations per budget key, with
+   `cargo xt dev p8-cadence-gate-smoke` proving each gate blocks before
+   default-off execution and without mutation.
 6. `test: add p8 bounded execution cadence smoke` - execute one approved
    bounded local operation set, observe it to completion, and prove duplicate
    execution remains idempotent.
