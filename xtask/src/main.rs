@@ -3047,6 +3047,208 @@ fn p8_cadence_candidate_key(plan: &SplitActivationOperatorPlan) -> Result<String
     ))
 }
 
+fn p8_cadence_plan_expected_assignments() -> Vec<(CellId, &'static str)> {
+    let mut assignments = vec![(p8_cadence_split_parent(), "worker-a")];
+    assignments.extend(
+        p8_cadence_merge_parent()
+            .legacy_shallow_children()
+            .expect("P8 cadence merge parent has legacy children")
+            .into_iter()
+            .map(|cell| (cell, "worker-a")),
+    );
+    assignments.push((p8_cadence_multi_depth_parent(), "worker-a"));
+    assignments
+}
+
+fn p8_cadence_split_parent() -> CellId {
+    CellId::grid(0, 0, 0)
+}
+
+fn p8_cadence_merge_parent() -> CellId {
+    CellId::grid(0, 8, 0)
+}
+
+fn p8_cadence_multi_depth_parent() -> CellId {
+    CellId::leaf(0, -4, 6, 2)
+}
+
+fn p8_cadence_candidate_batch(
+    split_plan: &SplitActivationOperatorPlan,
+    listing: &AssignmentListing,
+    snapshots: &[LiveWorkerMetricsSnapshot],
+    policy: LiveMetricsPlanPolicy,
+) -> Result<Vec<serde_json::Value>> {
+    Ok(vec![
+        p8_cadence_split_candidate_json(split_plan)?,
+        p8_cadence_merge_candidate_json(listing, snapshots, policy)?,
+        p8_cadence_multi_depth_candidate_json(listing, snapshots, policy)?,
+    ])
+}
+
+fn p8_cadence_split_candidate_json(
+    plan: &SplitActivationOperatorPlan,
+) -> Result<serde_json::Value> {
+    let parent = plan
+        .parent
+        .ok_or_else(|| anyhow::anyhow!("P8 cadence split candidate has no parent"))?;
+    let source_worker = plan
+        .source_worker_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("P8 cadence split candidate has no source worker"))?;
+    Ok(serde_json::json!({
+        "kind": "split",
+        "candidate_key": p8_cadence_candidate_key(plan)?,
+        "parent": parent,
+        "source_worker_id": source_worker,
+        "targets": plan.recommended_targets.iter().map(|target| {
+            serde_json::json!({
+                "sub": target.sub,
+                "worker_id": target.worker_id
+            })
+        }).collect::<Vec<_>>(),
+        "submission_command": plan.submission_command
+    }))
+}
+
+fn p8_cadence_merge_candidate_json(
+    listing: &AssignmentListing,
+    snapshots: &[LiveWorkerMetricsSnapshot],
+    policy: LiveMetricsPlanPolicy,
+) -> Result<serde_json::Value> {
+    let parent = p8_cadence_merge_parent();
+    let children = parent
+        .legacy_shallow_children()
+        .ok_or_else(|| anyhow::anyhow!("P8 cadence merge parent has no legacy children"))?;
+    let mut owner = None::<String>;
+    let mut siblings = Vec::with_capacity(children.len());
+    for child in children {
+        let owners = owners_for_listing_cell(listing, child)?;
+        let child_owner = match owners.as_slice() {
+            [owner] => owner.clone(),
+            [] => bail!(
+                "P8 cadence merge child {} is not assigned",
+                cell_id_key(child)
+            ),
+            _ => bail!(
+                "P8 cadence merge child {} has multiple owners: {:?}",
+                cell_id_key(child),
+                owners
+            ),
+        };
+        if owner.as_deref().is_some_and(|owner| owner != child_owner) {
+            bail!("P8 cadence merge siblings do not share a single owner");
+        }
+        owner.get_or_insert_with(|| child_owner.clone());
+        let (actor_count, pending_moves) = p8_cadence_metric_counts(snapshots, &child_owner, child);
+        if actor_count > policy.actor_threshold || pending_moves > policy.move_threshold {
+            bail!(
+                "P8 cadence merge child {} is not cold enough: actors={}, pending_moves={}",
+                cell_id_key(child),
+                actor_count,
+                pending_moves
+            );
+        }
+        siblings.push(serde_json::json!({
+            "cell": child,
+            "worker_id": child_owner,
+            "actor_count": actor_count,
+            "pending_moves": pending_moves
+        }));
+    }
+    let owner = owner.ok_or_else(|| anyhow::anyhow!("P8 cadence merge candidate has no owner"))?;
+    let sibling_keys = children
+        .into_iter()
+        .map(cell_id_key)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(serde_json::json!({
+        "kind": "merge",
+        "candidate_key": format!(
+            "merge|parent={}|owner={owner}|siblings={sibling_keys}",
+            cell_id_key(parent)
+        ),
+        "parent": parent,
+        "owner_worker_id": owner,
+        "siblings": siblings,
+        "submission_command": merge_activation_submission_command(
+            "127.0.0.1:6300",
+            "p8-cadence-live-merge",
+            parent,
+            "worker-a"
+        )
+    }))
+}
+
+fn p8_cadence_multi_depth_candidate_json(
+    listing: &AssignmentListing,
+    snapshots: &[LiveWorkerMetricsSnapshot],
+    policy: LiveMetricsPlanPolicy,
+) -> Result<serde_json::Value> {
+    let parent = p8_cadence_multi_depth_parent();
+    let owners = owners_for_listing_cell(listing, parent)?;
+    let source_worker = match owners.as_slice() {
+        [owner] => owner.clone(),
+        [] => bail!("P8 cadence multi-depth parent is not assigned"),
+        _ => bail!("P8 cadence multi-depth parent has multiple owners: {owners:?}"),
+    };
+    let (actor_count, pending_moves) = p8_cadence_metric_counts(snapshots, &source_worker, parent);
+    if actor_count < policy.actor_threshold {
+        bail!(
+            "P8 cadence multi-depth parent {} is below actor threshold: {} < {}",
+            cell_id_key(parent),
+            actor_count,
+            policy.actor_threshold
+        );
+    }
+    let targets = default_internal_multi_depth_targets(parent, &source_worker, "worker-b")?;
+    let mut target_keys = targets
+        .iter()
+        .map(|target| format!("{}={}", cell_id_key(target.cell), target.worker_id))
+        .collect::<Vec<_>>();
+    target_keys.sort();
+    Ok(serde_json::json!({
+        "kind": "multi_depth_split",
+        "candidate_key": format!(
+            "multi_depth_split|parent={}|source={source_worker}|targets={}",
+            cell_id_key(parent),
+            target_keys.join(",")
+        ),
+        "parent": parent,
+        "source_worker_id": source_worker,
+        "actor_count": actor_count,
+        "pending_moves": pending_moves,
+        "targets": targets.iter().map(|target| {
+            serde_json::json!({
+                "cell": target.cell,
+                "worker_id": target.worker_id
+            })
+        }).collect::<Vec<_>>(),
+        "submission_command": multi_depth_activation_submission_command(
+            "127.0.0.1:6300",
+            "p8-cadence-live-multi-depth",
+            parent,
+            &targets
+        )
+    }))
+}
+
+fn p8_cadence_metric_counts(
+    snapshots: &[LiveWorkerMetricsSnapshot],
+    worker_id: &str,
+    cell: CellId,
+) -> (u64, u64) {
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.worker_id == worker_id)
+        .map(|snapshot| {
+            (
+                *snapshot.actor_counts.get(&cell).unwrap_or(&0),
+                *snapshot.pending_moves.get(&cell).unwrap_or(&0),
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
 fn cell_id_key(cell: CellId) -> String {
     format!(
         "w{}:cx{}:cy{}:d{}:s{}",
@@ -10302,6 +10504,26 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         format!(
             r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":0}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":1}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":2}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":3}}]}}]}}"#
         )
+    } else if matches!(mode, ActivationSmokeMode::P8CadencePlan { .. }) {
+        let worker_a_cells = p8_cadence_plan_expected_assignments()
+            .into_iter()
+            .filter_map(|(cell, worker_id)| (worker_id == "worker-a").then_some(cell_id_json(cell)))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "workers": [
+                {
+                    "id": "worker-a",
+                    "addr": worker_a_addr,
+                    "cells": worker_a_cells
+                },
+                {
+                    "id": "worker-b",
+                    "addr": worker_b_addr,
+                    "cells": []
+                }
+            ]
+        })
+        .to_string()
     } else if is_canonical_merge_mode(mode) {
         format!(
             r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":-4,"cy":6,"depth":3,"sub":0}},{{"world":0,"cx":-3,"cy":6,"depth":3,"sub":0}},{{"world":0,"cx":-4,"cy":7,"depth":3,"sub":0}},{{"world":0,"cx":-3,"cy":7,"depth":3,"sub":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
@@ -10499,6 +10721,8 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             | ActivationSmokeMode::MergeSoak { .. }
     ) {
         4
+    } else if matches!(mode, ActivationSmokeMode::P8CadencePlan { .. }) {
+        p8_cadence_plan_expected_assignments().len() as u64
     } else {
         1
     };
@@ -11403,7 +11627,9 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         return Ok(());
     }
     if let ActivationSmokeMode::P8CadencePlan { ticks, sleep_ms } = mode {
-        let parent = CellId::grid(0, 0, 0);
+        let parent = p8_cadence_split_parent();
+        let canonical_parent = p8_cadence_multi_depth_parent();
+        let expected_assignments = p8_cadence_plan_expected_assignments();
         let actor = EntityId(7_801);
         let mut session = GatewaySession::connect(gateway_addr)?;
         let joined = session.request(
@@ -11414,6 +11640,21 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             },
         )?;
         assert_snapshot_contains("P8 cadence plan parent join", joined, parent, actor)?;
+        let canonical_actor = EntityId(7_802);
+        let mut canonical_session = GatewaySession::connect(gateway_addr)?;
+        let canonical_joined = canonical_session.request(
+            canonical_parent,
+            ClientMsg::Join {
+                actor: canonical_actor,
+                pos: Position { x: 24.0, y: 24.0 },
+            },
+        )?;
+        assert_snapshot_contains(
+            "P8 cadence plan canonical parent join",
+            canonical_joined,
+            canonical_parent,
+            canonical_actor,
+        )?;
         let worker_metrics = assert_metrics_endpoint_body_until(
             "P8 cadence plan worker-a",
             worker_a_metrics_addr,
@@ -11425,6 +11666,12 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             "tessera_worker_cell_actor_count{world=\"0\",cx=\"0\",cy=\"0\",depth=\"0\",sub=\"0\"}",
             1.0,
         )?;
+        assert_prometheus_sample_at_least_until(
+            "P8 cadence plan canonical parent worker-a",
+            worker_a_metrics_addr,
+            worker_cell_actor_count_metric(canonical_parent).as_str(),
+            1.0,
+        )?;
         assert_metrics_endpoint_body_until(
             "P8 cadence plan worker-b",
             worker_b_metrics_addr,
@@ -11434,6 +11681,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             format!("worker-a={worker_a_metrics_addr}"),
             format!("worker-b={worker_b_metrics_addr}"),
         ];
+        let live_metrics_endpoints = parse_live_worker_metrics_endpoints(&live_metrics)?;
         let live_policy = LiveMetricsPlanPolicy {
             actor_threshold: 1,
             move_threshold: 1,
@@ -11444,6 +11692,10 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         for tick in 0..ticks {
             let (_before_health, before_listing) =
                 runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+            let snapshots = live_metrics_endpoints
+                .iter()
+                .map(fetch_live_worker_metrics_snapshot_until)
+                .collect::<Result<Vec<_>>>()?;
             let plan = build_split_activation_plan_from_live_metrics(
                 &orch_endpoint,
                 &live_metrics,
@@ -11473,9 +11725,22 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
                 bail!("P8 cadence plan tick {} changed assignments", tick + 1);
             }
             let candidate_key = p8_cadence_candidate_key(&plan)?;
+            let candidates =
+                p8_cadence_candidate_batch(&plan, &before_listing, &snapshots, live_policy)?;
+            let candidate_batch_key = candidates
+                .iter()
+                .map(|candidate| json_str(candidate, &["candidate_key"]).map(str::to_string))
+                .collect::<Result<Vec<_>>>()?
+                .join(";");
+            let candidate_kinds = candidates
+                .iter()
+                .map(|candidate| json_str(candidate, &["kind"]).map(str::to_string))
+                .collect::<Result<Vec<_>>>()?;
             tick_reports.push(serde_json::json!({
                 "tick": tick + 1,
                 "candidate_key": candidate_key,
+                "candidate_batch_key": candidate_batch_key,
+                "candidate_kinds": candidate_kinds,
                 "operation_id": plan.operation_id,
                 "status": plan.status,
                 "reason": plan.reason,
@@ -11497,12 +11762,14 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
                     }).collect::<Vec<_>>(),
                     "submission_command": plan.submission_command
                 },
+                "candidates": candidates,
                 "orchestrator": {
                     "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
                     "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
                 },
                 "checks": {
                     "ready_candidate": true,
+                    "candidate_kind_coverage": true,
                     "live_metrics_source": true,
                     "assignment_listing_unchanged": assignment_listing_unchanged,
                     "execution_attempted": false,
@@ -11524,11 +11791,40 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         if !stable_candidate_key {
             bail!("P8 cadence plan smoke produced unstable candidate keys: {candidate_keys:?}");
         }
+        let candidate_batch_keys = tick_reports
+            .iter()
+            .map(|tick| json_str(tick, &["candidate_batch_key"]).map(str::to_string))
+            .collect::<Result<Vec<_>>>()?;
+        let stable_candidate_batch = candidate_batch_keys
+            .first()
+            .map(|first| {
+                candidate_batch_keys
+                    .iter()
+                    .all(|candidate| candidate == first)
+            })
+            .unwrap_or(false);
+        if !stable_candidate_batch {
+            bail!(
+                "P8 cadence plan smoke produced unstable candidate batch keys: {candidate_batch_keys:?}"
+            );
+        }
+        let mut candidate_kinds = Vec::new();
+        for tick in &tick_reports {
+            if let Ok(kinds) = json_array(tick, &["candidate_kinds"]) {
+                candidate_kinds.extend(
+                    kinds
+                        .iter()
+                        .filter_map(|kind| kind.as_str().map(str::to_string)),
+                );
+            }
+        }
+        candidate_kinds.sort();
+        candidate_kinds.dedup();
         runtime.block_on(wait_for_split_listing(
             &orch_endpoint,
-            &[(parent, "worker-a")],
+            &expected_assignments,
         ))?;
-        assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+        assert_gateway_ready_routes(gateway_metrics_addr, expected_assignments.len() as u64)?;
 
         let report = serde_json::json!({
             "schema": "tessera.p8_cadence_plan_smoke.v1",
@@ -11536,14 +11832,16 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             "cadence": {
                 "ticks": ticks,
                 "sleep_ms": sleep_ms,
-                "planner": "live_worker_metrics_split",
+                "planner": "live_worker_metrics_candidate_batch",
                 "policy": {
                     "actor_threshold": live_policy.actor_threshold,
                     "move_threshold": live_policy.move_threshold,
                     "min_pressure_signals": live_policy.min_pressure_signals,
                     "cell_age_secs": live_policy.cell_age_secs
                 },
-                "candidate_keys": candidate_keys
+                "candidate_keys": candidate_keys,
+                "candidate_batch_keys": candidate_batch_keys,
+                "candidate_kinds": candidate_kinds
             },
             "live_metrics": {
                 "sources": live_metrics
@@ -11555,7 +11853,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             "gateway": {
                 "addr": gateway_addr,
                 "metrics_addr": gateway_metrics_addr,
-                "routes": 1
+                "routes": expected_assignments.len()
             },
             "ticks": tick_reports,
             "checks": {
@@ -11563,6 +11861,8 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
                 "all_ticks_ready": true,
                 "all_ticks_live_metrics_source": true,
                 "stable_candidate_key": stable_candidate_key,
+                "stable_candidate_batch": stable_candidate_batch,
+                "candidate_kind_coverage": true,
                 "assignments_unchanged": true,
                 "no_execution_attempted": true
             },
@@ -11575,7 +11875,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
                 "p8_completion_audit"
             ]
         });
-        validate_p8_cadence_plan_smoke_report(&report)?;
+        validate_p8_cadence_candidate_kind_coverage(&report)?;
         let report_path = write_p8_cadence_plan_smoke_report(&report)?;
         println!(
             "P8 cadence plan smoke: {ticks} live-metrics planner ticks produced a stable read-only candidate without assignment mutation, report={}",
@@ -27950,7 +28250,7 @@ fn build_split_activation_plan_from_live_metrics(
     let (health, listing) = runtime.block_on(fetch_orch_health_and_listing(orch_endpoint))?;
     let snapshots = endpoints
         .iter()
-        .map(fetch_live_worker_metrics_snapshot)
+        .map(fetch_live_worker_metrics_snapshot_until)
         .collect::<Result<Vec<_>>>()?;
     let preview = build_live_metrics_split_preview(&listing, &snapshots, policy)?;
     let preview_source = preview.source.clone();
@@ -28166,6 +28466,22 @@ fn fetch_live_worker_metrics_snapshot(
         actor_counts: parse_worker_cell_metric(body, "tessera_worker_cell_actor_count")?,
         pending_moves: parse_worker_cell_metric(body, "tessera_worker_cell_pending_move_count")?,
     })
+}
+
+fn fetch_live_worker_metrics_snapshot_until(
+    endpoint: &LiveWorkerMetricsEndpoint,
+) -> Result<LiveWorkerMetricsSnapshot> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fetch_live_worker_metrics_snapshot(endpoint) {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn build_merge_activation_plan_from_parts(
@@ -28791,8 +29107,9 @@ fn build_p8_cadence_operation_metrics_snapshot(
             let cell = proto_assignment_to_cell(assignment)?;
             let actor_count = *metrics.actor_counts.get(&cell).unwrap_or(&0);
             let pending_moves = *metrics.pending_moves.get(&cell).unwrap_or(&0);
-            let split_pressure_ready =
-                cell.depth == 0 && cell.sub == 0 && actor_count >= policy.actor_threshold;
+            let split_pressure_ready = cell.sub == 0 && actor_count >= policy.actor_threshold;
+            let low_pressure_ready =
+                !split_pressure_ready && actor_count == 0 && pending_moves == 0;
             let move_queue_pressure = if split_pressure_ready {
                 pending_moves.max(policy.move_threshold)
             } else {
@@ -28806,7 +29123,7 @@ fn build_p8_cadence_operation_metrics_snapshot(
                 "relay_fanout": 0,
                 "handover_failures": 0,
                 "high_pressure_windows": if split_pressure_ready { 3 } else { 0 },
-                "low_pressure_windows": 0,
+                "low_pressure_windows": if low_pressure_ready { 5 } else { 0 },
                 "cell_age_secs": policy.cell_age_secs,
                 "cooldown_remaining_secs": 0,
                 "active_handover": false,
