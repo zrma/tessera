@@ -109,6 +109,10 @@ This document is the repo-local quality map for agents. It keeps the expected au
   counter evidence. Failure/recovery evidence is covered by `cargo xt dev
   p8-cadence-recovery-smoke`, which publishes the same bounded cadence path,
   injects a target Worker outage, records `recovery_required` without automatic
-  rollback, and verifies operator Worker restart recovery. Restart/soak,
-  internal rollout, and P8 completion audit remain future P8 slices.
+  rollback, and verifies operator Worker restart recovery. Orchestrator restart
+  recovery is covered by `cargo xt dev p8-cadence-restart-smoke`, which mounts a
+  P8 assignment state path, restarts the Orchestrator after approved bounded
+  publish, verifies ledger/assignment recovery, and completes post-restart
+  observation. Soak, internal rollout, and P8 completion audit remain future P8
+  slices.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
