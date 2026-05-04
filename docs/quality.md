@@ -117,8 +117,19 @@ This document is the repo-local quality map for agents. It keeps the expected au
   p8-cadence-soak-smoke`, which keeps the bounded cadence path under sustained
   post-execution Ping/Move traffic and records route convergence, Worker child
   refresh, remote AOI frames, clean close counters, and completed observation.
-  `cargo xt p8-completion-audit --json` now aggregates the P8 local cadence
+  `cargo xt k8s p8-cadence-smoke --allow-execution` is the guarded internal
+  MicroK8s helper for the P8 runtime-affecting path: it requires the GitOps
+  smoke window to expose manual operation execution, manual split/merge
+  activation, a P8 preview path, a P8 operation ledger/state path, and
+  budget/concurrency gates; it then writes a live Worker metrics preview
+  snapshot into the Orchestrator PVC, publishes one approved bounded split
+  operation, proves repeat execution idempotency, runs child-route soak, and
+  records `.dev/reports/internal-microk8s-p8-cadence-smoke-latest.json`.
+  `cargo xt k8s p8-cadence-cleanup-check` must run after the GitOps cleanup
+  revision; it verifies ArgoCD `Synced / Healthy`, image match, default-off
+  execution/activation env, preview fixture removal, and finalizes that report.
+  `cargo xt p8-completion-audit --json` aggregates the P8 local cadence
   evidence, including stable split/merge/canonical multi-depth candidate
   coverage, and is expected to fail until the P8 GitOps rollout/default-off
-  report and the internal controlled cadence smoke are covered.
+  report and finalized internal controlled cadence smoke are covered.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

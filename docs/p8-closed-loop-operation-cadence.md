@@ -73,11 +73,11 @@ cargo xt p8-completion-audit --json
 ```
 
 As of 2026-05-05 this is intentionally incomplete. It must stay
-`complete=false` until the audit findings for the P8 GitOps rollout/default-off
-report and the internal MicroK8s controlled cadence smoke have concrete
-evidence. The local read-only cadence now records stable split, merge, and
-canonical multi-depth candidate batches from live Worker metrics and assignment
-state.
+`complete=false` until the audit finding for the internal MicroK8s controlled
+cadence smoke has concrete evidence. The P8 GitOps rollout/default-off report
+exists for the `v2026.05.7` rollout, and the local read-only cadence now records
+stable split, merge, and canonical multi-depth candidate batches from live
+Worker metrics and assignment state.
 
 ## Initial Implementation Order
 
@@ -124,9 +124,19 @@ state.
 8. **Image and GitOps rollout**: publish a new runtime image, promote through
    the k8s GitOps repo, wait for ArgoCD `Synced / Healthy`, and verify image
    match.
-9. **Internal controlled cadence smoke**: run the approved bounded cadence
-   against MicroK8s, record report checker evidence, then clean up mutating
-   flags and preview fixtures to default-off.
+9. **Internal controlled cadence smoke**: open a GitOps smoke window with
+   `TESSERA_ORCH_OPERATION_EXECUTION=manual`,
+   `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`, a P8 preview path, P8
+   assignment/ledger paths, and bounded budget/concurrency gates. Then run
+   `cargo xt k8s p8-cadence-smoke --context microk8s-ts --namespace tessera
+   --expected-image <new-tag> --allow-execution` to materialize live Worker
+   metrics into the Orchestrator PVC preview snapshot, approve and publish one
+   bounded split operation, prove repeat execution idempotency, run child-route
+   soak, and close observation. After the GitOps cleanup revision removes the
+   mutating env and preview fixture, run `cargo xt k8s
+   p8-cadence-cleanup-check --context microk8s-ts --namespace tessera
+   --expected-image <new-tag>` to finalize
+   `.dev/reports/internal-microk8s-p8-cadence-smoke-latest.json`.
 10. **Completion audit**: `cargo xt p8-completion-audit --json` maps every
     criterion to concrete local, internal, cleanup, and CI evidence and fails
     until the remaining runtime gates are closed.

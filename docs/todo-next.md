@@ -177,11 +177,14 @@ Recommended P8 slices:
 10. Done operationally: `build: publish p8 cadence runtime image` - published
    the P8 cadence runtime image after local P8 gates were green and promoted the
    tag through the k8s GitOps repo. The P8-specific rollout/default-off report
-   artifact is still required by the completion audit.
+   now covers the `v2026.05.7` deployment and default-off baseline.
 11. Done: `test: add p8 completion audit` - `cargo xt
    p8-completion-audit --json` now aggregates local cadence evidence and fails
    until the P8 GitOps rollout/default-off report and internal MicroK8s
    controlled cadence smoke are covered.
-12. `test: add internal p8 cadence smoke` - wait for ArgoCD `Synced / Healthy`,
-   run controlled internal cadence smoke, restore default-off state, and close
-   the remaining P8 completion audit findings.
+12. In progress: `test: add internal p8 cadence smoke` - `cargo xt k8s
+   p8-cadence-smoke --allow-execution` records the controlled internal cadence
+   execution evidence while the GitOps smoke window is open, and `cargo xt k8s
+   p8-cadence-cleanup-check` finalizes the same report after default-off cleanup.
+   The remaining P8 completion audit finding is the actual internal smoke and
+   cleanup evidence.
