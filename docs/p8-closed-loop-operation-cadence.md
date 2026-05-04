@@ -92,9 +92,12 @@ P8 is complete only when all of these are true:
    window and before the default-off executor block. Evidence is
    `.dev/reports/p8-cadence-gate-smoke-latest.json` plus per-case gate ledger
    files.
-6. **Bounded local execution cadence**: run a small approved cadence window that
-   executes one operation set, observes it, and proves repeated execution is
-   idempotent.
+6. **Bounded local execution cadence**: `cargo xt dev
+   p8-cadence-execution-smoke` runs a small approved cadence window from a
+   live-metrics proposal, executes one operation set, observes it to completion,
+   and proves repeated execution is idempotent. Evidence is
+   `.dev/reports/p8-cadence-execution-smoke-latest.json` plus
+   `.dev/reports/p8-cadence-execution-ledger-latest.json`.
 7. **Failure/restart/soak cadence evidence**: extend the bounded cadence through
    recovery-required, Orchestrator restart, and soak reports.
 8. **Image and GitOps rollout**: publish a new runtime image, promote through

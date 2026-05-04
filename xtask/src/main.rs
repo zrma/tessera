@@ -952,6 +952,12 @@ enum DevSub {
     },
     /// Start Orchestrator-only cases and prove P8 cadence cooldown/budget/concurrency gates
     P8CadenceGateSmoke,
+    /// Start a two-worker dev stack and prove P8 bounded approved execution cadence
+    P8CadenceExecutionSmoke {
+        /// Number of actors to join on the parent cell before bounded execution
+        #[arg(long, default_value_t = 105)]
+        actors: u32,
+    },
     /// Start an Orchestrator-only dev stack and prove the P7 proposal/approval/default-off execution loop
     P7OperationLoopSmoke,
     /// Start an Orchestrator-only dev stack and prove approved P7 merge execution publishes once
@@ -1792,6 +1798,7 @@ fn main() -> Result<()> {
             } => dev_p8_cadence_proposal_smoke(ticks, sleep_ms, actors)?,
             DevSub::P8CadenceApprovalSmoke { actors } => dev_p8_cadence_approval_smoke(actors)?,
             DevSub::P8CadenceGateSmoke => dev_p8_cadence_gate_smoke()?,
+            DevSub::P8CadenceExecutionSmoke { actors } => dev_p8_cadence_execution_smoke(actors)?,
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
@@ -2568,6 +2575,9 @@ enum ActivationSmokeMode {
     P8CadenceApproval {
         actors: u32,
     },
+    P8CadenceExecution {
+        actors: u32,
+    },
     MergePlan,
     PlannerMutation,
     MergeActivation,
@@ -2661,6 +2671,13 @@ fn dev_p8_cadence_approval_smoke(actors: u32) -> Result<()> {
         bail!("P8 cadence approval smoke requires --actors >= 100 for default planner thresholds");
     }
     dev_activation_smoke_inner(ActivationSmokeMode::P8CadenceApproval { actors })
+}
+
+fn dev_p8_cadence_execution_smoke(actors: u32) -> Result<()> {
+    if actors < 100 {
+        bail!("P8 cadence execution smoke requires --actors >= 100 for default planner thresholds");
+    }
+    dev_activation_smoke_inner(ActivationSmokeMode::P8CadenceExecution { actors })
 }
 
 fn dev_p8_cadence_gate_smoke() -> Result<()> {
@@ -10139,10 +10156,10 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
     let assignment_state_path = root
         .join(".dev/reports")
         .join("activation-restart-assignment-state.json");
-    let p8_operation_prefix = if matches!(mode, ActivationSmokeMode::P8CadenceApproval { .. }) {
-        "p8-cadence-approval"
-    } else {
-        "p8-cadence-proposal"
+    let p8_operation_prefix = match mode {
+        ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval",
+        ActivationSmokeMode::P8CadenceExecution { .. } => "p8-cadence-execution",
+        _ => "p8-cadence-proposal",
     };
     let p8_proposal_preview_path = root
         .join(".dev/reports")
@@ -10160,6 +10177,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         mode,
         ActivationSmokeMode::P8CadenceProposal { .. }
             | ActivationSmokeMode::P8CadenceApproval { .. }
+            | ActivationSmokeMode::P8CadenceExecution { .. }
     ) {
         if let Some(parent) = p8_proposal_preview_path.parent() {
             fs::create_dir_all(parent)?;
@@ -10264,6 +10282,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         mode,
         ActivationSmokeMode::P8CadenceProposal { .. }
             | ActivationSmokeMode::P8CadenceApproval { .. }
+            | ActivationSmokeMode::P8CadenceExecution { .. }
     ) {
         orch_envs.push((
             "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH",
@@ -10273,6 +10292,11 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             "TESSERA_ORCH_OPERATION_LEDGER_PATH",
             p8_proposal_ledger_path_raw.as_str(),
         ));
+    }
+    if matches!(mode, ActivationSmokeMode::P8CadenceExecution { .. }) {
+        orch_envs.push(("TESSERA_ORCH_OPERATION_EXECUTION", "manual"));
+        orch_envs.push(("TESSERA_ORCH_OPERATION_BUDGET_LIMITS", "p8-cadence-local=1"));
+        orch_envs.push(("TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY", "1"));
     }
 
     let mut stack = ManagedDevStack::default();
@@ -12075,6 +12099,394 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         );
         return Ok(());
     }
+    if let ActivationSmokeMode::P8CadenceExecution { actors } = mode {
+        let parent = CellId::grid(0, 0, 0);
+        let actor_child0 = EntityId(8_301);
+        let actor_child3 = EntityId(8_302);
+        let _child0_session = open_gateway_join_until_snapshot(
+            gateway_addr,
+            parent,
+            actor_child0,
+            activation_soak_position(0),
+        )?;
+        let mut child3_session = open_gateway_join_until_snapshot(
+            gateway_addr,
+            parent,
+            actor_child3,
+            activation_soak_position(3),
+        )?;
+        let mut filler_session = GatewaySession::connect(gateway_addr)?;
+        for idx in 2..actors {
+            let actor = EntityId(8_400 + u64::from(idx));
+            let joined = filler_session.request(
+                parent,
+                ClientMsg::Join {
+                    actor,
+                    pos: activation_soak_position((idx % 4) as u8),
+                },
+            )?;
+            assert_snapshot_contains("P8 cadence execution parent join", joined, parent, actor)?;
+        }
+
+        let parent_metric = worker_cell_actor_count_metric(parent);
+        let actor_count_after_join = assert_prometheus_sample_at_least_until(
+            "P8 cadence execution worker-a",
+            worker_a_metrics_addr,
+            parent_metric.as_str(),
+            f64::from(actors),
+        )?;
+        assert_metrics_endpoint_body_until(
+            "P8 cadence execution worker-b",
+            worker_b_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+        let gateway_metrics_before = assert_metrics_endpoint_body_until(
+            "P8 cadence execution gateway before",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_routes_before =
+            prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+        let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+
+        let live_metrics = vec![
+            format!("worker-a={worker_a_metrics_addr}"),
+            format!("worker-b={worker_b_metrics_addr}"),
+        ];
+        let live_metrics_endpoints = parse_live_worker_metrics_endpoints(&live_metrics)?;
+        let live_policy = LiveMetricsPlanPolicy::default();
+        let (before_health, before_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let snapshots = live_metrics_endpoints
+            .iter()
+            .map(fetch_live_worker_metrics_snapshot)
+            .collect::<Result<Vec<_>>>()?;
+        let source_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.worker_id == "worker-a")
+            .ok_or_else(|| anyhow::anyhow!("P8 cadence execution missing worker-a metrics"))?;
+        let live_parent_actor_count = *source_snapshot.actor_counts.get(&parent).unwrap_or(&0);
+        if live_parent_actor_count < u64::from(actors) {
+            bail!(
+                "P8 cadence execution expected at least {actors} live parent actors, got {live_parent_actor_count}"
+            );
+        }
+        let live_parent_pending_moves = *source_snapshot.pending_moves.get(&parent).unwrap_or(&0);
+        let preview_snapshot =
+            build_p8_cadence_operation_metrics_snapshot(&before_listing, &snapshots, live_policy)?;
+        fs::write(
+            &p8_proposal_preview_path,
+            format!("{}\n", serde_json::to_string_pretty(&preview_snapshot)?),
+        )
+        .with_context(|| {
+            format!(
+                "write P8 cadence execution preview {}",
+                p8_proposal_preview_path.display()
+            )
+        })?;
+
+        let proposal_response = http_json_post(
+            "P8 cadence execution proposal",
+            orch_metrics_addr,
+            "/operations/proposals",
+        )?;
+        assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+        assert_json_number_at_least(&proposal_response, &["planned_count"], 1.0)?;
+        assert_json_number_eq(&proposal_response, &["recorded_count"], 1.0)?;
+        let operation_id = p8_cadence_operation_ids(&proposal_response)?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("P8 cadence execution proposal has no operation id"))?;
+        let proposal_snapshot = http_json_get(
+            "P8 cadence execution ledger",
+            orch_metrics_addr,
+            "/operations",
+        )?;
+        let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+        assert_json_str_eq(proposal_record, &["kind"], "split")?;
+        let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+        let policy_id = "operator_approved_dynamic_operation_v1";
+
+        let approval_response = http_json_post(
+            "P8 cadence execution approval",
+            orch_metrics_addr,
+            &format!(
+                "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p8-cadence-execution-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p8-cadence-root-w0&budget_key=p8-cadence-local"
+            ),
+        )?;
+        assert_json_str_eq(&approval_response, &["status"], "approved")?;
+        assert_json_bool_eq(&approval_response, &["assignments_changed"], false)?;
+
+        let execution_response = http_json_post(
+            "P8 cadence execution",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+            ),
+        )?;
+        assert_json_str_eq(&execution_response, &["status"], "published")?;
+        assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+        assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+        assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+        let repeat_execution_response = http_json_post(
+            "P8 cadence execution repeat",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+            ),
+        )?;
+        assert_json_str_eq(&repeat_execution_response, &["status"], "already_published")?;
+        assert_json_bool_eq(&repeat_execution_response, &["assignments_changed"], false)?;
+        assert_json_bool_eq(&repeat_execution_response, &["mutation_attempted"], false)?;
+
+        let expected_children = [
+            (activation_child_cell(0), "worker-a"),
+            (activation_child_cell(1), "worker-b"),
+            (activation_child_cell(2), "worker-a"),
+            (activation_child_cell(3), "worker-b"),
+        ];
+        runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+        for (idx, (child, _worker_id)) in expected_children.iter().enumerate() {
+            assert_gateway_ping_until(gateway_addr, *child, 8_880 + idx as u64)?;
+        }
+
+        let child3 = activation_child_cell(3);
+        let child_move_observed = request_move_until_delta(
+            &mut child3_session,
+            child3,
+            actor_child3,
+            1.0,
+            1.0,
+            "P8 cadence execution child move",
+        )?;
+        let child0 = activation_child_cell(0);
+        let worker_a_child_metric = worker_cell_actor_count_metric(child0);
+        let worker_b_child_metric = worker_cell_actor_count_metric(child3);
+        let worker_a_metrics = assert_metrics_endpoint_body_until(
+            "P8 cadence execution worker-a children",
+            worker_a_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+        let worker_b_metrics = assert_metrics_endpoint_body_until(
+            "P8 cadence execution worker-b children",
+            worker_b_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+        assert_prometheus_sample_at_least(
+            "P8 cadence execution worker-a child",
+            &worker_a_metrics,
+            worker_a_child_metric.as_str(),
+            1.0,
+        )?;
+        assert_prometheus_sample_at_least(
+            "P8 cadence execution worker-b child",
+            &worker_b_metrics,
+            worker_b_child_metric.as_str(),
+            1.0,
+        )?;
+        let worker_a_child_actor_count =
+            prometheus_sample_value(&worker_a_metrics, worker_a_child_metric.as_str())?;
+        let worker_b_child_actor_count =
+            prometheus_sample_value(&worker_b_metrics, worker_b_child_metric.as_str())?;
+
+        let gateway_metrics_after = assert_metrics_endpoint_body_until(
+            "P8 cadence execution gateway after",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_ping_roundtrip_seconds_count",
+                "tessera_gateway_request_roundtrip_seconds_count",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_routes_after =
+            prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_routes")?;
+        assert_prometheus_sample_at_least(
+            "P8 cadence execution gateway",
+            &gateway_metrics_after,
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            4.0,
+        )?;
+        assert_prometheus_sample_at_least(
+            "P8 cadence execution gateway",
+            &gateway_metrics_after,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+            f64::from(actors),
+        )?;
+        assert_prometheus_sample_at_least(
+            "P8 cadence execution gateway",
+            &gateway_metrics_after,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+            1.0,
+        )?;
+        let gateway_close_after = gateway_close_counters_from_metrics(&gateway_metrics_after)?;
+        assert_gateway_close_counters_not_increased(
+            "P8 cadence execution gateway",
+            gateway_close_before,
+            gateway_close_after,
+        )?;
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+        let route_converged = (gateway_routes_after - 4.0).abs() < f64::EPSILON;
+        let worker_refreshed =
+            worker_a_child_actor_count >= 1.0 && worker_b_child_actor_count >= 1.0;
+        let traffic_confirmed = prometheus_sample_value(
+            &gateway_metrics_after,
+            "tessera_gateway_ping_roundtrip_seconds_count",
+        )? >= 4.0
+            && prometheus_sample_value(
+                &gateway_metrics_after,
+                "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+            )? >= 1.0;
+        let counters_clean = gateway_close_before == gateway_close_after;
+        if !(route_converged && worker_refreshed && traffic_confirmed && counters_clean) {
+            bail!(
+                "P8 cadence execution observation evidence incomplete: route_converged={route_converged} worker_refreshed={worker_refreshed} traffic_confirmed={traffic_confirmed} counters_clean={counters_clean}"
+            );
+        }
+
+        let observation_response = http_json_post(
+            "P8 cadence execution observation",
+            orch_metrics_addr,
+            &format!(
+                "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=p8-cadence-execution-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true"
+            ),
+        )?;
+        assert_json_str_eq(&observation_response, &["status"], "completed")?;
+        assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+        assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
+
+        let ledger = read_json_report(&p8_proposal_ledger_path)?;
+        let ledger_summary = validate_p7_operation_ledger(&ledger, true, false, true, true, false)?;
+        let operation_record = find_p7_operation_record(&ledger, &operation_id)?;
+        validate_p7_completed_observation(operation_record)?;
+
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_execution_smoke.v1",
+            "unix_secs": unix_timestamp_secs(),
+            "cadence": {
+                "actors": actors,
+                "planner": "operation_proposals_from_live_metrics_snapshot",
+                "bounded_operation_limit": 1,
+                "operation_id": operation_id.as_str()
+            },
+            "operation": {
+                "operation_id": operation_id.as_str(),
+                "kind": "split",
+                "proposal_hash": proposal_hash.as_str(),
+                "policy_id": policy_id
+            },
+            "live_metrics": {
+                "sources": live_metrics,
+                "parent_actor_count": live_parent_actor_count,
+                "parent_pending_moves": live_parent_pending_moves,
+                "actor_count_after_join": actor_count_after_join
+            },
+            "approval": {
+                "policy_id": policy_id,
+                "approver": "p8-cadence-execution-smoke",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local",
+                "proposal_hash": proposal_hash.as_str()
+            },
+            "gate_policy": {
+                "budget_limits": {"p8-cadence-local": 1},
+                "max_in_flight_per_budget_key": 1
+            },
+            "preview_snapshot": {
+                "path": p8_proposal_preview_path_raw.as_str()
+            },
+            "orchestrator": {
+                "grpc_addr": orch_addr,
+                "metrics_addr": orch_metrics_addr,
+                "registered_workers": before_health.registered_workers,
+                "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+                "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+            },
+            "gateway": {
+                "addr": gateway_addr,
+                "metrics_addr": gateway_metrics_addr,
+                "routes_before": gateway_routes_before,
+                "routes_after": gateway_routes_after,
+                "ping_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_ping_roundtrip_seconds_count")?,
+                "join_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}")?,
+                "move_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}")?,
+                "close_counters": {
+                    "before": gateway_close_counters_json(gateway_close_before),
+                    "after": gateway_close_counters_json(gateway_close_after)
+                }
+            },
+            "worker": {
+                "worker_a_addr": worker_a_addr,
+                "worker_a_metrics_addr": worker_a_metrics_addr,
+                "worker_b_addr": worker_b_addr,
+                "worker_b_metrics_addr": worker_b_metrics_addr,
+                "worker_a_child_actor_count": worker_a_child_actor_count,
+                "worker_b_child_actor_count": worker_b_child_actor_count
+            },
+            "ledger": {
+                "path": p8_proposal_ledger_path_raw.as_str(),
+                "records": ledger_summary.records,
+                "proposal_records": ledger_summary.proposal_records,
+                "approval_records": ledger_summary.approval_records,
+                "published_execution_records": ledger_summary.published_execution_records,
+                "completed_observation_records": ledger_summary.completed_observation_records
+            },
+            "responses": {
+                "proposal": proposal_response,
+                "approval": approval_response,
+                "execution": execution_response,
+                "repeat_execution": repeat_execution_response,
+                "observation": observation_response
+            },
+            "checks": {
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "gate_policy_allowed": true,
+                "bounded_operation_limit_respected": true,
+                "bounded_execution_published": true,
+                "repeat_execution_idempotent": true,
+                "child_assignments_published": true,
+                "parent_assignment_removed": true,
+                "child_routes_converged": route_converged,
+                "worker_child_refresh": worker_refreshed,
+                "child_traffic_confirmed": traffic_confirmed,
+                "gateway_close_counters_clean": counters_clean,
+                "stable_session_child_move": true,
+                "observation_completed": true,
+                "ledger_observation_completed": true
+            },
+            "frames": {
+                "ignored_before_child_delta": child_move_observed.ignored_frames,
+                "remote_delta_before_child_delta": child_move_observed.remote_delta_frames,
+                "remote_snapshot_before_child_delta": child_move_observed.remote_snapshot_frames
+            },
+            "remaining_uncovered": [
+                "p8_failure_restart_soak",
+                "internal_microk8s_p8_cadence_smoke",
+                "p8_completion_audit"
+            ]
+        });
+        validate_p8_cadence_execution_smoke_report(&report)?;
+        let report_path = write_p8_cadence_execution_smoke_report(&report)?;
+        println!(
+            "P8 cadence execution smoke: live-metrics proposal was approved, bounded manual execution published once, repeat execution stayed idempotent, and observation completed, report={}, ledger={}",
+            report_path.display(),
+            p8_proposal_ledger_path.display()
+        );
+        return Ok(());
+    }
 
     let parent = CellId::grid(0, 0, 0);
     let actor = EntityId(if mode == ActivationSmokeMode::LiveMetricsActivation {
@@ -12100,6 +12512,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::P8CadencePlan { .. } => "p8-cadence-plan-smoke",
         ActivationSmokeMode::P8CadenceProposal { .. } => "p8-cadence-proposal-smoke",
         ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval-smoke",
+        ActivationSmokeMode::P8CadenceExecution { .. } => "p8-cadence-execution-smoke",
         ActivationSmokeMode::MergePlan => "merge-plan-smoke",
         ActivationSmokeMode::PlannerMutation => "planner-mutation-smoke",
         ActivationSmokeMode::MergeActivation => "merge-activation-smoke",
@@ -19245,6 +19658,12 @@ fn default_p8_cadence_gate_smoke_path() -> PathBuf {
         .join("p8-cadence-gate-smoke-latest.json")
 }
 
+fn default_p8_cadence_execution_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p8-cadence-execution-smoke-latest.json")
+}
+
 fn default_p7_operation_loop_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -19455,6 +19874,20 @@ fn write_p8_cadence_gate_smoke_report(report: &serde_json::Value) -> Result<Path
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p8_cadence_gate_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p8_cadence_execution_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p8-cadence-execution-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p8_cadence_execution_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -22605,6 +23038,81 @@ fn validate_p8_cadence_gate_smoke_report(report: &serde_json::Value) -> Result<(
         assert_json_bool_eq(case, &["checks", "mutation_attempted"], false)?;
         assert_json_bool_eq(case, &["checks", "mutation_allowed"], false)?;
     }
+    Ok(())
+}
+
+fn validate_p8_cadence_execution_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p8_cadence_execution_smoke.v1")?;
+    assert_json_bool_eq(report, &["checks", "live_metrics_materialized"], true)?;
+    assert_json_bool_eq(report, &["checks", "proposal_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "gate_policy_allowed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "bounded_operation_limit_respected"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "bounded_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "repeat_execution_idempotent"], true)?;
+    assert_json_bool_eq(report, &["checks", "child_assignments_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "parent_assignment_removed"], true)?;
+    assert_json_bool_eq(report, &["checks", "child_routes_converged"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_child_refresh"], true)?;
+    assert_json_bool_eq(report, &["checks", "child_traffic_confirmed"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "stable_session_child_move"], true)?;
+    assert_json_bool_eq(report, &["checks", "observation_completed"], true)?;
+    assert_json_bool_eq(report, &["checks", "ledger_observation_completed"], true)?;
+    assert_json_number_eq(report, &["cadence", "bounded_operation_limit"], 1.0)?;
+    assert_json_number_at_least(report, &["live_metrics", "parent_actor_count"], 100.0)?;
+    assert_json_str_eq(report, &["operation", "kind"], "split")?;
+    assert_json_str_eq(
+        report,
+        &["approval", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    assert_json_str_eq(report, &["approval", "cooldown_key"], "p8-cadence-root-w0")?;
+    assert_json_str_eq(report, &["approval", "budget_key"], "p8-cadence-local")?;
+    assert_json_number_eq(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "published_execution_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "completed_observation_records"], 1.0)?;
+    assert_json_number_eq(report, &["responses", "proposal", "recorded_count"], 1.0)?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(report, &["responses", "execution", "status"], "published")?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_attempted"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "mutation_allowed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "execution", "assignments_changed"],
+        true,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "repeat_execution", "status"],
+        "already_published",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "repeat_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_str_eq(report, &["responses", "observation", "status"], "completed")?;
+    assert_json_number_eq(report, &["gateway", "routes_before"], 1.0)?;
+    assert_json_number_eq(report, &["gateway", "routes_after"], 4.0)?;
+    assert_json_number_at_least(report, &["gateway", "ping_roundtrips"], 4.0)?;
+    assert_json_number_at_least(report, &["gateway", "move_roundtrips"], 1.0)?;
+    assert_json_number_at_least(report, &["worker", "worker_a_child_actor_count"], 1.0)?;
+    assert_json_number_at_least(report, &["worker", "worker_b_child_actor_count"], 1.0)?;
     Ok(())
 }
 
@@ -32608,6 +33116,86 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
         });
 
         validate_p8_cadence_gate_smoke_report(&report).expect("valid P8 cadence gate smoke report");
+    }
+
+    #[test]
+    fn p8_cadence_execution_smoke_report_accepts_bounded_completed_execution() {
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_execution_smoke.v1",
+            "cadence": {
+                "bounded_operation_limit": 1
+            },
+            "operation": {
+                "kind": "split"
+            },
+            "live_metrics": {
+                "parent_actor_count": 105
+            },
+            "approval": {
+                "policy_id": "operator_approved_dynamic_operation_v1",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local"
+            },
+            "ledger": {
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "published_execution_records": 1,
+                "completed_observation_records": 1
+            },
+            "responses": {
+                "proposal": {
+                    "recorded_count": 1
+                },
+                "approval": {
+                    "status": "approved"
+                },
+                "execution": {
+                    "status": "published",
+                    "mutation_attempted": true,
+                    "mutation_allowed": true,
+                    "assignments_changed": true
+                },
+                "repeat_execution": {
+                    "status": "already_published",
+                    "mutation_attempted": false
+                },
+                "observation": {
+                    "status": "completed"
+                }
+            },
+            "gateway": {
+                "routes_before": 1,
+                "routes_after": 4,
+                "ping_roundtrips": 4,
+                "move_roundtrips": 1
+            },
+            "worker": {
+                "worker_a_child_actor_count": 1,
+                "worker_b_child_actor_count": 1
+            },
+            "checks": {
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "gate_policy_allowed": true,
+                "bounded_operation_limit_respected": true,
+                "bounded_execution_published": true,
+                "repeat_execution_idempotent": true,
+                "child_assignments_published": true,
+                "parent_assignment_removed": true,
+                "child_routes_converged": true,
+                "worker_child_refresh": true,
+                "child_traffic_confirmed": true,
+                "gateway_close_counters_clean": true,
+                "stable_session_child_move": true,
+                "observation_completed": true,
+                "ledger_observation_completed": true
+            }
+        });
+
+        validate_p8_cadence_execution_smoke_report(&report)
+            .expect("valid P8 cadence execution smoke report");
     }
 
     #[test]

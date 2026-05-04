@@ -159,8 +159,9 @@ Recommended P8 slices:
    per-budget-key limits, and max in-flight operations per budget key, with
    `cargo xt dev p8-cadence-gate-smoke` proving each gate blocks before
    default-off execution and without mutation.
-6. `test: add p8 bounded execution cadence smoke` - execute one approved
-   bounded local operation set, observe it to completion, and prove duplicate
+6. Done: `test: add p8 bounded execution cadence smoke` - `cargo xt dev
+   p8-cadence-execution-smoke` executes one approved bounded local operation
+   set from live Worker metrics, observes it to completion, and proves duplicate
    execution remains idempotent.
 7. `test: add p8 cadence failure restart soak smokes` - extend the bounded
    cadence through recovery-required, Orchestrator restart, and soak evidence.
