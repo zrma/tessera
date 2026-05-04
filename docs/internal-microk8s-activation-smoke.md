@@ -1,6 +1,6 @@
 # Internal MicroK8s Activation Smoke Evidence
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-04
 
 This is the controlled internal-cluster gate for turning the local
 default-off/manual split activation harness into cluster evidence. The
@@ -362,9 +362,9 @@ The command stopped before mutation with
 `stage=blocked_before_activation`, `activation_mutated=false`,
 `plan.status=no_split_candidate`, `plan.preview.source=live_worker_metrics:...`,
 `plan.preview.plan_count=0`, and all recorded deployment images still matching
-`v2026.05.2`. This verifies the read-only helper path and records that live
-metrics internal completion still needs a new image/evidence run that produces a
-ready plan.
+`v2026.05.2`. This verifies the read-only helper path and records why that
+particular run could not close live-metrics internal completion without a later
+image/evidence run that produced a ready plan.
 
 Policy-gated planner mutation from live metrics is currently covered by local
 evidence only (`cargo xt dev activation-live-planner-mutation-smoke`). The

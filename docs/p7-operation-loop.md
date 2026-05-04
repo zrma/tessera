@@ -67,11 +67,12 @@ Current completion audit:
 cargo xt p7-completion-audit --json
 ```
 
-As of the `v2026.05.5` internal operation-loop evidence set, this returns
+As of the `v2026.05.6` internal operation-loop evidence set, this returns
 `complete=true` with an empty `findings` list. It aggregates the local
 default-off/execution/observation/recovery/restart/soak reports, the GitOps
-rollout/default-off cleanup report, and the three internal MicroK8s operation
-reports for execution+soak, failure/recovery, and restart recovery.
+rollout/default-off cleanup report, the internal MicroK8s operation reports for
+execution+soak, failure/recovery, restart recovery, and canonical multi-depth
+operation child-route soak/observation.
 
 Current ledger verifier:
 
@@ -145,8 +146,8 @@ parent assignment is removed and four child assignments are published, then
 verifies repeat execution returns `already_published` without another mutation.
 It writes `.dev/reports/p7-operation-split-execution-smoke-latest.json` plus
 `.dev/reports/p7-operation-split-execution-ledger-latest.json`. Split
-failure/recovery, restart, soak, and internal MicroK8s evidence remain explicit
-P7+ follow-up gates.
+failure/recovery, restart, and soak are covered below; internal rollout/audit
+evidence is summarized in the internal baseline section.
 
 Current canonical multi-depth execution expansion smoke:
 
@@ -170,7 +171,8 @@ child route, remote AOI resync is observed, and repeat execution returns
 `.dev/reports/p7-operation-multi-depth-execution-smoke-latest.json` plus
 `.dev/reports/p7-operation-multi-depth-execution-ledger-latest.json`.
 Canonical multi-depth observation, recovery, restart, and soak are covered
-below; internal MicroK8s evidence remains an explicit P7+ follow-up gate.
+below; internal rollout/audit evidence is summarized in the internal baseline
+section.
 
 Current canonical multi-depth observation expansion smoke:
 
@@ -192,8 +194,8 @@ remote AOI resync, traffic metrics, and clean close counters, then records
 `POST /operations/observations` as `status=completed`. It writes
 `.dev/reports/p7-operation-multi-depth-observation-smoke-latest.json` plus
 `.dev/reports/p7-operation-multi-depth-observation-ledger-latest.json`.
-Canonical multi-depth recovery and restart are covered below; soak and internal
-MicroK8s evidence remain explicit P7+ follow-up gates.
+Canonical multi-depth recovery, restart, and soak are covered below; internal
+rollout/audit evidence is summarized in the internal baseline section.
 
 Current canonical multi-depth recovery expansion smoke:
 
@@ -215,8 +217,8 @@ as `status=recovery_required`, then restarts the target Worker and verifies
 canonical child route traffic recovers without automatic rollback. It writes
 `.dev/reports/p7-operation-multi-depth-recovery-smoke-latest.json` plus
 `.dev/reports/p7-operation-multi-depth-recovery-ledger-latest.json`.
-Canonical multi-depth restart is covered below; soak and internal MicroK8s
-evidence remain explicit P7+ follow-up gates.
+Canonical multi-depth restart and soak are covered below; internal rollout/audit
+evidence is summarized in the internal baseline section.
 
 Current canonical multi-depth restart expansion smoke:
 
@@ -237,8 +239,8 @@ stable-session child Move, Worker child refresh, and remote AOI resync after
 restart, then records `POST /operations/observations` as `status=completed`. It
 writes `.dev/reports/p7-operation-multi-depth-restart-smoke-latest.json` plus
 `.dev/reports/p7-operation-multi-depth-restart-ledger-latest.json`.
-Canonical multi-depth soak is covered below; internal MicroK8s evidence remains
-an explicit P7+ follow-up gate.
+Canonical multi-depth soak is covered below; internal rollout/audit evidence is
+summarized in the internal baseline section.
 
 Current canonical multi-depth soak expansion smoke:
 
@@ -259,7 +261,7 @@ clean close counters, Worker child actor metrics, and remote AOI frames before
 `POST /operations/observations` closes the operation to `completed`. It writes
 `.dev/reports/p7-operation-multi-depth-soak-smoke-latest.json` plus
 `.dev/reports/p7-operation-multi-depth-soak-ledger-latest.json`. Internal
-MicroK8s evidence remains an explicit P7+ follow-up gate.
+rollout/audit evidence is summarized in the internal baseline section.
 
 Current split observation expansion smoke:
 
@@ -282,8 +284,8 @@ calls `POST /operations/observations` and verifies the ledger reaches
 `status=completed`. The smoke writes
 `.dev/reports/p7-operation-split-observation-smoke-latest.json` plus
 `.dev/reports/p7-operation-split-observation-ledger-latest.json`. Split
-recovery, restart, and soak are covered below; internal MicroK8s evidence
-remains an explicit P7+ follow-up gate.
+recovery, restart, and soak are covered below; internal rollout/audit evidence
+is summarized in the internal baseline section.
 
 Current split recovery expansion smoke:
 
@@ -306,8 +308,8 @@ restarts the target Worker and proves all child routes recover without automatic
 rollback. The smoke writes
 `.dev/reports/p7-operation-split-recovery-smoke-latest.json` plus
 `.dev/reports/p7-operation-split-recovery-ledger-latest.json`. Split restart
-and soak are covered below; internal MicroK8s evidence remains an explicit P7+
-follow-up gate.
+and soak are covered below; internal rollout/audit evidence is summarized in the
+internal baseline section.
 
 Current split restart expansion smoke:
 
@@ -330,9 +332,9 @@ state. Gateway child routes, Worker child actor metrics, stable-session child
 traffic, and clean close counters are verified after restart before
 `POST /operations/observations` closes the operation to `completed`. The smoke
 writes `.dev/reports/p7-operation-split-restart-smoke-latest.json` plus
-`.dev/reports/p7-operation-split-restart-ledger-latest.json`. The follow-up
-split soak smoke covers sustained child-route traffic; internal MicroK8s
-evidence remains an explicit P7+ follow-up gate.
+`.dev/reports/p7-operation-split-restart-ledger-latest.json`. The split soak
+smoke below covers sustained child-route traffic; internal rollout/audit
+evidence is summarized in the internal baseline section.
 
 Current split soak expansion smoke:
 
@@ -354,8 +356,8 @@ operation to `completed`. It writes
 `.dev/reports/p7-operation-split-soak-smoke-latest.json` plus
 `.dev/reports/p7-operation-split-soak-ledger-latest.json`. Canonical
 multi-depth operation execution, observation, recovery, restart, and soak are
-covered above; internal MicroK8s evidence remains an explicit P7+ follow-up
-gate.
+covered above; internal rollout/audit evidence is summarized in the internal
+baseline section.
 
 Current observation smoke:
 
@@ -375,8 +377,8 @@ clean close counters before calling `POST /operations/observations`. The ledger
 ends with `status=completed` and a succeeded `observation_completed` phase in
 `.dev/reports/p7-operation-observation-ledger-latest.json`; the smoke report is
 `.dev/reports/p7-operation-observation-smoke-latest.json`. Recovery, restart,
-and soak are covered below; internal MicroK8s observation evidence remains an
-explicit follow-up gate.
+and soak are covered below; internal rollout/audit evidence is summarized in the
+internal baseline section.
 
 Current recovery smoke:
 
@@ -396,8 +398,8 @@ operation observation is written with missing traffic/counter evidence, and the
 ledger ends with `status=recovery_required` plus a failed
 `observation_failed` phase. The smoke then restarts the owner Worker and proves
 the parent route and fresh parent Ping recover without automatic rollback.
-Restart and soak are covered below; internal MicroK8s recovery evidence remains
-an explicit follow-up gate.
+Restart and soak are covered below; internal rollout/audit evidence is
+summarized in the internal baseline section.
 
 Current restart smoke:
 
@@ -420,8 +422,8 @@ converge to the parent, Worker parent actor metrics refresh, stable-session
 parent traffic succeeds, and `POST /operations/observations` can close the
 operation to `completed` after restart. The smoke writes
 `.dev/reports/p7-operation-restart-smoke-latest.json` plus
-`.dev/reports/p7-operation-restart-ledger-latest.json`. Internal MicroK8s
-restart evidence remains an explicit follow-up gate.
+`.dev/reports/p7-operation-restart-ledger-latest.json`. Internal rollout/audit
+evidence is summarized in the internal baseline section.
 
 Current soak smoke:
 
@@ -440,8 +442,8 @@ traffic with `--iterations` and `--sleep-ms`, verifies Gateway route count,
 latency histograms, clean close counters, and Worker parent actor metrics, then
 closes the operation with `POST /operations/observations`. The smoke writes
 `.dev/reports/p7-operation-soak-smoke-latest.json` plus
-`.dev/reports/p7-operation-soak-ledger-latest.json`. Internal MicroK8s soak
-evidence remains an explicit follow-up gate.
+`.dev/reports/p7-operation-soak-ledger-latest.json`. Internal rollout/audit
+evidence is summarized in the internal baseline section.
 
 Current internal rollout baseline:
 
@@ -449,101 +451,60 @@ Current internal rollout baseline:
 cargo xt p6-rollout-report \
   --context microk8s-ts \
   --namespace tessera \
-  --image harbor.1day1coding.com/1day1coding/tessera:v2026.05.5 \
-  --rollout-revision 2c01847475ecbc65f43e9a5979449422f3ed2b4f \
-  --cleanup-revision 2c01847475ecbc65f43e9a5979449422f3ed2b4f \
+  --image harbor.1day1coding.com/1day1coding/tessera:v2026.05.6 \
+  --rollout-revision fcec5c0a \
+  --cleanup-revision 10f585b1 \
   --image-published \
   --gitops-rollout-approved \
   --post-smoke-default-off-cleanup \
   --manual-activation-default-off \
   --preview-fixture-removed
 cargo xt p6-rollout-report-check \
-  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.5
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.6
+cargo xt p7-completion-audit --json
 ```
 
-The `v2026.05.5` rollout carries the P7 ledger/executor/observation code. The
-initial default-off rollout enabled operation ledger persistence on the live
-Orchestrator while leaving `TESSERA_ORCH_OPERATION_EXECUTION` and
-`TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` unset. ArgoCD `tessera` reached
-`Synced / Healthy` at GitOps revision
-`2c01847475ecbc65f43e9a5979449422f3ed2b4f`, all four Tessera deployments ran
-`harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`, Gateway port-forward
-Ping returned `Pong { ts: 123 }`, `GET /operations` reported
-`persistence_enabled=true`, and `POST /operations/proposals` returned zero plans
-without mutation for the default topology.
+The `v2026.05.6` rollout carries the completed P7
+ledger/executor/observation code and the internal canonical multi-depth
+operation helper. The default-off rollout at GitOps revision `fcec5c0a` promoted
+all Tessera deployments to
+`harbor.1day1coding.com/1day1coding/tessera:v2026.05.6`. The final cleanup
+revision `10f585b1` removed manual operation execution, split/merge activation,
+and preview fixture settings while keeping only non-mutating config/state/ledger
+paths on the live Orchestrator. After cleanup, ArgoCD `tessera` was `Synced /
+Healthy`, Gateway port-forward Ping returned `Pong { ts: 123 }`, live
+deployments remained image-matched, and the rollout report checker accepted the
+default-off state.
 
-On 2026-05-04 KST, the internal controlled window opened via k8s GitOps
-revisions `0d2cc86aa29be5220d14f49936c4e8e95c5b19dd` and
-`2a172c6ba6c7acb3ed15563b077c7531cd2301e1`: worker-a owned the four shallow
-merge siblings, the Orchestrator used fresh assignment-state and operation-ledger
-paths, and manual operation execution plus split/merge activation were enabled
-with a cold-sibling preview fixture. `cargo xt k8s operation-smoke
---allow-execution --with-soak` completed operation
-`p7-merge-w0-cx0-cy0-d0-s0-1586936fe8a4`, and
-`cargo xt k8s operation-report-check --require-published-execution
---require-completed-observation --require-soak` validated the report at
-`.dev/reports/internal-microk8s-p7-operation-smoke-latest.json`. The report
-records approved merge execution, parent-route convergence, Worker parent actor
-refresh, clean Gateway close counters, 64 successful soak pings, 64 successful
-soak moves, and completed observation.
+The final internal P7 evidence set includes approved merge success/soak, owner
+Worker failure/recovery, Orchestrator restart windows, and the `v2026.05.6`
+canonical multi-depth operation window. The multi-depth window ran:
 
-Cleanup revision `b5ae307da1309633f9b5f15df0ebb807ec364c2d` removed the manual
-execution flag, split/merge activation flag, and preview fixture while keeping
-the fresh state/ledger paths. After cleanup, ArgoCD returned to
-`Synced / Healthy`, Gateway parent Ping still returned `Pong { ts: 123 }`,
-`GET /operations` retained the completed operation record, and
-`GET /split-merge/preview` reported `assignment_listing_zero_metrics` with zero
-plans.
+```sh
+cargo xt k8s operation-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.6 \
+  --operation-kind multi-depth-split \
+  --allow-execution \
+  --with-soak
+cargo xt k8s operation-report-check \
+  --report .dev/reports/internal-microk8s-p7-multi-depth-operation-smoke-latest.json \
+  --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.6 \
+  --require-published-execution \
+  --require-completed-observation \
+  --require-soak
+```
 
-The same day, failure/recovery was recorded in a second controlled window. k8s
-revision `4db4487efda3a50c0eef1739a5bdcaccc85d7d85` reopened the four-sibling
-topology with fresh failure state/ledger paths and manual mutation flags.
-`cargo xt k8s operation-smoke --allow-execution --with-failure --allow-scale`
-completed operation `p7-merge-w0-cx0-cy0-d0-s0-1586936fe8a4`, and
-`cargo xt k8s operation-report-check --require-published-execution
---require-recovery-required` validated
-`.dev/reports/internal-microk8s-p7-operation-failure-smoke-latest.json`. The
-report records approved execution, owner Worker scale-down detection,
-`status=recovery_required`, one recovery-required ledger record, operator
-scale-up recovery, and no automatic rollback observation.
-
-Cleanup revision `b0307901cb037492a8dbb57084170a1c56c8bd6e` removed the manual
-execution flag, split/merge activation flag, and preview fixture again while
-keeping the failure state/ledger paths. After cleanup, ArgoCD returned to
-`Synced / Healthy`, live Orchestrator env contained only the non-mutating
-config/state/ledger paths, Gateway parent Ping returned `Pong { ts: 123 }`,
-`GET /operations` retained one `recovery_required` record, and
-`GET /split-merge/preview` again reported `assignment_listing_zero_metrics` with
-zero plans.
-
-The restart gate then ran in a third controlled window. k8s revision
-`085cd7715eeaae01e898225e2a07ded85e31ce7f` reopened the four-sibling topology
-with restart-specific PVC-backed assignment state and operation ledger paths,
-manual mutation flags, and the cold-sibling preview fixture. `cargo xt k8s
-operation-smoke --allow-execution --with-restart --allow-rollout-restart
---expected-assignment-state-path
-/var/lib/tessera/assignment-state-p7-operation-restart-20260504.json` completed
-operation `p7-merge-w0-cx0-cy0-d0-s0-1586936fe8a4`, rollout-restarted
-`deploy/tessera-orch`, and wrote
-`.dev/reports/internal-microk8s-p7-operation-restart-smoke-latest.json`.
-`cargo xt k8s operation-report-check --require-published-execution
---require-restart` validated that report against
-`harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`. The report records
-PVC-backed assignment-state storage, approved execution, persisted parent route
-and operation ledger recovery after Orchestrator restart, parent traffic, and a
-completed post-restart observation.
-
-Cleanup revision `50100c54363b22d759e61bfb1935af5bbe10327c` removed the manual
-execution flag, split/merge activation flag, and preview fixture while keeping
-the restart state/ledger paths. After cleanup, ArgoCD returned to `Synced /
-Healthy`, all Tessera deployments stayed on
-`harbor.1day1coding.com/1day1coding/tessera:v2026.05.5`, the live Orchestrator
-env contained only non-mutating config/state/ledger paths, the ConfigMap
-returned to the root-cell default topology, Gateway parent Ping returned
-`Pong { ts: 123 }`, `GET /operations` retained one `completed` restart record,
-and `GET /split-merge/preview` again reported
-`assignment_listing_zero_metrics` with zero plans. Internal completion-audit
-evidence remains the follow-up gate.
+That report records operation
+`p7-multi-depth-split-w0-cx-2-cy3-d2-s0-80ffa1b91ce2`,
+`kind=multi_depth_split`, `policy_id=operator_approved_dynamic_operation_v1`,
+approved execution, Gateway route convergence from one parent route to four
+canonical child routes, Worker child actor refresh, clean close counters, 64
+successful soak pings, 64 successful soak moves, completed observation, and
+ArgoCD `Synced / Healthy` image evidence for `v2026.05.6`. The final
+`cargo xt p7-completion-audit --json` gate returns `complete=true` with an empty
+`findings` list against the current `.dev/reports` artifact set.
 
 Current internal operation helper:
 
@@ -659,7 +620,7 @@ Each slice should be self-contained:
    window additionally requires `TESSERA_ORCH_OPERATION_EXECUTION=manual` and
    `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`; the first runtime mutation path
    is approved same-Worker merge publish with idempotent repeat execution. The
-   P7+ expansion now also covers approved legacy split and canonical
+   P7 expansion also covers approved legacy split and canonical
    multi-depth split publish/idempotent repeat execution locally.
 6. **Closed-loop smoke**: verify proposal-to-approval-to-execution locally for
    split, merge, and canonical multi-depth paths. The first repo-native smoke is

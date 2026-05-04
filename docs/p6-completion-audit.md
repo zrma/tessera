@@ -61,8 +61,8 @@ evidence:
 
 ## Next Boundary
 
-P6+ closed the durable/manual/default-off dynamic cell control plane. The next
-milestone is P7: Closed-Loop, Policy-Gated Dynamic Cell Operations. P7 should
-begin with durable operation records and proposal/approval/execution audit
-state, not with unguarded autonomous mutation. See `docs/p7-operation-loop.md`.
-
+P6+ closed the durable/manual/default-off dynamic cell control plane. The
+immediate next boundary after P6 was P7: Closed-Loop, Policy-Gated Dynamic Cell
+Operations, documented in `docs/p7-operation-loop.md`. P7 is now complete; the
+current active boundary is P8 closed-loop operation cadence in
+`docs/p8-closed-loop-operation-cadence.md`.

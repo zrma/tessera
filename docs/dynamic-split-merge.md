@@ -610,16 +610,20 @@ The P5 split-activation completion boundary uses
   requires the final cluster report to include this policy and to have an empty
   `remaining_uncovered` list.
 
-Future runtime slices must add focused checks for:
+Completed P6/P7 runtime evidence now includes:
 
-- Internal MicroK8s restart recovery evidence run for
-  `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` using the prepared PVC/GitOps draft,
-  helper, and `--require-restart` report verifier.
-- Internal MicroK8s live metrics planner-to-operator evidence run using
+- Internal MicroK8s restart recovery for
+  `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` with PVC-backed state and report
+  verifier coverage.
+- Internal MicroK8s live metrics planner-to-operator evidence using
   `--use-live-worker-metrics` and `--require-live-metrics-plan`, still without
   automatic mutation by default.
 - Cross-Worker merge replay, merge failure/recovery smoke, and internal
-  MicroK8s merge evidence.
-- Canonical merge end-to-end smoke plus internal planner mutation evidence and
-  multi-depth publish/failure/restart/soak internal evidence if those decision
-  gates are opened.
+  MicroK8s merge execution/failure/restart/soak evidence.
+- Canonical merge end-to-end smoke, internal planner mutation evidence, and
+  multi-depth publish/failure/restart/soak evidence through the P7 completion
+  audit.
+
+Future P8 runtime slices should add focused checks for repeated cadence
+candidate batches, proposal idempotency, cooldown/budget/concurrency blocking,
+bounded approved execution windows, and post-smoke default-off cleanup.

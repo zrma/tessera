@@ -1,14 +1,13 @@
 # P6 Durable Split State
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-04
 
 This document records the first P6 slice after P5 internal activation
 completion. It is intentionally narrower than the full P6+ objective: it makes
-published split assignments survive Orchestrator restart, while keeping
-unapproved planner submission, internal MicroK8s restart evidence, and later
-runtime expansion as follow-up gates. Later same-Worker/cross-Worker merge,
-policy-gated planner mutation, and multi-depth local split slices now exist, but
-they are not part of the durable split-state proof.
+published split assignments survive Orchestrator restart. Later P6/P7 work added
+planner submission, internal MicroK8s restart evidence, same-Worker/cross-Worker
+merge, policy-gated planner mutation, and multi-depth split/operation evidence,
+but those are not part of this durable split-state proof.
 
 ## Objective Slice
 

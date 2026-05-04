@@ -19,8 +19,7 @@ Last reviewed: 2026-05-04
 - The live Tessera GitOps cleanup revision returned Orchestrator activation to
   default-off, restored the standard assignment state path, removed smoke
   preview fixtures, and left ArgoCD `tessera` `Synced / Healthy`.
-- P6 completion audit details remain in `docs/p6-completion-audit.md`. The next
-  active design boundary is `docs/p7-operation-loop.md`.
+- P6 completion audit details remain in `docs/p6-completion-audit.md`.
 - P7 initial local/dev slices are complete through durable proposal records,
   explicit approvals, default-off execution blocks, approved same-Worker merge
   execution idempotency, approved legacy split execution success/idempotency,
@@ -35,28 +34,32 @@ Last reviewed: 2026-05-04
   recovery-required owner-outage handling, plus Orchestrator restart recovery for
   the published operation ledger and assignment state, and local load/soak
   observation completion.
-  `v2026.05.5` has been published and promoted
+  `v2026.05.6` has been published and promoted
   through the k8s GitOps repo with the P7 operation ledger path enabled on the
   live Orchestrator, while executor and split/merge activation flags remain
-  default-off outside controlled smoke windows. Internal `v2026.05.5` controlled
+  default-off outside controlled smoke windows. Internal `v2026.05.6` controlled
   windows have now covered approved execution/observation/soak, owner Worker
-  failure/recovery, Orchestrator restart recovery, ArgoCD `Synced / Healthy`
-  cleanup, Gateway parent Ping, and durable operation ledger persistence after
-  each cleanup.
+  failure/recovery, Orchestrator restart recovery, canonical multi-depth
+  operation execution/observation/child-route soak, ArgoCD `Synced / Healthy`
+  cleanup, Gateway parent Ping, durable operation ledger persistence after each
+  cleanup, and `cargo xt p7-completion-audit --json` returning `complete=true`.
+- The next active design boundary is
+  `docs/p8-closed-loop-operation-cadence.md`.
 
 ## Next
 
-The next milestone is P7: Closed-Loop, Policy-Gated Dynamic Cell Operations.
+The next milestone is P8: Policy-Governed Closed-Loop Operation Cadence.
 
-P7 should not start by enabling autonomous mutations. The first implementation
-track is a durable, auditable operation loop:
+P8 should not start by enabling autonomous mutations. The implementation track
+turns the completed P7 operation loop into a bounded operator cadence:
 
-1. Record planner proposals from live Worker metrics and current assignment
-   state without mutation.
-2. Persist operation records with proposal, approval, execution, observation,
-   recovery/backout, and audit states.
-3. Require explicit policy, approval, cooldown, and budget gates before any
-   executor submits split or merge activation.
+1. Collect live Worker metrics and current assignment state on repeated planner
+   ticks, then produce candidate batches without assignment mutation.
+2. Persist candidate/proposal records with stable hashes so cadence reruns are
+   idempotent and auditable.
+3. Require explicit policy, approval, cooldown, budget, and concurrency gates
+   before any bounded executor window submits split, merge, or canonical
+   multi-depth activation.
 4. Keep all mutating automation default-off or policy-gated, with no automatic
    rollback unless a future policy explicitly changes that contract.
 5. Verify each runtime-affecting slice with local/dev smoke first, then image
@@ -64,7 +67,7 @@ track is a durable, auditable operation loop:
    success/failure/restart/soak smoke, default-off cleanup, and verifier
    reports.
 
-Recommended next slices:
+Recently completed P7 slices:
 
 1. Done: `test: add p7 execution observation smoke` - local full-stack smoke
    records route convergence, Worker refresh, stable-session traffic,
@@ -126,6 +129,32 @@ Recommended next slices:
 18. Done: `test: add p7 multi-depth operation soak smoke` - extend the canonical
    multi-depth operation path through sustained child Ping/Move traffic before
    internal rollout.
-19. `build: publish p7 multi-depth operation runtime image` - publish a new
-   image tag from the current local evidence set, then promote it through the
-   k8s GitOps repo before controlled internal MicroK8s operation smoke.
+19. Done: `build: publish p7 multi-depth operation runtime image` - published
+   `harbor.1day1coding.com/1day1coding/tessera:v2026.05.6`, promoted it
+   through the k8s GitOps repo, verified ArgoCD `Synced / Healthy`, ran
+   canonical multi-depth internal operation smoke, cleaned mutating flags back
+   to default-off, and closed `cargo xt p7-completion-audit --json` with
+   `complete=true`.
+
+Recommended P8 slices:
+
+1. `docs: refresh p8 cadence goal` - close stale P7 status references, add the
+   P8 prompt-to-artifact contract, and keep the next milestone explicitly
+   default-off/no automatic mutation.
+2. `feat: add p8 read-only cadence planner` - run repeated live-metrics and
+   assignment-state planner ticks, emit candidate batches, and prove
+   `assignments_changed=false`.
+3. `test: add p8 cadence proposal idempotency smoke` - write cadence candidates
+   to the durable proposal ledger and prove reruns do not duplicate records.
+4. `feat: add p8 approval and gate preflight` - enforce approval, policy id,
+   cooldown, budget, and concurrency limits before any execution window.
+5. `test: add p8 bounded execution cadence smoke` - execute one approved
+   bounded local operation set, observe it to completion, and prove duplicate
+   execution remains idempotent.
+6. `test: add p8 cadence failure restart soak smokes` - extend the bounded
+   cadence through recovery-required, Orchestrator restart, and soak evidence.
+7. `build: publish p8 cadence runtime image` - publish a new image only after
+   local P8 gates are green.
+8. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for
+   ArgoCD `Synced / Healthy`, run controlled internal cadence smoke, restore
+   default-off state, and verify a P8 completion audit.
