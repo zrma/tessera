@@ -149,15 +149,20 @@ Recommended P8 slices:
    p8-cadence-proposal-smoke` materializes live Worker actor metrics into the
    Orchestrator proposal preview path, writes one durable proposal record, and
    proves repeat ticks reuse it without assignment mutation or execution.
-4. `feat: add p8 approval and gate preflight` - enforce approval, policy id,
-   cooldown, budget, and concurrency limits before any execution window.
-5. `test: add p8 bounded execution cadence smoke` - execute one approved
+4. Done: `test: add p8 cadence approval preflight smoke` - `cargo xt dev
+   p8-cadence-approval-smoke` records a live-metrics proposal, persists an
+   operator approval with policy/cooldown/budget keys, proves repeat approval is
+   idempotent, and keeps unapproved/missing-policy/wrong-policy/default-off
+   execution preflight mutation-free.
+5. `feat: add p8 cooldown budget concurrency gates` - enforce cooldown, budget,
+   and concurrency limits before any execution window.
+6. `test: add p8 bounded execution cadence smoke` - execute one approved
    bounded local operation set, observe it to completion, and prove duplicate
    execution remains idempotent.
-6. `test: add p8 cadence failure restart soak smokes` - extend the bounded
+7. `test: add p8 cadence failure restart soak smokes` - extend the bounded
    cadence through recovery-required, Orchestrator restart, and soak evidence.
-7. `build: publish p8 cadence runtime image` - publish a new image only after
+8. `build: publish p8 cadence runtime image` - publish a new image only after
    local P8 gates are green.
-8. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for
+9. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for
    ArgoCD `Synced / Healthy`, run controlled internal cadence smoke, restore
    default-off state, and verify a P8 completion audit.

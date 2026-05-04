@@ -95,7 +95,11 @@ This document is the repo-local quality map for agents. It keeps the expected au
   attempt. Proposal ledger idempotency is covered by `cargo xt dev
   p8-cadence-proposal-smoke`, which materializes live Worker actor metrics into
   the Orchestrator proposal preview path and proves repeated proposal ticks
-  reuse one durable record without mutation or execution. Approval gates,
-  bounded execution, failure/restart/soak, internal rollout, and P8 completion
-  audit remain future P8 slices.
+  reuse one durable record without mutation or execution. Approval/default-off
+  preflight is covered by `cargo xt dev p8-cadence-approval-smoke`, which
+  records policy/cooldown/budget approval evidence and blocks
+  unapproved/missing-policy/wrong-policy/default-off execution attempts without
+  mutation. Cooldown/budget/concurrency enforcement, bounded execution,
+  failure/restart/soak, internal rollout, and P8 completion audit remain future
+  P8 slices.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
