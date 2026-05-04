@@ -75,7 +75,11 @@ P8 is complete only when all of these are true:
    `.dev/reports/p8-cadence-plan-smoke-latest.json`, and proves no assignment
    mutation or execution attempt.
 3. **Proposal ledger idempotency**: connect cadence output to durable proposal
-   writes and prove repeated cadence ticks do not duplicate records.
+   writes with `cargo xt dev p8-cadence-proposal-smoke`, proving repeated
+   proposal ticks reuse one durable operation record without assignment mutation
+   or execution attempt. Evidence is
+   `.dev/reports/p8-cadence-proposal-smoke-latest.json` plus
+   `.dev/reports/p8-cadence-proposal-ledger-latest.json`.
 4. **Approval selection**: add an operator-selected approval path for cadence
    candidates, keeping execution blocked by default.
 5. **Gate enforcement**: add cooldown, budget, and concurrency preflight

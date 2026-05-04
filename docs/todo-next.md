@@ -145,8 +145,10 @@ Recommended P8 slices:
    p8-cadence-plan-smoke` runs repeated live-metrics and assignment-state
    planner ticks, emits stable candidate batches, and proves
    `assignments_changed=false` with no execution attempt.
-3. `test: add p8 cadence proposal idempotency smoke` - write cadence candidates
-   to the durable proposal ledger and prove reruns do not duplicate records.
+3. Done: `test: add p8 cadence proposal idempotency smoke` - `cargo xt dev
+   p8-cadence-proposal-smoke` materializes live Worker actor metrics into the
+   Orchestrator proposal preview path, writes one durable proposal record, and
+   proves repeat ticks reuse it without assignment mutation or execution.
 4. `feat: add p8 approval and gate preflight` - enforce approval, policy id,
    cooldown, budget, and concurrency limits before any execution window.
 5. `test: add p8 bounded execution cadence smoke` - execute one approved
