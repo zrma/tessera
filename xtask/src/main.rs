@@ -884,6 +884,135 @@ enum K8sSub {
         #[arg(long = "expect-preflight-error")]
         expect_preflight_errors: Vec<String>,
     },
+    /// Run the guarded Kubernetes P8 closed-loop cadence smoke during a controlled GitOps window
+    P8CadenceSmoke {
+        /// Kubernetes namespace that contains the Tessera runtime
+        #[arg(long, default_value = "tessera")]
+        namespace: String,
+        /// Optional kube context. If unset, the current context is used.
+        #[arg(long)]
+        context: Option<String>,
+        /// Orchestrator service name
+        #[arg(long, default_value = "tessera-orch")]
+        orch_service: String,
+        /// Orchestrator deployment name used for image and smoke-window preflight
+        #[arg(long, default_value = "tessera-orch")]
+        orch_deploy: String,
+        /// Gateway service name
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_service: String,
+        /// Gateway deployment name used for image preflight
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_deploy: String,
+        /// Source Worker deployment expected to own the split parent before execution
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_deploy: String,
+        /// Source Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_service: String,
+        /// Source Worker id expected to own the split parent before execution
+        #[arg(long, default_value = "worker-a")]
+        source_worker_id: String,
+        /// Target Worker deployment used for child-route evidence
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_deploy: String,
+        /// Target Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_service: String,
+        /// Target Worker id used for child-route evidence
+        #[arg(long, default_value = "worker-b")]
+        target_worker_id: String,
+        /// Preview snapshot path configured on the Orchestrator deployment
+        #[arg(
+            long,
+            default_value = "/var/lib/tessera/p8-cadence-preview-20260505.json"
+        )]
+        preview_path: String,
+        /// ArgoCD Application namespace used for Synced/Healthy preflight
+        #[arg(long, default_value = "argocd")]
+        argocd_namespace: String,
+        /// ArgoCD Application name used for Synced/Healthy preflight
+        #[arg(long, default_value = "tessera")]
+        argocd_app: String,
+        /// Skip the ArgoCD Application Synced/Healthy preflight
+        #[arg(long, default_value_t = false)]
+        skip_argocd_check: bool,
+        /// Expected runtime image for all recorded Tessera deployments
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Local Orchestrator gRPC port for kubectl port-forward
+        #[arg(long, default_value_t = 6000)]
+        local_orch_port: u16,
+        /// Local Orchestrator metrics/operation port for kubectl port-forward
+        #[arg(long, default_value_t = 6100)]
+        local_orch_metrics_port: u16,
+        /// Local Gateway TCP port for kubectl port-forward
+        #[arg(long, default_value_t = 4000)]
+        local_gateway_port: u16,
+        /// Local Gateway metrics/ready port for kubectl port-forward
+        #[arg(long, default_value_t = 4100)]
+        local_gateway_metrics_port: u16,
+        /// Local source Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 5100)]
+        local_source_worker_metrics_port: u16,
+        /// Local target Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 5101)]
+        local_target_worker_metrics_port: u16,
+        /// Number of parent actors used to materialize live split pressure
+        #[arg(long, default_value_t = 105)]
+        actors: u32,
+        /// Child-route soak iterations per child
+        #[arg(long, default_value_t = 16)]
+        soak_iterations: u32,
+        /// Sleep between child-route soak iterations
+        #[arg(long, default_value_t = 10)]
+        soak_sleep_ms: u64,
+        /// Approve and execute the selected P8 cadence operation
+        #[arg(long, default_value_t = false)]
+        allow_execution: bool,
+        /// Output JSON path. Defaults to .dev/reports/guarded-kubernetes-p8-cadence-smoke-latest.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Verify post-smoke default-off cleanup and fold it into the internal P8 cadence report
+    P8CadenceCleanupCheck {
+        /// Kubernetes namespace that contains the Tessera runtime
+        #[arg(long, default_value = "tessera")]
+        namespace: String,
+        /// Optional kube context. If unset, the current context is used.
+        #[arg(long)]
+        context: Option<String>,
+        /// Orchestrator deployment name used for cleanup preflight
+        #[arg(long, default_value = "tessera-orch")]
+        orch_deploy: String,
+        /// Gateway deployment name used for image preflight
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_deploy: String,
+        /// Source Worker deployment used for image preflight
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_deploy: String,
+        /// Target Worker deployment used for image preflight
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_deploy: String,
+        /// ArgoCD Application namespace used for Synced/Healthy preflight
+        #[arg(long, default_value = "argocd")]
+        argocd_namespace: String,
+        /// ArgoCD Application name used for Synced/Healthy preflight
+        #[arg(long, default_value = "tessera")]
+        argocd_app: String,
+        /// Skip the ArgoCD Application Synced/Healthy preflight
+        #[arg(long, default_value_t = false)]
+        skip_argocd_check: bool,
+        /// Expected runtime image for all recorded Tessera deployments
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Existing internal P8 cadence report to update. Defaults to latest.
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Output JSON path. Defaults to overwriting the report/latest path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1800,6 +1929,92 @@ fn main() -> Result<()> {
                 expected_image.as_deref(),
                 &expect_preflight_errors,
             )?,
+            K8sSub::P8CadenceSmoke {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                source_worker_id,
+                target_worker_deploy,
+                target_worker_service,
+                target_worker_id,
+                preview_path,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                soak_iterations,
+                soak_sleep_ms,
+                allow_execution,
+                out,
+            } => run_k8s_p8_cadence_smoke(K8sP8CadenceSmokeOptions {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                source_worker_id,
+                target_worker_deploy,
+                target_worker_service,
+                target_worker_id,
+                preview_path,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                soak_iterations,
+                soak_sleep_ms,
+                allow_execution,
+                out,
+            })?,
+            K8sSub::P8CadenceCleanupCheck {
+                namespace,
+                context,
+                orch_deploy,
+                gateway_deploy,
+                source_worker_deploy,
+                target_worker_deploy,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                report,
+                out,
+            } => run_k8s_p8_cadence_cleanup_check(K8sP8CadenceCleanupCheckOptions {
+                namespace,
+                context,
+                orch_deploy,
+                gateway_deploy,
+                source_worker_deploy,
+                target_worker_deploy,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                report,
+                out,
+            })?,
         },
         Cmd::Dev { sub } => match sub {
             DevSub::Up {
@@ -18432,6 +18647,650 @@ fn run_k8s_multi_depth_operation_smoke(options: K8sOperationSmokeOptions) -> Res
     Ok(())
 }
 
+#[derive(Debug)]
+struct K8sP8CadenceSmokeOptions {
+    namespace: String,
+    context: Option<String>,
+    orch_service: String,
+    orch_deploy: String,
+    gateway_service: String,
+    gateway_deploy: String,
+    source_worker_deploy: String,
+    source_worker_service: String,
+    source_worker_id: String,
+    target_worker_deploy: String,
+    target_worker_service: String,
+    target_worker_id: String,
+    preview_path: String,
+    argocd_namespace: String,
+    argocd_app: String,
+    skip_argocd_check: bool,
+    expected_image: Option<String>,
+    local_orch_port: u16,
+    local_orch_metrics_port: u16,
+    local_gateway_port: u16,
+    local_gateway_metrics_port: u16,
+    local_source_worker_metrics_port: u16,
+    local_target_worker_metrics_port: u16,
+    actors: u32,
+    soak_iterations: u32,
+    soak_sleep_ms: u64,
+    allow_execution: bool,
+    out: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct K8sP8CadenceCleanupCheckOptions {
+    namespace: String,
+    context: Option<String>,
+    orch_deploy: String,
+    gateway_deploy: String,
+    source_worker_deploy: String,
+    target_worker_deploy: String,
+    argocd_namespace: String,
+    argocd_app: String,
+    skip_argocd_check: bool,
+    expected_image: Option<String>,
+    report: Option<PathBuf>,
+    out: Option<PathBuf>,
+}
+
+fn run_k8s_p8_cadence_smoke(options: K8sP8CadenceSmokeOptions) -> Result<()> {
+    if !options.allow_execution {
+        bail!("internal k8s P8 cadence smoke mutates assignment state; pass --allow-execution");
+    }
+    if options.actors < 100 {
+        bail!("internal k8s P8 cadence smoke requires at least 100 actors for live split pressure");
+    }
+    if options.soak_iterations == 0 {
+        bail!("internal k8s P8 cadence smoke soak iterations must be greater than zero");
+    }
+    if options.preview_path.trim().is_empty() || !options.preview_path.starts_with('/') {
+        bail!("internal k8s P8 cadence smoke --preview-path must be an absolute pod path");
+    }
+
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let argocd_status = if options.skip_argocd_check {
+        None
+    } else {
+        let status =
+            kubectl_argocd_app_status(&context, &options.argocd_namespace, &options.argocd_app)?;
+        validate_argocd_app_ready(&status)?;
+        Some(status)
+    };
+    let deployment_images = collect_k8s_p8_cadence_deployment_images(&context, &options)?;
+    if let Some(expected_image) = options.expected_image.as_deref() {
+        validate_k8s_deployment_images(&deployment_images, expected_image)?;
+    }
+    let smoke_window_errors = k8s_p8_cadence_smoke_window_errors(&context, &options)?;
+    if !smoke_window_errors.is_empty() {
+        bail!(
+            "internal k8s P8 cadence smoke window preflight failed: {}",
+            smoke_window_errors.join("; ")
+        );
+    }
+    for resource in [
+        format!("svc/{}", options.orch_service),
+        format!("svc/{}", options.gateway_service),
+        format!("svc/{}", options.source_worker_service),
+        format!("svc/{}", options.target_worker_service),
+        format!("deploy/{}", options.source_worker_deploy),
+        format!("deploy/{}", options.target_worker_deploy),
+    ] {
+        kubectl_resource_name(&context, &options.namespace, &resource)
+            .with_context(|| format!("required resource {resource} is not ready"))?;
+    }
+
+    let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_orch_metrics_addr = format!("127.0.0.1:{}", options.local_orch_metrics_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
+    let local_source_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_source_worker_metrics_port);
+    let local_target_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_target_worker_metrics_port);
+
+    let mut forwards = ManagedK8sPortForwards::default();
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.orch_service,
+        "p8-cadence-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.gateway_service,
+        "p8-cadence-gateway",
+        &[
+            (options.local_gateway_port, 4000),
+            (options.local_gateway_metrics_port, 4100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.source_worker_service,
+        "p8-cadence-source-worker",
+        &[(options.local_source_worker_metrics_port, 5100)],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.target_worker_service,
+        "p8-cadence-target-worker",
+        &[(options.local_target_worker_metrics_port, 5100)],
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let orch_endpoint = grpc_endpoint(&local_orch_addr);
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    assert_http_status_endpoint(
+        "internal P8 cadence gateway readiness",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 1)?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let mut parent_session = GatewaySession::connect(&local_gateway_addr)?;
+    for idx in 0..options.actors {
+        let actor = EntityId(10_000 + u64::from(idx));
+        let joined = parent_session.request(
+            parent,
+            ClientMsg::Join {
+                actor,
+                pos: activation_soak_position((idx % 4) as u8),
+            },
+        )?;
+        assert_snapshot_contains("internal P8 cadence parent join", joined, parent, actor)?;
+    }
+
+    let parent_metric = worker_cell_actor_count_metric(parent);
+    let actor_count_after_join = assert_prometheus_sample_at_least_until(
+        "internal P8 cadence source worker parent",
+        &local_source_worker_metrics_addr,
+        parent_metric.as_str(),
+        f64::from(options.actors),
+    )?;
+    assert_metrics_endpoint_body_until(
+        "internal P8 cadence target worker metrics",
+        &local_target_worker_metrics_addr,
+        &["tessera_worker_cell_actor_count"],
+    )?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "internal P8 cadence gateway before",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_routes_before =
+        prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+
+    let live_metrics = vec![
+        format!(
+            "{}={local_source_worker_metrics_addr}",
+            options.source_worker_id
+        ),
+        format!(
+            "{}={local_target_worker_metrics_addr}",
+            options.target_worker_id
+        ),
+    ];
+    let live_metrics_endpoints = parse_live_worker_metrics_endpoints(&live_metrics)?;
+    let live_policy = LiveMetricsPlanPolicy::default();
+    let snapshots = live_metrics_endpoints
+        .iter()
+        .map(fetch_live_worker_metrics_snapshot_until)
+        .collect::<Result<Vec<_>>>()?;
+    let source_snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.worker_id == options.source_worker_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "internal P8 cadence missing {} metrics",
+                options.source_worker_id
+            )
+        })?;
+    let live_parent_actor_count = *source_snapshot.actor_counts.get(&parent).unwrap_or(&0);
+    if live_parent_actor_count < u64::from(options.actors) {
+        bail!(
+            "internal P8 cadence expected at least {} live parent actors, got {live_parent_actor_count}",
+            options.actors
+        );
+    }
+    let live_parent_pending_moves = *source_snapshot.pending_moves.get(&parent).unwrap_or(&0);
+    let preview_snapshot =
+        build_p8_cadence_operation_metrics_snapshot(&before_listing, &snapshots, live_policy)?;
+    kubectl_write_file_to_deploy_first_pod(
+        &context,
+        &options.namespace,
+        &options.orch_deploy,
+        "orch",
+        &options.preview_path,
+        &format!("{}\n", serde_json::to_string_pretty(&preview_snapshot)?),
+    )?;
+
+    let proposal_response = http_json_post(
+        "internal P8 cadence proposal",
+        &local_orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+    assert_json_number_at_least(&proposal_response, &["planned_count"], 1.0)?;
+    assert_json_number_eq(&proposal_response, &["recorded_count"], 1.0)?;
+    let operation_id = p8_cadence_operation_ids(&proposal_response)?
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("internal P8 cadence proposal has no operation id"))?;
+    let proposal_snapshot = http_json_get(
+        "internal P8 cadence ledger",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    assert_json_str_eq(proposal_record, &["kind"], "split")?;
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+    let policy_id = "operator_approved_dynamic_operation_v1";
+
+    let approval_response = http_json_post(
+        "internal P8 cadence approval",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=internal-p8-cadence-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p8-cadence-root-w0&budget_key=p8-cadence-local"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+    assert_json_bool_eq(&approval_response, &["assignments_changed"], false)?;
+
+    let execution_response = http_json_post(
+        "internal P8 cadence execution",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "published")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], true)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], true)?;
+
+    let repeat_execution_response = http_json_post(
+        "internal P8 cadence repeat execution",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&repeat_execution_response, &["status"], "already_published")?;
+    assert_json_bool_eq(&repeat_execution_response, &["assignments_changed"], false)?;
+    assert_json_bool_eq(&repeat_execution_response, &["mutation_attempted"], false)?;
+
+    let expected_children = [
+        (activation_child_cell(0), options.source_worker_id.as_str()),
+        (activation_child_cell(1), options.target_worker_id.as_str()),
+        (activation_child_cell(2), options.source_worker_id.as_str()),
+        (activation_child_cell(3), options.target_worker_id.as_str()),
+    ];
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+    let pre_soak_probe = probe_split_convergence(&local_gateway_addr, 10_700);
+    pre_soak_probe.assert_success()?;
+
+    let child_cells = [
+        activation_child_cell(0),
+        activation_child_cell(1),
+        activation_child_cell(2),
+        activation_child_cell(3),
+    ];
+    let soak_run = run_cell_activation_soak_loop_keepalive(
+        &local_gateway_addr,
+        &child_cells,
+        options.soak_iterations,
+        Duration::from_millis(options.soak_sleep_ms),
+    )?;
+    let stats = soak_run.stats;
+    let active_soak_sessions = soak_run.sessions.len();
+    runtime.block_on(wait_for_split_listing(&orch_endpoint, &expected_children))?;
+    assert_gateway_ready_routes(&local_gateway_metrics_addr, 4)?;
+
+    let source_child0_metric = worker_cell_actor_count_metric(activation_child_cell(0));
+    let source_child2_metric = worker_cell_actor_count_metric(activation_child_cell(2));
+    let target_child1_metric = worker_cell_actor_count_metric(activation_child_cell(1));
+    let target_child3_metric = worker_cell_actor_count_metric(activation_child_cell(3));
+    let source_child0_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P8 cadence source worker child0",
+        &local_source_worker_metrics_addr,
+        source_child0_metric.as_str(),
+        1.0,
+    )?;
+    let source_child2_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P8 cadence source worker child2",
+        &local_source_worker_metrics_addr,
+        source_child2_metric.as_str(),
+        1.0,
+    )?;
+    let target_child1_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P8 cadence target worker child1",
+        &local_target_worker_metrics_addr,
+        target_child1_metric.as_str(),
+        1.0,
+    )?;
+    let target_child3_actor_count = assert_prometheus_sample_at_least_until(
+        "internal P8 cadence target worker child3",
+        &local_target_worker_metrics_addr,
+        target_child3_metric.as_str(),
+        1.0,
+    )?;
+
+    let gateway_metrics_after_soak = assert_metrics_endpoint_body_until(
+        "internal P8 cadence gateway after soak",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let expected_actor_requests = u64::from(options.soak_iterations) * 4;
+    assert_prometheus_sample_at_least(
+        "internal P8 cadence gateway",
+        &gateway_metrics_after_soak,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        expected_actor_requests as f64,
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P8 cadence gateway",
+        &gateway_metrics_after_soak,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        expected_actor_requests as f64,
+    )?;
+    let gateway_routes_after_soak =
+        prometheus_sample_value(&gateway_metrics_after_soak, "tessera_gateway_routes")?;
+    let gateway_close_after_soak =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_soak)?;
+    assert_gateway_close_counters_not_increased(
+        "internal P8 cadence gateway",
+        gateway_close_before,
+        gateway_close_after_soak,
+    )?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+
+    let route_converged = (gateway_routes_after_soak - 4.0).abs() < f64::EPSILON;
+    let worker_refreshed = source_child0_actor_count >= 1.0
+        && source_child2_actor_count >= 1.0
+        && target_child1_actor_count >= 1.0
+        && target_child3_actor_count >= 1.0;
+    let traffic_confirmed =
+        stats.pings_ok >= expected_actor_requests && stats.moves_ok >= expected_actor_requests;
+    let counters_clean = gateway_close_before == gateway_close_after_soak;
+    if !(route_converged && worker_refreshed && traffic_confirmed && counters_clean) {
+        bail!(
+            "internal P8 cadence smoke evidence incomplete: route_converged={route_converged} worker_refreshed={worker_refreshed} traffic_confirmed={traffic_confirmed} counters_clean={counters_clean}"
+        );
+    }
+
+    let observation_response = http_json_post(
+        "internal P8 cadence observation",
+        &local_orch_metrics_addr,
+        &format!(
+            "/operations/observations?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&observer=internal-p8-cadence-smoke&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true"
+        ),
+    )?;
+    assert_json_str_eq(&observation_response, &["status"], "completed")?;
+    assert_json_bool_eq(&observation_response, &["observation_accepted"], true)?;
+    assert_json_bool_eq(&observation_response, &["assignments_changed"], false)?;
+
+    let completed_snapshot = http_json_get(
+        "internal P8 cadence ledger after observation",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let ledger_summary =
+        validate_p7_operation_ledger(&completed_snapshot, true, false, true, true, false)?;
+    let completed_record = find_p7_operation_record(&completed_snapshot, &operation_id)?;
+    validate_p7_completed_observation(completed_record)?;
+
+    let report = serde_json::json!({
+        "schema": "tessera.guarded_kubernetes_p8_cadence_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "stage": "completed",
+        "reason": "guarded Kubernetes P8 cadence smoke published one bounded operator-approved split operation and completed child-route soak observation; post-smoke cleanup is recorded by k8s p8-cadence-cleanup-check",
+        "cluster": {
+            "context": context.as_str(),
+            "namespace": options.namespace.as_str(),
+            "orchestrator_service": options.orch_service.as_str(),
+            "gateway_service": options.gateway_service.as_str(),
+            "source_worker_service": options.source_worker_service.as_str(),
+            "target_worker_service": options.target_worker_service.as_str(),
+            "argocd": argocd_status_json(
+                &options.argocd_namespace,
+                &options.argocd_app,
+                argocd_status.as_ref()
+            ),
+            "expected_image": options.expected_image.as_deref(),
+            "deployment_images": k8s_deployment_images_json(&deployment_images)
+        },
+        "cadence": {
+            "actors": options.actors,
+            "planner": "operation_proposals_from_internal_live_metrics_snapshot",
+            "bounded_operation_limit": 1,
+            "operation_id": operation_id.as_str(),
+            "soak_iterations": options.soak_iterations,
+            "soak_sleep_ms": options.soak_sleep_ms
+        },
+        "operation": {
+            "operation_id": operation_id.as_str(),
+            "kind": "split",
+            "proposal_hash": proposal_hash.as_str(),
+            "policy_id": policy_id
+        },
+        "live_metrics": {
+            "sources": live_metrics,
+            "parent_actor_count": live_parent_actor_count,
+            "parent_pending_moves": live_parent_pending_moves,
+            "actor_count_after_join": actor_count_after_join
+        },
+        "approval": {
+            "policy_id": policy_id,
+            "approver": "internal-p8-cadence-smoke",
+            "cooldown_key": "p8-cadence-root-w0",
+            "budget_key": "p8-cadence-local",
+            "proposal_hash": proposal_hash.as_str()
+        },
+        "gate_policy": {
+            "budget_limits": {"p8-cadence-local": 1},
+            "max_in_flight_per_budget_key": 1
+        },
+        "preview_snapshot": {
+            "path": options.preview_path.as_str(),
+            "source": "internal_live_worker_metrics_materialized_to_orchestrator_pvc"
+        },
+        "soak": {
+            "iterations": options.soak_iterations,
+            "sleep_ms": options.soak_sleep_ms,
+            "pings_ok": stats.pings_ok,
+            "moves_ok": stats.moves_ok,
+            "expected_actor_requests": expected_actor_requests,
+            "active_sessions": active_soak_sessions,
+            "remote_delta_frames": stats.remote_delta_frames,
+            "remote_snapshot_frames": stats.remote_snapshot_frames
+        },
+        "orchestrator": {
+            "grpc_addr": local_orch_addr.as_str(),
+            "metrics_addr": local_orch_metrics_addr.as_str(),
+            "registered_workers": before_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "gateway": {
+            "addr": local_gateway_addr.as_str(),
+            "metrics_addr": local_gateway_metrics_addr.as_str(),
+            "routes_before": gateway_routes_before,
+            "routes_after_soak": gateway_routes_after_soak,
+            "ping_roundtrips": prometheus_sample_value(&gateway_metrics_after_soak, "tessera_gateway_ping_roundtrip_seconds_count")?,
+            "join_roundtrips": prometheus_sample_value(&gateway_metrics_after_soak, "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}")?,
+            "move_roundtrips": prometheus_sample_value(&gateway_metrics_after_soak, "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}")?,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after_soak": gateway_close_counters_json(gateway_close_after_soak)
+            }
+        },
+        "worker": {
+            "source_worker_id": options.source_worker_id.as_str(),
+            "source_worker_metrics_addr": local_source_worker_metrics_addr.as_str(),
+            "target_worker_id": options.target_worker_id.as_str(),
+            "target_worker_metrics_addr": local_target_worker_metrics_addr.as_str(),
+            "source_child0_actor_count_after_soak": source_child0_actor_count,
+            "source_child2_actor_count_after_soak": source_child2_actor_count,
+            "target_child1_actor_count_after_soak": target_child1_actor_count,
+            "target_child3_actor_count_after_soak": target_child3_actor_count
+        },
+        "ledger": {
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "published_execution_records": ledger_summary.published_execution_records,
+            "completed_observation_records": ledger_summary.completed_observation_records
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response,
+            "repeat_execution": repeat_execution_response,
+            "observation": observation_response
+        },
+        "probes": {
+            "pre_soak": split_convergence_probe_json(&pre_soak_probe)
+        },
+        "cleanup": {
+            "manual_activation_default_off": false,
+            "preview_fixture_removed": false
+        },
+        "checks": {
+            "argocd_synced_healthy": argocd_status.as_ref().is_some_and(|status| status.sync == "Synced" && status.health == "Healthy"),
+            "deployment_images_match": options.expected_image.as_deref().is_none_or(|expected| deployment_images.iter().all(|image| image.image == expected)),
+            "live_metrics_materialized": true,
+            "proposal_recorded": true,
+            "approval_recorded": true,
+            "gate_policy_allowed": true,
+            "bounded_operation_limit_respected": ledger_summary.published_execution_records == 1,
+            "bounded_execution_published": true,
+            "repeat_execution_idempotent": true,
+            "child_routes_converged_after_soak": route_converged,
+            "worker_child_refresh_after_soak": worker_refreshed,
+            "child_traffic_confirmed_after_soak": traffic_confirmed,
+            "gateway_close_counters_clean": counters_clean,
+            "observation_completed_after_soak": true,
+            "ledger_observation_completed": true,
+            "post_smoke_default_off_cleanup": false
+        },
+        "preflight_errors": [],
+        "remaining_uncovered": [
+            "post_smoke_default_off_cleanup"
+        ]
+    });
+    let report_path = write_internal_k8s_p8_cadence_smoke_report(&report, options.out.as_deref())?;
+    println!(
+        "internal P8 cadence smoke completed before cleanup: operation={} report={}",
+        operation_id,
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn run_k8s_p8_cadence_cleanup_check(options: K8sP8CadenceCleanupCheckOptions) -> Result<()> {
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let report_path = options
+        .report
+        .clone()
+        .unwrap_or_else(default_internal_k8s_p8_cadence_smoke_path);
+    let mut report = read_json_report(&report_path)?;
+    assert_json_str_eq(
+        &report,
+        &["schema"],
+        "tessera.guarded_kubernetes_p8_cadence_smoke.v1",
+    )?;
+
+    let argocd_status = if options.skip_argocd_check {
+        None
+    } else {
+        let status =
+            kubectl_argocd_app_status(&context, &options.argocd_namespace, &options.argocd_app)?;
+        validate_argocd_app_ready(&status)?;
+        Some(status)
+    };
+    let deployment_images = collect_k8s_p8_cadence_cleanup_deployment_images(&context, &options)?;
+    if let Some(expected_image) = options.expected_image.as_deref() {
+        validate_k8s_deployment_images(&deployment_images, expected_image)?;
+    }
+    let cleanup =
+        k8s_p8_cadence_cleanup_status(&context, &options.namespace, &options.orch_deploy)?;
+    if !cleanup.manual_activation_default_off || !cleanup.preview_fixture_removed {
+        bail!(
+            "internal P8 cadence cleanup incomplete: manual_activation_default_off={} preview_fixture_removed={}",
+            cleanup.manual_activation_default_off,
+            cleanup.preview_fixture_removed
+        );
+    }
+
+    report["cluster"]["argocd"] = argocd_status_json(
+        &options.argocd_namespace,
+        &options.argocd_app,
+        argocd_status.as_ref(),
+    );
+    report["cluster"]["deployment_images"] = k8s_deployment_images_json(&deployment_images);
+    report["cluster"]["expected_image"] = serde_json::json!(options.expected_image.as_deref());
+    report["cleanup"]["manual_activation_default_off"] = serde_json::json!(true);
+    report["cleanup"]["preview_fixture_removed"] = serde_json::json!(true);
+    report["cleanup"]["checked_at_unix_secs"] = serde_json::json!(unix_timestamp_secs());
+    report["cleanup"]["orchestrator_env"] = serde_json::json!({
+        "operation_execution": cleanup.operation_execution,
+        "split_merge_activation": cleanup.split_merge_activation,
+        "preview_json": cleanup.preview_json,
+        "preview_path": cleanup.preview_path
+    });
+    report["checks"]["argocd_synced_healthy"] = serde_json::json!(
+        argocd_status
+            .as_ref()
+            .is_some_and(|status| status.sync == "Synced" && status.health == "Healthy")
+    );
+    report["checks"]["deployment_images_match"] =
+        serde_json::json!(options.expected_image.as_deref().is_none_or(|expected| {
+            deployment_images
+                .iter()
+                .all(|image| image.image == expected)
+        }));
+    report["checks"]["post_smoke_default_off_cleanup"] = serde_json::json!(true);
+    report["preflight_errors"] = serde_json::json!([]);
+    report["remaining_uncovered"] = serde_json::json!([]);
+
+    validate_internal_k8s_p8_cadence_smoke_report(&report, options.expected_image.as_deref())?;
+    let out_path = options.out.as_deref().unwrap_or(report_path.as_path());
+    let written = write_internal_k8s_p8_cadence_smoke_report(&report, Some(out_path))?;
+    println!(
+        "internal P8 cadence cleanup verified and report finalized: {}",
+        written.display()
+    );
+    Ok(())
+}
+
 fn resolve_kube_context(context: Option<&str>) -> Result<String> {
     if let Some(context) = context {
         if context.trim().is_empty() {
@@ -18722,6 +19581,175 @@ fn collect_k8s_operation_deployment_images(
     (images, errors)
 }
 
+fn collect_k8s_p8_cadence_deployment_images(
+    context: &str,
+    options: &K8sP8CadenceSmokeOptions,
+) -> Result<Vec<K8sDeploymentImage>> {
+    let deployments = [
+        ("orchestrator", options.orch_deploy.as_str()),
+        ("gateway", options.gateway_deploy.as_str()),
+        ("source_worker", options.source_worker_deploy.as_str()),
+        ("target_worker", options.target_worker_deploy.as_str()),
+    ];
+    collect_k8s_deployment_images_by_role(context, &options.namespace, &deployments)
+}
+
+fn collect_k8s_p8_cadence_cleanup_deployment_images(
+    context: &str,
+    options: &K8sP8CadenceCleanupCheckOptions,
+) -> Result<Vec<K8sDeploymentImage>> {
+    let deployments = [
+        ("orchestrator", options.orch_deploy.as_str()),
+        ("gateway", options.gateway_deploy.as_str()),
+        ("source_worker", options.source_worker_deploy.as_str()),
+        ("target_worker", options.target_worker_deploy.as_str()),
+    ];
+    collect_k8s_deployment_images_by_role(context, &options.namespace, &deployments)
+}
+
+fn collect_k8s_deployment_images_by_role(
+    context: &str,
+    namespace: &str,
+    deployments: &[(&'static str, &str)],
+) -> Result<Vec<K8sDeploymentImage>> {
+    deployments
+        .iter()
+        .map(|(role, deployment)| {
+            let image = kubectl_deploy_first_container_image(context, namespace, deployment)
+                .with_context(|| format!("read image for deployment {deployment}"))?;
+            Ok(K8sDeploymentImage {
+                role,
+                deployment: (*deployment).to_string(),
+                image,
+            })
+        })
+        .collect()
+}
+
+fn k8s_p8_cadence_smoke_window_errors(
+    context: &str,
+    options: &K8sP8CadenceSmokeOptions,
+) -> Result<Vec<String>> {
+    let env = kubectl_deploy_container_env_map(context, &options.namespace, &options.orch_deploy)?;
+    let mut errors = Vec::new();
+    require_k8s_env_eq(
+        &env,
+        "TESSERA_ORCH_SPLIT_MERGE_ACTIVATION",
+        "manual",
+        &mut errors,
+    );
+    require_k8s_env_eq(
+        &env,
+        "TESSERA_ORCH_OPERATION_EXECUTION",
+        "manual",
+        &mut errors,
+    );
+    require_k8s_env_eq(
+        &env,
+        "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH",
+        options.preview_path.as_str(),
+        &mut errors,
+    );
+    require_k8s_env_contains(
+        &env,
+        "TESSERA_ORCH_OPERATION_BUDGET_LIMITS",
+        "p8-cadence-local=1",
+        &mut errors,
+    );
+    require_k8s_env_eq(
+        &env,
+        "TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY",
+        "1",
+        &mut errors,
+    );
+    require_k8s_env_contains(
+        &env,
+        "TESSERA_ORCH_ASSIGNMENT_STATE_PATH",
+        "p8-cadence",
+        &mut errors,
+    );
+    require_k8s_env_contains(
+        &env,
+        "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+        "p8-cadence",
+        &mut errors,
+    );
+    Ok(errors)
+}
+
+fn require_k8s_env_eq(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    expected: &str,
+    errors: &mut Vec<String>,
+) {
+    match env.get(key) {
+        Some(actual) if actual == expected => {}
+        Some(actual) => errors.push(format!("{key} expected `{expected}`, got `{actual}`")),
+        None => errors.push(format!("{key} is not set")),
+    }
+}
+
+fn require_k8s_env_contains(
+    env: &std::collections::HashMap<String, String>,
+    key: &str,
+    expected_substring: &str,
+    errors: &mut Vec<String>,
+) {
+    match env.get(key) {
+        Some(actual) if actual.contains(expected_substring) => {}
+        Some(actual) => errors.push(format!(
+            "{key} expected to contain `{expected_substring}`, got `{actual}`"
+        )),
+        None => errors.push(format!("{key} is not set")),
+    }
+}
+
+#[derive(Debug)]
+struct K8sP8CleanupStatus {
+    manual_activation_default_off: bool,
+    preview_fixture_removed: bool,
+    operation_execution: Option<String>,
+    split_merge_activation: Option<String>,
+    preview_json: Option<String>,
+    preview_path: Option<String>,
+}
+
+fn k8s_p8_cadence_cleanup_status(
+    context: &str,
+    namespace: &str,
+    orch_deploy: &str,
+) -> Result<K8sP8CleanupStatus> {
+    let env = kubectl_deploy_container_env_map(context, namespace, orch_deploy)?;
+    let operation_execution = env.get("TESSERA_ORCH_OPERATION_EXECUTION").cloned();
+    let split_merge_activation = env.get("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION").cloned();
+    let preview_json = env.get("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON").cloned();
+    let preview_path = env.get("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH").cloned();
+    let manual_activation_default_off = env_absent_or_off(operation_execution.as_deref())
+        && env_absent_or_off(split_merge_activation.as_deref());
+    let preview_fixture_removed = preview_json.as_deref().is_none_or(str::is_empty)
+        && preview_path.as_deref().is_none_or(str::is_empty);
+    Ok(K8sP8CleanupStatus {
+        manual_activation_default_off,
+        preview_fixture_removed,
+        operation_execution,
+        split_merge_activation,
+        preview_json,
+        preview_path,
+    })
+}
+
+fn env_absent_or_off(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "" | "off" | "disabled" | "false" | "0"
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn k8s_multi_depth_activation_preflight(
     context: &str,
     options: &K8sMultiDepthActivationSmokeOptions,
@@ -18981,6 +20009,107 @@ fn kubectl_deploy_first_container_image(
         bail!("deployment {deploy} has no first container image");
     }
     Ok(image)
+}
+
+fn kubectl_deploy_container_env_map(
+    context: &str,
+    namespace: &str,
+    deploy: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args(["get", "deploy", deploy, "-o", "json"]);
+    let output = command_stdout(&mut cmd)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parse Kubernetes Deployment JSON")?;
+    let env = document
+        .pointer("/spec/template/spec/containers/0/env")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("deployment {deploy} first container is missing env[]"))?;
+    let mut values = std::collections::HashMap::new();
+    for item in env {
+        let Some(name) = item.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let value = item
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        values.insert(name.to_string(), value.to_string());
+    }
+    Ok(values)
+}
+
+fn kubectl_write_file_to_deploy_first_pod(
+    context: &str,
+    namespace: &str,
+    deploy: &str,
+    container: &str,
+    path: &str,
+    body: &str,
+) -> Result<()> {
+    let pod = kubectl_first_active_pod_for_deploy(context, namespace, deploy)?;
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args([
+        "exec",
+        "-i",
+        &pod,
+        "-c",
+        container,
+        "--",
+        "sh",
+        "-c",
+        "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"",
+        "sh",
+        path,
+    ]);
+    let debug = format!("{cmd:?}");
+    let mut child = cmd
+        .current_dir(workspace_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("failed to open kubectl exec stdin"))?
+        .write_all(body.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "command failed: {debug}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn kubectl_first_active_pod_for_deploy(
+    context: &str,
+    namespace: &str,
+    deploy: &str,
+) -> Result<String> {
+    let selector = kubectl_deploy_selector(context, namespace, deploy)?;
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args(["get", "pods", "-l", &selector, "-o", "json"]);
+    let output = command_stdout(&mut cmd)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&output).context("parse Kubernetes PodList JSON")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("PodList JSON is missing items[]"))?;
+    items
+        .iter()
+        .filter(|pod| kubernetes_pod_counts_as_active(pod))
+        .filter_map(|pod| {
+            pod.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_string)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("deployment {deploy} has no active pod"))
 }
 
 const ORCH_ASSIGNMENT_STATE_ENV: &str = "TESSERA_ORCH_ASSIGNMENT_STATE_PATH";
@@ -20325,6 +21454,12 @@ fn default_internal_k8s_multi_depth_operation_smoke_path() -> PathBuf {
         .join("guarded-kubernetes-p7-multi-depth-operation-smoke-latest.json")
 }
 
+fn default_internal_k8s_p8_cadence_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("guarded-kubernetes-p8-cadence-smoke-latest.json")
+}
+
 fn select_internal_p7_merge_operation<'a>(
     proposal_response: &serde_json::Value,
     ledger_snapshot: &'a serde_json::Value,
@@ -21464,6 +22599,29 @@ fn write_p8_cadence_soak_smoke_report(report: &serde_json::Value) -> Result<Path
     let latest = default_p8_cadence_soak_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
+}
+
+fn write_internal_k8s_p8_cadence_smoke_report(
+    report: &serde_json::Value,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let report_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_p8_cadence_smoke_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped_name = report
+        .get("operation")
+        .and_then(|operation| operation.get("operation_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("internal-p8-cadence-{}", unix_timestamp_secs()));
+    let stamped = report_path.with_file_name(format!("{stamped_name}.json"));
+    fs::write(&stamped, &body)?;
+    fs::write(&report_path, body)?;
+    Ok(report_path)
 }
 
 fn write_p7_operation_execution_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
