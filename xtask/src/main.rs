@@ -923,6 +923,15 @@ enum DevSub {
     ActivationLiveMetricsSmoke,
     /// Start a two-worker dev stack and prove live metrics planner mutation stays policy-gated
     ActivationLivePlannerMutationSmoke,
+    /// Start a two-worker dev stack and prove P8 read-only cadence candidate batches are stable
+    P8CadencePlanSmoke {
+        /// Number of read-only cadence ticks to collect
+        #[arg(long, default_value_t = 3)]
+        ticks: u32,
+        /// Delay between cadence ticks, in milliseconds
+        #[arg(long, default_value_t = 10)]
+        sleep_ms: u64,
+    },
     /// Start an Orchestrator-only dev stack and prove the P7 proposal/approval/default-off execution loop
     P7OperationLoopSmoke,
     /// Start an Orchestrator-only dev stack and prove approved P7 merge execution publishes once
@@ -1753,6 +1762,9 @@ fn main() -> Result<()> {
             DevSub::ActivationLivePlannerMutationSmoke => {
                 dev_activation_live_planner_mutation_smoke()?
             }
+            DevSub::P8CadencePlanSmoke { ticks, sleep_ms } => {
+                dev_p8_cadence_plan_smoke(ticks, sleep_ms)?
+            }
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
@@ -2517,6 +2529,7 @@ enum ActivationSmokeMode {
     LiveMetricsPlan,
     LiveMetricsActivation,
     LivePlannerMutation,
+    P8CadencePlan { ticks: u32, sleep_ms: u64 },
     MergePlan,
     PlannerMutation,
     MergeActivation,
@@ -2573,6 +2586,44 @@ fn dev_activation_live_metrics_smoke() -> Result<()> {
 
 fn dev_activation_live_planner_mutation_smoke() -> Result<()> {
     dev_activation_smoke_inner(ActivationSmokeMode::LivePlannerMutation)
+}
+
+fn dev_p8_cadence_plan_smoke(ticks: u32, sleep_ms: u64) -> Result<()> {
+    if ticks == 0 {
+        bail!("P8 cadence plan smoke requires --ticks > 0");
+    }
+    dev_activation_smoke_inner(ActivationSmokeMode::P8CadencePlan { ticks, sleep_ms })
+}
+
+fn p8_cadence_candidate_key(plan: &SplitActivationOperatorPlan) -> Result<String> {
+    let parent = plan
+        .parent
+        .ok_or_else(|| anyhow::anyhow!("P8 cadence candidate has no parent cell"))?;
+    let source_worker = plan
+        .source_worker_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("P8 cadence candidate has no source worker"))?;
+    if plan.recommended_targets.is_empty() {
+        bail!("P8 cadence candidate has no recommended targets");
+    }
+    let mut targets = plan
+        .recommended_targets
+        .iter()
+        .map(|target| format!("sub{}={}", target.sub, target.worker_id))
+        .collect::<Vec<_>>();
+    targets.sort();
+    Ok(format!(
+        "split|parent={}|source={source_worker}|targets={}",
+        cell_id_key(parent),
+        targets.join(",")
+    ))
+}
+
+fn cell_id_key(cell: CellId) -> String {
+    format!(
+        "w{}:cx{}:cy{}:d{}:s{}",
+        cell.world, cell.cx, cell.cy, cell.depth, cell.sub
+    )
 }
 
 fn dev_p7_operation_loop_smoke() -> Result<()> {
@@ -9817,8 +9868,10 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ("TESSERA_ORCH_ADDR", orch_addr),
         ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
         ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
-        ("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"),
     ];
+    if !matches!(mode, ActivationSmokeMode::P8CadencePlan { .. }) {
+        orch_envs.push(("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"));
+    }
     if matches!(mode, ActivationSmokeMode::RestartRecovery) || is_merge_restart_mode(mode) {
         orch_envs.push((
             "TESSERA_ORCH_ASSIGNMENT_STATE_PATH",
@@ -10845,6 +10898,187 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         );
         return Ok(());
     }
+    if let ActivationSmokeMode::P8CadencePlan { ticks, sleep_ms } = mode {
+        let parent = CellId::grid(0, 0, 0);
+        let actor = EntityId(7_801);
+        let mut session = GatewaySession::connect(gateway_addr)?;
+        let joined = session.request(
+            parent,
+            ClientMsg::Join {
+                actor,
+                pos: Position { x: 16.0, y: 16.0 },
+            },
+        )?;
+        assert_snapshot_contains("P8 cadence plan parent join", joined, parent, actor)?;
+        let worker_metrics = assert_metrics_endpoint_body_until(
+            "P8 cadence plan worker-a",
+            worker_a_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+        assert_prometheus_sample_at_least(
+            "P8 cadence plan worker-a",
+            &worker_metrics,
+            "tessera_worker_cell_actor_count{world=\"0\",cx=\"0\",cy=\"0\",depth=\"0\",sub=\"0\"}",
+            1.0,
+        )?;
+        assert_metrics_endpoint_body_until(
+            "P8 cadence plan worker-b",
+            worker_b_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+        let live_metrics = vec![
+            format!("worker-a={worker_a_metrics_addr}"),
+            format!("worker-b={worker_b_metrics_addr}"),
+        ];
+        let live_policy = LiveMetricsPlanPolicy {
+            actor_threshold: 1,
+            move_threshold: 1,
+            min_pressure_signals: 1,
+            cell_age_secs: 60,
+        };
+        let mut tick_reports = Vec::with_capacity(ticks as usize);
+        for tick in 0..ticks {
+            let (_before_health, before_listing) =
+                runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+            let plan = build_split_activation_plan_from_live_metrics(
+                &orch_endpoint,
+                &live_metrics,
+                live_policy,
+                Some("p8-cadence-live-split".to_string()),
+                &[],
+            )?;
+            if plan.status != "ready" {
+                bail!(
+                    "P8 cadence plan tick {} expected ready plan, got status={} reason={}",
+                    tick + 1,
+                    plan.status,
+                    plan.reason
+                );
+            }
+            if !plan.preview_source.starts_with("live_worker_metrics:") {
+                bail!(
+                    "P8 cadence plan tick {} expected live_worker_metrics source, got {}",
+                    tick + 1,
+                    plan.preview_source
+                );
+            }
+            let (_after_health, after_listing) =
+                runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+            let assignment_listing_unchanged = before_listing == after_listing;
+            if !assignment_listing_unchanged {
+                bail!("P8 cadence plan tick {} changed assignments", tick + 1);
+            }
+            let candidate_key = p8_cadence_candidate_key(&plan)?;
+            tick_reports.push(serde_json::json!({
+                "tick": tick + 1,
+                "candidate_key": candidate_key,
+                "operation_id": plan.operation_id,
+                "status": plan.status,
+                "reason": plan.reason,
+                "preview": {
+                    "source": plan.preview_source,
+                    "mode": plan.preview_mode,
+                    "assignments_changed": false,
+                    "plan_count": plan.preview_plan_count
+                },
+                "candidate": {
+                    "parent": plan.parent,
+                    "source_worker_id": plan.source_worker_id,
+                    "target_count": plan.recommended_targets.len(),
+                    "targets": plan.recommended_targets.iter().map(|target| {
+                        serde_json::json!({
+                            "sub": target.sub,
+                            "worker_id": target.worker_id
+                        })
+                    }).collect::<Vec<_>>(),
+                    "submission_command": plan.submission_command
+                },
+                "orchestrator": {
+                    "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+                    "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+                },
+                "checks": {
+                    "ready_candidate": true,
+                    "live_metrics_source": true,
+                    "assignment_listing_unchanged": assignment_listing_unchanged,
+                    "execution_attempted": false,
+                    "assignments_changed": false
+                }
+            }));
+            if tick + 1 < ticks {
+                thread::sleep(Duration::from_millis(sleep_ms));
+            }
+        }
+        let candidate_keys = tick_reports
+            .iter()
+            .map(|tick| json_str(tick, &["candidate_key"]).map(str::to_string))
+            .collect::<Result<Vec<_>>>()?;
+        let stable_candidate_key = candidate_keys
+            .first()
+            .map(|first| candidate_keys.iter().all(|candidate| candidate == first))
+            .unwrap_or(false);
+        if !stable_candidate_key {
+            bail!("P8 cadence plan smoke produced unstable candidate keys: {candidate_keys:?}");
+        }
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &[(parent, "worker-a")],
+        ))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_plan_smoke.v1",
+            "unix_secs": unix_timestamp_secs(),
+            "cadence": {
+                "ticks": ticks,
+                "sleep_ms": sleep_ms,
+                "planner": "live_worker_metrics_split",
+                "policy": {
+                    "actor_threshold": live_policy.actor_threshold,
+                    "move_threshold": live_policy.move_threshold,
+                    "min_pressure_signals": live_policy.min_pressure_signals,
+                    "cell_age_secs": live_policy.cell_age_secs
+                },
+                "candidate_keys": candidate_keys
+            },
+            "live_metrics": {
+                "sources": live_metrics
+            },
+            "orchestrator": {
+                "grpc_addr": orch_addr,
+                "metrics_addr": orch_metrics_addr
+            },
+            "gateway": {
+                "addr": gateway_addr,
+                "metrics_addr": gateway_metrics_addr,
+                "routes": 1
+            },
+            "ticks": tick_reports,
+            "checks": {
+                "read_only_cadence": true,
+                "all_ticks_ready": true,
+                "all_ticks_live_metrics_source": true,
+                "stable_candidate_key": stable_candidate_key,
+                "assignments_unchanged": true,
+                "no_execution_attempted": true
+            },
+            "remaining_uncovered": [
+                "p8_proposal_ledger_idempotency",
+                "p8_approval_gate_preflight",
+                "p8_bounded_execution_cadence",
+                "p8_failure_restart_soak",
+                "internal_microk8s_p8_cadence_smoke",
+                "p8_completion_audit"
+            ]
+        });
+        validate_p8_cadence_plan_smoke_report(&report)?;
+        let report_path = write_p8_cadence_plan_smoke_report(&report)?;
+        println!(
+            "P8 cadence plan smoke: {ticks} live-metrics planner ticks produced a stable read-only candidate without assignment mutation, report={}",
+            report_path.display()
+        );
+        return Ok(());
+    }
 
     let parent = CellId::grid(0, 0, 0);
     let actor = EntityId(if mode == ActivationSmokeMode::LiveMetricsActivation {
@@ -10867,6 +11101,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::LiveMetricsPlan => "activation-live-plan-smoke",
         ActivationSmokeMode::LiveMetricsActivation => "activation-live-metrics-smoke",
         ActivationSmokeMode::LivePlannerMutation => "activation-live-planner-mutation-smoke",
+        ActivationSmokeMode::P8CadencePlan { .. } => "p8-cadence-plan-smoke",
         ActivationSmokeMode::MergePlan => "merge-plan-smoke",
         ActivationSmokeMode::PlannerMutation => "planner-mutation-smoke",
         ActivationSmokeMode::MergeActivation => "merge-activation-smoke",
@@ -17988,6 +18223,12 @@ fn default_p7_operation_ledger_path() -> PathBuf {
     workspace_root().join(".dev/operation-ledger.json")
 }
 
+fn default_p8_cadence_plan_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p8-cadence-plan-smoke-latest.json")
+}
+
 fn default_p7_operation_loop_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -18142,6 +18383,20 @@ fn write_p7_operation_loop_smoke_report(report: &serde_json::Value) -> Result<Pa
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p7_operation_loop_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p8_cadence_plan_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p8-cadence-plan-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p8_cadence_plan_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -21027,6 +21282,56 @@ fn validate_split_activation_live_metrics_plan_report(report: &serde_json::Value
     }
     assert_json_number_at_least(report, &["preview", "plan_count"], 1.0)?;
     assert_json_array_len(report, &["recommendation", "targets"], 4)?;
+    Ok(())
+}
+
+fn validate_p8_cadence_plan_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p8_cadence_plan_smoke.v1")?;
+    assert_json_bool_eq(report, &["checks", "read_only_cadence"], true)?;
+    assert_json_bool_eq(report, &["checks", "all_ticks_ready"], true)?;
+    assert_json_bool_eq(report, &["checks", "all_ticks_live_metrics_source"], true)?;
+    assert_json_bool_eq(report, &["checks", "stable_candidate_key"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignments_unchanged"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_execution_attempted"], true)?;
+    let ticks = json_array(report, &["ticks"])?;
+    if ticks.is_empty() {
+        bail!("P8 cadence plan smoke report has no ticks");
+    }
+    let expected_ticks = json_u64(report, &["cadence", "ticks"])?;
+    if ticks.len() != expected_ticks as usize {
+        bail!(
+            "P8 cadence plan smoke expected {} ticks, got {}",
+            expected_ticks,
+            ticks.len()
+        );
+    }
+    let mut first_candidate_key = None;
+    for tick in ticks {
+        assert_json_str_eq(tick, &["status"], "ready")?;
+        assert_json_bool_eq(tick, &["preview", "assignments_changed"], false)?;
+        assert_json_number_at_least(tick, &["preview", "plan_count"], 1.0)?;
+        assert_json_bool_eq(tick, &["checks", "ready_candidate"], true)?;
+        assert_json_bool_eq(tick, &["checks", "live_metrics_source"], true)?;
+        assert_json_bool_eq(tick, &["checks", "assignment_listing_unchanged"], true)?;
+        assert_json_bool_eq(tick, &["checks", "execution_attempted"], false)?;
+        assert_json_bool_eq(tick, &["checks", "assignments_changed"], false)?;
+        assert_json_array_len(tick, &["candidate", "targets"], 4)?;
+        let source = json_str(tick, &["preview", "source"])?;
+        if !source.starts_with("live_worker_metrics:") {
+            bail!("P8 cadence plan tick source is not live_worker_metrics: {source}");
+        }
+        let candidate_key = json_str(tick, &["candidate_key"])?;
+        if candidate_key.trim().is_empty() {
+            bail!("P8 cadence plan tick has empty candidate_key");
+        }
+        if let Some(first) = first_candidate_key {
+            if first != candidate_key {
+                bail!("P8 cadence plan candidate key changed from {first} to {candidate_key}");
+            }
+        } else {
+            first_candidate_key = Some(candidate_key);
+        }
+    }
     Ok(())
 }
 
@@ -30697,6 +31002,71 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
         validate_split_activation_plan_report(&report).expect("valid base plan report");
         validate_split_activation_live_metrics_plan_report(&report)
             .expect("valid live metrics plan report");
+    }
+
+    #[test]
+    fn p8_cadence_plan_smoke_report_accepts_stable_read_only_live_metrics_ticks() {
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_plan_smoke.v1",
+            "cadence": {
+                "ticks": 2,
+                "candidate_keys": [
+                    "split|parent=w0:cx0:cy0:d0:s0|source=worker-a|targets=sub0=worker-a,sub1=worker-b,sub2=worker-a,sub3=worker-b",
+                    "split|parent=w0:cx0:cy0:d0:s0|source=worker-a|targets=sub0=worker-a,sub1=worker-b,sub2=worker-a,sub3=worker-b"
+                ]
+            },
+            "ticks": [
+                {
+                    "status": "ready",
+                    "candidate_key": "split|parent=w0:cx0:cy0:d0:s0|source=worker-a|targets=sub0=worker-a,sub1=worker-b,sub2=worker-a,sub3=worker-b",
+                    "preview": {
+                        "source": "live_worker_metrics:worker-a=127.0.0.1:5303,worker-b=127.0.0.1:5304",
+                        "assignments_changed": false,
+                        "plan_count": 1
+                    },
+                    "candidate": {
+                        "targets": [{}, {}, {}, {}]
+                    },
+                    "checks": {
+                        "ready_candidate": true,
+                        "live_metrics_source": true,
+                        "assignment_listing_unchanged": true,
+                        "execution_attempted": false,
+                        "assignments_changed": false
+                    }
+                },
+                {
+                    "status": "ready",
+                    "candidate_key": "split|parent=w0:cx0:cy0:d0:s0|source=worker-a|targets=sub0=worker-a,sub1=worker-b,sub2=worker-a,sub3=worker-b",
+                    "preview": {
+                        "source": "live_worker_metrics:worker-a=127.0.0.1:5303,worker-b=127.0.0.1:5304",
+                        "assignments_changed": false,
+                        "plan_count": 1
+                    },
+                    "candidate": {
+                        "targets": [{}, {}, {}, {}]
+                    },
+                    "checks": {
+                        "ready_candidate": true,
+                        "live_metrics_source": true,
+                        "assignment_listing_unchanged": true,
+                        "execution_attempted": false,
+                        "assignments_changed": false
+                    }
+                }
+            ],
+            "checks": {
+                "read_only_cadence": true,
+                "all_ticks_ready": true,
+                "all_ticks_live_metrics_source": true,
+                "stable_candidate_key": true,
+                "assignments_unchanged": true,
+                "no_execution_attempted": true
+            }
+        });
+
+        validate_p8_cadence_plan_smoke_report(&report)
+            .expect("valid P8 cadence read-only smoke report");
     }
 
     #[test]

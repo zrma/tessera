@@ -141,9 +141,10 @@ Recommended P8 slices:
 1. `docs: refresh p8 cadence goal` - close stale P7 status references, add the
    P8 prompt-to-artifact contract, and keep the next milestone explicitly
    default-off/no automatic mutation.
-2. `feat: add p8 read-only cadence planner` - run repeated live-metrics and
-   assignment-state planner ticks, emit candidate batches, and prove
-   `assignments_changed=false`.
+2. Done: `feat: add p8 read-only cadence planner` - `cargo xt dev
+   p8-cadence-plan-smoke` runs repeated live-metrics and assignment-state
+   planner ticks, emits stable candidate batches, and proves
+   `assignments_changed=false` with no execution attempt.
 3. `test: add p8 cadence proposal idempotency smoke` - write cadence candidates
    to the durable proposal ledger and prove reruns do not duplicate records.
 4. `feat: add p8 approval and gate preflight` - enforce approval, policy id,

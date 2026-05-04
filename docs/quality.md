@@ -88,4 +88,11 @@ This document is the repo-local quality map for agents. It keeps the expected au
   Orchestrator restart recovery, canonical multi-depth operation
   execution/observation/child-route soak, post-smoke default-off cleanup, and
   `cargo xt p7-completion-audit --json`.
+- P8 read-only cadence coverage starts with `cargo xt dev p8-cadence-plan-smoke`,
+  which collects repeated live Worker metrics plus Orchestrator assignment
+  listing ticks, emits `.dev/reports/p8-cadence-plan-smoke-latest.json`, and
+  verifies stable candidate keys with no assignment mutation or execution
+  attempt. Ledger idempotency, approval gates, bounded execution,
+  failure/restart/soak, internal rollout, and P8 completion audit remain future
+  P8 slices.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

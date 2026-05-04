@@ -70,9 +70,10 @@ P8 is complete only when all of these are true:
 
 1. **Status refresh**: close stale P7 docs against the `v2026.05.6` evidence set
    and point the next milestone at this P8 contract.
-2. **Read-only cadence report**: add a local command that runs multiple planner
-   ticks from live Worker metrics and assignment listing, writes candidate batch
-   reports, and proves no assignment mutation.
+2. **Read-only cadence report**: `cargo xt dev p8-cadence-plan-smoke` runs
+   multiple planner ticks from live Worker metrics and assignment listing, writes
+   `.dev/reports/p8-cadence-plan-smoke-latest.json`, and proves no assignment
+   mutation or execution attempt.
 3. **Proposal ledger idempotency**: connect cadence output to durable proposal
    writes and prove repeated cadence ticks do not duplicate records.
 4. **Approval selection**: add an operator-selected approval path for cadence
