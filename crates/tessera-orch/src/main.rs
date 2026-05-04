@@ -48,6 +48,13 @@ enum OperationExecutionMode {
     Manual,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OperationGatePolicy {
+    cooldown_active_keys: Vec<String>,
+    budget_limits: HashMap<String, usize>,
+    max_in_flight_per_budget_key: Option<usize>,
+}
+
 fn load_split_activation_mode() -> Result<SplitActivationMode> {
     let Ok(raw) = std::env::var("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION") else {
         return Ok(SplitActivationMode::Disabled);
@@ -79,6 +86,75 @@ fn load_operation_execution_mode() -> Result<OperationExecutionMode> {
     }
     Err(anyhow!(
         "TESSERA_ORCH_OPERATION_EXECUTION must be unset, off, disabled, or manual"
+    ))
+}
+
+fn load_operation_gate_policy() -> Result<OperationGatePolicy> {
+    Ok(OperationGatePolicy {
+        cooldown_active_keys: load_csv_env("TESSERA_ORCH_OPERATION_COOLDOWN_ACTIVE_KEYS")?,
+        budget_limits: load_key_usize_map_env("TESSERA_ORCH_OPERATION_BUDGET_LIMITS")?,
+        max_in_flight_per_budget_key: load_optional_usize_env(
+            "TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY",
+        )?,
+    })
+}
+
+fn load_csv_env(name: &str) -> Result<Vec<String>> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(Vec::new());
+    };
+    let mut values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    Ok(values)
+}
+
+fn load_key_usize_map_env(name: &str) -> Result<HashMap<String, usize>> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(HashMap::new());
+    };
+    let mut values = HashMap::new();
+    for entry in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(anyhow!("{name} entry `{entry}` must use key=value"));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(anyhow!("{name} contains an empty key"));
+        }
+        let limit = value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("parse {name} limit for key `{key}`"))?;
+        values.insert(key.to_string(), limit);
+    }
+    Ok(values)
+}
+
+fn load_optional_usize_env(name: &str) -> Result<Option<usize>> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        trimmed
+            .parse::<usize>()
+            .with_context(|| format!("parse {name}"))?,
     ))
 }
 
@@ -119,6 +195,8 @@ async fn main() -> Result<()> {
         load_split_activation_mode().context("load split/merge activation mode")?;
     let operation_execution_mode =
         load_operation_execution_mode().context("load operation execution mode")?;
+    let operation_gate_policy =
+        load_operation_gate_policy().context("load operation gate policy")?;
     let assignment_state_path =
         load_assignment_state_path().context("load orchestrator assignment state path")?;
     let operation_ledger_path =
@@ -129,13 +207,15 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("resolve TESSERA_ORCH_ADDR={addr_raw}"))?;
 
-    let service = OrchestratorService::try_new_with_persistence_and_operation_execution(
-        config,
-        split_activation_mode,
-        operation_execution_mode,
-        assignment_state_path,
-        operation_ledger_path,
-    )?;
+    let service =
+        OrchestratorService::try_new_with_persistence_operation_execution_and_gate_policy(
+            config,
+            split_activation_mode,
+            operation_execution_mode,
+            operation_gate_policy,
+            assignment_state_path,
+            operation_ledger_path,
+        )?;
     let metrics_listener = load_metrics_listener().await?;
     info!(target: "orch", %listen_addr, "tessera-orch listening");
 
@@ -1565,6 +1645,75 @@ fn execution_block_reason(
     None
 }
 
+fn operation_gate_block_reason(
+    record: &OperationRecord,
+    ledger: &OperationLedgerFile,
+    policy: &OperationGatePolicy,
+) -> Option<String> {
+    let approval = record.approval.as_ref()?;
+    if policy
+        .cooldown_active_keys
+        .iter()
+        .any(|key| key == &approval.cooldown_key)
+    {
+        return Some(format!(
+            "cooldown key {} is active for operation execution",
+            approval.cooldown_key
+        ));
+    }
+
+    if let Some(limit) = policy.budget_limits.get(&approval.budget_key) {
+        let used = ledger
+            .records
+            .iter()
+            .filter(|other| other.operation_id != record.operation_id)
+            .filter(|other| operation_counts_against_budget(other, &approval.budget_key))
+            .count();
+        if used >= *limit {
+            return Some(format!(
+                "budget key {} is exhausted: used {} of limit {}",
+                approval.budget_key, used, limit
+            ));
+        }
+    }
+
+    if let Some(limit) = policy.max_in_flight_per_budget_key {
+        let in_flight = ledger
+            .records
+            .iter()
+            .filter(|other| other.operation_id != record.operation_id)
+            .filter(|other| operation_is_in_flight_for_budget(other, &approval.budget_key))
+            .count();
+        if in_flight >= limit {
+            return Some(format!(
+                "concurrency limit for budget key {} is reached: in_flight {} of limit {}",
+                approval.budget_key, in_flight, limit
+            ));
+        }
+    }
+
+    None
+}
+
+fn operation_counts_against_budget(record: &OperationRecord, budget_key: &str) -> bool {
+    record
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.budget_key == budget_key)
+        && !matches!(record.status, OperationStatus::Failed)
+}
+
+fn operation_is_in_flight_for_budget(record: &OperationRecord, budget_key: &str) -> bool {
+    record
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.budget_key == budget_key)
+        && matches!(
+            record.status,
+            OperationStatus::Executing | OperationStatus::Observing
+        )
+}
+
 fn operation_execution_disabled_reason() -> String {
     "executor mutation is default-off; set TESSERA_ORCH_OPERATION_EXECUTION=manual for a controlled execution window".to_string()
 }
@@ -2253,6 +2402,7 @@ struct OrchestratorService {
     metrics: Arc<OrchestratorMetricsCounters>,
     split_activation_mode: SplitActivationMode,
     operation_execution_mode: OperationExecutionMode,
+    operation_gate_policy: OperationGatePolicy,
     assignment_state_path: Option<Arc<PathBuf>>,
     operation_ledger_path: Option<Arc<PathBuf>>,
 }
@@ -2305,10 +2455,29 @@ impl OrchestratorService {
         )
     }
 
+    #[cfg(test)]
     fn try_new_with_persistence_and_operation_execution(
         config: Config,
         split_activation_mode: SplitActivationMode,
         operation_execution_mode: OperationExecutionMode,
+        assignment_state_path: Option<PathBuf>,
+        operation_ledger_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::try_new_with_persistence_operation_execution_and_gate_policy(
+            config,
+            split_activation_mode,
+            operation_execution_mode,
+            OperationGatePolicy::default(),
+            assignment_state_path,
+            operation_ledger_path,
+        )
+    }
+
+    fn try_new_with_persistence_operation_execution_and_gate_policy(
+        config: Config,
+        split_activation_mode: SplitActivationMode,
+        operation_execution_mode: OperationExecutionMode,
+        operation_gate_policy: OperationGatePolicy,
         assignment_state_path: Option<PathBuf>,
         operation_ledger_path: Option<PathBuf>,
     ) -> Result<Self> {
@@ -2336,6 +2505,7 @@ impl OrchestratorService {
             metrics: Arc::new(OrchestratorMetricsCounters::default()),
             split_activation_mode,
             operation_execution_mode,
+            operation_gate_policy,
             assignment_state_path: assignment_state_path.map(Arc::new),
             operation_ledger_path,
         })
@@ -2611,6 +2781,7 @@ impl OrchestratorService {
         let activation = {
             let mut ledger = self.operation_ledger.write().await;
             let mut next_ledger = ledger.clone();
+            let gate_ledger_snapshot = next_ledger.clone();
             let Some(record) = next_ledger
                 .records
                 .iter_mut()
@@ -2644,6 +2815,13 @@ impl OrchestratorService {
 
             let block_reason =
                 execution_block_reason(record, request.policy_id.as_deref(), now_unix_secs)
+                    .or_else(|| {
+                        operation_gate_block_reason(
+                            record,
+                            &gate_ledger_snapshot,
+                            &self.operation_gate_policy,
+                        )
+                    })
                     .or_else(|| {
                         (self.operation_execution_mode != OperationExecutionMode::Manual)
                             .then(operation_execution_disabled_reason)
@@ -5622,6 +5800,26 @@ mod tests {
         }
     }
 
+    fn approve_sample_operation_record(
+        mut record: OperationRecord,
+        cooldown_key: &str,
+        budget_key: &str,
+    ) -> OperationRecord {
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        record.status = OperationStatus::Approved;
+        record.approval = Some(OperationApproval {
+            policy_id: "operator_approved_dynamic_operation_v1".to_string(),
+            approver: "operator".to_string(),
+            allowed_kind: record.kind,
+            approved_unix_secs: 400,
+            expires_unix_secs: 1000,
+            expected_proposal_hash: proposal_hash,
+            cooldown_key: cooldown_key.to_string(),
+            budget_key: budget_key.to_string(),
+        });
+        record
+    }
+
     fn sample_observing_operation_record(operation_id: &str) -> OperationRecord {
         let mut record = sample_operation_record(operation_id);
         record.status = OperationStatus::Observing;
@@ -7415,19 +7613,12 @@ mod tests {
     #[tokio::test]
     async fn operation_ledger_execution_blocks_default_off_after_approval_idempotently() {
         let ledger_path = unique_assignment_state_path("operation-ledger-execution-approved");
-        let mut record = sample_operation_record("execute-approved-op");
+        let record = approve_sample_operation_record(
+            sample_operation_record("execute-approved-op"),
+            "world-0",
+            "dynamic-ops-daily",
+        );
         let proposal_hash = record.proposal.proposal_hash.clone();
-        record.status = OperationStatus::Approved;
-        record.approval = Some(OperationApproval {
-            policy_id: "operator_approved_dynamic_operation_v1".to_string(),
-            approver: "operator".to_string(),
-            allowed_kind: DynamicOperationKind::Split,
-            approved_unix_secs: 400,
-            expires_unix_secs: 1000,
-            expected_proposal_hash: proposal_hash.clone(),
-            cooldown_key: "world-0".to_string(),
-            budget_key: "dynamic-ops-daily".to_string(),
-        });
         write_operation_ledger_file(
             &ledger_path,
             &OperationLedgerFile {
@@ -7474,6 +7665,116 @@ mod tests {
                 .count(),
             1
         );
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[test]
+    fn operation_gate_policy_blocks_cooldown_budget_and_concurrency() {
+        let current = approve_sample_operation_record(
+            sample_operation_record("gate-current-op"),
+            "world-0",
+            "p8-budget",
+        );
+        let current_ledger = OperationLedgerFile {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: vec![current.clone()],
+        };
+
+        let cooldown = operation_gate_block_reason(
+            &current,
+            &current_ledger,
+            &OperationGatePolicy {
+                cooldown_active_keys: vec!["world-0".to_string()],
+                ..OperationGatePolicy::default()
+            },
+        )
+        .expect("cooldown gate should block");
+        assert!(cooldown.contains("cooldown key world-0"));
+
+        let budget = operation_gate_block_reason(
+            &current,
+            &current_ledger,
+            &OperationGatePolicy {
+                budget_limits: HashMap::from([("p8-budget".to_string(), 0)]),
+                ..OperationGatePolicy::default()
+            },
+        )
+        .expect("budget gate should block");
+        assert!(budget.contains("budget key p8-budget is exhausted"));
+
+        let mut active = approve_sample_operation_record(
+            sample_operation_record("gate-active-op"),
+            "world-1",
+            "p8-budget",
+        );
+        active.status = OperationStatus::Observing;
+        let active_ledger = OperationLedgerFile {
+            schema: OPERATION_LEDGER_SCHEMA.to_string(),
+            records: vec![current.clone(), active],
+        };
+        let concurrency = operation_gate_block_reason(
+            &current,
+            &active_ledger,
+            &OperationGatePolicy {
+                max_in_flight_per_budget_key: Some(1),
+                ..OperationGatePolicy::default()
+            },
+        )
+        .expect("concurrency gate should block");
+        assert!(concurrency.contains("concurrency limit for budget key p8-budget"));
+
+        let allowed =
+            operation_gate_block_reason(&current, &current_ledger, &OperationGatePolicy::default());
+        assert!(allowed.is_none());
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_execution_blocks_gate_policy_before_default_off() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-gate-preflight");
+        let record = approve_sample_operation_record(
+            sample_operation_record("execute-gated-op"),
+            "world-0",
+            "dynamic-ops-daily",
+        );
+        let proposal_hash = record.proposal.proposal_hash.clone();
+        write_operation_ledger_file(
+            &ledger_path,
+            &OperationLedgerFile {
+                schema: OPERATION_LEDGER_SCHEMA.to_string(),
+                records: vec![record],
+            },
+        )
+        .expect("write operation ledger");
+        let service =
+            OrchestratorService::try_new_with_persistence_operation_execution_and_gate_policy(
+                two_worker_handover_config(),
+                SplitActivationMode::Disabled,
+                OperationExecutionMode::Disabled,
+                OperationGatePolicy {
+                    cooldown_active_keys: vec!["world-0".to_string()],
+                    ..OperationGatePolicy::default()
+                },
+                None,
+                Some(ledger_path.clone()),
+            )
+            .expect("construct service with gate policy");
+        let response = service
+            .execute_operation(
+                OperationExecutionRequest {
+                    operation_id: "execute-gated-op".to_string(),
+                    expected_proposal_hash: proposal_hash,
+                    policy_id: Some("operator_approved_dynamic_operation_v1".to_string()),
+                },
+                UNIX_EPOCH + std::time::Duration::from_secs(500),
+            )
+            .await
+            .expect("execute gated operation");
+
+        assert_eq!(response.status, "blocked_by_policy");
+        assert!(response.reason.contains("cooldown key world-0"));
+        assert!(!response.reason.contains("default-off"));
+        assert!(!response.mutation_attempted);
+        assert!(!response.mutation_allowed);
         let _ = fs::remove_file(ledger_path);
     }
 

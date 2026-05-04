@@ -950,6 +950,8 @@ enum DevSub {
         #[arg(long, default_value_t = 105)]
         actors: u32,
     },
+    /// Start Orchestrator-only cases and prove P8 cadence cooldown/budget/concurrency gates
+    P8CadenceGateSmoke,
     /// Start an Orchestrator-only dev stack and prove the P7 proposal/approval/default-off execution loop
     P7OperationLoopSmoke,
     /// Start an Orchestrator-only dev stack and prove approved P7 merge execution publishes once
@@ -1789,6 +1791,7 @@ fn main() -> Result<()> {
                 actors,
             } => dev_p8_cadence_proposal_smoke(ticks, sleep_ms, actors)?,
             DevSub::P8CadenceApprovalSmoke { actors } => dev_p8_cadence_approval_smoke(actors)?,
+            DevSub::P8CadenceGateSmoke => dev_p8_cadence_gate_smoke()?,
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
@@ -2658,6 +2661,258 @@ fn dev_p8_cadence_approval_smoke(actors: u32) -> Result<()> {
         bail!("P8 cadence approval smoke requires --actors >= 100 for default planner thresholds");
     }
     dev_activation_smoke_inner(ActivationSmokeMode::P8CadenceApproval { actors })
+}
+
+fn dev_p8_cadence_gate_smoke() -> Result<()> {
+    let orch_addr = "127.0.0.1:6350";
+    let orch_metrics_addr = "127.0.0.1:6351";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let worker_a_addr = "127.0.0.1:5351";
+    let worker_b_addr = "127.0.0.1:5352";
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    let report_dir = root.join(".dev/reports");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+    fs::create_dir_all(&report_dir)?;
+
+    let mut build = Command::new("cargo");
+    build.args(["build", "--bin", "tessera-orch"]);
+    run(&mut build)?;
+
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+    );
+    let cases = p8_cadence_gate_smoke_cases();
+    let mut case_reports = Vec::with_capacity(cases.len());
+    for case in &cases {
+        case_reports.push(run_p8_cadence_gate_smoke_case(
+            &root,
+            &logs,
+            &pids,
+            &orchestrator_bin,
+            rust_log.as_str(),
+            orch_addr,
+            orch_metrics_addr,
+            orch_endpoint.as_str(),
+            orch_config_json.as_str(),
+            &report_dir,
+            case,
+        )?);
+    }
+
+    let report = serde_json::json!({
+        "schema": "tessera.p8_cadence_gate_smoke.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "cases": case_reports,
+        "checks": {
+            "cooldown_gate_blocked": true,
+            "budget_gate_blocked": true,
+            "concurrency_gate_blocked": true,
+            "gate_allowed_path_reached_default_off": true,
+            "assignments_unchanged": true,
+            "no_mutation_attempted": true
+        },
+        "remaining_uncovered": [
+            "p8_bounded_execution_cadence",
+            "p8_failure_restart_soak",
+            "guarded_kubernetes_p8_cadence_smoke",
+            "p8_completion_audit"
+        ]
+    });
+    validate_p8_cadence_gate_smoke_report(&report)?;
+    let report_path = write_p8_cadence_gate_smoke_report(&report)?;
+    println!(
+        "P8 cadence gate smoke: cooldown, budget, concurrency, and allowed default-off preflight cases passed mutation-free, report={}",
+        report_path.display()
+    );
+    Ok(())
+}
+
+struct P8CadenceGateSmokeCase {
+    name: &'static str,
+    gate: &'static str,
+    extra_envs: Vec<(&'static str, &'static str)>,
+    expected_reason_fragment: &'static str,
+}
+
+fn p8_cadence_gate_smoke_cases() -> Vec<P8CadenceGateSmokeCase> {
+    vec![
+        P8CadenceGateSmokeCase {
+            name: "cooldown",
+            gate: "cooldown",
+            extra_envs: vec![("TESSERA_ORCH_OPERATION_COOLDOWN_ACTIVE_KEYS", "p8-cooldown")],
+            expected_reason_fragment: "cooldown key p8-cooldown",
+        },
+        P8CadenceGateSmokeCase {
+            name: "budget",
+            gate: "budget",
+            extra_envs: vec![("TESSERA_ORCH_OPERATION_BUDGET_LIMITS", "p8-budget=0")],
+            expected_reason_fragment: "budget key p8-budget is exhausted",
+        },
+        P8CadenceGateSmokeCase {
+            name: "concurrency",
+            gate: "concurrency",
+            extra_envs: vec![("TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY", "0")],
+            expected_reason_fragment: "concurrency limit for budget key p8-budget",
+        },
+        P8CadenceGateSmokeCase {
+            name: "allowed_default_off",
+            gate: "default_off",
+            extra_envs: Vec::new(),
+            expected_reason_fragment: "default-off",
+        },
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_p8_cadence_gate_smoke_case(
+    root: &Path,
+    logs: &Path,
+    pids: &Path,
+    orchestrator_bin: &Path,
+    rust_log: &str,
+    orch_addr: &str,
+    orch_metrics_addr: &str,
+    orch_endpoint: &str,
+    orch_config_json: &str,
+    report_dir: &Path,
+    case: &P8CadenceGateSmokeCase,
+) -> Result<serde_json::Value> {
+    let ledger_path = report_dir.join(format!("p8-cadence-gate-{}-ledger-latest.json", case.name));
+    let _ = fs::remove_file(&ledger_path);
+    let ledger_path_raw = ledger_path.to_string_lossy().into_owned();
+    let preview_json = r#"{"cells":[{"cell":{"world":0,"cx":0,"cy":0},"actor_count":140,"move_queue_pressure":70,"high_pressure_windows":3,"cell_age_secs":120,"owner_worker_id":"worker-a"}]}"#;
+    let mut orch_envs = vec![
+        ("RUST_LOG", rust_log),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json),
+        ("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", preview_json),
+        (
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            ledger_path_raw.as_str(),
+        ),
+    ];
+    orch_envs.extend(case.extra_envs.iter().copied());
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        root,
+        logs,
+        pids,
+        DevProcessSpec {
+            name: "p8-cadence-gate-orch",
+            bin: orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(register_orchestrator_worker(
+        orch_endpoint,
+        "worker-a",
+        "127.0.0.1:5351",
+    ))?;
+    runtime.block_on(register_orchestrator_worker(
+        orch_endpoint,
+        "worker-b",
+        "127.0.0.1:5352",
+    ))?;
+    runtime.block_on(wait_for_orchestrator_registered(orch_endpoint, 2))?;
+    let (before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(orch_endpoint))?;
+
+    let proposal_response = http_json_post(
+        "P8 cadence gate proposal",
+        orch_metrics_addr,
+        "/operations/proposals",
+    )?;
+    assert_json_number_at_least(&proposal_response, &["planned_count"], 1.0)?;
+    assert_json_number_eq(&proposal_response, &["recorded_count"], 1.0)?;
+    let operation_id = p8_cadence_operation_ids(&proposal_response)?
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("P8 cadence gate proposal has no operation id"))?;
+    let proposal_snapshot =
+        http_json_get("P8 cadence gate ledger", orch_metrics_addr, "/operations")?;
+    let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+    let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+    let policy_id = "operator_approved_dynamic_operation_v1";
+
+    let approval_response = http_json_post(
+        "P8 cadence gate approval",
+        orch_metrics_addr,
+        &format!(
+            "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p8-cadence-gate-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p8-cooldown&budget_key=p8-budget"
+        ),
+    )?;
+    assert_json_str_eq(&approval_response, &["status"], "approved")?;
+
+    let execution_response = http_json_post(
+        "P8 cadence gate execution preflight",
+        orch_metrics_addr,
+        &format!(
+            "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+        ),
+    )?;
+    assert_json_str_eq(&execution_response, &["status"], "blocked_by_policy")?;
+    assert_json_bool_eq(&execution_response, &["assignments_changed"], false)?;
+    assert_json_bool_eq(&execution_response, &["mutation_attempted"], false)?;
+    assert_json_bool_eq(&execution_response, &["mutation_allowed"], false)?;
+    let reason = json_str(&execution_response, &["reason"])?;
+    if !reason.contains(case.expected_reason_fragment) {
+        bail!(
+            "P8 cadence gate case {} expected reason containing `{}`, got `{}`",
+            case.name,
+            case.expected_reason_fragment,
+            reason
+        );
+    }
+
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(orch_endpoint))?;
+    let assignments_unchanged = before_listing == after_listing;
+    if !assignments_unchanged {
+        bail!("P8 cadence gate case {} changed assignments", case.name);
+    }
+    let ledger = http_json_get("P8 cadence gate ledger", orch_metrics_addr, "/operations")?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, true, true, false, false, false)?;
+
+    Ok(serde_json::json!({
+        "case": case.name,
+        "gate": case.gate,
+        "ledger": {
+            "path": ledger_path_raw.as_str(),
+            "records": ledger_summary.records,
+            "proposal_records": ledger_summary.proposal_records,
+            "approval_records": ledger_summary.approval_records,
+            "blocked_execution_records": ledger_summary.blocked_execution_records
+        },
+        "orchestrator": {
+            "grpc_addr": orch_addr,
+            "metrics_addr": orch_metrics_addr,
+            "registered_workers": before_health.registered_workers,
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "responses": {
+            "proposal": proposal_response,
+            "approval": approval_response,
+            "execution": execution_response
+        },
+        "checks": {
+            "proposal_recorded": true,
+            "approval_recorded": true,
+            "execution_blocked_by_expected_gate": true,
+            "assignments_unchanged": assignments_unchanged,
+            "mutation_attempted": false,
+            "mutation_allowed": false
+        }
+    }))
 }
 
 fn p8_cadence_operation_ids(response: &serde_json::Value) -> Result<Vec<String>> {
@@ -18984,6 +19239,12 @@ fn default_p8_cadence_approval_smoke_path() -> PathBuf {
         .join("p8-cadence-approval-smoke-latest.json")
 }
 
+fn default_p8_cadence_gate_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p8-cadence-gate-smoke-latest.json")
+}
+
 fn default_p7_operation_loop_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -19180,6 +19441,20 @@ fn write_p8_cadence_approval_smoke_report(report: &serde_json::Value) -> Result<
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p8_cadence_approval_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p8_cadence_gate_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p8-cadence-gate-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p8_cadence_gate_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -22282,6 +22557,54 @@ fn validate_p8_cadence_approval_smoke_report(report: &serde_json::Value) -> Resu
         ],
         false,
     )?;
+    Ok(())
+}
+
+fn validate_p8_cadence_gate_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p8_cadence_gate_smoke.v1")?;
+    assert_json_bool_eq(report, &["checks", "cooldown_gate_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "budget_gate_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "concurrency_gate_blocked"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "gate_allowed_path_reached_default_off"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "assignments_unchanged"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_mutation_attempted"], true)?;
+    let cases = json_array(report, &["cases"])?;
+    for expected in ["cooldown", "budget", "concurrency", "default_off"] {
+        let Some(case) = cases
+            .iter()
+            .find(|case| json_str(case, &["gate"]).is_ok_and(|gate| gate == expected))
+        else {
+            bail!("P8 cadence gate smoke report missing gate case `{expected}`");
+        };
+        assert_json_number_eq(case, &["ledger", "records"], 1.0)?;
+        assert_json_number_eq(case, &["ledger", "proposal_records"], 1.0)?;
+        assert_json_number_eq(case, &["ledger", "approval_records"], 1.0)?;
+        assert_json_number_eq(case, &["ledger", "blocked_execution_records"], 1.0)?;
+        assert_json_str_eq(case, &["responses", "approval", "status"], "approved")?;
+        assert_json_str_eq(
+            case,
+            &["responses", "execution", "status"],
+            "blocked_by_policy",
+        )?;
+        assert_json_bool_eq(
+            case,
+            &["responses", "execution", "mutation_attempted"],
+            false,
+        )?;
+        assert_json_bool_eq(case, &["responses", "execution", "mutation_allowed"], false)?;
+        assert_json_bool_eq(
+            case,
+            &["checks", "execution_blocked_by_expected_gate"],
+            true,
+        )?;
+        assert_json_bool_eq(case, &["checks", "assignments_unchanged"], true)?;
+        assert_json_bool_eq(case, &["checks", "mutation_attempted"], false)?;
+        assert_json_bool_eq(case, &["checks", "mutation_allowed"], false)?;
+    }
     Ok(())
 }
 
@@ -32235,6 +32558,56 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
 
         validate_p8_cadence_approval_smoke_report(&report)
             .expect("valid P8 cadence approval smoke report");
+    }
+
+    #[test]
+    fn p8_cadence_gate_smoke_report_accepts_gate_cases() {
+        let case = |gate: &str| {
+            serde_json::json!({
+                "gate": gate,
+                "ledger": {
+                    "records": 1,
+                    "proposal_records": 1,
+                    "approval_records": 1,
+                    "blocked_execution_records": 1
+                },
+                "responses": {
+                    "approval": {
+                        "status": "approved"
+                    },
+                    "execution": {
+                        "status": "blocked_by_policy",
+                        "mutation_attempted": false,
+                        "mutation_allowed": false
+                    }
+                },
+                "checks": {
+                    "execution_blocked_by_expected_gate": true,
+                    "assignments_unchanged": true,
+                    "mutation_attempted": false,
+                    "mutation_allowed": false
+                }
+            })
+        };
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_gate_smoke.v1",
+            "cases": [
+                case("cooldown"),
+                case("budget"),
+                case("concurrency"),
+                case("default_off")
+            ],
+            "checks": {
+                "cooldown_gate_blocked": true,
+                "budget_gate_blocked": true,
+                "concurrency_gate_blocked": true,
+                "gate_allowed_path_reached_default_off": true,
+                "assignments_unchanged": true,
+                "no_mutation_attempted": true
+            }
+        });
+
+        validate_p8_cadence_gate_smoke_report(&report).expect("valid P8 cadence gate smoke report");
     }
 
     #[test]
