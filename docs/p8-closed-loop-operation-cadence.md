@@ -73,9 +73,11 @@ cargo xt p8-completion-audit --json
 ```
 
 As of 2026-05-05 this is intentionally incomplete. It must stay
-`complete=false` until the audit findings for split/merge/canonical multi-depth
-candidate coverage, the P8 GitOps rollout/default-off report, and the internal
-MicroK8s controlled cadence smoke have concrete evidence.
+`complete=false` until the audit findings for the P8 GitOps rollout/default-off
+report and the internal MicroK8s controlled cadence smoke have concrete
+evidence. The local read-only cadence now records stable split, merge, and
+canonical multi-depth candidate batches from live Worker metrics and assignment
+state.
 
 ## Initial Implementation Order
 

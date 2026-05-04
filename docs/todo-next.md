@@ -143,8 +143,8 @@ Recommended P8 slices:
    default-off/no automatic mutation.
 2. Done: `feat: add p8 read-only cadence planner` - `cargo xt dev
    p8-cadence-plan-smoke` runs repeated live-metrics and assignment-state
-   planner ticks, emits stable candidate batches, and proves
-   `assignments_changed=false` with no execution attempt.
+   planner ticks, emits stable split/merge/canonical multi-depth candidate
+   batches, and proves `assignments_changed=false` with no execution attempt.
 3. Done: `test: add p8 cadence proposal idempotency smoke` - `cargo xt dev
    p8-cadence-proposal-smoke` materializes live Worker actor metrics into the
    Orchestrator proposal preview path, writes one durable proposal record, and
@@ -180,9 +180,8 @@ Recommended P8 slices:
    artifact is still required by the completion audit.
 11. Done: `test: add p8 completion audit` - `cargo xt
    p8-completion-audit --json` now aggregates local cadence evidence and fails
-   until split/merge/canonical multi-depth candidate coverage, P8 GitOps
-   rollout/default-off report, and internal MicroK8s controlled cadence smoke
-   are covered.
+   until the P8 GitOps rollout/default-off report and internal MicroK8s
+   controlled cadence smoke are covered.
 12. `test: add internal p8 cadence smoke` - wait for ArgoCD `Synced / Healthy`,
    run controlled internal cadence smoke, restore default-off state, and close
    the remaining P8 completion audit findings.
