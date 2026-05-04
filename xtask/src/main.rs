@@ -944,6 +944,12 @@ enum DevSub {
         #[arg(long, default_value_t = 105)]
         actors: u32,
     },
+    /// Start a two-worker dev stack and prove P8 cadence approval/default-off preflight gates
+    P8CadenceApprovalSmoke {
+        /// Number of actors to join on the parent cell before proposal approval
+        #[arg(long, default_value_t = 105)]
+        actors: u32,
+    },
     /// Start an Orchestrator-only dev stack and prove the P7 proposal/approval/default-off execution loop
     P7OperationLoopSmoke,
     /// Start an Orchestrator-only dev stack and prove approved P7 merge execution publishes once
@@ -1782,6 +1788,7 @@ fn main() -> Result<()> {
                 sleep_ms,
                 actors,
             } => dev_p8_cadence_proposal_smoke(ticks, sleep_ms, actors)?,
+            DevSub::P8CadenceApprovalSmoke { actors } => dev_p8_cadence_approval_smoke(actors)?,
             DevSub::P7OperationLoopSmoke => dev_p7_operation_loop_smoke()?,
             DevSub::P7OperationExecutionSmoke => dev_p7_operation_execution_smoke()?,
             DevSub::P7OperationSplitExecutionSmoke => dev_p7_operation_split_execution_smoke()?,
@@ -2555,6 +2562,9 @@ enum ActivationSmokeMode {
         sleep_ms: u64,
         actors: u32,
     },
+    P8CadenceApproval {
+        actors: u32,
+    },
     MergePlan,
     PlannerMutation,
     MergeActivation,
@@ -2641,6 +2651,13 @@ fn dev_p8_cadence_proposal_smoke(ticks: u32, sleep_ms: u64, actors: u32) -> Resu
         sleep_ms,
         actors,
     })
+}
+
+fn dev_p8_cadence_approval_smoke(actors: u32) -> Result<()> {
+    if actors < 100 {
+        bail!("P8 cadence approval smoke requires --actors >= 100 for default planner thresholds");
+    }
+    dev_activation_smoke_inner(ActivationSmokeMode::P8CadenceApproval { actors })
 }
 
 fn p8_cadence_operation_ids(response: &serde_json::Value) -> Result<Vec<String>> {
@@ -9867,19 +9884,28 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
     let assignment_state_path = root
         .join(".dev/reports")
         .join("activation-restart-assignment-state.json");
+    let p8_operation_prefix = if matches!(mode, ActivationSmokeMode::P8CadenceApproval { .. }) {
+        "p8-cadence-approval"
+    } else {
+        "p8-cadence-proposal"
+    };
     let p8_proposal_preview_path = root
         .join(".dev/reports")
-        .join("p8-cadence-proposal-preview-latest.json");
+        .join(format!("{p8_operation_prefix}-preview-latest.json"));
     let p8_proposal_ledger_path = root
         .join(".dev/reports")
-        .join("p8-cadence-proposal-ledger-latest.json");
+        .join(format!("{p8_operation_prefix}-ledger-latest.json"));
     if matches!(mode, ActivationSmokeMode::RestartRecovery) || is_merge_restart_mode(mode) {
         if let Some(parent) = assignment_state_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let _ = fs::remove_file(&assignment_state_path);
     }
-    if matches!(mode, ActivationSmokeMode::P8CadenceProposal { .. }) {
+    if matches!(
+        mode,
+        ActivationSmokeMode::P8CadenceProposal { .. }
+            | ActivationSmokeMode::P8CadenceApproval { .. }
+    ) {
         if let Some(parent) = p8_proposal_preview_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -9945,7 +9971,9 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
     ];
     if !matches!(
         mode,
-        ActivationSmokeMode::P8CadencePlan { .. } | ActivationSmokeMode::P8CadenceProposal { .. }
+        ActivationSmokeMode::P8CadencePlan { .. }
+            | ActivationSmokeMode::P8CadenceProposal { .. }
+            | ActivationSmokeMode::P8CadenceApproval { .. }
     ) {
         orch_envs.push(("TESSERA_ORCH_SPLIT_MERGE_ACTIVATION", "manual"));
     }
@@ -9977,7 +10005,11 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
     ) {
         orch_envs.push(("TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON", merge_preview_json));
     }
-    if matches!(mode, ActivationSmokeMode::P8CadenceProposal { .. }) {
+    if matches!(
+        mode,
+        ActivationSmokeMode::P8CadenceProposal { .. }
+            | ActivationSmokeMode::P8CadenceApproval { .. }
+    ) {
         orch_envs.push((
             "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH",
             p8_proposal_preview_path_raw.as_str(),
@@ -11447,6 +11479,347 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         );
         return Ok(());
     }
+    if let ActivationSmokeMode::P8CadenceApproval { actors } = mode {
+        let parent = CellId::grid(0, 0, 0);
+        let mut session = GatewaySession::connect(gateway_addr)?;
+        for idx in 0..actors {
+            let actor = EntityId(8_100 + u64::from(idx));
+            let joined = session.request(
+                parent,
+                ClientMsg::Join {
+                    actor,
+                    pos: Position {
+                        x: 12.0 + (idx % 8) as f32,
+                        y: 12.0 + (idx / 8) as f32,
+                    },
+                },
+            )?;
+            assert_snapshot_contains("P8 cadence approval parent join", joined, parent, actor)?;
+        }
+        let parent_metric = worker_cell_actor_count_metric(parent);
+        let actor_count_after_join = assert_prometheus_sample_at_least_until(
+            "P8 cadence approval worker-a",
+            worker_a_metrics_addr,
+            parent_metric.as_str(),
+            f64::from(actors),
+        )?;
+        assert_metrics_endpoint_body_until(
+            "P8 cadence approval worker-b",
+            worker_b_metrics_addr,
+            &["tessera_worker_cell_actor_count"],
+        )?;
+
+        let live_metrics = vec![
+            format!("worker-a={worker_a_metrics_addr}"),
+            format!("worker-b={worker_b_metrics_addr}"),
+        ];
+        let live_metrics_endpoints = parse_live_worker_metrics_endpoints(&live_metrics)?;
+        let live_policy = LiveMetricsPlanPolicy::default();
+        let (before_health, before_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let snapshots = live_metrics_endpoints
+            .iter()
+            .map(fetch_live_worker_metrics_snapshot)
+            .collect::<Result<Vec<_>>>()?;
+        let source_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.worker_id == "worker-a")
+            .ok_or_else(|| anyhow::anyhow!("P8 cadence approval missing worker-a metrics"))?;
+        let live_parent_actor_count = *source_snapshot.actor_counts.get(&parent).unwrap_or(&0);
+        if live_parent_actor_count < u64::from(actors) {
+            bail!(
+                "P8 cadence approval expected at least {actors} live parent actors, got {live_parent_actor_count}"
+            );
+        }
+        let live_parent_pending_moves = *source_snapshot.pending_moves.get(&parent).unwrap_or(&0);
+        let preview_snapshot =
+            build_p8_cadence_operation_metrics_snapshot(&before_listing, &snapshots, live_policy)?;
+        fs::write(
+            &p8_proposal_preview_path,
+            format!("{}\n", serde_json::to_string_pretty(&preview_snapshot)?),
+        )
+        .with_context(|| {
+            format!(
+                "write P8 cadence approval preview {}",
+                p8_proposal_preview_path.display()
+            )
+        })?;
+
+        let proposal_response = http_json_post(
+            "P8 cadence approval proposal",
+            orch_metrics_addr,
+            "/operations/proposals",
+        )?;
+        assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+        assert_json_number_at_least(&proposal_response, &["planned_count"], 1.0)?;
+        assert_json_number_eq(&proposal_response, &["recorded_count"], 1.0)?;
+        let operation_id = p8_cadence_operation_ids(&proposal_response)?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("P8 cadence approval proposal has no operation id"))?;
+        let proposal_snapshot = http_json_get(
+            "P8 cadence approval ledger",
+            orch_metrics_addr,
+            "/operations",
+        )?;
+        let proposal_record = find_p7_operation_record(&proposal_snapshot, &operation_id)?;
+        assert_json_str_eq(proposal_record, &["kind"], "split")?;
+        let proposal_hash = json_str(proposal_record, &["proposal", "proposal_hash"])?.to_string();
+        let policy_id = "operator_approved_dynamic_operation_v1";
+
+        let unapproved_execution_response = http_json_post(
+            "P8 cadence unapproved execution preflight",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+            ),
+        )?;
+        assert_json_str_eq(
+            &unapproved_execution_response,
+            &["status"],
+            "blocked_by_policy",
+        )?;
+        assert_json_bool_eq(
+            &unapproved_execution_response,
+            &["assignments_changed"],
+            false,
+        )?;
+        assert_json_bool_eq(
+            &unapproved_execution_response,
+            &["mutation_attempted"],
+            false,
+        )?;
+        assert_json_bool_eq(&unapproved_execution_response, &["mutation_allowed"], false)?;
+        if !json_str(&unapproved_execution_response, &["reason"])?.contains("not approved") {
+            bail!("P8 cadence unapproved execution did not block on approval");
+        }
+
+        let approval_response = http_json_post(
+            "P8 cadence approval",
+            orch_metrics_addr,
+            &format!(
+                "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p8-cadence-approval-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p8-cadence-root-w0&budget_key=p8-cadence-local"
+            ),
+        )?;
+        assert_json_str_eq(&approval_response, &["status"], "approved")?;
+        assert_json_bool_eq(&approval_response, &["assignments_changed"], false)?;
+
+        let repeat_approval_response = http_json_post(
+            "P8 cadence repeat approval",
+            orch_metrics_addr,
+            &format!(
+                "/operations/approvals?operation_id={operation_id}&policy_id={policy_id}&approver=p8-cadence-approval-smoke&expected_proposal_hash={proposal_hash}&ttl_secs=600&cooldown_key=p8-cadence-root-w0&budget_key=p8-cadence-local"
+            ),
+        )?;
+        assert_json_str_eq(&repeat_approval_response, &["status"], "already_approved")?;
+        assert_json_bool_eq(&repeat_approval_response, &["assignments_changed"], false)?;
+
+        let missing_policy_execution_response = http_json_post(
+            "P8 cadence missing-policy execution preflight",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}"
+            ),
+        )?;
+        assert_json_str_eq(
+            &missing_policy_execution_response,
+            &["status"],
+            "blocked_by_policy",
+        )?;
+        assert_json_bool_eq(
+            &missing_policy_execution_response,
+            &["mutation_attempted"],
+            false,
+        )?;
+        if !json_str(&missing_policy_execution_response, &["reason"])?
+            .contains("policy_id is required")
+        {
+            bail!("P8 cadence missing-policy execution did not block on policy_id");
+        }
+
+        let wrong_policy_execution_response = http_json_post(
+            "P8 cadence wrong-policy execution preflight",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id=p8-wrong-policy"
+            ),
+        )?;
+        assert_json_str_eq(
+            &wrong_policy_execution_response,
+            &["status"],
+            "blocked_by_policy",
+        )?;
+        assert_json_bool_eq(
+            &wrong_policy_execution_response,
+            &["mutation_attempted"],
+            false,
+        )?;
+        if !json_str(&wrong_policy_execution_response, &["reason"])?.contains("does not match") {
+            bail!("P8 cadence wrong-policy execution did not block on policy mismatch");
+        }
+
+        let default_off_execution_response = http_json_post(
+            "P8 cadence default-off execution preflight",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+            ),
+        )?;
+        assert_json_str_eq(
+            &default_off_execution_response,
+            &["status"],
+            "blocked_by_policy",
+        )?;
+        assert_json_bool_eq(
+            &default_off_execution_response,
+            &["assignments_changed"],
+            false,
+        )?;
+        assert_json_bool_eq(
+            &default_off_execution_response,
+            &["mutation_attempted"],
+            false,
+        )?;
+        assert_json_bool_eq(
+            &default_off_execution_response,
+            &["mutation_allowed"],
+            false,
+        )?;
+        if !json_str(&default_off_execution_response, &["reason"])?.contains("default-off") {
+            bail!("P8 cadence default-off execution did not block on default-off executor");
+        }
+
+        let repeat_default_off_execution_response = http_json_post(
+            "P8 cadence repeat default-off execution preflight",
+            orch_metrics_addr,
+            &format!(
+                "/operations/executions?operation_id={operation_id}&expected_proposal_hash={proposal_hash}&policy_id={policy_id}"
+            ),
+        )?;
+        assert_json_str_eq(
+            &repeat_default_off_execution_response,
+            &["status"],
+            "already_blocked_by_policy",
+        )?;
+        assert_json_bool_eq(
+            &repeat_default_off_execution_response,
+            &["mutation_attempted"],
+            false,
+        )?;
+
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let assignments_unchanged = before_listing == after_listing;
+        if !assignments_unchanged {
+            bail!("P8 cadence approval preflight changed assignments");
+        }
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &[(parent, "worker-a")],
+        ))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+
+        let ledger = http_json_get(
+            "P8 cadence approval ledger",
+            orch_metrics_addr,
+            "/operations",
+        )?;
+        let ledger_summary =
+            validate_p7_operation_ledger(&ledger, true, true, false, false, false)?;
+        let operation_record = find_p7_operation_record(&ledger, &operation_id)?;
+        validate_p7_operation_approval(operation_record)?;
+        validate_p7_blocked_execution(operation_record)?;
+        let approval = json_field(operation_record, &["approval"])?;
+        assert_json_str_eq(approval, &["policy_id"], policy_id)?;
+        assert_json_str_eq(approval, &["cooldown_key"], "p8-cadence-root-w0")?;
+        assert_json_str_eq(approval, &["budget_key"], "p8-cadence-local")?;
+
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_approval_smoke.v1",
+            "unix_secs": unix_timestamp_secs(),
+            "cadence": {
+                "actors": actors,
+                "planner": "operation_proposals_from_live_metrics_snapshot",
+                "operation_id": operation_id.as_str()
+            },
+            "live_metrics": {
+                "sources": live_metrics,
+                "parent_actor_count": live_parent_actor_count,
+                "parent_pending_moves": live_parent_pending_moves,
+                "actor_count_after_join": actor_count_after_join
+            },
+            "approval": {
+                "policy_id": policy_id,
+                "approver": "p8-cadence-approval-smoke",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local",
+                "proposal_hash": proposal_hash.as_str()
+            },
+            "ledger": {
+                "path": p8_proposal_ledger_path_raw.as_str(),
+                "records": ledger_summary.records,
+                "proposal_records": ledger_summary.proposal_records,
+                "approval_records": ledger_summary.approval_records,
+                "blocked_execution_records": ledger_summary.blocked_execution_records
+            },
+            "preview_snapshot": {
+                "path": p8_proposal_preview_path_raw.as_str()
+            },
+            "orchestrator": {
+                "grpc_addr": orch_addr,
+                "metrics_addr": orch_metrics_addr,
+                "registered_workers": before_health.registered_workers,
+                "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+                "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+            },
+            "gateway": {
+                "addr": gateway_addr,
+                "metrics_addr": gateway_metrics_addr,
+                "routes": 1
+            },
+            "responses": {
+                "proposal": proposal_response,
+                "unapproved_execution": unapproved_execution_response,
+                "approval": approval_response,
+                "repeat_approval": repeat_approval_response,
+                "missing_policy_execution": missing_policy_execution_response,
+                "wrong_policy_execution": wrong_policy_execution_response,
+                "default_off_execution": default_off_execution_response,
+                "repeat_default_off_execution": repeat_default_off_execution_response
+            },
+            "checks": {
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "repeat_approval_idempotent": true,
+                "unapproved_execution_blocked": true,
+                "missing_policy_blocked": true,
+                "wrong_policy_blocked": true,
+                "default_off_execution_blocked": true,
+                "repeat_default_off_idempotent": true,
+                "approval_policy_id_recorded": true,
+                "approval_cooldown_key_recorded": true,
+                "approval_budget_key_recorded": true,
+                "assignments_unchanged": assignments_unchanged,
+                "no_mutation_attempted": true
+            },
+            "remaining_uncovered": [
+                "p8_cooldown_budget_concurrency_gate_enforcement",
+                "p8_bounded_execution_cadence",
+                "p8_failure_restart_soak",
+                "guarded_kubernetes_p8_cadence_smoke",
+                "p8_completion_audit"
+            ]
+        });
+        validate_p8_cadence_approval_smoke_report(&report)?;
+        let report_path = write_p8_cadence_approval_smoke_report(&report)?;
+        println!(
+            "P8 cadence approval smoke: live-metrics proposal was approved and default-off execution preflight stayed mutation-free, report={}, ledger={}",
+            report_path.display(),
+            p8_proposal_ledger_path.display()
+        );
+        return Ok(());
+    }
 
     let parent = CellId::grid(0, 0, 0);
     let actor = EntityId(if mode == ActivationSmokeMode::LiveMetricsActivation {
@@ -11471,6 +11844,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::LivePlannerMutation => "activation-live-planner-mutation-smoke",
         ActivationSmokeMode::P8CadencePlan { .. } => "p8-cadence-plan-smoke",
         ActivationSmokeMode::P8CadenceProposal { .. } => "p8-cadence-proposal-smoke",
+        ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval-smoke",
         ActivationSmokeMode::MergePlan => "merge-plan-smoke",
         ActivationSmokeMode::PlannerMutation => "planner-mutation-smoke",
         ActivationSmokeMode::MergeActivation => "merge-activation-smoke",
@@ -18604,6 +18978,12 @@ fn default_p8_cadence_proposal_smoke_path() -> PathBuf {
         .join("p8-cadence-proposal-smoke-latest.json")
 }
 
+fn default_p8_cadence_approval_smoke_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p8-cadence-approval-smoke-latest.json")
+}
+
 fn default_p7_operation_loop_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -18786,6 +19166,20 @@ fn write_p8_cadence_proposal_smoke_report(report: &serde_json::Value) -> Result<
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p8_cadence_proposal_smoke_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p8_cadence_approval_smoke_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p8-cadence-approval-smoke-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p8_cadence_approval_smoke_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -21786,6 +22180,108 @@ fn validate_p8_cadence_proposal_smoke_report(report: &serde_json::Value) -> Resu
             first_operation_id = Some(operation_id);
         }
     }
+    Ok(())
+}
+
+fn validate_p8_cadence_approval_smoke_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p8_cadence_approval_smoke.v1")?;
+    assert_json_bool_eq(report, &["checks", "live_metrics_materialized"], true)?;
+    assert_json_bool_eq(report, &["checks", "proposal_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "repeat_approval_idempotent"], true)?;
+    assert_json_bool_eq(report, &["checks", "unapproved_execution_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "missing_policy_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "wrong_policy_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "default_off_execution_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "repeat_default_off_idempotent"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_policy_id_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_cooldown_key_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "approval_budget_key_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignments_unchanged"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_mutation_attempted"], true)?;
+    assert_json_number_eq(report, &["ledger", "records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "proposal_records"], 1.0)?;
+    assert_json_number_eq(report, &["ledger", "approval_records"], 1.0)?;
+    assert_json_number_at_least(report, &["ledger", "blocked_execution_records"], 1.0)?;
+    assert_json_number_at_least(report, &["live_metrics", "parent_actor_count"], 100.0)?;
+    assert_json_str_eq(
+        report,
+        &["approval", "policy_id"],
+        "operator_approved_dynamic_operation_v1",
+    )?;
+    assert_json_str_eq(report, &["approval", "cooldown_key"], "p8-cadence-root-w0")?;
+    assert_json_str_eq(report, &["approval", "budget_key"], "p8-cadence-local")?;
+    assert_json_number_at_least(report, &["responses", "proposal", "planned_count"], 1.0)?;
+    assert_json_number_eq(report, &["responses", "proposal", "recorded_count"], 1.0)?;
+    assert_json_str_eq(
+        report,
+        &["responses", "unapproved_execution", "status"],
+        "blocked_by_policy",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "unapproved_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_str_eq(report, &["responses", "approval", "status"], "approved")?;
+    assert_json_str_eq(
+        report,
+        &["responses", "repeat_approval", "status"],
+        "already_approved",
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "missing_policy_execution", "status"],
+        "blocked_by_policy",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &[
+            "responses",
+            "missing_policy_execution",
+            "mutation_attempted",
+        ],
+        false,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "wrong_policy_execution", "status"],
+        "blocked_by_policy",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "wrong_policy_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "default_off_execution", "status"],
+        "blocked_by_policy",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "default_off_execution", "mutation_attempted"],
+        false,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["responses", "default_off_execution", "mutation_allowed"],
+        false,
+    )?;
+    assert_json_str_eq(
+        report,
+        &["responses", "repeat_default_off_execution", "status"],
+        "already_blocked_by_policy",
+    )?;
+    assert_json_bool_eq(
+        report,
+        &[
+            "responses",
+            "repeat_default_off_execution",
+            "mutation_attempted",
+        ],
+        false,
+    )?;
     Ok(())
 }
 
@@ -31666,6 +32162,79 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
 
         validate_p8_cadence_proposal_smoke_report(&report)
             .expect("valid P8 cadence proposal smoke report");
+    }
+
+    #[test]
+    fn p8_cadence_approval_smoke_report_accepts_default_off_preflight() {
+        let report = serde_json::json!({
+            "schema": "tessera.p8_cadence_approval_smoke.v1",
+            "live_metrics": {
+                "parent_actor_count": 105
+            },
+            "approval": {
+                "policy_id": "operator_approved_dynamic_operation_v1",
+                "cooldown_key": "p8-cadence-root-w0",
+                "budget_key": "p8-cadence-local"
+            },
+            "ledger": {
+                "records": 1,
+                "proposal_records": 1,
+                "approval_records": 1,
+                "blocked_execution_records": 4
+            },
+            "responses": {
+                "proposal": {
+                    "planned_count": 1,
+                    "recorded_count": 1
+                },
+                "unapproved_execution": {
+                    "status": "blocked_by_policy",
+                    "mutation_attempted": false
+                },
+                "approval": {
+                    "status": "approved"
+                },
+                "repeat_approval": {
+                    "status": "already_approved"
+                },
+                "missing_policy_execution": {
+                    "status": "blocked_by_policy",
+                    "mutation_attempted": false
+                },
+                "wrong_policy_execution": {
+                    "status": "blocked_by_policy",
+                    "mutation_attempted": false
+                },
+                "default_off_execution": {
+                    "status": "blocked_by_policy",
+                    "mutation_attempted": false,
+                    "mutation_allowed": false
+                },
+                "repeat_default_off_execution": {
+                    "status": "already_blocked_by_policy",
+                    "mutation_attempted": false
+                }
+            },
+            "checks": {
+                "live_metrics_materialized": true,
+                "proposal_recorded": true,
+                "approval_recorded": true,
+                "repeat_approval_idempotent": true,
+                "unapproved_execution_blocked": true,
+                "missing_policy_blocked": true,
+                "wrong_policy_blocked": true,
+                "default_off_execution_blocked": true,
+                "repeat_default_off_idempotent": true,
+                "approval_policy_id_recorded": true,
+                "approval_cooldown_key_recorded": true,
+                "approval_budget_key_recorded": true,
+                "assignments_unchanged": true,
+                "no_mutation_attempted": true
+            }
+        });
+
+        validate_p8_cadence_approval_smoke_report(&report)
+            .expect("valid P8 cadence approval smoke report");
     }
 
     #[test]
