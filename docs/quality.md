@@ -113,6 +113,9 @@ This document is the repo-local quality map for agents. It keeps the expected au
   recovery is covered by `cargo xt dev p8-cadence-restart-smoke`, which mounts a
   P8 assignment state path, restarts the Orchestrator after approved bounded
   publish, verifies ledger/assignment recovery, and completes post-restart
-  observation. Soak, internal rollout, and P8 completion audit remain future P8
-  slices.
+  observation. Child-route soak is covered by `cargo xt dev
+  p8-cadence-soak-smoke`, which keeps the bounded cadence path under sustained
+  post-execution Ping/Move traffic and records route convergence, Worker child
+  refresh, remote AOI frames, clean close counters, and completed observation.
+  Internal rollout and P8 completion audit remain future P8 slices.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

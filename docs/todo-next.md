@@ -171,8 +171,9 @@ Recommended P8 slices:
    p8-cadence-restart-smoke` proves the approved bounded cadence ledger and
    published child assignments survive Orchestrator restart, then closes
    post-restart observation to `completed`.
-9. `test: add p8 cadence soak smoke` - extend the bounded cadence through
-   sustained post-execution child traffic and clean counters.
+9. Done: `test: add p8 cadence soak smoke` - extend the bounded cadence through
+   sustained post-execution child traffic, remote AOI observation, Worker child
+   refresh, completed observation, and clean Gateway close counters.
 10. `build: publish p8 cadence runtime image` - publish a new image only after
    local P8 gates are green.
 11. `test: add internal p8 cadence smoke` - promote through k8s GitOps, wait for

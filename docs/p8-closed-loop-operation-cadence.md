@@ -104,7 +104,10 @@ P8 is complete only when all of these are true:
    Worker restart recovery without automatic rollback. `cargo xt dev
    p8-cadence-restart-smoke` proves the operation ledger and persisted child
    assignments survive Orchestrator restart and closes post-restart observation
-   to `completed`. The remaining local follow-up is the soak report.
+   to `completed`. `cargo xt dev p8-cadence-soak-smoke` then keeps the same
+   bounded cadence path under sustained child-route Ping/Move traffic and
+   records route convergence, Worker child refresh, remote AOI frames, clean
+   Gateway close counters, and completed observation evidence.
 8. **Image and GitOps rollout**: publish a new runtime image, promote through
    the k8s GitOps repo, wait for ArgoCD `Synced / Healthy`, and verify image
    match.
