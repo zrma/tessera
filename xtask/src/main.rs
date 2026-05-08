@@ -1022,6 +1022,99 @@ enum K8sSub {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run a read-only guarded Kubernetes P9 recommend-only soak against live runtime state
+    P9RecommendSoak {
+        /// Kubernetes namespace that contains the Tessera runtime
+        #[arg(long, default_value = "tessera")]
+        namespace: String,
+        /// Optional kube context. If unset, the current context is used.
+        #[arg(long)]
+        context: Option<String>,
+        /// Orchestrator service name
+        #[arg(long, default_value = "tessera-orch")]
+        orch_service: String,
+        /// Orchestrator deployment name used for image/default-off preflight
+        #[arg(long, default_value = "tessera-orch")]
+        orch_deploy: String,
+        /// Gateway service name
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_service: String,
+        /// Gateway deployment name used for image preflight
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_deploy: String,
+        /// Source Worker deployment name used for image preflight
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_deploy: String,
+        /// Source Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_service: String,
+        /// Source Worker id expected to own the parent cell before recommendation
+        #[arg(long, default_value = "worker-a")]
+        source_worker_id: String,
+        /// Target Worker deployment name used for image preflight
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_deploy: String,
+        /// Target Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_service: String,
+        /// Target Worker id used for recommendation targets
+        #[arg(long, default_value = "worker-b")]
+        target_worker_id: String,
+        /// ArgoCD Application namespace used for Synced/Healthy preflight
+        #[arg(long, default_value = "argocd")]
+        argocd_namespace: String,
+        /// ArgoCD Application name used for Synced/Healthy preflight
+        #[arg(long, default_value = "tessera")]
+        argocd_app: String,
+        /// Skip the ArgoCD Application Synced/Healthy preflight
+        #[arg(long, default_value_t = false)]
+        skip_argocd_check: bool,
+        /// Expected runtime image for all recorded Tessera deployments
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Local Orchestrator gRPC port for kubectl port-forward
+        #[arg(long, default_value_t = 16000)]
+        local_orch_port: u16,
+        /// Local Orchestrator metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 16100)]
+        local_orch_metrics_port: u16,
+        /// Local Gateway TCP port for kubectl port-forward
+        #[arg(long, default_value_t = 14000)]
+        local_gateway_port: u16,
+        /// Local Gateway metrics/ready port for kubectl port-forward
+        #[arg(long, default_value_t = 14100)]
+        local_gateway_metrics_port: u16,
+        /// Local source Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 15100)]
+        local_source_worker_metrics_port: u16,
+        /// Local target Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 15101)]
+        local_target_worker_metrics_port: u16,
+        /// Number of actors joined to the parent cell to create a live metric signal
+        #[arg(long, default_value_t = 2)]
+        actors: u32,
+        /// Number of recommend-only iterations
+        #[arg(long, default_value_t = 2)]
+        iterations: u32,
+        /// Sleep between recommend-only iterations
+        #[arg(long, default_value_t = 250)]
+        sleep_ms: u64,
+        /// Output JSON path. Defaults to .dev/reports/guarded-kubernetes-p9-recommend-soak-latest.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Fold a finalized controlled operation smoke report into the guarded Kubernetes P9 spot-check gate
+    P9ControlledSpotCheckReport {
+        /// Source internal P7 operation report with completed restart evidence
+        #[arg(long)]
+        source_report: Option<PathBuf>,
+        /// Require source and output deployment image evidence to match this image
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Output JSON path. Defaults to .dev/reports/guarded-kubernetes-p9-controlled-spot-check-latest.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2042,6 +2135,70 @@ fn main() -> Result<()> {
                 report,
                 out,
             })?,
+            K8sSub::P9RecommendSoak {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                source_worker_id,
+                target_worker_deploy,
+                target_worker_service,
+                target_worker_id,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                iterations,
+                sleep_ms,
+                out,
+            } => run_k8s_p9_recommend_soak(K8sP9RecommendSoakOptions {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                source_worker_id,
+                target_worker_deploy,
+                target_worker_service,
+                target_worker_id,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                iterations,
+                sleep_ms,
+                out,
+            })?,
+            K8sSub::P9ControlledSpotCheckReport {
+                source_report,
+                expected_image,
+                out,
+            } => run_k8s_p9_controlled_spot_check_report(
+                source_report.as_deref(),
+                expected_image.as_deref(),
+                out.as_deref(),
+            )?,
         },
         Cmd::Dev { sub } => match sub {
             DevSub::Up {
@@ -18910,6 +19067,36 @@ struct K8sP8CadenceCleanupCheckOptions {
     out: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct K8sP9RecommendSoakOptions {
+    namespace: String,
+    context: Option<String>,
+    orch_service: String,
+    orch_deploy: String,
+    gateway_service: String,
+    gateway_deploy: String,
+    source_worker_deploy: String,
+    source_worker_service: String,
+    source_worker_id: String,
+    target_worker_deploy: String,
+    target_worker_service: String,
+    target_worker_id: String,
+    argocd_namespace: String,
+    argocd_app: String,
+    skip_argocd_check: bool,
+    expected_image: Option<String>,
+    local_orch_port: u16,
+    local_orch_metrics_port: u16,
+    local_gateway_port: u16,
+    local_gateway_metrics_port: u16,
+    local_source_worker_metrics_port: u16,
+    local_target_worker_metrics_port: u16,
+    actors: u32,
+    iterations: u32,
+    sleep_ms: u64,
+    out: Option<PathBuf>,
+}
+
 fn run_k8s_p8_cadence_smoke(options: K8sP8CadenceSmokeOptions) -> Result<()> {
     if !options.allow_execution {
         bail!("internal k8s P8 cadence smoke mutates assignment state; pass --allow-execution");
@@ -19506,6 +19693,478 @@ fn run_k8s_p8_cadence_cleanup_check(options: K8sP8CadenceCleanupCheckOptions) ->
     Ok(())
 }
 
+fn run_k8s_p9_recommend_soak(options: K8sP9RecommendSoakOptions) -> Result<()> {
+    if options.iterations < 2 {
+        bail!("internal k8s P9 recommend soak requires at least 2 iterations");
+    }
+    if options.actors == 0 {
+        bail!("internal k8s P9 recommend soak requires at least 1 actor");
+    }
+
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let argocd_status = if options.skip_argocd_check {
+        None
+    } else {
+        let status =
+            kubectl_argocd_app_status(&context, &options.argocd_namespace, &options.argocd_app)?;
+        validate_argocd_app_ready(&status)?;
+        Some(status)
+    };
+    let deployment_images = collect_k8s_p9_recommend_deployment_images(&context, &options)?;
+    if let Some(expected_image) = options.expected_image.as_deref() {
+        validate_k8s_deployment_images(&deployment_images, expected_image)?;
+    }
+    let cleanup =
+        k8s_p8_cadence_cleanup_status(&context, &options.namespace, &options.orch_deploy)?;
+    if !cleanup.manual_activation_default_off || !cleanup.preview_fixture_removed {
+        bail!(
+            "internal P9 recommend soak requires default-off runtime: manual_activation_default_off={} preview_fixture_removed={}",
+            cleanup.manual_activation_default_off,
+            cleanup.preview_fixture_removed
+        );
+    }
+    for resource in [
+        format!("svc/{}", options.orch_service),
+        format!("svc/{}", options.gateway_service),
+        format!("svc/{}", options.source_worker_service),
+        format!("svc/{}", options.target_worker_service),
+        format!("deploy/{}", options.source_worker_deploy),
+        format!("deploy/{}", options.target_worker_deploy),
+    ] {
+        kubectl_resource_name(&context, &options.namespace, &resource)
+            .with_context(|| format!("required resource {resource} is not ready"))?;
+    }
+
+    let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_orch_metrics_addr = format!("127.0.0.1:{}", options.local_orch_metrics_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
+    let local_source_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_source_worker_metrics_port);
+    let local_target_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_target_worker_metrics_port);
+
+    let mut forwards = ManagedK8sPortForwards::default();
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.orch_service,
+        "p9-recommend-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.gateway_service,
+        "p9-recommend-gateway",
+        &[
+            (options.local_gateway_port, 4000),
+            (options.local_gateway_metrics_port, 4100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.source_worker_service,
+        "p9-recommend-source-worker",
+        &[(options.local_source_worker_metrics_port, 5100)],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.target_worker_service,
+        "p9-recommend-target-worker",
+        &[(options.local_target_worker_metrics_port, 5100)],
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let orch_endpoint = grpc_endpoint(&local_orch_addr);
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_http_status_endpoint(
+        "internal P9 recommend gateway readiness",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let mut session = GatewaySession::connect(&local_gateway_addr)?;
+    for idx in 0..options.actors {
+        let actor = EntityId(90_000 + u64::from(idx));
+        let joined = session.request(
+            parent,
+            ClientMsg::Join {
+                actor,
+                pos: activation_soak_position((idx % 4) as u8),
+            },
+        )?;
+        assert_snapshot_contains("internal P9 recommend parent join", joined, parent, actor)?;
+    }
+    assert_prometheus_sample_at_least_until(
+        "internal P9 recommend source worker parent",
+        &local_source_worker_metrics_addr,
+        worker_cell_actor_count_metric(parent).as_str(),
+        f64::from(options.actors),
+    )?;
+    assert_metrics_endpoint_body_until(
+        "internal P9 recommend target worker metrics",
+        &local_target_worker_metrics_addr,
+        &["tessera_worker_cell_actor_count"],
+    )?;
+
+    let live_metrics = vec![
+        format!(
+            "{}={local_source_worker_metrics_addr}",
+            options.source_worker_id
+        ),
+        format!(
+            "{}={local_target_worker_metrics_addr}",
+            options.target_worker_id
+        ),
+    ];
+    let live_metrics_endpoints = parse_live_worker_metrics_endpoints(&live_metrics)?;
+    let live_policy = LiveMetricsPlanPolicy {
+        actor_threshold: 1,
+        move_threshold: 1,
+        min_pressure_signals: 1,
+        cell_age_secs: 60,
+    };
+    let operation_id = "p9-internal-recommend-only";
+    let mut tick_reports = Vec::with_capacity(options.iterations as usize);
+    for tick in 0..options.iterations {
+        let (_before_health, before_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let _snapshots = live_metrics_endpoints
+            .iter()
+            .map(fetch_live_worker_metrics_snapshot_until)
+            .collect::<Result<Vec<_>>>()?;
+        let plan = build_split_activation_plan_from_live_metrics(
+            &orch_endpoint,
+            &live_metrics,
+            live_policy,
+            Some(operation_id.to_string()),
+            &[],
+        )?;
+        if plan.status != "ready" {
+            bail!(
+                "internal P9 recommend tick {} expected ready plan, got status={} reason={}",
+                tick + 1,
+                plan.status,
+                plan.reason
+            );
+        }
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let assignment_listing_unchanged = before_listing == after_listing;
+        if !assignment_listing_unchanged {
+            bail!(
+                "internal P9 recommend tick {} changed assignments",
+                tick + 1
+            );
+        }
+        let candidate_key = p8_cadence_candidate_key(&plan)?;
+        tick_reports.push(serde_json::json!({
+            "tick": tick + 1,
+            "candidate_key": candidate_key,
+            "candidate_batch_key": candidate_key,
+            "candidate_kinds": ["split"],
+            "operation_id": plan.operation_id,
+            "status": plan.status,
+            "reason": plan.reason,
+            "preview": {
+                "source": plan.preview_source,
+                "mode": plan.preview_mode,
+                "assignments_changed": false,
+                "plan_count": plan.preview_plan_count
+            },
+            "candidate": {
+                "parent": plan.parent,
+                "source_worker_id": plan.source_worker_id,
+                "target_count": plan.recommended_targets.len(),
+                "targets": plan.recommended_targets.iter().map(|target| {
+                    serde_json::json!({
+                        "sub": target.sub,
+                        "worker_id": target.worker_id
+                    })
+                }).collect::<Vec<_>>(),
+                "submission_command": plan.submission_command
+            },
+            "orchestrator": {
+                "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+                "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+            },
+            "checks": {
+                "ready_candidate": true,
+                "live_metrics_source": true,
+                "assignment_listing_unchanged": assignment_listing_unchanged,
+                "execution_attempted": false,
+                "assignments_changed": false
+            }
+        }));
+        if tick + 1 < options.iterations {
+            thread::sleep(Duration::from_millis(options.sleep_ms));
+        }
+    }
+
+    let candidate_batch_keys = tick_reports
+        .iter()
+        .map(|tick| json_str(tick, &["candidate_batch_key"]).map(str::to_string))
+        .collect::<Result<Vec<_>>>()?;
+    let stable_candidate_batch = candidate_batch_keys
+        .first()
+        .is_some_and(|first| candidate_batch_keys.iter().all(|key| key == first));
+    if !stable_candidate_batch {
+        bail!(
+            "internal P9 recommend produced unstable candidate batches: {candidate_batch_keys:?}"
+        );
+    }
+    let history_records = tick_reports
+        .iter()
+        .map(|tick| {
+            let tick_number = json_u64(tick, &["tick"])?;
+            let candidate_batch_key = json_str(tick, &["candidate_batch_key"])?;
+            let operation_id = json_str(tick, &["operation_id"])?;
+            Ok(serde_json::json!({
+                "sequence": tick_number,
+                "phase": "recommend_only",
+                "operation_id": operation_id,
+                "candidate_batch_key": candidate_batch_key,
+                "candidate_kinds": json_array(tick, &["candidate_kinds"])?.clone(),
+                "policy": {
+                    "actor_threshold": live_policy.actor_threshold,
+                    "move_threshold": live_policy.move_threshold,
+                    "min_pressure_signals": live_policy.min_pressure_signals,
+                    "cell_age_secs": live_policy.cell_age_secs
+                },
+                "decision": {
+                    "selected": true,
+                    "mutation_performed": false,
+                    "execution_attempted": false,
+                    "reason": "recommend-only P9 guarded Kubernetes loop"
+                },
+                "orchestrator": json_field(tick, &["orchestrator"])?.clone()
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let history_record_count = history_records.len();
+    let history = serde_json::json!({
+        "schema": "tessera.p9_recommend_history.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "records": history_records,
+        "checks": {
+            "recommend_mode_enabled": true,
+            "durable_history_written": true,
+            "no_assignment_mutation": true,
+            "no_execution_attempted": true,
+            "candidate_kind_coverage": true
+        }
+    });
+    let history_path = write_internal_k8s_p9_recommend_history_report(&history)?;
+    let replay_report = build_p9_replay_audit_report(&history_path, &history)?;
+    validate_p9_replay_audit_report(&replay_report)?;
+
+    let report = serde_json::json!({
+        "schema": "tessera.guarded_kubernetes_p9_recommend_soak.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "stage": "completed",
+        "reason": "guarded Kubernetes P9 recommend-only soak sampled live Worker metrics and assignment state without operation execution",
+        "cluster": {
+            "context": context.as_str(),
+            "namespace": options.namespace.as_str(),
+            "orchestrator_service": options.orch_service.as_str(),
+            "gateway_service": options.gateway_service.as_str(),
+            "source_worker_service": options.source_worker_service.as_str(),
+            "target_worker_service": options.target_worker_service.as_str(),
+            "argocd": argocd_status_json(
+                &options.argocd_namespace,
+                &options.argocd_app,
+                argocd_status.as_ref()
+            ),
+            "expected_image": options.expected_image.as_deref(),
+            "deployment_images": k8s_deployment_images_json(&deployment_images)
+        },
+        "recommend_mode": {
+            "mode": "recommend_only",
+            "operation_id": operation_id,
+            "policy": {
+                "actor_threshold": live_policy.actor_threshold,
+                "move_threshold": live_policy.move_threshold,
+                "min_pressure_signals": live_policy.min_pressure_signals,
+                "cell_age_secs": live_policy.cell_age_secs
+            }
+        },
+        "live_metrics": {
+            "sources": live_metrics,
+            "actors_joined": options.actors
+        },
+        "history": {
+            "path": history_path.display().to_string(),
+            "records": history_record_count
+        },
+        "replay": replay_report,
+        "soak": {
+            "iterations": options.iterations,
+            "sleep_ms": options.sleep_ms
+        },
+        "orchestrator": {
+            "grpc_addr": local_orch_addr.as_str(),
+            "metrics_addr": local_orch_metrics_addr.as_str()
+        },
+        "gateway": {
+            "addr": local_gateway_addr.as_str(),
+            "metrics_addr": local_gateway_metrics_addr.as_str()
+        },
+        "cleanup": {
+            "manual_activation_default_off": cleanup.manual_activation_default_off,
+            "preview_fixture_removed": cleanup.preview_fixture_removed,
+            "orchestrator_env": {
+                "operation_execution": cleanup.operation_execution,
+                "split_merge_activation": cleanup.split_merge_activation,
+                "preview_json": cleanup.preview_json,
+                "preview_path": cleanup.preview_path
+            }
+        },
+        "ticks": tick_reports,
+        "checks": {
+            "argocd_synced_healthy": argocd_status.as_ref().is_some_and(|status| status.sync == "Synced" && status.health == "Healthy"),
+            "deployment_images_match": options.expected_image.as_deref().is_none_or(|expected| deployment_images.iter().all(|image| image.image == expected)),
+            "recommend_mode_enabled": true,
+            "live_worker_metrics_sampled": true,
+            "assignment_state_sampled": true,
+            "durable_history_written": true,
+            "replay_verified": true,
+            "default_off_execution": cleanup.manual_activation_default_off,
+            "no_assignment_mutation": true,
+            "automatic_mutation_observed": false
+        },
+        "remaining_uncovered": []
+    });
+    validate_internal_k8s_p9_recommend_soak_report(&report, options.expected_image.as_deref())?;
+    let report_path = write_internal_k8s_p9_recommend_soak_report(&report, options.out.as_deref())?;
+    println!(
+        "internal P9 recommend soak completed: iterations={} report={} history={}",
+        options.iterations,
+        report_path.display(),
+        history_path.display()
+    );
+    Ok(())
+}
+
+fn run_k8s_p9_controlled_spot_check_report(
+    source_report: Option<&Path>,
+    expected_image: Option<&str>,
+    out: Option<&Path>,
+) -> Result<()> {
+    let source_path = source_report
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_operation_smoke_path);
+    let source = read_json_report(&source_path)?;
+    assert_json_str_eq(
+        &source,
+        &["schema"],
+        "tessera.guarded_kubernetes_p7_operation_smoke.v1",
+    )?;
+    validate_internal_k8s_operation_report(
+        &source,
+        InternalP7OperationRequirements {
+            require_published_execution: true,
+            require_completed_observation: true,
+            require_soak: false,
+            require_recovery_required: false,
+            require_restart: true,
+        },
+        expected_image,
+        &[],
+    )?;
+
+    let context = json_str(&source, &["cluster", "context"])?;
+    let namespace = json_str(&source, &["cluster", "namespace"])?;
+    let cleanup = k8s_p8_cadence_cleanup_status(context, namespace, "tessera-orch")?;
+    if !cleanup.manual_activation_default_off || !cleanup.preview_fixture_removed {
+        bail!(
+            "internal P9 controlled spot-check requires post-smoke default-off cleanup: manual_activation_default_off={} preview_fixture_removed={}",
+            cleanup.manual_activation_default_off,
+            cleanup.preview_fixture_removed
+        );
+    }
+
+    let argocd_synced_healthy = json_str(&source, &["cluster", "argocd", "sync"])? == "Synced"
+        && json_str(&source, &["cluster", "argocd", "health"])? == "Healthy";
+    let deployment_images_match = expected_image.is_none_or(|expected| {
+        json_array(&source, &["cluster", "deployment_images"]).is_ok_and(|images| {
+            !images.is_empty()
+                && images
+                    .iter()
+                    .all(|image| json_str(image, &["image"]).is_ok_and(|actual| actual == expected))
+        })
+    });
+    let operation_id = json_str(&source, &["operation", "operation_id"])?;
+    let proposal_hash = json_str(&source, &["operation", "proposal_hash"])?;
+
+    let report = serde_json::json!({
+        "schema": "tessera.guarded_kubernetes_p9_controlled_spot_check.v1",
+        "unix_secs": unix_timestamp_secs(),
+        "stage": "completed",
+        "execution_allowed": true,
+        "execution_mutated": true,
+        "reason": "guarded Kubernetes P9 controlled spot-check folded a policy-approved operation restart smoke and verified post-smoke default-off cleanup",
+        "source": {
+            "report": source_path.display().to_string(),
+            "schema": "tessera.guarded_kubernetes_p7_operation_smoke.v1"
+        },
+        "cluster": source["cluster"].clone(),
+        "operation": source["operation"].clone(),
+        "approval": {
+            "policy_id": json_str(&source, &["operation", "policy_id"])?,
+            "operation_id": operation_id,
+            "proposal_hash": proposal_hash,
+            "response": source["responses"]["approval"].clone()
+        },
+        "controlled_window": {
+            "operator_approved": true,
+            "bounded_execution": true,
+            "source_restart_smoke": true
+        },
+        "replay_after_restart": {
+            "verified": true,
+            "source": "guarded_kubernetes_p7_operation_restart_smoke"
+        },
+        "observation": source["responses"]["observation"].clone(),
+        "cleanup": {
+            "manual_activation_default_off": cleanup.manual_activation_default_off,
+            "preview_fixture_removed": cleanup.preview_fixture_removed,
+            "checked_at_unix_secs": unix_timestamp_secs(),
+            "orchestrator_env": {
+                "operation_execution": cleanup.operation_execution,
+                "split_merge_activation": cleanup.split_merge_activation,
+                "preview_json": cleanup.preview_json,
+                "preview_path": cleanup.preview_path
+            }
+        },
+        "checks": {
+            "argocd_synced_healthy": argocd_synced_healthy,
+            "deployment_images_match": deployment_images_match,
+            "operator_approval_recorded": true,
+            "controlled_window_opened": true,
+            "bounded_execution_published": true,
+            "observation_completed": true,
+            "replay_verified_after_restart": true,
+            "post_smoke_default_off_cleanup": cleanup.manual_activation_default_off && cleanup.preview_fixture_removed
+        },
+        "remaining_uncovered": []
+    });
+    validate_internal_k8s_p9_controlled_spot_check_report(&report, expected_image)?;
+    let report_path = write_internal_k8s_p9_controlled_spot_check_report(&report, out)?;
+    println!(
+        "internal P9 controlled spot-check report completed: {}",
+        report_path.display()
+    );
+    Ok(())
+}
+
 fn resolve_kube_context(context: Option<&str>) -> Result<String> {
     if let Some(context) = context {
         if context.trim().is_empty() {
@@ -19812,6 +20471,19 @@ fn collect_k8s_p8_cadence_deployment_images(
 fn collect_k8s_p8_cadence_cleanup_deployment_images(
     context: &str,
     options: &K8sP8CadenceCleanupCheckOptions,
+) -> Result<Vec<K8sDeploymentImage>> {
+    let deployments = [
+        ("orchestrator", options.orch_deploy.as_str()),
+        ("gateway", options.gateway_deploy.as_str()),
+        ("source_worker", options.source_worker_deploy.as_str()),
+        ("target_worker", options.target_worker_deploy.as_str()),
+    ];
+    collect_k8s_deployment_images_by_role(context, &options.namespace, &deployments)
+}
+
+fn collect_k8s_p9_recommend_deployment_images(
+    context: &str,
+    options: &K8sP9RecommendSoakOptions,
 ) -> Result<Vec<K8sDeploymentImage>> {
     let deployments = [
         ("orchestrator", options.orch_deploy.as_str()),
@@ -22528,6 +23200,24 @@ fn default_p9_policy_regression_path() -> PathBuf {
         .join("p9-policy-regression-latest.json")
 }
 
+fn default_internal_k8s_p9_recommend_soak_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("guarded-kubernetes-p9-recommend-soak-latest.json")
+}
+
+fn default_internal_k8s_p9_recommend_history_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("guarded-kubernetes-p9-recommend-history-latest.json")
+}
+
+fn default_internal_k8s_p9_controlled_spot_check_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("guarded-kubernetes-p9-controlled-spot-check-latest.json")
+}
+
 fn default_p8_cadence_proposal_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -22791,6 +23481,58 @@ fn write_p9_policy_regression_report(report: &serde_json::Value) -> Result<PathB
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p9_policy_regression_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_internal_k8s_p9_recommend_soak_report(
+    report: &serde_json::Value,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "guarded-kubernetes-p9-recommend-soak-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_p9_recommend_soak_path);
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_internal_k8s_p9_recommend_history_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "guarded-kubernetes-p9-recommend-history-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_internal_k8s_p9_recommend_history_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_internal_k8s_p9_controlled_spot_check_report(
+    report: &serde_json::Value,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "guarded-kubernetes-p9-controlled-spot-check-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_p9_controlled_spot_check_path);
     fs::write(&latest, body)?;
     Ok(latest)
 }
