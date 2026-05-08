@@ -142,4 +142,9 @@ This document is the repo-local quality map for agents. It keeps the expected au
   mutation or execution attempt, while any runtime-affecting spot-check must
   happen only inside an operator-approved controlled window followed by
   default-off cleanup.
+  `cargo xt dev p9-recommend-loop-soak` is the first local gate: it runs the
+  two-Worker dev stack, records repeated live Worker metrics and assignment
+  snapshots, writes `.dev/reports/p9-recommend-history-latest.json`, and
+  validates `.dev/reports/p9-recommend-loop-soak-latest.json` with
+  `no_assignment_mutation=true` and `no_execution_attempted=true`.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

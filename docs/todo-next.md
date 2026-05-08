@@ -57,7 +57,7 @@ Recommended P9 slices:
    goal contract, and add a fail-closed `cargo xt p9-completion-audit --json`
    skeleton requiring local recommend-loop, replay, policy, GitOps, internal
    recommend soak, and controlled spot-check evidence.
-2. `feat: add p9 recommend loop history` - add `cargo xt dev
+2. Done: `feat: add p9 recommend loop history` - add `cargo xt dev
    p9-recommend-loop-soak` to collect repeated live Worker metrics and
    assignment snapshots, write durable recommend-only history, prove stable
    split/merge/canonical multi-depth candidate keys, and report
