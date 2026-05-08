@@ -42,7 +42,7 @@ Recommended P10 slices:
    `cargo xt p10-completion-audit --json` skeleton requiring local
    observability soak, ghost relay soak, replay audit, GitOps rollout/default-off
    cleanup, and internal MicroK8s observability soak evidence.
-2. Pending: `feat: add p10 observability soak` - add `cargo xt dev
+2. Done: `feat: add p10 observability soak` - add `cargo xt dev
    p10-observability-soak` to sample Gateway, Worker, and Orchestrator metrics,
    request latency histograms, ghost relay counters, assignment snapshots, and
    operation/recommend histories into a durable replayable report.

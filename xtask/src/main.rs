@@ -1190,6 +1190,15 @@ enum DevSub {
         #[arg(long, default_value_t = 10)]
         sleep_ms: u64,
     },
+    /// Start a two-worker dev stack and record P10 observability soak evidence
+    P10ObservabilitySoak {
+        /// Number of observability soak iterations to collect
+        #[arg(long, default_value_t = 4)]
+        iterations: u32,
+        /// Delay between observability iterations, in milliseconds
+        #[arg(long, default_value_t = 10)]
+        sleep_ms: u64,
+    },
     /// Replay P9 recommend-only history and verify stable durable decisions
     P9ReplayAudit {
         /// Recommend history JSON path. Defaults to .dev/reports/p9-recommend-history-latest.json
@@ -2239,6 +2248,10 @@ fn main() -> Result<()> {
             DevSub::P9RecommendLoopSoak { ticks, sleep_ms } => {
                 dev_p9_recommend_loop_soak(ticks, sleep_ms)?
             }
+            DevSub::P10ObservabilitySoak {
+                iterations,
+                sleep_ms,
+            } => dev_p10_observability_soak(iterations, sleep_ms)?,
             DevSub::P9ReplayAudit { history } => dev_p9_replay_audit(history.as_deref())?,
             DevSub::P9PolicyRegressionSmoke => dev_p9_policy_regression_smoke()?,
             DevSub::P8CadenceProposalSmoke {
@@ -3028,6 +3041,10 @@ enum ActivationSmokeMode {
         ticks: u32,
         sleep_ms: u64,
     },
+    P10ObservabilitySoak {
+        iterations: u32,
+        sleep_ms: u64,
+    },
     P8CadenceProposal {
         ticks: u32,
         sleep_ms: u64,
@@ -3129,6 +3146,16 @@ fn dev_p9_recommend_loop_soak(ticks: u32, sleep_ms: u64) -> Result<()> {
         bail!("P9 recommend-loop soak requires --ticks > 0");
     }
     dev_activation_smoke_inner(ActivationSmokeMode::P9RecommendLoopSoak { ticks, sleep_ms })
+}
+
+fn dev_p10_observability_soak(iterations: u32, sleep_ms: u64) -> Result<()> {
+    if iterations < 2 {
+        bail!("P10 observability soak requires --iterations >= 2");
+    }
+    dev_activation_smoke_inner(ActivationSmokeMode::P10ObservabilitySoak {
+        iterations,
+        sleep_ms,
+    })
 }
 
 fn dev_p9_replay_audit(history: Option<&Path>) -> Result<()> {
@@ -10918,6 +10945,12 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
     let p8_assignment_state_path = root.join(".dev/reports").join(format!(
         "{p8_operation_prefix}-assignment-state-latest.json"
     ));
+    let p10_observability_preview_path = root
+        .join(".dev/reports")
+        .join("p10-observability-preview-latest.json");
+    let p10_observability_ledger_path = root
+        .join(".dev/reports")
+        .join("p10-observability-ledger-latest.json");
     if matches!(mode, ActivationSmokeMode::RestartRecovery) || is_merge_restart_mode(mode) {
         if let Some(parent) = assignment_state_path.parent() {
             fs::create_dir_all(parent)?;
@@ -10940,10 +10973,22 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         let _ = fs::remove_file(&p8_proposal_ledger_path);
         let _ = fs::remove_file(&p8_assignment_state_path);
     }
+    if matches!(mode, ActivationSmokeMode::P10ObservabilitySoak { .. }) {
+        if let Some(parent) = p10_observability_preview_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _ = fs::remove_file(&p10_observability_preview_path);
+        let _ = fs::remove_file(&p10_observability_ledger_path);
+    }
     let assignment_state_path_raw = assignment_state_path.to_string_lossy().into_owned();
     let p8_proposal_preview_path_raw = p8_proposal_preview_path.to_string_lossy().into_owned();
     let p8_proposal_ledger_path_raw = p8_proposal_ledger_path.to_string_lossy().into_owned();
     let p8_assignment_state_path_raw = p8_assignment_state_path.to_string_lossy().into_owned();
+    let p10_observability_preview_path_raw = p10_observability_preview_path
+        .to_string_lossy()
+        .into_owned();
+    let p10_observability_ledger_path_raw =
+        p10_observability_ledger_path.to_string_lossy().into_owned();
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(&pids)?;
 
@@ -10969,7 +11014,9 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         )
     } else if matches!(
         mode,
-        ActivationSmokeMode::P8CadencePlan { .. } | ActivationSmokeMode::P9RecommendLoopSoak { .. }
+        ActivationSmokeMode::P8CadencePlan { .. }
+            | ActivationSmokeMode::P9RecommendLoopSoak { .. }
+            | ActivationSmokeMode::P10ObservabilitySoak { .. }
     ) {
         let worker_a_cells = p8_cadence_plan_expected_assignments()
             .into_iter()
@@ -11025,6 +11072,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         mode,
         ActivationSmokeMode::P8CadencePlan { .. }
             | ActivationSmokeMode::P9RecommendLoopSoak { .. }
+            | ActivationSmokeMode::P10ObservabilitySoak { .. }
             | ActivationSmokeMode::P8CadenceProposal { .. }
             | ActivationSmokeMode::P8CadenceApproval { .. }
     ) {
@@ -11074,6 +11122,16 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         orch_envs.push((
             "TESSERA_ORCH_OPERATION_LEDGER_PATH",
             p8_proposal_ledger_path_raw.as_str(),
+        ));
+    }
+    if matches!(mode, ActivationSmokeMode::P10ObservabilitySoak { .. }) {
+        orch_envs.push((
+            "TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH",
+            p10_observability_preview_path_raw.as_str(),
+        ));
+        orch_envs.push((
+            "TESSERA_ORCH_OPERATION_LEDGER_PATH",
+            p10_observability_ledger_path_raw.as_str(),
         ));
     }
     if matches!(
@@ -11190,7 +11248,9 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         4
     } else if matches!(
         mode,
-        ActivationSmokeMode::P8CadencePlan { .. } | ActivationSmokeMode::P9RecommendLoopSoak { .. }
+        ActivationSmokeMode::P8CadencePlan { .. }
+            | ActivationSmokeMode::P9RecommendLoopSoak { .. }
+            | ActivationSmokeMode::P10ObservabilitySoak { .. }
     ) {
         p8_cadence_plan_expected_assignments().len() as u64
     } else {
@@ -12096,14 +12156,22 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         );
         return Ok(());
     }
-    let p8_or_p9_read_only_mode = match mode {
-        ActivationSmokeMode::P8CadencePlan { ticks, sleep_ms } => Some((ticks, sleep_ms, false)),
-        ActivationSmokeMode::P9RecommendLoopSoak { ticks, sleep_ms } => {
-            Some((ticks, sleep_ms, true))
+    let p8_p9_or_p10_read_only_mode = match mode {
+        ActivationSmokeMode::P8CadencePlan { ticks, sleep_ms } => {
+            Some((ticks, sleep_ms, false, false))
         }
+        ActivationSmokeMode::P9RecommendLoopSoak { ticks, sleep_ms } => {
+            Some((ticks, sleep_ms, true, false))
+        }
+        ActivationSmokeMode::P10ObservabilitySoak {
+            iterations,
+            sleep_ms,
+        } => Some((iterations, sleep_ms, false, true)),
         _ => None,
     };
-    if let Some((ticks, sleep_ms, p9_recommend_loop)) = p8_or_p9_read_only_mode {
+    if let Some((ticks, sleep_ms, p9_recommend_loop, p10_observability_soak)) =
+        p8_p9_or_p10_read_only_mode
+    {
         let parent = p8_cadence_split_parent();
         let canonical_parent = p8_cadence_multi_depth_parent();
         let expected_assignments = p8_cadence_plan_expected_assignments();
@@ -12310,6 +12378,391 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             &expected_assignments,
         ))?;
         assert_gateway_ready_routes(gateway_metrics_addr, expected_assignments.len() as u64)?;
+
+        if p10_observability_soak {
+            let (_soak_before_health, soak_before_listing) =
+                runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+            let gateway_metrics_before = assert_metrics_endpoint_body_until(
+                "P10 observability gateway before",
+                gateway_metrics_addr,
+                &[
+                    "tessera_gateway_routes",
+                    "tessera_gateway_client_closes_no_route_total",
+                    "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                    "tessera_gateway_client_closes_ambiguous_upstream_total",
+                ],
+            )?;
+            let gateway_close_before =
+                gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+            let gateway_routes_before =
+                prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+
+            let mut soak_stats = ActivationSoakStats::default();
+            for iteration in 0..ticks {
+                let parent_ts = 11_000 + u64::from(iteration) * 10;
+                let observed = request_ping_until_pong(
+                    &mut session,
+                    parent,
+                    parent_ts,
+                    "P10 observability parent ping",
+                )?;
+                soak_stats.add(observed);
+                soak_stats.pings_ok += 1;
+
+                let step = if iteration % 2 == 0 { 0.2 } else { -0.2 };
+                let observed = request_move_until_delta(
+                    &mut session,
+                    parent,
+                    actor,
+                    step,
+                    step,
+                    "P10 observability parent move",
+                )?;
+                soak_stats.add(observed);
+                soak_stats.moves_ok += 1;
+
+                let canonical_ts = parent_ts + 1;
+                let observed = request_ping_until_pong(
+                    &mut canonical_session,
+                    canonical_parent,
+                    canonical_ts,
+                    "P10 observability canonical parent ping",
+                )?;
+                soak_stats.add(observed);
+                soak_stats.pings_ok += 1;
+
+                let observed = request_move_until_delta(
+                    &mut canonical_session,
+                    canonical_parent,
+                    canonical_actor,
+                    -step,
+                    step,
+                    "P10 observability canonical parent move",
+                )?;
+                soak_stats.add(observed);
+                soak_stats.moves_ok += 1;
+
+                if iteration + 1 < ticks {
+                    thread::sleep(Duration::from_millis(sleep_ms));
+                }
+            }
+
+            let (_soak_after_health, soak_after_listing) =
+                runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+            let assignment_stable = soak_before_listing == soak_after_listing;
+            if !assignment_stable {
+                bail!("P10 observability soak changed assignments");
+            }
+
+            let operation_live_policy = LiveMetricsPlanPolicy::default();
+            let mut pressure_sessions =
+                Vec::with_capacity(operation_live_policy.actor_threshold as usize);
+            for idx in 0..operation_live_policy.actor_threshold {
+                let pressure_actor = EntityId(8_000 + idx);
+                let pressure_session = open_gateway_join_until_snapshot(
+                    gateway_addr,
+                    parent,
+                    pressure_actor,
+                    Position {
+                        x: 4.0 + (idx % 16) as f32,
+                        y: 4.0 + (idx / 16) as f32,
+                    },
+                )?;
+                pressure_sessions.push(pressure_session);
+            }
+
+            let p10_snapshots = live_metrics_endpoints
+                .iter()
+                .map(fetch_live_worker_metrics_snapshot_until)
+                .collect::<Result<Vec<_>>>()?;
+            let p10_preview_snapshot = build_p8_cadence_operation_metrics_snapshot(
+                &soak_after_listing,
+                &p10_snapshots,
+                operation_live_policy,
+            )?;
+            fs::write(
+                &p10_observability_preview_path,
+                format!("{}\n", serde_json::to_string_pretty(&p10_preview_snapshot)?),
+            )
+            .with_context(|| {
+                format!(
+                    "write P10 observability preview {}",
+                    p10_observability_preview_path.display()
+                )
+            })?;
+            let proposal_response = http_json_post(
+                "P10 observability proposal",
+                orch_metrics_addr,
+                "/operations/proposals",
+            )?;
+            assert_json_bool_eq(&proposal_response, &["assignments_changed"], false)?;
+            assert_json_number_at_least(&proposal_response, &["planned_count"], 1.0)?;
+            let operation_ids = p8_cadence_operation_ids(&proposal_response)?;
+            let operation_id = operation_ids.first().cloned().ok_or_else(|| {
+                anyhow::anyhow!("P10 observability proposal response has no operation id")
+            })?;
+            let operation_ledger = http_json_get(
+                "P10 observability operation ledger",
+                orch_metrics_addr,
+                "/operations",
+            )?;
+            let ledger_summary =
+                validate_p7_operation_ledger(&operation_ledger, false, false, false, false, false)?;
+            let operation_record = find_p7_operation_record(&operation_ledger, &operation_id)?;
+            let proposal_hash =
+                json_str(operation_record, &["proposal", "proposal_hash"])?.to_string();
+
+            let recommend_records = tick_reports
+                .iter()
+                .map(|tick| {
+                    let sequence = json_u64(tick, &["tick"])?;
+                    Ok(serde_json::json!({
+                        "sequence": sequence,
+                        "phase": "observability_recommend_only",
+                        "operation_id": json_str(tick, &["operation_id"])?,
+                        "candidate_batch_key": json_str(tick, &["candidate_batch_key"])?,
+                        "candidate_kinds": json_array(tick, &["candidate_kinds"])?.clone(),
+                        "decision": {
+                            "selected": true,
+                            "mutation_performed": false,
+                            "execution_attempted": false,
+                            "reason": "P10 observability soak samples recommend history without runtime mutation"
+                        }
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let recommend_history = serde_json::json!({
+                "schema": "tessera.p10_recommend_history.v1",
+                "unix_secs": unix_timestamp_secs(),
+                "records": recommend_records,
+                "checks": {
+                    "recommend_history_sampled": true,
+                    "no_assignment_mutation": true,
+                    "no_execution_attempted": true
+                }
+            });
+            let recommend_history_path = write_p10_recommend_history_report(&recommend_history)?;
+
+            let worker_a_metrics_after = assert_metrics_endpoint_body_until(
+                "P10 observability worker-a after",
+                worker_a_metrics_addr,
+                &[
+                    "tessera_worker_cell_actor_count",
+                    "tessera_worker_relay_subscribers",
+                    "tessera_worker_relay_connections_total",
+                    "tessera_worker_relay_outbound_drops_total",
+                    "tessera_worker_relay_forward_drops_total",
+                    "tessera_worker_remote_relay_connects_total",
+                    "tessera_worker_remote_relay_frames_sent_total",
+                    "tessera_worker_remote_relay_frames_received_total",
+                ],
+            )?;
+            let worker_b_metrics_after = assert_metrics_endpoint_body_until(
+                "P10 observability worker-b after",
+                worker_b_metrics_addr,
+                &[
+                    "tessera_worker_cell_actor_count",
+                    "tessera_worker_relay_subscribers",
+                    "tessera_worker_relay_connections_total",
+                    "tessera_worker_relay_outbound_drops_total",
+                    "tessera_worker_relay_forward_drops_total",
+                    "tessera_worker_remote_relay_connects_total",
+                    "tessera_worker_remote_relay_frames_sent_total",
+                    "tessera_worker_remote_relay_frames_received_total",
+                ],
+            )?;
+            let orch_metrics_after = assert_metrics_endpoint_body_until(
+                "P10 observability orchestrator after",
+                orch_metrics_addr,
+                &[
+                    "tessera_orch_configured_workers",
+                    "tessera_orch_registered_workers",
+                    "tessera_orch_assigned_cells",
+                    "tessera_orch_listing_requests_total",
+                ],
+            )?;
+            let gateway_metrics_after = assert_metrics_endpoint_body_until(
+                "P10 observability gateway after",
+                gateway_metrics_addr,
+                &[
+                    "tessera_gateway_routes",
+                    "tessera_gateway_ping_roundtrip_seconds_count",
+                    "tessera_gateway_request_roundtrip_seconds_count",
+                    "tessera_gateway_client_closes_no_route_total",
+                    "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                    "tessera_gateway_client_closes_ambiguous_upstream_total",
+                ],
+            )?;
+            let expected_requests = u64::from(ticks) * 2;
+            assert_prometheus_sample_at_least(
+                "P10 observability gateway",
+                &gateway_metrics_after,
+                "tessera_gateway_ping_roundtrip_seconds_count",
+                expected_requests as f64,
+            )?;
+            assert_prometheus_sample_at_least(
+                "P10 observability gateway",
+                &gateway_metrics_after,
+                "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+                expected_requests as f64,
+            )?;
+            let gateway_close_after = gateway_close_counters_from_metrics(&gateway_metrics_after)?;
+            assert_gateway_close_counters_not_increased(
+                "P10 observability gateway",
+                gateway_close_before,
+                gateway_close_after,
+            )?;
+            let gateway_routes_after =
+                prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_routes")?;
+            let route_converged =
+                (gateway_routes_after - expected_assignments.len() as f64).abs() < f64::EPSILON;
+            let counters_clean = gateway_close_before == gateway_close_after;
+            let request_samples = prometheus_sample_value(
+                &gateway_metrics_after,
+                "tessera_gateway_ping_roundtrip_seconds_count",
+            )? + prometheus_sample_value(
+                &gateway_metrics_after,
+                "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+            )? + prometheus_sample_value(
+                &gateway_metrics_after,
+                "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+            )?;
+            let replay_fingerprint_body = serde_json::to_vec(&serde_json::json!({
+                "operation_id": operation_id,
+                "proposal_hash": proposal_hash,
+                "candidate_batch_keys": candidate_batch_keys,
+                "request_samples": request_samples,
+                "assignment_listing": assignment_listing_summary_json(&soak_after_listing)?,
+            }))?;
+            let replay_fingerprint =
+                format!("fnv1a64:{:016x}", p9_fnv1a64(&replay_fingerprint_body));
+
+            let report = serde_json::json!({
+                "schema": "tessera.p10_observability_soak.v1",
+                "status": "complete",
+                "unix_secs": unix_timestamp_secs(),
+                "soak": {
+                    "iterations": ticks,
+                    "sleep_ms": sleep_ms,
+                    "pings_ok": soak_stats.pings_ok,
+                    "moves_ok": soak_stats.moves_ok,
+                    "expected_requests_per_kind": expected_requests,
+                    "pressure_sessions": pressure_sessions.len(),
+                    "ignored_frames": soak_stats.ignored_frames,
+                    "remote_delta_frames": soak_stats.remote_delta_frames,
+                    "remote_snapshot_frames": soak_stats.remote_snapshot_frames
+                },
+                "latency": {
+                    "request_samples": request_samples,
+                    "ping_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_ping_roundtrip_seconds_count")?,
+                    "join_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}")?,
+                    "move_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}")?
+                },
+                "gateway": {
+                    "addr": gateway_addr,
+                    "metrics_addr": gateway_metrics_addr,
+                    "routes_before": gateway_routes_before,
+                    "routes_after": gateway_routes_after,
+                    "close_counters": {
+                        "before": gateway_close_counters_json(gateway_close_before),
+                        "after": gateway_close_counters_json(gateway_close_after)
+                    }
+                },
+                "workers": {
+                    "worker_a": {
+                        "addr": worker_a_addr,
+                        "metrics_addr": worker_a_metrics_addr,
+                        "relay_subscribers": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_relay_subscribers")?,
+                        "relay_connections": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_relay_connections_total")?,
+                        "relay_outbound_drops": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_relay_outbound_drops_total")?,
+                        "relay_forward_drops": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_relay_forward_drops_total")?,
+                        "remote_relay_connects": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_remote_relay_connects_total")?,
+                        "remote_relay_frames_sent": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_remote_relay_frames_sent_total")?,
+                        "remote_relay_frames_received": prometheus_sample_value(&worker_a_metrics_after, "tessera_worker_remote_relay_frames_received_total")?
+                    },
+                    "worker_b": {
+                        "addr": worker_b_addr,
+                        "metrics_addr": worker_b_metrics_addr,
+                        "relay_subscribers": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_relay_subscribers")?,
+                        "relay_connections": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_relay_connections_total")?,
+                        "relay_outbound_drops": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_relay_outbound_drops_total")?,
+                        "relay_forward_drops": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_relay_forward_drops_total")?,
+                        "remote_relay_connects": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_remote_relay_connects_total")?,
+                        "remote_relay_frames_sent": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_remote_relay_frames_sent_total")?,
+                        "remote_relay_frames_received": prometheus_sample_value(&worker_b_metrics_after, "tessera_worker_remote_relay_frames_received_total")?
+                    }
+                },
+                "orchestrator": {
+                    "grpc_addr": orch_addr,
+                    "metrics_addr": orch_metrics_addr,
+                    "registered_workers": prometheus_sample_value(&orch_metrics_after, "tessera_orch_registered_workers")?,
+                    "assigned_cells": prometheus_sample_value(&orch_metrics_after, "tessera_orch_assigned_cells")?,
+                    "assignment_listing_before": assignment_listing_summary_json(&soak_before_listing)?,
+                    "assignment_listing_after": assignment_listing_summary_json(&soak_after_listing)?
+                },
+                "operation_history": {
+                    "ledger_path": p10_observability_ledger_path_raw.as_str(),
+                    "records": ledger_summary.records,
+                    "proposal_records": ledger_summary.proposal_records,
+                    "operation_id": operation_id.as_str(),
+                    "proposal_hash": proposal_hash.as_str(),
+                    "proposal_response": proposal_response
+                },
+                "recommend_history": {
+                    "path": recommend_history_path.display().to_string(),
+                    "records": json_array(&recommend_history, &["records"])?.len()
+                },
+                "preview_snapshot": {
+                    "path": p10_observability_preview_path_raw.as_str(),
+                    "source": "live_worker_metrics_materialized_for_operation_history"
+                },
+                "ticks": tick_reports,
+                "replay": {
+                    "fingerprint": replay_fingerprint,
+                    "inputs": [
+                        "gateway_metrics",
+                        "worker_metrics",
+                        "orchestrator_metrics",
+                        "assignment_snapshots",
+                        "operation_history",
+                        "recommend_history"
+                    ]
+                },
+                "checks": {
+                    "gateway_metrics_sampled": true,
+                    "worker_metrics_sampled": true,
+                    "orchestrator_metrics_sampled": true,
+                    "request_latency_histograms_observed": true,
+                    "ghost_relay_counters_observed": true,
+                    "assignment_snapshots_sampled": true,
+                    "operation_history_sampled": ledger_summary.records >= 1,
+                    "recommend_history_sampled": true,
+                    "durable_report_written": true,
+                    "replayable_report": true,
+                    "route_convergence_maintained": route_converged,
+                    "close_counters_clean": counters_clean,
+                    "assignment_stability_checked": assignment_stable,
+                    "runtime_mutation_default_off": true,
+                    "no_execution_attempted": true
+                },
+                "remaining_uncovered": [
+                    "p10_ghost_relay_soak",
+                    "p10_replay_audit",
+                    "p10_gitops_rollout",
+                    "internal_microk8s_p10_observability_soak",
+                    "p10_completion_audit"
+                ]
+            });
+            validate_p10_observability_soak_report(&report)?;
+            let report_path = write_p10_observability_soak_report(&report)?;
+            println!(
+                "P10 observability soak: {ticks} iterations sampled Gateway/Worker/Orchestrator metrics, operation/recommend histories, and stable assignments without runtime mutation, report={}, ledger={}, recommend_history={}",
+                report_path.display(),
+                p10_observability_ledger_path.display(),
+                recommend_history_path.display()
+            );
+            return Ok(());
+        }
 
         if p9_recommend_loop {
             let history_records = tick_reports
@@ -14620,6 +15073,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::LivePlannerMutation => "activation-live-planner-mutation-smoke",
         ActivationSmokeMode::P8CadencePlan { .. } => "p8-cadence-plan-smoke",
         ActivationSmokeMode::P9RecommendLoopSoak { .. } => "p9-recommend-loop-soak",
+        ActivationSmokeMode::P10ObservabilitySoak { .. } => "p10-observability-soak",
         ActivationSmokeMode::P8CadenceProposal { .. } => "p8-cadence-proposal-smoke",
         ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval-smoke",
         ActivationSmokeMode::P8CadenceExecution { .. } => "p8-cadence-execution-smoke",
@@ -23212,6 +23666,18 @@ fn default_p9_policy_regression_path() -> PathBuf {
         .join("p9-policy-regression-latest.json")
 }
 
+fn default_p10_observability_soak_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p10-observability-soak-latest.json")
+}
+
+fn default_p10_recommend_history_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p10-recommend-history-latest.json")
+}
+
 fn default_internal_k8s_p9_recommend_soak_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -23493,6 +23959,34 @@ fn write_p9_policy_regression_report(report: &serde_json::Value) -> Result<PathB
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p9_policy_regression_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p10_observability_soak_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p10-observability-soak-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p10_observability_soak_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p10_recommend_history_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p10-recommend-history-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p10_recommend_history_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }

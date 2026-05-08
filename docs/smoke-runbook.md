@@ -195,13 +195,19 @@ implemented and captured:
 cargo xt p10-completion-audit --json
 ```
 
-Planned local gates:
+Local gates:
 
 ```sh
-cargo xt dev p10-observability-soak
+cargo xt dev p10-observability-soak --iterations 2 --sleep-ms 1
 cargo xt dev p10-ghost-relay-soak
 cargo xt dev p10-replay-audit
 ```
+
+`p10-observability-soak` is implemented and writes:
+
+- `.dev/reports/p10-observability-soak-latest.json`
+- `.dev/reports/p10-observability-ledger-latest.json`
+- `.dev/reports/p10-recommend-history-latest.json`
 
 Planned internal gate after image publish and GitOps promotion:
 

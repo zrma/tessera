@@ -56,6 +56,7 @@ Useful variants:
   - `cargo xt dev p9-policy-regression-smoke`
   - `cargo xt p9-completion-audit --json`
 - Active P10 completion gate:
+  - `cargo xt dev p10-observability-soak --iterations 2 --sleep-ms 1`
   - `cargo xt p10-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical
