@@ -68,12 +68,12 @@ Recommended P9 slices:
 4. Done: `test: add p9 policy regression smoke` - add a local verifier for
    default-off execution, explicit approval, deny evidence, cooldown, budget,
    and concurrency gates.
-5. `build: publish p9 control-plane runtime image` - publish the P9 image,
+5. Done: `build: publish p9 control-plane runtime image` - publish the P9 image,
    promote it through the k8s GitOps repo, verify ArgoCD `Synced / Healthy`, and
    record `.dev/reports/p9-gitops-rollout-latest.json`.
-6. `test: add internal p9 recommend soak` - run internal MicroK8s recommend-only
-   soak against live Worker metrics and durable storage, then replay the history
-   while keeping assignment state unchanged.
+6. Done: `test: add internal p9 recommend soak` - run internal MicroK8s
+   recommend-only soak against live Worker metrics and durable storage, then
+   replay the history while keeping assignment state unchanged.
 7. `test: add internal p9 controlled spot-check` - open a short approved window,
    execute one bounded operation, observe/replay it, clean mutating flags back
    to default-off, and close the P9 audit.

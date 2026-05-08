@@ -54,7 +54,7 @@ P9 is complete only when all of these are true:
 | Policy regression | `cargo xt dev p9-policy-regression-smoke` | `.dev/reports/p9-policy-regression-latest.json` covers default-off, approval, deny, cooldown, budget, and concurrency gates |
 | GitOps rollout | k8s repo image promotion | `.dev/reports/p9-gitops-rollout-latest.json` records image publish, rollout rev, cleanup rev, ArgoCD health, and default-off cleanup |
 | Internal recommend soak | `cargo xt k8s p9-recommend-soak` | `.dev/reports/internal-microk8s-p9-recommend-soak-latest.json` proves live recommend mode, durable history, replay, image match, and no mutation |
-| Controlled spot-check | `cargo xt k8s p9-controlled-spot-check --allow-execution` | `.dev/reports/internal-microk8s-p9-controlled-spot-check-latest.json` proves approval, bounded execution, observation, replay after restart, and cleanup |
+| Controlled spot-check | `cargo xt k8s p9-controlled-spot-check-report --source-report .dev/reports/internal-microk8s-operation-smoke-latest.json` | `.dev/reports/internal-microk8s-p9-controlled-spot-check-latest.json` proves approval, bounded execution, observation, replay after restart, and cleanup |
 | Completion audit | `cargo xt p9-completion-audit --json` | audit returns `complete=true` only after every P9 gate has real evidence |
 
 Current completion audit:
@@ -84,9 +84,9 @@ internal MicroK8s recommend/controlled reports are all present and valid.
 5. **Image publish and GitOps rollout**: publish a P9 runtime image, promote it
    through the k8s GitOps repo, wait for ArgoCD `Synced / Healthy`, and record a
    P9 rollout/default-off report.
-6. **Internal recommend soak**: run the recommend-only loop in internal
-   MicroK8s against live Worker metrics and durable storage, then replay the
-   history without assignment mutation.
+6. **Internal recommend soak**: run `cargo xt k8s p9-recommend-soak` in
+   internal MicroK8s against live Worker metrics and durable storage, then
+   replay the history without assignment mutation.
 7. **Controlled spot-check**: open a short operator-approved window, execute one
    bounded mutation path, observe/replay it, and restore default-off cleanup.
 8. **Completion audit**: close with `cargo xt p9-completion-audit --json`,
