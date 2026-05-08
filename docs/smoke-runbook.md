@@ -199,15 +199,16 @@ Local gates:
 
 ```sh
 cargo xt dev p10-observability-soak --iterations 2 --sleep-ms 1
-cargo xt dev p10-ghost-relay-soak
+cargo xt dev p10-ghost-relay-soak --iterations 2 --sleep-ms 1
 cargo xt dev p10-replay-audit
 ```
 
-`p10-observability-soak` is implemented and writes:
+Implemented local reports:
 
 - `.dev/reports/p10-observability-soak-latest.json`
 - `.dev/reports/p10-observability-ledger-latest.json`
 - `.dev/reports/p10-recommend-history-latest.json`
+- `.dev/reports/p10-ghost-relay-soak-latest.json`
 
 Planned internal gate after image publish and GitOps promotion:
 

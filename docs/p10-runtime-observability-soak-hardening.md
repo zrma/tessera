@@ -70,8 +70,8 @@ Current completion audit:
 cargo xt p10-completion-audit --json
 ```
 
-The audit is still expected to fail closed until ghost relay, replay, GitOps,
-and internal MicroK8s P10 evidence reports exist and validate.
+The audit is still expected to fail closed until replay, GitOps, and internal
+MicroK8s P10 evidence reports exist and validate.
 
 ## Initial Implementation Order
 
@@ -84,9 +84,12 @@ and internal MicroK8s P10 evidence reports exist and validate.
    `.dev/reports/p10-recommend-history-latest.json` with Gateway, Worker,
    Orchestrator, request latency, assignment, operation, recommend, route,
    close-counter, and default-off evidence.
-3. **Ghost relay soak**: add focused local/dev coverage for ghost relay fanout,
-   backpressure, reconnect counters, assignment stability, and clean close
-   counters under repeated load.
+3. **Ghost relay soak**: done. `cargo xt dev p10-ghost-relay-soak
+   --iterations 2 --sleep-ms 1` writes
+   `.dev/reports/p10-ghost-relay-soak-latest.json` from an initial
+   cross-worker child-route topology without runtime mutation, covering relay
+   fanout, backpressure counters, reconnect counters, assignment stability,
+   route convergence, and clean Gateway close counters.
 4. **Replay audit**: replay the durable observability reports and verify stable
    report hashes without runtime mutation.
 5. **Image publish and GitOps rollout**: publish a P10 runtime image, promote it

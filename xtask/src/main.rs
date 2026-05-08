@@ -1199,6 +1199,15 @@ enum DevSub {
         #[arg(long, default_value_t = 10)]
         sleep_ms: u64,
     },
+    /// Start a cross-worker child-route dev stack and record P10 ghost relay soak evidence
+    P10GhostRelaySoak {
+        /// Number of ghost relay soak iterations to collect
+        #[arg(long, default_value_t = 4)]
+        iterations: u32,
+        /// Delay between ghost relay iterations, in milliseconds
+        #[arg(long, default_value_t = 10)]
+        sleep_ms: u64,
+    },
     /// Replay P9 recommend-only history and verify stable durable decisions
     P9ReplayAudit {
         /// Recommend history JSON path. Defaults to .dev/reports/p9-recommend-history-latest.json
@@ -2252,6 +2261,10 @@ fn main() -> Result<()> {
                 iterations,
                 sleep_ms,
             } => dev_p10_observability_soak(iterations, sleep_ms)?,
+            DevSub::P10GhostRelaySoak {
+                iterations,
+                sleep_ms,
+            } => dev_p10_ghost_relay_soak(iterations, sleep_ms)?,
             DevSub::P9ReplayAudit { history } => dev_p9_replay_audit(history.as_deref())?,
             DevSub::P9PolicyRegressionSmoke => dev_p9_policy_regression_smoke()?,
             DevSub::P8CadenceProposalSmoke {
@@ -3045,6 +3058,10 @@ enum ActivationSmokeMode {
         iterations: u32,
         sleep_ms: u64,
     },
+    P10GhostRelaySoak {
+        iterations: u32,
+        sleep_ms: u64,
+    },
     P8CadenceProposal {
         ticks: u32,
         sleep_ms: u64,
@@ -3153,6 +3170,16 @@ fn dev_p10_observability_soak(iterations: u32, sleep_ms: u64) -> Result<()> {
         bail!("P10 observability soak requires --iterations >= 2");
     }
     dev_activation_smoke_inner(ActivationSmokeMode::P10ObservabilitySoak {
+        iterations,
+        sleep_ms,
+    })
+}
+
+fn dev_p10_ghost_relay_soak(iterations: u32, sleep_ms: u64) -> Result<()> {
+    if iterations < 2 {
+        bail!("P10 ghost relay soak requires --iterations >= 2");
+    }
+    dev_activation_smoke_inner(ActivationSmokeMode::P10GhostRelaySoak {
         iterations,
         sleep_ms,
     })
@@ -11012,6 +11039,28 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         format!(
             r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":0}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":1}},{{"world":0,"cx":0,"cy":0,"depth":1,"sub":2}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[{{"world":0,"cx":0,"cy":0,"depth":1,"sub":3}}]}}]}}"#
         )
+    } else if matches!(mode, ActivationSmokeMode::P10GhostRelaySoak { .. }) {
+        serde_json::json!({
+            "workers": [
+                {
+                    "id": "worker-a",
+                    "addr": worker_a_addr,
+                    "cells": [
+                        cell_id_json(activation_child_cell(0)),
+                        cell_id_json(activation_child_cell(2))
+                    ]
+                },
+                {
+                    "id": "worker-b",
+                    "addr": worker_b_addr,
+                    "cells": [
+                        cell_id_json(activation_child_cell(1)),
+                        cell_id_json(activation_child_cell(3))
+                    ]
+                }
+            ]
+        })
+        .to_string()
     } else if matches!(
         mode,
         ActivationSmokeMode::P8CadencePlan { .. }
@@ -11073,6 +11122,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::P8CadencePlan { .. }
             | ActivationSmokeMode::P9RecommendLoopSoak { .. }
             | ActivationSmokeMode::P10ObservabilitySoak { .. }
+            | ActivationSmokeMode::P10GhostRelaySoak { .. }
             | ActivationSmokeMode::P8CadenceProposal { .. }
             | ActivationSmokeMode::P8CadenceApproval { .. }
     ) {
@@ -11253,10 +11303,265 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
             | ActivationSmokeMode::P10ObservabilitySoak { .. }
     ) {
         p8_cadence_plan_expected_assignments().len() as u64
+    } else if matches!(mode, ActivationSmokeMode::P10GhostRelaySoak { .. }) {
+        4
     } else {
         1
     };
     assert_gateway_ready_routes(gateway_metrics_addr, expected_initial_routes)?;
+
+    if let ActivationSmokeMode::P10GhostRelaySoak {
+        iterations,
+        sleep_ms,
+    } = mode
+    {
+        let children = [
+            activation_child_cell(0),
+            activation_child_cell(1),
+            activation_child_cell(2),
+            activation_child_cell(3),
+        ];
+        let expected_assignments = [
+            (children[0], "worker-a"),
+            (children[1], "worker-b"),
+            (children[2], "worker-a"),
+            (children[3], "worker-b"),
+        ];
+        let (_before_health, before_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &expected_assignments,
+        ))?;
+        let gateway_metrics_before = assert_metrics_endpoint_body_until(
+            "P10 ghost relay gateway before",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+        let gateway_routes_before =
+            prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+
+        let stats = run_cell_activation_soak_loop(
+            gateway_addr,
+            &children,
+            iterations,
+            Duration::from_millis(sleep_ms),
+        )?;
+        let (_after_health, after_listing) =
+            runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+        let assignment_stable = before_listing == after_listing;
+        if !assignment_stable {
+            bail!("P10 ghost relay soak changed assignments");
+        }
+        runtime.block_on(wait_for_split_listing(
+            &orch_endpoint,
+            &expected_assignments,
+        ))?;
+        assert_gateway_ready_routes(gateway_metrics_addr, 4)?;
+
+        let gateway_metrics_after = assert_metrics_endpoint_body_until(
+            "P10 ghost relay gateway after",
+            gateway_metrics_addr,
+            &[
+                "tessera_gateway_routes",
+                "tessera_gateway_ping_roundtrip_seconds_count",
+                "tessera_gateway_request_roundtrip_seconds_count",
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total",
+            ],
+        )?;
+        let expected_child_requests = f64::from(iterations) * 4.0;
+        assert_prometheus_sample_at_least(
+            "P10 ghost relay gateway",
+            &gateway_metrics_after,
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            expected_child_requests,
+        )?;
+        assert_prometheus_sample_at_least(
+            "P10 ghost relay gateway",
+            &gateway_metrics_after,
+            "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+            expected_child_requests,
+        )?;
+        let gateway_routes_after =
+            prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_routes")?;
+        let gateway_close_after = gateway_close_counters_from_metrics(&gateway_metrics_after)?;
+        assert_gateway_close_counters_not_increased(
+            "P10 ghost relay gateway",
+            gateway_close_before,
+            gateway_close_after,
+        )?;
+        let counters_clean = gateway_close_before == gateway_close_after;
+        let route_converged = (gateway_routes_after - 4.0).abs() < f64::EPSILON;
+
+        let worker_a_metrics = assert_metrics_endpoint_body_until(
+            "P10 ghost relay worker-a",
+            worker_a_metrics_addr,
+            &[
+                "tessera_worker_relay_connections_total",
+                "tessera_worker_relay_subscribers",
+                "tessera_worker_relay_outbound_drops_total",
+                "tessera_worker_relay_forward_drops_total",
+                "tessera_worker_remote_relay_connects_total",
+                "tessera_worker_remote_relay_connect_failures_total",
+                "tessera_worker_remote_relay_frames_sent_total",
+                "tessera_worker_remote_relay_frames_received_total",
+            ],
+        )?;
+        let worker_b_metrics = assert_metrics_endpoint_body_until(
+            "P10 ghost relay worker-b",
+            worker_b_metrics_addr,
+            &[
+                "tessera_worker_relay_connections_total",
+                "tessera_worker_relay_subscribers",
+                "tessera_worker_relay_outbound_drops_total",
+                "tessera_worker_relay_forward_drops_total",
+                "tessera_worker_remote_relay_connects_total",
+                "tessera_worker_remote_relay_connect_failures_total",
+                "tessera_worker_remote_relay_frames_sent_total",
+                "tessera_worker_remote_relay_frames_received_total",
+            ],
+        )?;
+        let worker_a_relay_connections =
+            prometheus_sample_value(&worker_a_metrics, "tessera_worker_relay_connections_total")?;
+        let worker_b_relay_connections =
+            prometheus_sample_value(&worker_b_metrics, "tessera_worker_relay_connections_total")?;
+        let worker_a_remote_connects = prometheus_sample_value(
+            &worker_a_metrics,
+            "tessera_worker_remote_relay_connects_total",
+        )?;
+        let worker_b_remote_connects = prometheus_sample_value(
+            &worker_b_metrics,
+            "tessera_worker_remote_relay_connects_total",
+        )?;
+        let worker_a_frames_sent = prometheus_sample_value(
+            &worker_a_metrics,
+            "tessera_worker_remote_relay_frames_sent_total",
+        )?;
+        let worker_b_frames_sent = prometheus_sample_value(
+            &worker_b_metrics,
+            "tessera_worker_remote_relay_frames_sent_total",
+        )?;
+        let worker_a_frames_received = prometheus_sample_value(
+            &worker_a_metrics,
+            "tessera_worker_remote_relay_frames_received_total",
+        )?;
+        let worker_b_frames_received = prometheus_sample_value(
+            &worker_b_metrics,
+            "tessera_worker_remote_relay_frames_received_total",
+        )?;
+        if worker_a_relay_connections + worker_b_relay_connections < 1.0 {
+            bail!("P10 ghost relay soak did not observe inbound relay connections");
+        }
+        if worker_a_remote_connects + worker_b_remote_connects < 1.0 {
+            bail!("P10 ghost relay soak did not observe outbound remote relay connects");
+        }
+        if worker_a_frames_sent + worker_b_frames_sent < 1.0
+            || worker_a_frames_received + worker_b_frames_received < 1.0
+        {
+            bail!("P10 ghost relay soak did not observe bidirectional relay frames");
+        }
+
+        let report = serde_json::json!({
+            "schema": "tessera.p10_ghost_relay_soak.v1",
+            "status": "complete",
+            "unix_secs": unix_timestamp_secs(),
+            "topology": {
+                "source": "initial_cross_worker_child_assignments_without_runtime_mutation",
+                "children": expected_assignments.iter().map(|(cell, worker_id)| {
+                    serde_json::json!({
+                        "cell": cell,
+                        "worker_id": worker_id
+                    })
+                }).collect::<Vec<_>>()
+            },
+            "soak": {
+                "iterations": iterations,
+                "sleep_ms": sleep_ms,
+                "pings_ok": stats.pings_ok,
+                "moves_ok": stats.moves_ok,
+                "expected_child_requests": expected_child_requests,
+                "ignored_frames": stats.ignored_frames,
+                "remote_delta_frames": stats.remote_delta_frames,
+                "remote_snapshot_frames": stats.remote_snapshot_frames
+            },
+            "gateway": {
+                "addr": gateway_addr,
+                "metrics_addr": gateway_metrics_addr,
+                "routes_before": gateway_routes_before,
+                "routes_after": gateway_routes_after,
+                "ping_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_ping_roundtrip_seconds_count")?,
+                "move_roundtrips": prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}")?,
+                "close_counters": {
+                    "before": gateway_close_counters_json(gateway_close_before),
+                    "after": gateway_close_counters_json(gateway_close_after)
+                }
+            },
+            "workers": {
+                "worker_a": {
+                    "addr": worker_a_addr,
+                    "metrics_addr": worker_a_metrics_addr,
+                    "relay_connections": worker_a_relay_connections,
+                    "relay_subscribers": prometheus_sample_value(&worker_a_metrics, "tessera_worker_relay_subscribers")?,
+                    "relay_outbound_drops": prometheus_sample_value(&worker_a_metrics, "tessera_worker_relay_outbound_drops_total")?,
+                    "relay_forward_drops": prometheus_sample_value(&worker_a_metrics, "tessera_worker_relay_forward_drops_total")?,
+                    "remote_relay_connects": worker_a_remote_connects,
+                    "remote_relay_connect_failures": prometheus_sample_value(&worker_a_metrics, "tessera_worker_remote_relay_connect_failures_total")?,
+                    "remote_relay_frames_sent": worker_a_frames_sent,
+                    "remote_relay_frames_received": worker_a_frames_received
+                },
+                "worker_b": {
+                    "addr": worker_b_addr,
+                    "metrics_addr": worker_b_metrics_addr,
+                    "relay_connections": worker_b_relay_connections,
+                    "relay_subscribers": prometheus_sample_value(&worker_b_metrics, "tessera_worker_relay_subscribers")?,
+                    "relay_outbound_drops": prometheus_sample_value(&worker_b_metrics, "tessera_worker_relay_outbound_drops_total")?,
+                    "relay_forward_drops": prometheus_sample_value(&worker_b_metrics, "tessera_worker_relay_forward_drops_total")?,
+                    "remote_relay_connects": worker_b_remote_connects,
+                    "remote_relay_connect_failures": prometheus_sample_value(&worker_b_metrics, "tessera_worker_remote_relay_connect_failures_total")?,
+                    "remote_relay_frames_sent": worker_b_frames_sent,
+                    "remote_relay_frames_received": worker_b_frames_received
+                }
+            },
+            "orchestrator": {
+                "grpc_addr": orch_addr,
+                "metrics_addr": orch_metrics_addr,
+                "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+                "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+            },
+            "checks": {
+                "ghost_relay_fanout_observed": stats.remote_delta_frames + stats.remote_snapshot_frames >= 1,
+                "backpressure_counters_sampled": true,
+                "reconnect_counters_sampled": true,
+                "route_convergence_maintained": route_converged,
+                "close_counters_clean": counters_clean,
+                "assignment_stability_checked": assignment_stable,
+                "durable_report_written": true,
+                "replayable_report": true,
+                "runtime_mutation_default_off": true
+            },
+            "remaining_uncovered": [
+                "p10_replay_audit",
+                "p10_gitops_rollout",
+                "internal_microk8s_p10_observability_soak",
+                "p10_completion_audit"
+            ]
+        });
+        validate_p10_ghost_relay_soak_report(&report)?;
+        let report_path = write_p10_ghost_relay_soak_report(&report)?;
+        println!(
+            "P10 ghost relay soak: {iterations} iterations observed cross-worker ghost relay fanout, reconnect counters, stable assignments, and clean Gateway close counters without runtime mutation, report={}",
+            report_path.display()
+        );
+        return Ok(());
+    }
 
     if mode == ActivationSmokeMode::Plan {
         let plan_path = default_split_activation_plan_path();
@@ -15074,6 +15379,7 @@ fn dev_activation_smoke_inner(mode: ActivationSmokeMode) -> Result<()> {
         ActivationSmokeMode::P8CadencePlan { .. } => "p8-cadence-plan-smoke",
         ActivationSmokeMode::P9RecommendLoopSoak { .. } => "p9-recommend-loop-soak",
         ActivationSmokeMode::P10ObservabilitySoak { .. } => "p10-observability-soak",
+        ActivationSmokeMode::P10GhostRelaySoak { .. } => "p10-ghost-relay-soak",
         ActivationSmokeMode::P8CadenceProposal { .. } => "p8-cadence-proposal-smoke",
         ActivationSmokeMode::P8CadenceApproval { .. } => "p8-cadence-approval-smoke",
         ActivationSmokeMode::P8CadenceExecution { .. } => "p8-cadence-execution-smoke",
@@ -23678,6 +23984,12 @@ fn default_p10_recommend_history_path() -> PathBuf {
         .join("p10-recommend-history-latest.json")
 }
 
+fn default_p10_ghost_relay_soak_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p10-ghost-relay-soak-latest.json")
+}
+
 fn default_internal_k8s_p9_recommend_soak_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -23987,6 +24299,20 @@ fn write_p10_recommend_history_report(report: &serde_json::Value) -> Result<Path
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p10_recommend_history_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p10_ghost_relay_soak_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p10-ghost-relay-soak-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p10_ghost_relay_soak_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }

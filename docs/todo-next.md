@@ -46,7 +46,7 @@ Recommended P10 slices:
    p10-observability-soak` to sample Gateway, Worker, and Orchestrator metrics,
    request latency histograms, ghost relay counters, assignment snapshots, and
    operation/recommend histories into a durable replayable report.
-3. Pending: `test: add p10 ghost relay soak` - add focused local/dev coverage
+3. Done: `test: add p10 ghost relay soak` - add focused local/dev coverage
    for relay fanout, backpressure, reconnect counters, route convergence,
    close-counter cleanliness, assignment stability, and default-off state.
 4. Pending: `test: add p10 replay audit` - replay durable P10 reports and prove
