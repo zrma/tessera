@@ -1,6 +1,6 @@
 # P8 Closed-Loop Operation Cadence
 
-Last reviewed: 2026-05-05
+Last reviewed: 2026-05-08
 
 ## Objective
 
@@ -72,12 +72,24 @@ Current completion audit:
 cargo xt p8-completion-audit --json
 ```
 
-As of 2026-05-05 this is intentionally incomplete. It must stay
-`complete=false` until the audit finding for the internal MicroK8s controlled
-cadence smoke has concrete evidence. The P8 GitOps rollout/default-off report
-exists for the `v2026.05.7` rollout, and the local read-only cadence now records
-stable split, merge, and canonical multi-depth candidate batches from live
-Worker metrics and assignment state.
+As of 2026-05-08 this is complete for the `v2026.05.7` evidence set. The P8
+GitOps rollout/default-off report and internal MicroK8s controlled cadence
+smoke/cleanup report are both part of the completion evidence, so the audit
+returns `complete=true` against the current `.dev/reports` set.
+
+## Completion Record
+
+P8 is closed with these evidence classes:
+
+1. Local read-only cadence with stable split, merge, and canonical multi-depth
+   candidate coverage from live Worker metrics and assignment state.
+2. Durable proposal idempotency, explicit approval/default-off preflight, and
+   cooldown/budget/concurrency gate evidence.
+3. Bounded approved execution, failure/recovery, Orchestrator restart recovery,
+   and child-route soak evidence.
+4. `v2026.05.7` runtime image publish, k8s GitOps rollout, ArgoCD
+   `Synced / Healthy`, and deployment image match evidence.
+5. Internal MicroK8s controlled cadence smoke followed by default-off cleanup.
 
 ## Initial Implementation Order
 
@@ -138,8 +150,8 @@ Worker metrics and assignment state.
    --expected-image <new-tag>` to finalize
    `.dev/reports/internal-microk8s-p8-cadence-smoke-latest.json`.
 10. **Completion audit**: `cargo xt p8-completion-audit --json` maps every
-    criterion to concrete local, internal, cleanup, and CI evidence and fails
-    until the remaining runtime gates are closed.
+    criterion to concrete local, internal, cleanup, and CI evidence and now
+    passes for the closed P8 evidence set.
 
 ## Guardrails
 

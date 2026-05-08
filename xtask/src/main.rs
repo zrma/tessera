@@ -71,6 +71,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit P9 operation control-plane readiness gates from report JSON
+    P9CompletionAudit {
+        /// Directory that contains smoke/report JSON files
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
     P7OperationLedgerCheck {
         /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
@@ -1362,6 +1371,7 @@ fn main() -> Result<()> {
         Cmd::P6CompletionAudit { report_dir, json } => run_p6_completion_audit(&report_dir, json)?,
         Cmd::P7CompletionAudit { report_dir, json } => run_p7_completion_audit(&report_dir, json)?,
         Cmd::P8CompletionAudit { report_dir, json } => run_p8_completion_audit(&report_dir, json)?,
+        Cmd::P9CompletionAudit { report_dir, json } => run_p9_completion_audit(&report_dir, json)?,
         Cmd::P7OperationLedgerCheck {
             ledger,
             require_approval,
@@ -25752,6 +25762,298 @@ fn push_p8_ledger_gate(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P9CompletionFinding {
+    gate: &'static str,
+    evidence: String,
+    missing: String,
+}
+
+fn run_p9_completion_audit(report_dir: &Path, json: bool) -> Result<()> {
+    let findings = p9_completion_findings(report_dir);
+    if json {
+        let body = serde_json::json!({
+            "schema": "tessera.p9_completion_audit.v1",
+            "complete": findings.is_empty(),
+            "report_dir": report_dir.display().to_string(),
+            "findings": findings.iter().map(|finding| {
+                serde_json::json!({
+                    "gate": finding.gate,
+                    "evidence": finding.evidence,
+                    "missing": finding.missing
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if findings.is_empty() {
+        println!(
+            "P9 completion audit passed: operation control-plane readiness gates are covered in {}",
+            report_dir.display()
+        );
+    } else {
+        println!(
+            "P9 completion audit incomplete: {} missing gate(s) in {}",
+            findings.len(),
+            report_dir.display()
+        );
+        for finding in &findings {
+            println!(
+                "- {}: evidence={} missing={}",
+                finding.gate, finding.evidence, finding.missing
+            );
+        }
+    }
+    if !findings.is_empty() {
+        bail!(
+            "P9 completion audit is incomplete: {} missing gate(s)",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+fn p9_completion_findings(report_dir: &Path) -> Vec<P9CompletionFinding> {
+    let mut findings = Vec::new();
+
+    push_p9_json_gate(
+        &mut findings,
+        report_dir,
+        "p9_local_recommend_loop_soak",
+        "p9-recommend-loop-soak-latest.json",
+        "local durable recommend-only loop with live metrics, assignment snapshots, stable candidates, and no mutation",
+        validate_p9_recommend_loop_soak_report,
+    );
+    push_p9_json_gate(
+        &mut findings,
+        report_dir,
+        "p9_local_replay_audit",
+        "p9-replay-audit-latest.json",
+        "replayable durable operation history with stable proposal hashes and restart recovery",
+        validate_p9_replay_audit_report,
+    );
+    push_p9_json_gate(
+        &mut findings,
+        report_dir,
+        "p9_local_policy_regression",
+        "p9-policy-regression-latest.json",
+        "policy regression report covering default-off, explicit approval, deny evidence, cooldown, budget, and concurrency gates",
+        validate_p9_policy_regression_report,
+    );
+
+    let rollout_image = p9_gitops_rollout_image(report_dir, &mut findings);
+    let expected_image = rollout_image.as_deref();
+    push_p9_json_gate(
+        &mut findings,
+        report_dir,
+        "p9_internal_recommend_soak",
+        "internal-microk8s-p9-recommend-soak-latest.json",
+        "internal MicroK8s recommend-only soak with durable history, replay evidence, and no automatic mutation",
+        |report| validate_internal_k8s_p9_recommend_soak_report(report, expected_image),
+    );
+    push_p9_json_gate(
+        &mut findings,
+        report_dir,
+        "p9_internal_controlled_spot_check",
+        "internal-microk8s-p9-controlled-spot-check-latest.json",
+        "operator-approved controlled mutation spot-check with observation, replay, and post-smoke default-off cleanup",
+        |report| validate_internal_k8s_p9_controlled_spot_check_report(report, expected_image),
+    );
+
+    findings
+}
+
+fn p9_gitops_rollout_image(
+    report_dir: &Path,
+    findings: &mut Vec<P9CompletionFinding>,
+) -> Option<String> {
+    let path = report_dir.join("p9-gitops-rollout-latest.json");
+    let report = match read_json_report(&path) {
+        Ok(report) => report,
+        Err(err) => {
+            findings.push(P9CompletionFinding {
+                gate: "p9_internal_gitops_rollout_default_off",
+                evidence: format!("{} unavailable: {err}", path.display()),
+                missing: "P9 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+            });
+            return None;
+        }
+    };
+    if let Err(err) = validate_p6_gitops_rollout_report(&report, None) {
+        findings.push(P9CompletionFinding {
+            gate: "p9_internal_gitops_rollout_default_off",
+            evidence: format!("{} failed verifier: {err}", path.display()),
+            missing: "P9 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+        });
+        return None;
+    }
+    match json_str(&report, &["image", "name"]) {
+        Ok(image) if image.ends_with(":v2026.05.7") => {
+            findings.push(P9CompletionFinding {
+                gate: "p9_internal_gitops_rollout_default_off",
+                evidence: format!("{} still references P8 image {}", path.display(), image),
+                missing: "new P9 runtime image promoted through GitOps".to_string(),
+            });
+            None
+        }
+        Ok(image) if !image.trim().is_empty() => Some(image.to_string()),
+        Ok(_) => {
+            findings.push(P9CompletionFinding {
+                gate: "p9_internal_gitops_rollout_default_off",
+                evidence: format!("{} has empty image.name", path.display()),
+                missing: "P9 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+        Err(err) => {
+            findings.push(P9CompletionFinding {
+                gate: "p9_internal_gitops_rollout_default_off",
+                evidence: format!("{} missing image.name: {err}", path.display()),
+                missing: "P9 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn push_p9_json_gate<F>(
+    findings: &mut Vec<P9CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    report_name: &str,
+    missing: &str,
+    validate: F,
+) where
+    F: FnOnce(&serde_json::Value) -> Result<()>,
+{
+    let path = report_dir.join(report_name);
+    match read_json_report(&path) {
+        Ok(report) => {
+            if let Err(err) = validate(&report) {
+                findings.push(P9CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P9CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
+fn validate_p9_recommend_loop_soak_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p9_recommend_loop_soak.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "recommend_mode_enabled"], true)?;
+    assert_json_bool_eq(report, &["checks", "live_worker_metrics_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_state_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "durable_history_written"], true)?;
+    assert_json_bool_eq(report, &["checks", "split_candidates_observed"], true)?;
+    assert_json_bool_eq(report, &["checks", "merge_candidates_observed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "canonical_multi_depth_candidates_observed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "candidate_keys_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_assignment_mutation"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_execution_attempted"], true)?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    assert_json_number_at_least(report, &["history", "records"], 1.0)?;
+    assert_remaining_uncovered_empty(report)?;
+    Ok(())
+}
+
+fn validate_p9_replay_audit_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p9_replay_audit.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "history_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "proposal_hashes_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "operation_ids_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "restart_recovered"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_assignment_mutation"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_execution_attempted"], true)?;
+    assert_json_number_at_least(report, &["history", "records"], 1.0)?;
+    assert_json_number_at_least(report, &["replay", "iterations"], 1.0)?;
+    assert_remaining_uncovered_empty(report)?;
+    Ok(())
+}
+
+fn validate_p9_policy_regression_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p9_policy_regression.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "default_off_execution_blocked"], true)?;
+    assert_json_bool_eq(report, &["checks", "explicit_approval_required"], true)?;
+    assert_json_bool_eq(report, &["checks", "deny_evidence_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "cooldown_gate_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "budget_gate_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "concurrency_gate_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "automatic_mutation_observed"], false)?;
+    assert_remaining_uncovered_empty(report)?;
+    Ok(())
+}
+
+fn validate_internal_k8s_p9_recommend_soak_report(
+    report: &serde_json::Value,
+    expected_image: Option<&str>,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.internal_microk8s_p9_recommend_soak.v1",
+    )?;
+    assert_json_str_eq(report, &["stage"], "completed")?;
+    if let Some(expected_image) = expected_image {
+        assert_report_images_match(report, expected_image)?;
+    }
+    assert_json_bool_eq(report, &["checks", "argocd_synced_healthy"], true)?;
+    assert_json_bool_eq(report, &["checks", "deployment_images_match"], true)?;
+    assert_json_bool_eq(report, &["checks", "recommend_mode_enabled"], true)?;
+    assert_json_bool_eq(report, &["checks", "live_worker_metrics_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_state_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "durable_history_written"], true)?;
+    assert_json_bool_eq(report, &["checks", "replay_verified"], true)?;
+    assert_json_bool_eq(report, &["checks", "default_off_execution"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_assignment_mutation"], true)?;
+    assert_json_bool_eq(report, &["checks", "automatic_mutation_observed"], false)?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    assert_json_number_at_least(report, &["history", "records"], 1.0)?;
+    assert_remaining_uncovered_empty(report)?;
+    Ok(())
+}
+
+fn validate_internal_k8s_p9_controlled_spot_check_report(
+    report: &serde_json::Value,
+    expected_image: Option<&str>,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.internal_microk8s_p9_controlled_spot_check.v1",
+    )?;
+    assert_json_str_eq(report, &["stage"], "completed")?;
+    if let Some(expected_image) = expected_image {
+        assert_report_images_match(report, expected_image)?;
+    }
+    assert_json_bool_eq(report, &["execution_allowed"], true)?;
+    assert_json_bool_eq(report, &["execution_mutated"], true)?;
+    assert_json_bool_eq(report, &["checks", "argocd_synced_healthy"], true)?;
+    assert_json_bool_eq(report, &["checks", "deployment_images_match"], true)?;
+    assert_json_bool_eq(report, &["checks", "operator_approval_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "controlled_window_opened"], true)?;
+    assert_json_bool_eq(report, &["checks", "bounded_execution_published"], true)?;
+    assert_json_bool_eq(report, &["checks", "observation_completed"], true)?;
+    assert_json_bool_eq(report, &["checks", "replay_verified_after_restart"], true)?;
+    assert_json_bool_eq(report, &["checks", "post_smoke_default_off_cleanup"], true)?;
+    assert_json_bool_eq(report, &["cleanup", "manual_activation_default_off"], true)?;
+    assert_json_bool_eq(report, &["cleanup", "preview_fixture_removed"], true)?;
+    assert_remaining_uncovered_empty(report)?;
+    Ok(())
+}
+
 fn p6_restart_preflight_evidence(report_dir: &Path) -> Option<String> {
     let expected_errors = [ORCH_ASSIGNMENT_STATE_ENV.to_string()];
     for report_name in [
@@ -36313,6 +36615,96 @@ demo_count 4
         }));
 
         fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
+    fn p9_completion_audit_reports_missing_control_plane_gates() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p9-audit-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let findings = p9_completion_findings(&dir);
+
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p9_local_recommend_loop_soak"
+                && finding.missing.contains("recommend-only loop")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p9_internal_gitops_rollout_default_off"
+                && finding.missing.contains("GitOps rollout")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p9_internal_recommend_soak"
+                && finding
+                    .missing
+                    .contains("internal MicroK8s recommend-only soak")
+        }));
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
+    fn p9_report_validators_accept_complete_minimal_reports() {
+        let recommend = serde_json::json!({
+            "schema": "tessera.p9_recommend_loop_soak.v1",
+            "status": "complete",
+            "checks": {
+                "recommend_mode_enabled": true,
+                "live_worker_metrics_sampled": true,
+                "assignment_state_sampled": true,
+                "durable_history_written": true,
+                "split_candidates_observed": true,
+                "merge_candidates_observed": true,
+                "canonical_multi_depth_candidates_observed": true,
+                "candidate_keys_stable": true,
+                "no_assignment_mutation": true,
+                "no_execution_attempted": true
+            },
+            "soak": {"iterations": 2},
+            "history": {"records": 1},
+            "remaining_uncovered": []
+        });
+        validate_p9_recommend_loop_soak_report(&recommend).expect("valid P9 recommend-loop report");
+
+        let replay = serde_json::json!({
+            "schema": "tessera.p9_replay_audit.v1",
+            "status": "complete",
+            "checks": {
+                "history_replayed": true,
+                "proposal_hashes_stable": true,
+                "operation_ids_stable": true,
+                "restart_recovered": true,
+                "no_assignment_mutation": true,
+                "no_execution_attempted": true
+            },
+            "history": {"records": 1},
+            "replay": {"iterations": 1},
+            "remaining_uncovered": []
+        });
+        validate_p9_replay_audit_report(&replay).expect("valid P9 replay report");
+
+        let policy = serde_json::json!({
+            "schema": "tessera.p9_policy_regression.v1",
+            "status": "complete",
+            "checks": {
+                "default_off_execution_blocked": true,
+                "explicit_approval_required": true,
+                "deny_evidence_recorded": true,
+                "cooldown_gate_checked": true,
+                "budget_gate_checked": true,
+                "concurrency_gate_checked": true,
+                "automatic_mutation_observed": false
+            },
+            "remaining_uncovered": []
+        });
+        validate_p9_policy_regression_report(&policy).expect("valid P9 policy report");
     }
 
     #[test]

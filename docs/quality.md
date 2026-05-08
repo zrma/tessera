@@ -130,6 +130,16 @@ This document is the repo-local quality map for agents. It keeps the expected au
   execution/activation env, preview fixture removal, and finalizes that report.
   `cargo xt p8-completion-audit --json` aggregates the P8 local cadence
   evidence, including stable split/merge/canonical multi-depth candidate
-  coverage, and is expected to fail until the P8 GitOps rollout/default-off
-  report and finalized internal controlled cadence smoke are covered.
+  coverage, P8 GitOps rollout/default-off evidence, and finalized internal
+  controlled cadence smoke; the `v2026.05.7` evidence set returns
+  `complete=true`.
+- P9 operation control-plane readiness starts with `cargo xt
+  p9-completion-audit --json`, which is intentionally incomplete until local
+  recommend-only soak, durable history replay audit, policy regression, P9
+  GitOps rollout/default-off cleanup, internal recommend soak, and a controlled
+  mutation spot-check all have machine-checkable reports. P9 keeps live runtime
+  mutation default-off; recommend-mode evidence must prove no assignment
+  mutation or execution attempt, while any runtime-affecting spot-check must
+  happen only inside an operator-approved controlled window followed by
+  default-off cleanup.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
