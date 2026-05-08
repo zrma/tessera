@@ -70,8 +70,8 @@ Current completion audit:
 cargo xt p10-completion-audit --json
 ```
 
-The audit is still expected to fail closed until replay, GitOps, and internal
-MicroK8s P10 evidence reports exist and validate.
+The audit is still expected to fail closed until GitOps and internal MicroK8s
+P10 evidence reports exist and validate.
 
 ## Initial Implementation Order
 
@@ -90,8 +90,10 @@ MicroK8s P10 evidence reports exist and validate.
    cross-worker child-route topology without runtime mutation, covering relay
    fanout, backpressure counters, reconnect counters, assignment stability,
    route convergence, and clean Gateway close counters.
-4. **Replay audit**: replay the durable observability reports and verify stable
-   report hashes without runtime mutation.
+4. **Replay audit**: done. `cargo xt dev p10-replay-audit` writes
+   `.dev/reports/p10-replay-audit-latest.json` after rereading the local
+   observability report, ghost relay report, operation ledger, and recommend
+   history, then verifying stable report hashes without touching runtime state.
 5. **Image publish and GitOps rollout**: publish a P10 runtime image, promote it
    through the k8s GitOps repo, verify ArgoCD and image state, and record a P10
    rollout/default-off report.

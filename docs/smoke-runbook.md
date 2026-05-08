@@ -209,6 +209,7 @@ Implemented local reports:
 - `.dev/reports/p10-observability-ledger-latest.json`
 - `.dev/reports/p10-recommend-history-latest.json`
 - `.dev/reports/p10-ghost-relay-soak-latest.json`
+- `.dev/reports/p10-replay-audit-latest.json`
 
 Planned internal gate after image publish and GitOps promotion:
 

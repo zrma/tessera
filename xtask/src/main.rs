@@ -1208,6 +1208,15 @@ enum DevSub {
         #[arg(long, default_value_t = 10)]
         sleep_ms: u64,
     },
+    /// Replay P10 observability and ghost relay evidence without runtime mutation
+    P10ReplayAudit {
+        /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
+        #[arg(long)]
+        observability: Option<PathBuf>,
+        /// Ghost relay soak JSON path. Defaults to .dev/reports/p10-ghost-relay-soak-latest.json
+        #[arg(long)]
+        ghost: Option<PathBuf>,
+    },
     /// Replay P9 recommend-only history and verify stable durable decisions
     P9ReplayAudit {
         /// Recommend history JSON path. Defaults to .dev/reports/p9-recommend-history-latest.json
@@ -2265,6 +2274,10 @@ fn main() -> Result<()> {
                 iterations,
                 sleep_ms,
             } => dev_p10_ghost_relay_soak(iterations, sleep_ms)?,
+            DevSub::P10ReplayAudit {
+                observability,
+                ghost,
+            } => dev_p10_replay_audit(observability.as_deref(), ghost.as_deref())?,
             DevSub::P9ReplayAudit { history } => dev_p9_replay_audit(history.as_deref())?,
             DevSub::P9PolicyRegressionSmoke => dev_p9_policy_regression_smoke()?,
             DevSub::P8CadenceProposalSmoke {
@@ -3183,6 +3196,40 @@ fn dev_p10_ghost_relay_soak(iterations: u32, sleep_ms: u64) -> Result<()> {
         iterations,
         sleep_ms,
     })
+}
+
+fn dev_p10_replay_audit(observability: Option<&Path>, ghost: Option<&Path>) -> Result<()> {
+    let observability_path_buf;
+    let observability_path = match observability {
+        Some(path) => path,
+        None => {
+            observability_path_buf = default_p10_observability_soak_path();
+            observability_path_buf.as_path()
+        }
+    };
+    let ghost_path_buf;
+    let ghost_path = match ghost {
+        Some(path) => path,
+        None => {
+            ghost_path_buf = default_p10_ghost_relay_soak_path();
+            ghost_path_buf.as_path()
+        }
+    };
+    let observability_report = read_json_report(observability_path)?;
+    let ghost_report = read_json_report(ghost_path)?;
+    let report = build_p10_replay_audit_report(
+        observability_path,
+        &observability_report,
+        ghost_path,
+        &ghost_report,
+    )?;
+    validate_p10_replay_audit_report(&report)?;
+    let report_path = write_p10_replay_audit_report(&report)?;
+    println!(
+        "P10 replay audit: observability and ghost relay evidence replayed with stable hashes, report={}",
+        report_path.display()
+    );
+    Ok(())
 }
 
 fn dev_p9_replay_audit(history: Option<&Path>) -> Result<()> {
@@ -23990,6 +24037,12 @@ fn default_p10_ghost_relay_soak_path() -> PathBuf {
         .join("p10-ghost-relay-soak-latest.json")
 }
 
+fn default_p10_replay_audit_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p10-replay-audit-latest.json")
+}
+
 fn default_internal_k8s_p9_recommend_soak_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -24313,6 +24366,17 @@ fn write_p10_ghost_relay_soak_report(report: &serde_json::Value) -> Result<PathB
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p10_ghost_relay_soak_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p10_replay_audit_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!("p10-replay-audit-{}.json", unix_timestamp_secs()));
+    fs::write(&stamped, &body)?;
+    let latest = default_p10_replay_audit_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -28064,6 +28128,159 @@ fn validate_internal_k8s_p10_observability_soak_report(
     assert_json_bool_eq(report, &["checks", "assignment_stability_checked"], true)?;
     assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
     Ok(())
+}
+
+fn build_p10_replay_audit_report(
+    observability_path: &Path,
+    observability_report: &serde_json::Value,
+    ghost_path: &Path,
+    ghost_report: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    validate_p10_observability_soak_report(observability_report)?;
+    validate_p10_ghost_relay_soak_report(ghost_report)?;
+
+    let observability_hash = p10_report_hash(observability_report)?;
+    let observability_hash_reread = p10_report_hash(&read_json_report(observability_path)?)?;
+    let ghost_hash = p10_report_hash(ghost_report)?;
+    let ghost_hash_reread = p10_report_hash(&read_json_report(ghost_path)?)?;
+    let report_hashes_stable =
+        observability_hash == observability_hash_reread && ghost_hash == ghost_hash_reread;
+
+    let ledger_path = PathBuf::from(json_str(
+        observability_report,
+        &["operation_history", "ledger_path"],
+    )?);
+    let ledger = read_json_report(&ledger_path)?;
+    let ledger_summary = validate_p7_operation_ledger(&ledger, false, false, false, false, false)?;
+    let operation_id = json_str(observability_report, &["operation_history", "operation_id"])?;
+    let operation_record = find_p7_operation_record(&ledger, operation_id)?;
+    let proposal_hash = json_str(operation_record, &["proposal", "proposal_hash"])?;
+    if proposal_hash
+        != json_str(
+            observability_report,
+            &["operation_history", "proposal_hash"],
+        )?
+    {
+        bail!("P10 replay audit operation ledger proposal hash differs from observability report");
+    }
+
+    let recommend_path = PathBuf::from(json_str(
+        observability_report,
+        &["recommend_history", "path"],
+    )?);
+    let recommend_history = read_json_report(&recommend_path)?;
+    assert_json_str_eq(
+        &recommend_history,
+        &["schema"],
+        "tessera.p10_recommend_history.v1",
+    )?;
+    assert_json_bool_eq(
+        &recommend_history,
+        &["checks", "recommend_history_sampled"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        &recommend_history,
+        &["checks", "no_assignment_mutation"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        &recommend_history,
+        &["checks", "no_execution_attempted"],
+        true,
+    )?;
+    let recommend_records = json_array(&recommend_history, &["records"])?;
+    if recommend_records.is_empty() {
+        bail!("P10 replay audit recommend history has no records");
+    }
+
+    json_field(
+        observability_report,
+        &["orchestrator", "assignment_listing_before"],
+    )?;
+    json_field(
+        observability_report,
+        &["orchestrator", "assignment_listing_after"],
+    )?;
+    json_field(ghost_report, &["orchestrator", "assignment_listing_before"])?;
+    json_field(ghost_report, &["orchestrator", "assignment_listing_after"])?;
+
+    let metrics_snapshots_replayed =
+        json_bool(observability_report, &["checks", "gateway_metrics_sampled"])?
+            && json_bool(observability_report, &["checks", "worker_metrics_sampled"])?
+            && json_bool(
+                observability_report,
+                &["checks", "orchestrator_metrics_sampled"],
+            )?
+            && json_bool(ghost_report, &["checks", "ghost_relay_fanout_observed"])?;
+    let assignment_snapshots_replayed =
+        json_bool(
+            observability_report,
+            &["checks", "assignment_stability_checked"],
+        )? && json_bool(ghost_report, &["checks", "assignment_stability_checked"])?;
+    let operation_history_replayed = ledger_summary.records >= 1 && !operation_id.trim().is_empty();
+    let recommend_history_replayed = !recommend_records.is_empty();
+    let runtime_mutation_default_off =
+        json_bool(
+            observability_report,
+            &["checks", "runtime_mutation_default_off"],
+        )? && json_bool(ghost_report, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(observability_report, &["checks", "no_execution_attempted"])?;
+
+    Ok(serde_json::json!({
+        "schema": "tessera.p10_replay_audit.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "sources": [
+            {
+                "kind": "observability_soak",
+                "path": observability_path.display().to_string(),
+                "schema": json_str(observability_report, &["schema"])?,
+                "hash": observability_hash,
+                "hash_reread": observability_hash_reread
+            },
+            {
+                "kind": "ghost_relay_soak",
+                "path": ghost_path.display().to_string(),
+                "schema": json_str(ghost_report, &["schema"])?,
+                "hash": ghost_hash,
+                "hash_reread": ghost_hash_reread
+            }
+        ],
+        "replay": {
+            "reports": 2,
+            "operation_ledger_path": ledger_path.display().to_string(),
+            "recommend_history_path": recommend_path.display().to_string(),
+            "operation_records": ledger_summary.records,
+            "recommend_records": recommend_records.len(),
+            "operation_id": operation_id,
+            "proposal_hash": proposal_hash
+        },
+        "metrics": {
+            "observability_request_samples": json_f64(observability_report, &["latency", "request_samples"])?,
+            "ghost_remote_delta_frames": json_f64(ghost_report, &["soak", "remote_delta_frames"])?,
+            "ghost_remote_snapshot_frames": json_f64(ghost_report, &["soak", "remote_snapshot_frames"])?
+        },
+        "checks": {
+            "evidence_replayed": true,
+            "metrics_snapshots_replayed": metrics_snapshots_replayed,
+            "assignment_snapshots_replayed": assignment_snapshots_replayed,
+            "operation_history_replayed": operation_history_replayed,
+            "recommend_history_replayed": recommend_history_replayed,
+            "report_hashes_stable": report_hashes_stable,
+            "runtime_mutation_default_off": runtime_mutation_default_off
+        },
+        "remaining_uncovered": [
+            "p10_gitops_rollout",
+            "internal_microk8s_p10_observability_soak",
+            "p10_completion_audit"
+        ]
+    }))
+}
+
+fn p10_report_hash(report: &serde_json::Value) -> Result<String> {
+    let body = serde_json::to_vec(report)?;
+    Ok(format!("fnv1a64:{:016x}", p9_fnv1a64(&body)))
 }
 
 fn build_p9_replay_audit_report(

@@ -58,6 +58,7 @@ Useful variants:
 - Active P10 completion gate:
   - `cargo xt dev p10-observability-soak --iterations 2 --sleep-ms 1`
   - `cargo xt dev p10-ghost-relay-soak --iterations 2 --sleep-ms 1`
+  - `cargo xt dev p10-replay-audit`
   - `cargo xt p10-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical

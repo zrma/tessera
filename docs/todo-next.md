@@ -49,7 +49,7 @@ Recommended P10 slices:
 3. Done: `test: add p10 ghost relay soak` - add focused local/dev coverage
    for relay fanout, backpressure, reconnect counters, route convergence,
    close-counter cleanliness, assignment stability, and default-off state.
-4. Pending: `test: add p10 replay audit` - replay durable P10 reports and prove
+4. Done: `test: add p10 replay audit` - replay durable P10 reports and prove
    stable report hashes without touching runtime state.
 5. Pending: `build: publish p10 observability runtime image` - publish the P10
    image only after local evidence is green, promote it through the k8s GitOps

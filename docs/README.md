@@ -37,7 +37,7 @@ or completion audit.
 | P7 policy-gated operation loop | Complete as `v2026.05.6` | `p7-operation-loop.md` |
 | P8 closed-loop operation cadence | Complete as `v2026.05.7` | `p8-closed-loop-operation-cadence.md` |
 | P9 operation control-plane readiness | Complete as `v2026.05.8` | `p9-operation-control-plane-readiness.md` |
-| P10 runtime observability and soak hardening | Active; local observability and ghost relay soaks added, remaining gates fail closed | `p10-runtime-observability-soak-hardening.md` |
+| P10 runtime observability and soak hardening | Active; local observability, ghost relay, and replay gates added; internal gates fail closed | `p10-runtime-observability-soak-hardening.md` |
 
 The P6/P7/P8/P9 documents are retained because they define evidence contracts,
 report shapes, and completion gates. P10 is the current active contract. Older
