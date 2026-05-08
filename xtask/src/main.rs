@@ -1094,6 +1094,8 @@ enum DevSub {
         #[arg(long)]
         history: Option<PathBuf>,
     },
+    /// Run P9 policy regression checks for default-off and gate denies
+    P9PolicyRegressionSmoke,
     /// Start a two-worker dev stack and prove P8 cadence proposal ledger idempotency
     P8CadenceProposalSmoke {
         /// Number of proposal cadence ticks to collect
@@ -2069,6 +2071,7 @@ fn main() -> Result<()> {
                 dev_p9_recommend_loop_soak(ticks, sleep_ms)?
             }
             DevSub::P9ReplayAudit { history } => dev_p9_replay_audit(history.as_deref())?,
+            DevSub::P9PolicyRegressionSmoke => dev_p9_policy_regression_smoke()?,
             DevSub::P8CadenceProposalSmoke {
                 ticks,
                 sleep_ms,
@@ -2976,6 +2979,21 @@ fn dev_p9_replay_audit(history: Option<&Path>) -> Result<()> {
         "P9 replay audit: durable recommend history replayed with stable proposal hashes and operation ids, report={}, history={}",
         report_path.display(),
         history_path.display()
+    );
+    Ok(())
+}
+
+fn dev_p9_policy_regression_smoke() -> Result<()> {
+    dev_p8_cadence_gate_smoke()?;
+    let source_path = default_p8_cadence_gate_smoke_path();
+    let source_report = read_json_report(&source_path)?;
+    let report = build_p9_policy_regression_report(&source_path, &source_report)?;
+    validate_p9_policy_regression_report(&report)?;
+    let report_path = write_p9_policy_regression_report(&report)?;
+    println!(
+        "P9 policy regression smoke: default-off, approval, deny, cooldown, budget, and concurrency gates are covered, report={}, source={}",
+        report_path.display(),
+        source_path.display()
     );
     Ok(())
 }
@@ -22504,6 +22522,12 @@ fn default_p9_replay_audit_path() -> PathBuf {
         .join("p9-replay-audit-latest.json")
 }
 
+fn default_p9_policy_regression_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p9-policy-regression-latest.json")
+}
+
 fn default_p8_cadence_proposal_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -22753,6 +22777,20 @@ fn write_p9_replay_audit_report(report: &serde_json::Value) -> Result<PathBuf> {
     let stamped = report_dir.join(format!("p9-replay-audit-{}.json", unix_timestamp_secs()));
     fs::write(&stamped, &body)?;
     let latest = default_p9_replay_audit_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p9_policy_regression_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p9-policy-regression-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p9_policy_regression_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -26281,6 +26319,86 @@ fn build_p9_replay_audit_report(
 fn p9_replay_proposal_hash(operation_id: &str, candidate_batch_key: &str) -> String {
     let body = format!("operation_id={operation_id}|candidate_batch_key={candidate_batch_key}");
     format!("fnv1a64:{:016x}", p9_fnv1a64(body.as_bytes()))
+}
+
+fn build_p9_policy_regression_report(
+    source_path: &Path,
+    source_report: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    validate_p8_cadence_gate_smoke_report(source_report)?;
+    let cases = json_array(source_report, &["cases"])?;
+    let mut observed_gates = Vec::with_capacity(cases.len());
+    let mut approval_records = 0_u64;
+    let mut blocked_execution_records = 0_u64;
+    let mut deny_evidence = Vec::with_capacity(cases.len());
+    let mut assignments_unchanged = json_bool(source_report, &["checks", "assignments_unchanged"])?;
+    let mut automatic_mutation_observed =
+        !json_bool(source_report, &["checks", "no_mutation_attempted"])?;
+
+    for case in cases {
+        assert_json_bool_eq(case, &["checks", "proposal_recorded"], true)?;
+        assert_json_bool_eq(case, &["checks", "approval_recorded"], true)?;
+        assert_json_bool_eq(
+            case,
+            &["checks", "execution_blocked_by_expected_gate"],
+            true,
+        )?;
+        assert_json_bool_eq(case, &["checks", "mutation_attempted"], false)?;
+        assert_json_bool_eq(case, &["checks", "mutation_allowed"], false)?;
+        assignments_unchanged &= json_bool(case, &["checks", "assignments_unchanged"])?;
+        let gate = json_str(case, &["gate"])?;
+        observed_gates.push(gate.to_string());
+        approval_records += json_u64(case, &["ledger", "approval_records"])?;
+        blocked_execution_records += json_u64(case, &["ledger", "blocked_execution_records"])?;
+        let reason = json_str(case, &["responses", "execution", "reason"])?;
+        deny_evidence.push(serde_json::json!({
+            "case": json_str(case, &["case"])?,
+            "gate": gate,
+            "reason": reason,
+            "operation_id": json_str(case, &["responses", "execution", "operation_id"])?
+        }));
+    }
+    observed_gates.sort();
+    observed_gates.dedup();
+    let has_cooldown = observed_gates.iter().any(|gate| gate == "cooldown");
+    let has_budget = observed_gates.iter().any(|gate| gate == "budget");
+    let has_concurrency = observed_gates.iter().any(|gate| gate == "concurrency");
+    let has_default_off = observed_gates.iter().any(|gate| gate == "default_off");
+    let explicit_approval_required = approval_records >= cases.len() as u64;
+    let deny_evidence_recorded = blocked_execution_records >= cases.len() as u64;
+    automatic_mutation_observed |= !assignments_unchanged;
+
+    Ok(serde_json::json!({
+        "schema": "tessera.p9_policy_regression.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "source": {
+            "path": source_path.display().to_string(),
+            "schema": json_str(source_report, &["schema"])?,
+            "cases": cases.len()
+        },
+        "policy": {
+            "observed_gates": observed_gates,
+            "approval_records": approval_records,
+            "blocked_execution_records": blocked_execution_records,
+            "deny_evidence": deny_evidence
+        },
+        "checks": {
+            "default_off_execution_blocked": has_default_off,
+            "explicit_approval_required": explicit_approval_required,
+            "deny_evidence_recorded": deny_evidence_recorded,
+            "cooldown_gate_checked": has_cooldown,
+            "budget_gate_checked": has_budget,
+            "concurrency_gate_checked": has_concurrency,
+            "automatic_mutation_observed": automatic_mutation_observed
+        },
+        "remaining_uncovered": [
+            "p9_gitops_rollout",
+            "guarded_kubernetes_p9_recommend_soak",
+            "guarded_kubernetes_p9_controlled_spot_check",
+            "p9_completion_audit"
+        ]
+    }))
 }
 
 fn p9_fnv1a64(bytes: &[u8]) -> u64 {
@@ -37470,8 +37588,9 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
 
     #[test]
     fn p8_cadence_gate_smoke_report_accepts_gate_cases() {
-        let case = |gate: &str| {
+        let case = |case_name: &str, gate: &str| {
             serde_json::json!({
+                "case": case_name,
                 "gate": gate,
                 "ledger": {
                     "records": 1,
@@ -37484,12 +37603,16 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
                         "status": "approved"
                     },
                     "execution": {
+                        "operation_id": "p7-split-w0-cx0-cy0-d0-s0-abc123",
                         "status": "blocked_by_policy",
+                        "reason": format!("{gate} blocked execution"),
                         "mutation_attempted": false,
                         "mutation_allowed": false
                     }
                 },
                 "checks": {
+                    "proposal_recorded": true,
+                    "approval_recorded": true,
                     "execution_blocked_by_expected_gate": true,
                     "assignments_unchanged": true,
                     "mutation_attempted": false,
@@ -37500,10 +37623,10 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
         let report = serde_json::json!({
             "schema": "tessera.p8_cadence_gate_smoke.v1",
             "cases": [
-                case("cooldown"),
-                case("budget"),
-                case("concurrency"),
-                case("default_off")
+                case("cooldown", "cooldown"),
+                case("budget", "budget"),
+                case("concurrency", "concurrency"),
+                case("allowed_default_off", "default_off")
             ],
             "checks": {
                 "cooldown_gate_blocked": true,
@@ -37516,6 +37639,12 @@ tessera_worker_cell_actor_count{world="0",cx="-1",cy="2",depth="1",sub="3"} 12
         });
 
         validate_p8_cadence_gate_smoke_report(&report).expect("valid P8 cadence gate smoke report");
+        let p9 = build_p9_policy_regression_report(
+            std::path::Path::new(".dev/reports/p8-cadence-gate-smoke-latest.json"),
+            &report,
+        )
+        .expect("build P9 policy regression report");
+        validate_p9_policy_regression_report(&p9).expect("valid P9 policy regression report");
     }
 
     #[test]
