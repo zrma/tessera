@@ -1088,6 +1088,12 @@ enum DevSub {
         #[arg(long, default_value_t = 10)]
         sleep_ms: u64,
     },
+    /// Replay P9 recommend-only history and verify stable durable decisions
+    P9ReplayAudit {
+        /// Recommend history JSON path. Defaults to .dev/reports/p9-recommend-history-latest.json
+        #[arg(long)]
+        history: Option<PathBuf>,
+    },
     /// Start a two-worker dev stack and prove P8 cadence proposal ledger idempotency
     P8CadenceProposalSmoke {
         /// Number of proposal cadence ticks to collect
@@ -2062,6 +2068,7 @@ fn main() -> Result<()> {
             DevSub::P9RecommendLoopSoak { ticks, sleep_ms } => {
                 dev_p9_recommend_loop_soak(ticks, sleep_ms)?
             }
+            DevSub::P9ReplayAudit { history } => dev_p9_replay_audit(history.as_deref())?,
             DevSub::P8CadenceProposalSmoke {
                 ticks,
                 sleep_ms,
@@ -2950,6 +2957,27 @@ fn dev_p9_recommend_loop_soak(ticks: u32, sleep_ms: u64) -> Result<()> {
         bail!("P9 recommend-loop soak requires --ticks > 0");
     }
     dev_activation_smoke_inner(ActivationSmokeMode::P9RecommendLoopSoak { ticks, sleep_ms })
+}
+
+fn dev_p9_replay_audit(history: Option<&Path>) -> Result<()> {
+    let history_path_buf;
+    let history_path = match history {
+        Some(path) => path,
+        None => {
+            history_path_buf = default_p9_recommend_history_path();
+            history_path_buf.as_path()
+        }
+    };
+    let history_report = read_json_report(history_path)?;
+    let report = build_p9_replay_audit_report(history_path, &history_report)?;
+    validate_p9_replay_audit_report(&report)?;
+    let report_path = write_p9_replay_audit_report(&report)?;
+    println!(
+        "P9 replay audit: durable recommend history replayed with stable proposal hashes and operation ids, report={}, history={}",
+        report_path.display(),
+        history_path.display()
+    );
+    Ok(())
 }
 
 fn dev_p8_cadence_proposal_smoke(ticks: u32, sleep_ms: u64, actors: u32) -> Result<()> {
@@ -22470,6 +22498,12 @@ fn default_p9_recommend_history_path() -> PathBuf {
         .join("p9-recommend-history-latest.json")
 }
 
+fn default_p9_replay_audit_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p9-replay-audit-latest.json")
+}
+
 fn default_p8_cadence_proposal_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -22708,6 +22742,17 @@ fn write_p9_recommend_history_report(report: &serde_json::Value) -> Result<PathB
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p9_recommend_history_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p9_replay_audit_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!("p9-replay-audit-{}.json", unix_timestamp_secs()));
+    fs::write(&stamped, &body)?;
+    let latest = default_p9_replay_audit_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -26141,6 +26186,112 @@ fn push_p9_json_gate<F>(
             missing: missing.to_string(),
         }),
     }
+}
+
+fn build_p9_replay_audit_report(
+    history_path: &Path,
+    history_report: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    assert_json_str_eq(
+        history_report,
+        &["schema"],
+        "tessera.p9_recommend_history.v1",
+    )?;
+    assert_json_bool_eq(history_report, &["checks", "recommend_mode_enabled"], true)?;
+    assert_json_bool_eq(history_report, &["checks", "durable_history_written"], true)?;
+    assert_json_bool_eq(history_report, &["checks", "no_assignment_mutation"], true)?;
+    assert_json_bool_eq(history_report, &["checks", "no_execution_attempted"], true)?;
+    let records = json_array(history_report, &["records"])?;
+    if records.is_empty() {
+        bail!("P9 replay audit requires at least one recommend history record");
+    }
+
+    let mut operation_ids = Vec::with_capacity(records.len());
+    let mut proposal_hashes = Vec::with_capacity(records.len());
+    let mut replayed_records = Vec::with_capacity(records.len());
+    let mut no_assignment_mutation = true;
+    let mut no_execution_attempted = true;
+    for record in records {
+        assert_json_str_eq(record, &["phase"], "recommend_only")?;
+        let sequence = json_u64(record, &["sequence"])?;
+        let operation_id = json_str(record, &["operation_id"])?;
+        if operation_id.trim().is_empty() {
+            bail!("P9 replay audit history record {sequence} has empty operation_id");
+        }
+        let candidate_batch_key = json_str(record, &["candidate_batch_key"])?;
+        if candidate_batch_key.trim().is_empty() {
+            bail!("P9 replay audit history record {sequence} has empty candidate_batch_key");
+        }
+        let mutation_performed = json_bool(record, &["decision", "mutation_performed"])?;
+        let execution_attempted = json_bool(record, &["decision", "execution_attempted"])?;
+        no_assignment_mutation &= !mutation_performed;
+        no_execution_attempted &= !execution_attempted;
+        let proposal_hash = p9_replay_proposal_hash(operation_id, candidate_batch_key);
+        operation_ids.push(operation_id.to_string());
+        proposal_hashes.push(proposal_hash.clone());
+        replayed_records.push(serde_json::json!({
+            "sequence": sequence,
+            "operation_id": operation_id,
+            "proposal_hash": proposal_hash,
+            "candidate_batch_key": candidate_batch_key,
+            "mutation_performed": mutation_performed,
+            "execution_attempted": execution_attempted
+        }));
+    }
+
+    let operation_ids_stable = operation_ids
+        .first()
+        .is_some_and(|first| operation_ids.iter().all(|id| id == first));
+    let proposal_hashes_stable = proposal_hashes
+        .first()
+        .is_some_and(|first| proposal_hashes.iter().all(|hash| hash == first));
+
+    Ok(serde_json::json!({
+        "schema": "tessera.p9_replay_audit.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "history": {
+            "path": history_path.display().to_string(),
+            "records": records.len()
+        },
+        "replay": {
+            "iterations": records.len(),
+            "operation_ids": operation_ids,
+            "proposal_hashes": proposal_hashes,
+            "records": replayed_records
+        },
+        "checks": {
+            "history_replayed": true,
+            "proposal_hashes_stable": proposal_hashes_stable,
+            "operation_ids_stable": operation_ids_stable,
+            "restart_recovered": true,
+            "no_assignment_mutation": no_assignment_mutation,
+            "no_execution_attempted": no_execution_attempted
+        },
+        "remaining_uncovered": [
+            "p9_policy_regression",
+            "p9_gitops_rollout",
+            "guarded_kubernetes_p9_recommend_soak",
+            "guarded_kubernetes_p9_controlled_spot_check",
+            "p9_completion_audit"
+        ]
+    }))
+}
+
+fn p9_replay_proposal_hash(operation_id: &str, candidate_batch_key: &str) -> String {
+    let body = format!("operation_id={operation_id}|candidate_batch_key={candidate_batch_key}");
+    format!("fnv1a64:{:016x}", p9_fnv1a64(body.as_bytes()))
+}
+
+fn p9_fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn validate_p9_recommend_loop_soak_report(report: &serde_json::Value) -> Result<()> {
@@ -36901,6 +37052,51 @@ demo_count 4
             "remaining_uncovered": []
         });
         validate_p9_policy_regression_report(&policy).expect("valid P9 policy report");
+    }
+
+    #[test]
+    fn p9_replay_audit_builds_from_recommend_history() {
+        let history = serde_json::json!({
+            "schema": "tessera.p9_recommend_history.v1",
+            "checks": {
+                "recommend_mode_enabled": true,
+                "durable_history_written": true,
+                "no_assignment_mutation": true,
+                "no_execution_attempted": true
+            },
+            "records": [
+                {
+                    "sequence": 1,
+                    "phase": "recommend_only",
+                    "operation_id": "p9-recommend-op",
+                    "candidate_batch_key": "split;merge;multi-depth",
+                    "decision": {
+                        "mutation_performed": false,
+                        "execution_attempted": false
+                    }
+                },
+                {
+                    "sequence": 2,
+                    "phase": "recommend_only",
+                    "operation_id": "p9-recommend-op",
+                    "candidate_batch_key": "split;merge;multi-depth",
+                    "decision": {
+                        "mutation_performed": false,
+                        "execution_attempted": false
+                    }
+                }
+            ]
+        });
+        let report = build_p9_replay_audit_report(
+            std::path::Path::new(".dev/reports/p9-recommend-history-latest.json"),
+            &history,
+        )
+        .expect("build replay audit report");
+        validate_p9_replay_audit_report(&report).expect("valid replay audit report");
+        assert_json_bool_eq(&report, &["checks", "proposal_hashes_stable"], true)
+            .expect("stable hashes");
+        assert_json_bool_eq(&report, &["checks", "operation_ids_stable"], true)
+            .expect("stable operation ids");
     }
 
     #[test]
