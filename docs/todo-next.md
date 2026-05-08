@@ -62,7 +62,7 @@ Recommended P9 slices:
    assignment snapshots, write durable recommend-only history, prove stable
    split/merge/canonical multi-depth candidate keys, and report
    `no_assignment_mutation=true` plus `no_execution_attempted=true`.
-3. `test: add p9 replay audit` - add `cargo xt dev p9-replay-audit` to replay
+3. Done: `test: add p9 replay audit` - add `cargo xt dev p9-replay-audit` to replay
    durable history after restart and verify stable proposal hashes, stable
    operation ids, and no mutation.
 4. `test: add p9 policy regression smoke` - add a local verifier for

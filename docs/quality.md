@@ -147,4 +147,7 @@ This document is the repo-local quality map for agents. It keeps the expected au
   snapshots, writes `.dev/reports/p9-recommend-history-latest.json`, and
   validates `.dev/reports/p9-recommend-loop-soak-latest.json` with
   `no_assignment_mutation=true` and `no_execution_attempted=true`.
+  `cargo xt dev p9-replay-audit` then reloads that durable history from disk,
+  recomputes stable proposal hashes, verifies stable operation ids, and records
+  `.dev/reports/p9-replay-audit-latest.json` without touching runtime state.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
