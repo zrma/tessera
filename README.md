@@ -29,9 +29,7 @@ skeleton for MMO-scale simulation, not a finished game server.
 - Full local quality gate: `cargo xt`
 - Harness only: `cargo xt harness`
 - Tests: `cargo test`
-- Last completed audit: `cargo xt p9-completion-audit --json`
-- Active P10 audit: `cargo xt p10-completion-audit --json` (expected to fail
-  until P10 evidence exists)
+- Last completed audit: `cargo xt p10-completion-audit --json`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -50,15 +48,16 @@ Useful variants:
 - Logs: `cargo xt dev logs --target all --follow`
 - Gateway only smoke: `cargo xt dev up`, client ping, then `cargo xt dev down`
 - Metrics smoke: `cargo xt dev metrics-smoke`
-- Last completed P9 local audit lane:
+- P9 regression lane:
   - `cargo xt dev p9-recommend-loop-soak`
   - `cargo xt dev p9-replay-audit`
   - `cargo xt dev p9-policy-regression-smoke`
   - `cargo xt p9-completion-audit --json`
-- Active P10 completion gate:
+- P10 completion lane:
   - `cargo xt dev p10-observability-soak --iterations 2 --sleep-ms 1`
   - `cargo xt dev p10-ghost-relay-soak --iterations 2 --sleep-ms 1`
   - `cargo xt dev p10-replay-audit`
+  - `cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.9`
   - `cargo xt p10-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical
@@ -80,19 +79,17 @@ P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
   all-or-nothing publish, failure/recovery evidence, restart recovery, and
   local plus internal smoke coverage.
 - Durable assignment state, operation ledger, policy-gated execution,
-  observation/recovery records, cooldown/budget/concurrency gates, and
-  completion audits through P9.
+  observation/recovery records, cooldown/budget/concurrency gates, runtime
+  observability/soak evidence, and completion audits through P10.
 - Kubernetes/GitOps rollout evidence through image
-  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.8`, with final live
+  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.9`, with final live
   state restored to default-off after controlled smoke windows.
 
 ### Current Open Boundary
 
-P9 is closed. `docs/todo-next.md` is the active open-work index and now points
-to P10 Runtime Observability and Soak Hardening. P10 keeps runtime mutation
-default-off and focuses on durable, replayable evidence for long-running
-Gateway/Worker/Orchestrator metrics, request latency, ghost relay behavior,
-route convergence, close-counter cleanliness, and assignment stability.
+P10 is closed as of the `v2026.05.9` evidence set. `docs/todo-next.md` is the
+active planning index for the next boundary; do not treat older milestone docs
+as open scope unless that file reopens them.
 
 ## Protocol Snapshot
 

@@ -24,18 +24,22 @@ Last reviewed: 2026-05-09
   with durable recommend-only history, replay audit, policy regression, P9
   GitOps rollout/default-off evidence, internal recommend soak, controlled
   operation restart spot-check, and final cleanup evidence.
+- P10 runtime observability and soak hardening is complete as of the
+  `v2026.05.9` evidence set. `cargo xt p10-completion-audit --json` reports
+  `complete=true` with local observability soak, ghost relay soak, replay audit,
+  P10 GitOps rollout/default-off evidence, and internal MicroK8s observability
+  soak.
 - The live Tessera GitOps cleanup revision keeps Orchestrator execution and
   split/merge activation default-off outside controlled smoke windows, removes
   preview fixtures after smoke, and leaves ArgoCD `tessera` `Synced / Healthy`.
-- P10 Runtime Observability and Soak Hardening is the active design boundary.
+- The next design boundary is not opened yet.
 
 ## Next
 
-P9 is closed. P10 should harden the runtime evidence surface rather than add
-automatic mutation. The active contract is
-`docs/p10-runtime-observability-soak-hardening.md`.
+P10 is closed. Keep this file as the planning index for the next milestone, and
+open a new contract before starting runtime-affecting P11 work.
 
-Recommended P10 slices:
+Completed P10 slices:
 
 1. Done: `test: add p10 completion audit` - mark P10 active in docs, add
    the P10 goal contract, and add a fail-closed
@@ -51,11 +55,11 @@ Recommended P10 slices:
    close-counter cleanliness, assignment stability, and default-off state.
 4. Done: `test: add p10 replay audit` - replay durable P10 reports and prove
    stable report hashes without touching runtime state.
-5. Pending: `build: publish p10 observability runtime image` - publish the P10
+5. Done: `build: publish p10 observability runtime image` - publish the P10
    image only after local evidence is green, promote it through the k8s GitOps
    repo, verify ArgoCD `Synced / Healthy`, and record
    `.dev/reports/p10-gitops-rollout-latest.json`.
-6. Pending: `test: add internal p10 observability soak` - validate the promoted
+6. Done: `test: add internal p10 observability soak` - validate the promoted
    image in internal MicroK8s with Gateway smoke, live metrics, durable report
    capture, and final default-off cleanup.
 

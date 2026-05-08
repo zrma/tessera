@@ -70,8 +70,9 @@ Current completion audit:
 cargo xt p10-completion-audit --json
 ```
 
-The audit is still expected to fail closed until GitOps and internal MicroK8s
-P10 evidence reports exist and validate.
+P10 is complete as of the `v2026.05.9` evidence set. The current audit returns
+`complete=true` with local observability, ghost relay, replay, GitOps rollout,
+internal MicroK8s observability soak, and default-off cleanup evidence.
 
 ## Initial Implementation Order
 
@@ -94,15 +95,23 @@ P10 evidence reports exist and validate.
    `.dev/reports/p10-replay-audit-latest.json` after rereading the local
    observability report, ghost relay report, operation ledger, and recommend
    history, then verifying stable report hashes without touching runtime state.
-5. **Image publish and GitOps rollout**: publish a P10 runtime image, promote it
-   through the k8s GitOps repo, verify ArgoCD and image state, and record a P10
-   rollout/default-off report.
-6. **Internal observability soak**: validate the same observability contract in
-   internal MicroK8s against the promoted image, then restore/verify default-off
-   cleanup.
-7. **Completion audit**: close with `cargo xt p10-completion-audit --json`,
-   logical commits/pushes, CI verification, ArgoCD health, and final default-off
-   state.
+5. **Image publish and GitOps rollout**: done. The build workflow published
+   `harbor.1day1coding.com/1day1coding/tessera:v2026.05.9`
+   (`sha256:6909ef3c682b10e36a9934c4a1deb26db8d46dfa13f3e80b0cab100f90d33e80`),
+   the k8s repo promoted it in GitOps revision
+   `e1a3bf80954e1694e9bfd8b3b0cedba864fa7e17`, ArgoCD returned
+   `Synced / Healthy`, and `.dev/reports/p10-gitops-rollout-latest.json`
+   validates deployment image match plus default-off cleanup.
+6. **Internal observability soak**: done. `cargo xt k8s
+   p10-observability-soak --context microk8s-ts --namespace tessera
+   --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.9
+   --iterations 2 --sleep-ms 100` writes
+   `.dev/reports/internal-microk8s-p10-observability-soak-latest.json` with
+   ArgoCD health, Gateway ping/move smoke, Gateway/Worker/Orchestrator metrics,
+   latency samples, relay counter sampling, assignment stability, and
+   default-off cleanup.
+7. **Completion audit**: done. `cargo xt p10-completion-audit --json` returns
+   `complete=true` and `findings=[]`.
 
 ## Guardrails
 

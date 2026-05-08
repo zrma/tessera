@@ -25,10 +25,11 @@ This document is the repo-local quality map for agents. It keeps the expected au
 - `docs/README.md` is the document index, `docs/todo-next.md` is the active
   open-work source, and `docs/smoke-runbook.md` is the command catalog.
 - `cargo xt p6-completion-audit` is the machine gate for P6+ completion evidence. In the completed P6+ state it returns `complete=true` only when the internal MicroK8s reports cover restart recovery, live metrics, GitOps rollout, merge, canonical multi-depth gates, and post-smoke default-off cleanup.
-- `cargo xt p10-completion-audit --json` is the active P10 fail-closed gate for
-  runtime observability and soak hardening. It should stay incomplete until
-  local observability, ghost relay, replay, GitOps rollout, internal MicroK8s
-  soak, and default-off cleanup evidence are present.
+- `cargo xt p10-completion-audit --json` is the machine gate for P10 runtime
+  observability and soak hardening. In the completed `v2026.05.9` state it
+  returns `complete=true` only when local observability, ghost relay, replay,
+  GitOps rollout, internal MicroK8s soak, and default-off cleanup evidence are
+  present.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
@@ -169,4 +170,13 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `cargo xt k8s p9-controlled-spot-check-report` only folds a finalized
   internal P7 operation restart smoke report after post-smoke default-off
   cleanup is visible on the live deployment.
+- P10 runtime observability and soak hardening is complete as of the
+  `v2026.05.9` evidence set. `cargo xt p10-completion-audit --json` should
+  return `complete=true` with local Gateway/Worker/Orchestrator observability,
+  request latency, ghost relay, replay, GitOps rollout/default-off, and
+  internal MicroK8s observability soak reports all machine-checkable. `cargo xt
+  k8s p10-observability-soak` is read-only against assignment state: it requires
+  ArgoCD `Synced / Healthy`, matching deployment images, Gateway smoke, sampled
+  Gateway/Worker/Orchestrator metrics, assignment stability, and live
+  default-off cleanup.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

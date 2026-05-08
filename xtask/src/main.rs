@@ -1112,6 +1112,81 @@ enum K8sSub {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run a read-only internal MicroK8s P10 observability soak against live runtime state
+    P10ObservabilitySoak {
+        /// Kubernetes namespace that contains the Tessera runtime
+        #[arg(long, default_value = "tessera")]
+        namespace: String,
+        /// Optional kube context. If unset, the current context is used.
+        #[arg(long)]
+        context: Option<String>,
+        /// Orchestrator service name
+        #[arg(long, default_value = "tessera-orch")]
+        orch_service: String,
+        /// Orchestrator deployment name used for image/default-off preflight
+        #[arg(long, default_value = "tessera-orch")]
+        orch_deploy: String,
+        /// Gateway service name
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_service: String,
+        /// Gateway deployment name used for image preflight
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_deploy: String,
+        /// Source Worker deployment name used for image preflight
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_deploy: String,
+        /// Source Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_service: String,
+        /// Target Worker deployment name used for image preflight
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_deploy: String,
+        /// Target Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_service: String,
+        /// ArgoCD Application namespace used for Synced/Healthy preflight
+        #[arg(long, default_value = "argocd")]
+        argocd_namespace: String,
+        /// ArgoCD Application name used for Synced/Healthy preflight
+        #[arg(long, default_value = "tessera")]
+        argocd_app: String,
+        /// Skip the ArgoCD Application Synced/Healthy preflight
+        #[arg(long, default_value_t = false)]
+        skip_argocd_check: bool,
+        /// Expected runtime image for all recorded Tessera deployments
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Local Orchestrator gRPC port for kubectl port-forward
+        #[arg(long, default_value_t = 26000)]
+        local_orch_port: u16,
+        /// Local Orchestrator metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 26100)]
+        local_orch_metrics_port: u16,
+        /// Local Gateway TCP port for kubectl port-forward
+        #[arg(long, default_value_t = 24000)]
+        local_gateway_port: u16,
+        /// Local Gateway metrics/ready port for kubectl port-forward
+        #[arg(long, default_value_t = 24100)]
+        local_gateway_metrics_port: u16,
+        /// Local source Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 25100)]
+        local_source_worker_metrics_port: u16,
+        /// Local target Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 25101)]
+        local_target_worker_metrics_port: u16,
+        /// Number of actors joined to the parent cell before the request loop
+        #[arg(long, default_value_t = 2)]
+        actors: u32,
+        /// Number of observability iterations
+        #[arg(long, default_value_t = 2)]
+        iterations: u32,
+        /// Sleep between observability iterations
+        #[arg(long, default_value_t = 250)]
+        sleep_ms: u64,
+        /// Output JSON path. Defaults to .dev/reports/internal-microk8s-p10-observability-soak-latest.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Fold a finalized controlled operation smoke report into the internal MicroK8s P9 spot-check gate
     P9ControlledSpotCheckReport {
         /// Source internal P7 operation report with completed restart evidence
@@ -2214,6 +2289,57 @@ fn main() -> Result<()> {
                 target_worker_deploy,
                 target_worker_service,
                 target_worker_id,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                iterations,
+                sleep_ms,
+                out,
+            })?,
+            K8sSub::P10ObservabilitySoak {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                target_worker_deploy,
+                target_worker_service,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                iterations,
+                sleep_ms,
+                out,
+            } => run_k8s_p10_observability_soak(K8sP10ObservabilitySoakOptions {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                target_worker_deploy,
+                target_worker_service,
                 argocd_namespace,
                 argocd_app,
                 skip_argocd_check,
@@ -19916,6 +20042,34 @@ struct K8sP9RecommendSoakOptions {
     out: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct K8sP10ObservabilitySoakOptions {
+    namespace: String,
+    context: Option<String>,
+    orch_service: String,
+    orch_deploy: String,
+    gateway_service: String,
+    gateway_deploy: String,
+    source_worker_deploy: String,
+    source_worker_service: String,
+    target_worker_deploy: String,
+    target_worker_service: String,
+    argocd_namespace: String,
+    argocd_app: String,
+    skip_argocd_check: bool,
+    expected_image: Option<String>,
+    local_orch_port: u16,
+    local_orch_metrics_port: u16,
+    local_gateway_port: u16,
+    local_gateway_metrics_port: u16,
+    local_source_worker_metrics_port: u16,
+    local_target_worker_metrics_port: u16,
+    actors: u32,
+    iterations: u32,
+    sleep_ms: u64,
+    out: Option<PathBuf>,
+}
+
 fn run_k8s_p8_cadence_smoke(options: K8sP8CadenceSmokeOptions) -> Result<()> {
     if !options.allow_execution {
         bail!("internal k8s P8 cadence smoke mutates assignment state; pass --allow-execution");
@@ -20872,6 +21026,391 @@ fn run_k8s_p9_recommend_soak(options: K8sP9RecommendSoakOptions) -> Result<()> {
     Ok(())
 }
 
+fn run_k8s_p10_observability_soak(options: K8sP10ObservabilitySoakOptions) -> Result<()> {
+    if options.iterations < 2 {
+        bail!("internal k8s P10 observability soak requires at least 2 iterations");
+    }
+    if options.actors == 0 {
+        bail!("internal k8s P10 observability soak requires at least 1 actor");
+    }
+
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let argocd_status = if options.skip_argocd_check {
+        None
+    } else {
+        let status =
+            kubectl_argocd_app_status(&context, &options.argocd_namespace, &options.argocd_app)?;
+        validate_argocd_app_ready(&status)?;
+        Some(status)
+    };
+    let deployment_images = collect_k8s_p10_observability_deployment_images(&context, &options)?;
+    if let Some(expected_image) = options.expected_image.as_deref() {
+        validate_k8s_deployment_images(&deployment_images, expected_image)?;
+    }
+    let cleanup =
+        k8s_p8_cadence_cleanup_status(&context, &options.namespace, &options.orch_deploy)?;
+    if !cleanup.manual_activation_default_off || !cleanup.preview_fixture_removed {
+        bail!(
+            "internal P10 observability soak requires default-off runtime: manual_activation_default_off={} preview_fixture_removed={}",
+            cleanup.manual_activation_default_off,
+            cleanup.preview_fixture_removed
+        );
+    }
+    for resource in [
+        format!("svc/{}", options.orch_service),
+        format!("svc/{}", options.gateway_service),
+        format!("svc/{}", options.source_worker_service),
+        format!("svc/{}", options.target_worker_service),
+        format!("deploy/{}", options.source_worker_deploy),
+        format!("deploy/{}", options.target_worker_deploy),
+    ] {
+        kubectl_resource_name(&context, &options.namespace, &resource)
+            .with_context(|| format!("required resource {resource} is not ready"))?;
+    }
+
+    let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_orch_metrics_addr = format!("127.0.0.1:{}", options.local_orch_metrics_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
+    let local_source_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_source_worker_metrics_port);
+    let local_target_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_target_worker_metrics_port);
+
+    let mut forwards = ManagedK8sPortForwards::default();
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.orch_service,
+        "p10-observability-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.gateway_service,
+        "p10-observability-gateway",
+        &[
+            (options.local_gateway_port, 4000),
+            (options.local_gateway_metrics_port, 4100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.source_worker_service,
+        "p10-observability-source-worker",
+        &[(options.local_source_worker_metrics_port, 5100)],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.target_worker_service,
+        "p10-observability-target-worker",
+        &[(options.local_target_worker_metrics_port, 5100)],
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let orch_endpoint = grpc_endpoint(&local_orch_addr);
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_http_status_endpoint(
+        "internal P10 observability gateway readiness",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+
+    let (_before_health, assignment_listing_before) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "internal P10 observability gateway before",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+    let gateway_routes_before =
+        prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let mut session = GatewaySession::connect(&local_gateway_addr)?;
+    for idx in 0..options.actors {
+        let actor = EntityId(120_000 + u64::from(idx));
+        let joined = session.request(
+            parent,
+            ClientMsg::Join {
+                actor,
+                pos: activation_soak_position((idx % 4) as u8),
+            },
+        )?;
+        assert_snapshot_contains("internal P10 observability join", joined, parent, actor)?;
+    }
+
+    assert_prometheus_sample_at_least_until(
+        "internal P10 observability source worker actor count",
+        &local_source_worker_metrics_addr,
+        worker_cell_actor_count_metric(parent).as_str(),
+        f64::from(options.actors),
+    )?;
+
+    let actor = EntityId(120_000);
+    let mut soak_stats = ActivationSoakStats::default();
+    for iteration in 0..options.iterations {
+        let ts = 30_000 + u64::from(iteration);
+        let observed =
+            request_ping_until_pong(&mut session, parent, ts, "internal P10 observability ping")?;
+        soak_stats.add(observed);
+        soak_stats.pings_ok += 1;
+
+        let step = if iteration % 2 == 0 { 0.3 } else { -0.3 };
+        let observed = request_move_until_delta(
+            &mut session,
+            parent,
+            actor,
+            step,
+            -step,
+            "internal P10 observability move",
+        )?;
+        soak_stats.add(observed);
+        soak_stats.moves_ok += 1;
+
+        if iteration + 1 < options.iterations {
+            thread::sleep(Duration::from_millis(options.sleep_ms));
+        }
+    }
+
+    let (_after_health, assignment_listing_after) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let assignment_stable = assignment_listing_before == assignment_listing_after;
+    if !assignment_stable {
+        bail!("internal P10 observability soak changed assignments");
+    }
+
+    let worker_metric_names = [
+        "tessera_worker_cell_actor_count",
+        "tessera_worker_relay_subscribers",
+        "tessera_worker_relay_connections_total",
+        "tessera_worker_relay_outbound_drops_total",
+        "tessera_worker_relay_forward_drops_total",
+        "tessera_worker_remote_relay_connects_total",
+        "tessera_worker_remote_relay_frames_sent_total",
+        "tessera_worker_remote_relay_frames_received_total",
+    ];
+    let source_worker_metrics = assert_metrics_endpoint_body_until(
+        "internal P10 observability source worker after",
+        &local_source_worker_metrics_addr,
+        &worker_metric_names,
+    )?;
+    let target_worker_metrics = assert_metrics_endpoint_body_until(
+        "internal P10 observability target worker after",
+        &local_target_worker_metrics_addr,
+        &worker_metric_names,
+    )?;
+    let orch_metrics = assert_metrics_endpoint_body_until(
+        "internal P10 observability orchestrator after",
+        &local_orch_metrics_addr,
+        &[
+            "tessera_orch_configured_workers",
+            "tessera_orch_registered_workers",
+            "tessera_orch_assigned_cells",
+            "tessera_orch_listing_requests_total",
+        ],
+    )?;
+    let gateway_metrics_after = assert_metrics_endpoint_body_until(
+        "internal P10 observability gateway after",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P10 observability gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        f64::from(options.iterations),
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P10 observability gateway",
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        f64::from(options.iterations),
+    )?;
+
+    let gateway_close_after = gateway_close_counters_from_metrics(&gateway_metrics_after)?;
+    assert_gateway_close_counters_not_increased(
+        "internal P10 observability gateway",
+        gateway_close_before,
+        gateway_close_after,
+    )?;
+    let gateway_routes_after =
+        prometheus_sample_value(&gateway_metrics_after, "tessera_gateway_routes")?;
+    let ping_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )?;
+    let join_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+    )?;
+    let move_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+    )?;
+    let request_samples = ping_roundtrips + join_roundtrips + move_roundtrips;
+    let image_name = options
+        .expected_image
+        .clone()
+        .or_else(|| deployment_images.first().map(|image| image.image.clone()))
+        .unwrap_or_default();
+    let argocd_synced_healthy = argocd_status
+        .as_ref()
+        .is_some_and(|status| status.sync == "Synced" && status.health == "Healthy");
+    let deployment_images_match = options.expected_image.as_deref().is_none_or(|expected| {
+        deployment_images
+            .iter()
+            .all(|image| image.image == expected)
+    });
+    let route_converged = gateway_routes_after >= 1.0;
+    let close_counters_clean = gateway_close_before == gateway_close_after;
+    let request_latency_histograms_observed = ping_roundtrips >= f64::from(options.iterations)
+        && join_roundtrips >= f64::from(options.actors)
+        && move_roundtrips >= f64::from(options.iterations);
+
+    let report = serde_json::json!({
+        "schema": "tessera.internal_microk8s_p10_observability_soak.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "image": {
+            "name": image_name,
+            "deployment_images_match": deployment_images_match
+        },
+        "cluster": {
+            "context": context.as_str(),
+            "namespace": options.namespace.as_str(),
+            "orchestrator_service": options.orch_service.as_str(),
+            "gateway_service": options.gateway_service.as_str(),
+            "source_worker_service": options.source_worker_service.as_str(),
+            "target_worker_service": options.target_worker_service.as_str(),
+            "argocd": argocd_status_json(
+                &options.argocd_namespace,
+                &options.argocd_app,
+                argocd_status.as_ref()
+            ),
+            "expected_image": options.expected_image.as_deref(),
+            "deployment_images": k8s_deployment_images_json(&deployment_images)
+        },
+        "soak": {
+            "iterations": options.iterations,
+            "sleep_ms": options.sleep_ms,
+            "actors_joined": options.actors,
+            "pings_ok": soak_stats.pings_ok,
+            "moves_ok": soak_stats.moves_ok,
+            "request_samples": request_samples,
+            "ignored_frames": soak_stats.ignored_frames,
+            "remote_delta_frames": soak_stats.remote_delta_frames,
+            "remote_snapshot_frames": soak_stats.remote_snapshot_frames
+        },
+        "latency": {
+            "ping_roundtrips": ping_roundtrips,
+            "join_roundtrips": join_roundtrips,
+            "move_roundtrips": move_roundtrips,
+            "request_samples": request_samples
+        },
+        "gateway": {
+            "addr": local_gateway_addr.as_str(),
+            "metrics_addr": local_gateway_metrics_addr.as_str(),
+            "routes_before": gateway_routes_before,
+            "routes_after": gateway_routes_after,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after": gateway_close_counters_json(gateway_close_after)
+            }
+        },
+        "workers": {
+            "source": {
+                "metrics_addr": local_source_worker_metrics_addr.as_str(),
+                "relay_subscribers": prometheus_sample_value(&source_worker_metrics, "tessera_worker_relay_subscribers")?,
+                "relay_connections": prometheus_sample_value(&source_worker_metrics, "tessera_worker_relay_connections_total")?,
+                "relay_outbound_drops": prometheus_sample_value(&source_worker_metrics, "tessera_worker_relay_outbound_drops_total")?,
+                "relay_forward_drops": prometheus_sample_value(&source_worker_metrics, "tessera_worker_relay_forward_drops_total")?,
+                "remote_relay_connects": prometheus_sample_value(&source_worker_metrics, "tessera_worker_remote_relay_connects_total")?,
+                "remote_relay_frames_sent": prometheus_sample_value(&source_worker_metrics, "tessera_worker_remote_relay_frames_sent_total")?,
+                "remote_relay_frames_received": prometheus_sample_value(&source_worker_metrics, "tessera_worker_remote_relay_frames_received_total")?
+            },
+            "target": {
+                "metrics_addr": local_target_worker_metrics_addr.as_str(),
+                "relay_subscribers": prometheus_sample_value(&target_worker_metrics, "tessera_worker_relay_subscribers")?,
+                "relay_connections": prometheus_sample_value(&target_worker_metrics, "tessera_worker_relay_connections_total")?,
+                "relay_outbound_drops": prometheus_sample_value(&target_worker_metrics, "tessera_worker_relay_outbound_drops_total")?,
+                "relay_forward_drops": prometheus_sample_value(&target_worker_metrics, "tessera_worker_relay_forward_drops_total")?,
+                "remote_relay_connects": prometheus_sample_value(&target_worker_metrics, "tessera_worker_remote_relay_connects_total")?,
+                "remote_relay_frames_sent": prometheus_sample_value(&target_worker_metrics, "tessera_worker_remote_relay_frames_sent_total")?,
+                "remote_relay_frames_received": prometheus_sample_value(&target_worker_metrics, "tessera_worker_remote_relay_frames_received_total")?
+            }
+        },
+        "orchestrator": {
+            "grpc_addr": local_orch_addr.as_str(),
+            "metrics_addr": local_orch_metrics_addr.as_str(),
+            "registered_workers": prometheus_sample_value(&orch_metrics, "tessera_orch_registered_workers")?,
+            "assigned_cells": prometheus_sample_value(&orch_metrics, "tessera_orch_assigned_cells")?,
+            "assignment_listing_before": assignment_listing_summary_json(&assignment_listing_before)?,
+            "assignment_listing_after": assignment_listing_summary_json(&assignment_listing_after)?
+        },
+        "cleanup": {
+            "manual_activation_default_off": cleanup.manual_activation_default_off,
+            "preview_fixture_removed": cleanup.preview_fixture_removed,
+            "orchestrator_env": {
+                "operation_execution": cleanup.operation_execution,
+                "split_merge_activation": cleanup.split_merge_activation,
+                "preview_json": cleanup.preview_json,
+                "preview_path": cleanup.preview_path
+            }
+        },
+        "checks": {
+            "argocd_synced_healthy": argocd_synced_healthy,
+            "deployment_images_match": deployment_images_match,
+            "gateway_smoke_passed": soak_stats.pings_ok >= u64::from(options.iterations) && soak_stats.moves_ok >= u64::from(options.iterations),
+            "durable_report_captured": true,
+            "default_off_cleanup_verified": cleanup.manual_activation_default_off && cleanup.preview_fixture_removed,
+            "runtime_mutation_default_off": cleanup.manual_activation_default_off,
+            "gateway_metrics_sampled": true,
+            "worker_metrics_sampled": true,
+            "orchestrator_metrics_sampled": true,
+            "request_latency_histograms_observed": request_latency_histograms_observed,
+            "ghost_relay_counters_observed": true,
+            "assignment_snapshots_sampled": true,
+            "route_convergence_maintained": route_converged,
+            "close_counters_clean": close_counters_clean,
+            "assignment_stability_checked": assignment_stable
+        },
+        "remaining_uncovered": []
+    });
+    validate_internal_k8s_p10_observability_soak_report(
+        &report,
+        options.expected_image.as_deref(),
+    )?;
+    let report_path =
+        write_internal_k8s_p10_observability_soak_report(&report, options.out.as_deref())?;
+    println!(
+        "internal P10 observability soak completed: iterations={} report={}",
+        options.iterations,
+        report_path.display()
+    );
+    Ok(())
+}
+
 fn run_k8s_p9_controlled_spot_check_report(
     source_report: Option<&Path>,
     expected_image: Option<&str>,
@@ -21303,6 +21842,19 @@ fn collect_k8s_p8_cadence_cleanup_deployment_images(
 fn collect_k8s_p9_recommend_deployment_images(
     context: &str,
     options: &K8sP9RecommendSoakOptions,
+) -> Result<Vec<K8sDeploymentImage>> {
+    let deployments = [
+        ("orchestrator", options.orch_deploy.as_str()),
+        ("gateway", options.gateway_deploy.as_str()),
+        ("source_worker", options.source_worker_deploy.as_str()),
+        ("target_worker", options.target_worker_deploy.as_str()),
+    ];
+    collect_k8s_deployment_images_by_role(context, &options.namespace, &deployments)
+}
+
+fn collect_k8s_p10_observability_deployment_images(
+    context: &str,
+    options: &K8sP10ObservabilitySoakOptions,
 ) -> Result<Vec<K8sDeploymentImage>> {
     let deployments = [
         ("orchestrator", options.orch_deploy.as_str()),
@@ -24061,6 +24613,12 @@ fn default_internal_k8s_p9_controlled_spot_check_path() -> PathBuf {
         .join("internal-microk8s-p9-controlled-spot-check-latest.json")
 }
 
+fn default_internal_k8s_p10_observability_soak_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("internal-microk8s-p10-observability-soak-latest.json")
+}
+
 fn default_p8_cadence_proposal_smoke_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -24429,6 +24987,25 @@ fn write_internal_k8s_p9_controlled_spot_check_report(
     let latest = out
         .map(Path::to_path_buf)
         .unwrap_or_else(default_internal_k8s_p9_controlled_spot_check_path);
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_internal_k8s_p10_observability_soak_report(
+    report: &serde_json::Value,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "internal-microk8s-p10-observability-soak-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_p10_observability_soak_path);
     fs::write(&latest, body)?;
     Ok(latest)
 }

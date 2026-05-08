@@ -188,8 +188,8 @@ later milestone intentionally reuses the recommend/replay evidence path.
 
 ## P10 Observability And Soak
 
-The P10 audit exists first and fails closed until the required reports are
-implemented and captured:
+P10 is complete as of `v2026.05.9`; use these commands for regression or when
+the next milestone intentionally reuses the observability/soak evidence path:
 
 ```sh
 cargo xt p10-completion-audit --json
@@ -210,11 +210,13 @@ Implemented local reports:
 - `.dev/reports/p10-recommend-history-latest.json`
 - `.dev/reports/p10-ghost-relay-soak-latest.json`
 - `.dev/reports/p10-replay-audit-latest.json`
+- `.dev/reports/p10-gitops-rollout-latest.json`
+- `.dev/reports/internal-microk8s-p10-observability-soak-latest.json`
 
-Planned internal gate after image publish and GitOps promotion:
+Internal gate after image publish and GitOps promotion:
 
 ```sh
-cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image <new-tag>
+cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.9
 ```
 
 ## Internal MicroK8s Activation
