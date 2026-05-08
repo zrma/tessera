@@ -1,6 +1,6 @@
 # P6 Durable Split State
 
-Last reviewed: 2026-05-04
+Last reviewed: 2026-05-09
 
 This document records the first P6 slice after P5 internal activation
 completion. It is intentionally narrower than the full P6+ objective: it makes
@@ -268,20 +268,17 @@ be run only after the new image exposing those Worker metrics is rolled out.
 For a combined restart/live-metrics evidence run, add `--use-live-worker-metrics`
 to the restart command and add `--require-live-metrics-plan` to the verifier.
 
-## Remaining P6 Gates
+## Closure Status
 
-1. Publish a new image, roll out the PVC-backed Orchestrator state storage, and
-   run the internal MicroK8s restart recovery evidence gate above.
-2. Run the internal MicroK8s live Worker metrics planner-to-operator evidence
-   gate above without enabling automatic mutation by default.
-3. Run internal MicroK8s merge evidence for the same-Worker and cross-Worker
-   local replay paths. Owner Worker restart actor state is currently excluded by
-   `volatile_worker_actor_state_rejoin_required_v1`.
-4. After a controlled topology assigns the canonical parent, run the guarded
-   internal multi-depth publish, failure/recovery, restart, and load/soak
-   helper with `--allow-activation`, `--allow-scale`, and
-   `--allow-rollout-restart`.
-5. Extend report verifiers so final P6 evidence covers local/dev and internal
-   MicroK8s success, failure, restart recovery, load/soak, rollback/backout, and
-   GitOps rollout state. Keep `docs/p6-completion-audit.md` updated as the
-   checklist source of truth.
+The original P6 gates in this design note are closed as of the `v2026.05.3`
+internal MicroK8s rollout and post-smoke default-off cleanup. The current source
+of truth for P6 completion is `docs/p6-completion-audit.md`, whose final gate is:
+
+```sh
+cargo xt p6-completion-audit --json
+```
+
+This document remains useful as the implementation note for durable assignment
+state, restart recovery, live-metrics operator planning, and the PVC-backed
+internal rollout shape. It is not the active TODO list; use `docs/todo-next.md`
+for current open work.

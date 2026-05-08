@@ -1,6 +1,6 @@
 # Tessera P4 Next Milestones
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-09
 
 ## Baseline
 
@@ -12,10 +12,15 @@ P4.2 internal GitOps manifests are committed, pushed, synced by ArgoCD, and
 runtime-smoked on the MicroK8s cluster. Completed milestone details are
 archived in `docs/completed-milestones.md`.
 
-The current P4.3 implementation has crossed from private split staging into
-manual runtime assignment publication, replay, and a local two-Worker
-convergence smoke. The next substantial decision is post-publish convergence
-failure handling and whether merge activation should remain design-only.
+This document is now historical. P6+ through P9 closed the later split/merge,
+operation loop, cadence, recommend-mode, internal GitOps, and cleanup evidence
+that originally followed this P4 planning boundary. Use `docs/todo-next.md` for
+the current active open-work index.
+
+At the P4.3 checkpoint, the implementation had crossed from private split
+staging into manual runtime assignment publication, replay, and a local
+two-Worker convergence smoke. The follow-up decisions recorded below were later
+closed by P5 through P9.
 
 ## 2026-05-01 Decision Checkpoint
 
@@ -239,44 +244,23 @@ P6 first slice:
    `cargo xt merge-activation-plan` validates a dry-run merge candidate against
    Orchestrator health/listing, and `cargo xt dev merge-plan-smoke` records
    `.dev/reports/merge-activation-plan-latest.json`.
-11. The first runtime merge activation lane is open for same-Worker and
-    mixed-owner sibling families under the manual/default-off flag. Canonical
-    `depth>0/sub=0` sibling detection is locally covered in the Orchestrator
-    planner/runtime, Worker coalescing detection, xtask merge plan builder, and
-    the `cargo xt dev canonical-merge-activation-*` success/failure/restart/soak
-    smoke set; canonical merge internal evidence is still a separate gate.
-12. The internal MicroK8s merge readiness lane is prepared without cluster
-    mutation: `cargo xt k8s merge-activation-smoke` records ArgoCD/image/owner
-    Worker preflight plus a port-forwarded ready merge plan, and
-    `cargo xt k8s merge-activation-report-check --require-ready-plan` validates
-    that read-only report. Internal merge publish/failure/restart/soak evidence
-    remains unrun until an approved image/GitOps rollout gate.
-13. The internal MicroK8s canonical multi-depth readiness lane is prepared
-    without cluster mutation: `cargo xt k8s multi-depth-activation-smoke`
-    records ArgoCD/image/source-target Worker preflight plus a live-listing
-    canonical parent/child target plan, and
-    `cargo xt k8s multi-depth-activation-report-check --require-ready-plan`
-    validates that read-only report. Internal multi-depth
-    publish/failure/restart/soak evidence remains unrun until an approved
-    image/GitOps rollout gate.
+11. The first runtime merge activation lane opened for same-Worker and
+    mixed-owner sibling families under the manual/default-off flag. Later P6
+    evidence closed same-Worker, cross-Worker, canonical, failure, restart,
+    soak, and internal MicroK8s merge gates.
+12. The internal MicroK8s merge and canonical multi-depth readiness lanes later
+    moved from read-only readiness to controlled publish/failure/restart/soak
+    evidence in P6+.
+13. P7 through P9 then layered policy-gated operation execution, bounded
+    cadence, recommend-only history, replay audit, internal GitOps evidence,
+    and default-off cleanup on top of this activation surface.
 
-Remaining implementation outside the current slice:
+Closure note:
 
-1. Publish a new image and run the approved internal MicroK8s restart recovery
-   evidence gate for persistent split state.
-2. Run the approved internal MicroK8s live metrics plan evidence gate after the
-   new image exposes per-cell Worker metrics.
-3. Run approved internal MicroK8s merge publish/failure/restart/soak evidence
-   after the read-only readiness report passes against the rollout candidate.
-4. Run approved internal MicroK8s canonical multi-depth
-   publish/failure/restart/soak evidence after the read-only readiness report
-   passes against the rollout candidate.
-5. Keep unapproved planner mutation disabled. The explicit local policy gate
-   exists for preview-backed merge and live-metrics-backed split, and the
-   read-only internal planner report now records the default-off block plus
-   policy-approved local publish against live ArgoCD/image evidence. A future
-   live-metrics-specific planner report should still be rerun after the new
-   image/internal live plan evidence is available.
+1. The P4/P5 split activation boundary is closed.
+2. P6+ closes the durable split/merge/multi-depth control-plane gates that were
+   once listed as remaining work here.
+3. The current open-work source is `docs/todo-next.md`.
 
 Internal MicroK8s activation preflight on 2026-05-02:
 

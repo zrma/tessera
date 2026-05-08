@@ -1,10 +1,10 @@
 # Tessera Completed Milestones
 
-Last reviewed: 2026-05-02
+Last reviewed: 2026-05-09
 
 This document records completed milestone plans that used to live in active
-`docs/todo-*` files. Current open work should stay in `docs/todo-next.md` and
-`docs/todo-p4-next-milestones.md`.
+`docs/todo-*` files. Current open work should stay in `docs/todo-next.md`.
+Historical P4 decision gates remain in `docs/todo-p4-next-milestones.md`.
 
 ## P0/P1 Runtime Baseline
 
@@ -252,17 +252,21 @@ cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
 ```
 
-## Active Follow-Up
+## Current Follow-Up
 
-Open work now starts after the P4.3/P5 split activation slice:
+This archive preserves the P0 through P4.3/P5 baseline history. Later runtime
+milestones moved into dedicated evidence contracts:
 
-1. Same-Worker runtime merge activation has since moved into the P6 local slice;
-   cross-Worker merge replay also has local evidence, while internal merge
-   evidence remains a separate gate.
-2. Keep unapproved planner submission disabled. The local policy-gated helper
-   exists, but internal planner mutation evidence remains a separate gate.
-3. Multi-depth split activation has local evidence; internal multi-depth
-   evidence remains a separate gate.
+1. P6+ durable/manual/default-off split, merge, and canonical multi-depth
+   control plane is complete as of `v2026.05.3`; see
+   `docs/p6-completion-audit.md`.
+2. P7 operation loop is complete as of `v2026.05.6`; see
+   `docs/p7-operation-loop.md`.
+3. P8 closed-loop operation cadence is complete as of `v2026.05.7`; see
+   `docs/p8-closed-loop-operation-cadence.md`.
+4. P9 operation control-plane readiness is complete as of `v2026.05.8`; see
+   `docs/p9-operation-control-plane-readiness.md`.
 
-Use `docs/todo-next.md` for the current open-work index and
-`docs/todo-p4-next-milestones.md` for the decision gates.
+Use `docs/todo-next.md` for the current open-work index. Historical P4 decision
+gates remain in `docs/todo-p4-next-milestones.md`, but they are not the current
+active TODO source unless `docs/todo-next.md` explicitly reopens them.

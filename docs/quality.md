@@ -22,6 +22,8 @@ This document is the repo-local quality map for agents. It keeps the expected au
 
 - `cargo xt` is the default local gate and runs fmt, clippy with `-D warnings`, workspace check, and `cargo xt harness`.
 - `cargo test` is the default behavioral gate.
+- `docs/README.md` is the document index, `docs/todo-next.md` is the active
+  open-work source, and `docs/smoke-runbook.md` is the command catalog.
 - `cargo xt p6-completion-audit` is the machine gate for P6+ completion evidence. In the completed P6+ state it returns `complete=true` only when the internal MicroK8s reports cover restart recovery, live metrics, GitOps rollout, merge, canonical multi-depth gates, and post-smoke default-off cleanup.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
@@ -37,7 +39,9 @@ This document is the repo-local quality map for agents. It keeps the expected au
 
 - `cargo xt harness` verifies this document, README/AGENTS discoverability, CI smoke coverage, and crate dependency boundaries.
 - If an intentional architecture edge fails the harness, update `README.md` Design Overview, this document, and the `xtask` rule in the same change.
-- Keep implemented and planned work separate: README's implemented/planned sections are treated as the user-facing status source.
+- Keep implemented, historical, and planned work separate: `README.md` is the
+  front door, `docs/todo-next.md` is the current status/open-work source, and
+  closed milestone evidence stays in the matching `docs/p*-*.md` file.
 
 ## Known gaps
 

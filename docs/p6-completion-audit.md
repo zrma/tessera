@@ -1,6 +1,6 @@
 # P6+ Completion Audit
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-09
 
 P6+ is complete as of the `v2026.05.3` internal MicroK8s rollout and
 post-smoke default-off cleanup.
@@ -63,6 +63,5 @@ evidence:
 
 P6+ closed the durable/manual/default-off dynamic cell control plane. The
 immediate next boundary after P6 was P7: Closed-Loop, Policy-Gated Dynamic Cell
-Operations, documented in `docs/p7-operation-loop.md`. P7 is now complete; the
-current active boundary is P8 closed-loop operation cadence in
-`docs/p8-closed-loop-operation-cadence.md`.
+Operations, documented in `docs/p7-operation-loop.md`. P7, P8, and P9 are now
+complete; the current active open-work index is `docs/todo-next.md`.

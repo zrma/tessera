@@ -1,80 +1,35 @@
 # Dynamic Split/Merge Design Note
 
-Last reviewed: 2026-05-03
+Last reviewed: 2026-05-09
 
 ## Scope
 
 This note fixes the V2 direction for quadtree-style cell split/merge. The
-Orchestrator now has an inactive split/merge planner skeleton with deterministic
-ranking, hysteresis/cooldown, churn-budget, complete sibling validation, overlap
-tests, an assignment-safe dry-run preview endpoint, a fixture-backed runtime
-smoke that proves the preview can emit a non-empty split plan, and a
-default-off manual split activation replay/publish RPC, default-off manual
-same-Worker merge coalescing and cross-Worker merge replay RPC paths, and an
-opt-in persistent assignment state path for Orchestrator restart recovery. A
-policy-gated `cargo xt planner-activation` helper now keeps selected planner
-mutation default-off unless `--allow-mutation --policy-id
-operator_approved_planner_mutation_v1` are both present.
-Automatic rebalancing, Orchestrator-side continuous metrics ingestion, and multi-depth
-assignment changes are not implemented yet. A local
-two-Worker activation smoke now proves successful manual split publication,
-Gateway child route convergence, source/target Worker owned-cell refresh,
-stable-session post-split Move, and remote child AOI resync. A companion failure
-smoke injects a post-publish target Worker outage, records failed child
-convergence without automatic rollback, and verifies target Worker restart
-recovery. A local activation soak smoke runs
-sustained child Ping/Move traffic after publish and records route convergence,
-remote AOI frames, Gateway latency histogram growth, and Gateway client close
-counters. A planner-to-operator helper converts dry-run preview output plus
-Orchestrator health/listing into mutation-free operator evidence and a manual
-submission command template. The same helper can now use live Worker metrics
-scraped from `--live-worker-metrics worker-id=addr`, backed by per-cell actor
-and pending-move gauges, to produce operator evidence without a preview fixture
-or assignment mutation. A local live metrics activation smoke uses that
-operator target map for manual `SubmitSplitActivation` and verifies Gateway
-route convergence, stable-session post-split Move, and remote AOI resync. A
-local live metrics planner mutation smoke feeds the same Worker metrics source
-through `cargo xt planner-activation --kind split`, proves the default report is
-`blocked_by_policy` without assignment mutation, and then proves only
-`--allow-mutation --policy-id operator_approved_planner_mutation_v1` publishes
-child assignments and Gateway convergence. The `--require-planner-live-metrics`
-report-check flag verifies that planner evidence source. A P6
-restart smoke persists published assignments, restarts the Orchestrator with
-manual activation disabled, and verifies Worker assignment refresh, Gateway
-route convergence, child traffic, and AOI resync from the recovered listing. An
-internal MicroK8s helper now automates the
-port-forwarded plan, optional publish, guarded target Worker scale-down/up
-failure recovery smoke, and a P6 opt-in Orchestrator rollout restart recovery
-path that requires PVC-backed assignment state storage. The 2026-05-02
-`v2026.05.2` controlled GitOps smoke window verified live internal split
-publish, target-only failure detection, and target Worker recovery, then a
-cleanup GitOps revision removed the manual activation flag and preview fixture
-from the live Orchestrator. The P6 internal restart helper and GitOps storage
-draft are prepared, and the internal helper can now build a read-only plan from
-live Worker metrics with `--use-live-worker-metrics` plus verify it with
-`--require-live-metrics-plan`; live P6 restart/live-metrics evidence still
-requires a new image and an approved rollout. The runtime merge slice is
-manual/default-off for complete legacy shallow or canonical sibling families:
-same-Worker families use Worker assignment refresh to coalesce child
-actor/owner/root/pending state into the parent, while mixed-owner families
-pre-stage the owner Worker parent and replay remote child actor/owner state
-before parent assignment publish. Canonical `depth>0/sub=0` merge sibling
-detection is now covered in the Orchestrator planner/runtime, Worker same-Worker
-coalescing detection, xtask merge plan builder, and
-`cargo xt dev canonical-merge-activation-smoke`; canonical merge internal
-readiness has a read-only `cargo xt k8s merge-activation-smoke` helper and
-`cargo xt k8s merge-activation-report-check --require-ready-plan` verifier, but
-merge publish/failure/restart/soak cluster evidence is still a separate gate.
-The 2026-05-03 read-only run against live `v2026.05.2` exercised that helper
-and verifier without mutation, but stopped at `no_merge_candidate` from
-`assignment_listing_zero_metrics`; it is negative readiness evidence only.
-Canonical multi-depth internal readiness also has a read-only `cargo xt k8s
-multi-depth-activation-smoke` helper and `cargo xt k8s
-multi-depth-activation-report-check --require-ready-plan` verifier. The
-2026-05-03 live `v2026.05.2` run verified the helper/report-check path without
-mutation, but stopped because the canonical parent
-`world=0,cx=-2,cy=3,depth=2,sub=0` is not currently assigned; it is negative
-readiness evidence only.
+completed P6 through P9 work now covers the manual/default-off dynamic cell
+control plane: split, merge, canonical multi-depth activation, durable
+assignment state, policy-gated operation execution, cadence, recommend-only
+history, replay audit, internal MicroK8s evidence, and post-smoke default-off
+cleanup.
+
+The remaining boundary is not "finish split/merge activation"; that control
+plane is complete for the current scope. Future work should focus on the next
+design boundary selected in `docs/todo-next.md`, such as long-running
+observability, request latency tracing, ghost relay hardening, or broader
+runtime soak. Unguarded automatic mutation remains out of scope unless a later
+milestone adds a separate policy and evidence contract.
+
+The Orchestrator has deterministic split/merge planning, hysteresis/cooldown,
+churn-budget, complete sibling validation, overlap tests, assignment-safe
+preview, default-off manual split and merge activation RPCs, policy-gated
+planner activation, durable assignment state, and operation ledger integration.
+Same-Worker merge coalesces child actor/owner/root/pending state into the
+parent, while mixed-owner merge pre-stages the owner Worker parent and replays
+remote child actor/owner state before parent assignment publish.
+
+The internal rollout history is preserved in the milestone docs:
+`docs/p6-completion-audit.md`, `docs/p7-operation-loop.md`,
+`docs/p8-closed-loop-operation-cadence.md`, and
+`docs/p9-operation-control-plane-readiness.md`.
 `cargo xt dev merge-activation-smoke` verifies same-Worker Gateway parent route
 convergence plus stable-session parent Move,
 `cargo xt dev canonical-merge-activation-smoke` verifies the same path for a
@@ -379,7 +334,7 @@ Rollback rules:
 
 ## Verification Plan
 
-Before runtime implementation, keep or extend tests for:
+For the original runtime implementation, keep or extend tests for:
 
 - Split candidate ranking and hysteresis. (initial inactive skeleton covered)
 - Merge candidate validation for complete sibling sets. (inactive skeleton
@@ -399,16 +354,16 @@ Runtime implementation should additionally run the existing full gate:
 - `cargo run -p tessera-client -- ping --ts 123`
 - `cargo xt dev down --with-orch`
 
-The current P4.3 replay/publish slice adds focused checks for:
+The P4.3 replay/publish slice added focused checks for:
 
 - Feature flag disabled: mutating activation is rejected and preview remains
   assignment-safe.
 - Manual target map validation: missing children, duplicate `sub` values,
   unknown targets, unregistered targets, and source-only no-op plans are
   rejected.
-- `CellId` depth validation: only the legacy `depth=0/sub=0` parent publish path
-  can split into `depth=1/sub=0..3` children; canonical explicit-child target
-  requests are validated but rejected before runtime mutation.
+- `CellId` depth validation: the initial legacy `depth=0/sub=0` parent publish
+  path split into `depth=1/sub=0..3` children; later P6 work added canonical
+  explicit-child split/merge coverage.
 - Assignment atomicity before publication: disabled activation, validation
   failures, unregistered targets, and staged-family conflicts leave the parent
   assignment published and publish no child assignment.

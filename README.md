@@ -2,324 +2,152 @@
 
 Cell-based world orchestration for real-time servers in Rust.
 
-**Tessera**는 심리스(Seamless) 오픈월드를 위해 월드를 **셀(Cell)** 로 분할하고,
-셀의 **소유권 이전(Handover)**, **AOI/ghost 동기화**, **동적 분할(쿼드트리)** 을 제공하는
-실시간 서버 프레임워크입니다. 목표는 “MMO급 시뮬레이션”의 **기본 뼈대**입니다.
+**Tessera** divides a seamless open world into cells and provides the control
+plane for ownership handover, AOI/ghost synchronization, dynamic split/merge,
+and operator-governed runtime operations. The target is the basic runtime
+skeleton for MMO-scale simulation, not a finished game server.
 
-- 언어/런타임: Rust + Tokio
-- 배포: Self-hosted / Kubernetes 친화
-- 통신: 클라↔게이트웨이(TCP/QUIC), 서버↔서버(gRPC stream 또는 NATS)
+- Runtime: Rust + Tokio
+- Deployment target: self-hosted and Kubernetes-friendly
+- Current state: P0 through P9 are complete; the next active design boundary is
+  intentionally not selected yet.
 
 ## Workspace
-- `crates/tessera-gateway`: 클라이언트 입출력 게이트웨이(Stateless)
-- `crates/tessera-worker`: 셀 소유자/틱 루프(Stateful)
-- `crates/tessera-orch`: 오케스트레이터(Control-plane)
-- `crates/tessera-core`: 공용 타입/프레이밍/CellId
-- `crates/tessera-proto`: (선택) gRPC/IDL 코드젠
-- `crates/tessera-sim`: 부하/플레이어 시뮬레이터
-- `crates/tessera-client`: 테스트용 CLI 클라이언트
-- `xtask`: 포맷/린트/체크/harness 헬퍼
+
+- `crates/tessera-gateway`: stateless client ingress and cell route gateway
+- `crates/tessera-worker`: stateful cell owner, tick loop, AOI/ghost relay
+- `crates/tessera-orch`: control plane, assignments, operations, audits
+- `crates/tessera-core`: shared types, framing, `CellId`
+- `crates/tessera-proto`: gRPC/IDL generated surface
+- `crates/tessera-sim`: load and player simulation helpers
+- `crates/tessera-client`: test CLI client
+- `xtask`: local verification, smoke, audit, and report helpers
 
 ## Quick Start
-- 빌드: `cargo build`
-- 검증: `cargo xt` (fmt → clippy → check → harness)
-- Harness만 확인: `cargo xt harness`
-- 전체 테스트: `cargo test`
-- P6+ completion gate 확인: `cargo xt p6-completion-audit` (모든 internal P6+ evidence가 닫히기 전에는 실패해야 함)
-- P7 operation-loop completion gate 확인: `cargo xt p7-completion-audit --json`
-- P8 closed-loop cadence completion gate 확인: `cargo xt p8-completion-audit --json`
-- P8 closed-loop cadence 목표/게이트: `docs/p8-closed-loop-operation-cadence.md`
-- P9 operation control-plane readiness gate 확인: `cargo xt p9-completion-audit --json`
-- P9 operation control-plane 목표/게이트: `docs/p9-operation-control-plane-readiness.md`
-- P6 internal rollout 승인/runbook: `docs/p6-internal-rollout-runbook.md`
-- 실행 예시:
-  - `cargo run -p tessera-gateway`
-  - `cargo run -p tessera-worker`
-  - `cargo run -p tessera-orch`
+
+- Build: `cargo build`
+- Full local quality gate: `cargo xt`
+- Harness only: `cargo xt harness`
+- Tests: `cargo test`
+- Current completion audit: `cargo xt p9-completion-audit --json`
+- Documentation index: `docs/README.md`
+- Smoke/runbook commands: `docs/smoke-runbook.md`
 
 ## Run Locally
-- 일괄 실행/정지(Worker+Gateway):
-  - 올리기: `cargo xt dev up`
-  - Orchestrator까지 포함: `cargo xt dev up --with-orch [--orch-config .dev/orch-config.json]`
-  - 내리기: `cargo xt dev down`
-  - Orchestrator 종료: `cargo xt dev down --with-orch`
-  - 로그: `.dev/logs/{worker,gateway,orch}.log`
-- 로그 보기: `cargo xt dev logs --target all --follow` (또는 `--target gateway|worker|orch`, `--lines 200`)
-- 로컬 스모크:
-  - `cargo xt dev up --with-orch`
-  - `cargo run -p tessera-client -- ping --ts 123`
-  - `cargo xt dev down --with-orch`
-- Metrics 스모크:
-  - `cargo xt dev metrics-smoke` (Gateway `127.0.0.1:4100`, Worker `127.0.0.1:5100`, Orchestrator `127.0.0.1:6100`의 `/metrics`, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed dry-run plan, Ping/Pong 및 Join/Move latency histogram 증가를 확인)
-- Split activation 스모크:
-  - `cargo xt dev activation-smoke` (두 Worker, Gateway, manual activation Orchestrator를 별도 포트로 기동하고 parent Join → manual split publish → Gateway child route 수렴 → source/target Worker child Ping → stable-session post-split Move → remote AOI resync snapshot을 확인하며 `.dev/reports/activation-smoke-latest.json` 증거를 남김)
-- Live metrics planner-to-operator 스모크:
-  - `cargo xt dev activation-live-plan-smoke` (두 Worker dev stack에서 실제 Gateway Join으로 Worker per-cell actor metric을 만들고, `--live-worker-metrics worker-id=addr` source로 mutation-free operator split plan을 생성하며 `.dev/reports/split-activation-plan-latest.json` 증거를 남김)
-  - `cargo xt dev activation-live-metrics-smoke` (live Worker metrics operator plan을 만든 뒤 그 target map으로 manual `SubmitSplitActivation`을 호출하고, Gateway route convergence, stable-session post-split Move, remote AOI resync까지 `.dev/reports/activation-smoke-latest.json`에 기록)
-- Merge planner-to-operator 스모크:
-  - `cargo xt dev merge-plan-smoke` (cold complete sibling fixture에서 mutation-free merge operator plan을 생성하고 `.dev/reports/merge-activation-plan-latest.json` 증거를 남김)
-- Policy-gated planner mutation 스모크:
-  - `cargo xt dev planner-mutation-smoke` (planner-selected merge가 기본값에서는 `blocked_by_policy`로 mutation 없이 남고, `operator_approved_planner_mutation_v1` policy id와 `--allow-mutation`이 함께 있을 때만 parent assignment publish까지 진행하는지 확인하며 `.dev/reports/planner-activation-{blocked-,}latest.json` 증거를 남김)
-  - `cargo xt dev activation-live-planner-mutation-smoke` (live Worker metrics에서 split planner candidate를 선택하고, 기본값은 `.dev/reports/planner-activation-live-blocked-latest.json`에 `blocked_by_policy` no-op으로 남으며, 같은 candidate가 `operator_approved_planner_mutation_v1` policy id와 `--allow-mutation`에서만 child assignment publish/Gateway convergence까지 진행하는지 `.dev/reports/planner-activation-latest.json`으로 검증)
-- P8 cadence 스모크:
-  - `cargo xt dev p8-cadence-plan-smoke [--ticks 3] [--sleep-ms 10]` (two-Worker full dev stack에서 실제 Worker metrics와 Orchestrator assignment listing을 여러 tick 수집해 stable split candidate batch를 만들고, candidate key가 반복 tick에서 안정적이며 assignment mutation/execution 없이 `.dev/reports/p8-cadence-plan-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev p8-cadence-proposal-smoke [--ticks 3] [--sleep-ms 10] [--actors 105]` (two-Worker full dev stack에서 실제 Worker actor metrics를 Orchestrator proposal preview snapshot으로 materialize하고, 반복 `/operations/proposals` tick이 같은 durable proposal record를 재사용하며 assignment mutation/execution 없이 `.dev/reports/p8-cadence-proposal-smoke-latest.json` 및 `.dev/reports/p8-cadence-proposal-ledger-latest.json` 증거를 남김)
-  - `cargo xt dev p8-cadence-approval-smoke [--actors 105]` (live-metrics proposal을 durable ledger에 기록한 뒤 approval, repeat approval, unapproved/missing-policy/wrong-policy/default-off execution preflight를 모두 mutation-free로 검증하고 `.dev/reports/p8-cadence-approval-smoke-latest.json` 및 `.dev/reports/p8-cadence-approval-ledger-latest.json` 증거를 남김)
-  - `cargo xt dev p8-cadence-gate-smoke` (Orchestrator-only proposal/approval cases에서 `TESSERA_ORCH_OPERATION_COOLDOWN_ACTIVE_KEYS`, `TESSERA_ORCH_OPERATION_BUDGET_LIMITS`, `TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY` gate가 default-off execution보다 먼저 mutation 없이 block되는지 `.dev/reports/p8-cadence-gate-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev p8-cadence-execution-smoke [--actors 105]` (two-Worker full dev stack에서 live Worker metrics proposal을 approval/gate 통과 후 bounded manual window로 한 번 publish하고, repeat execution idempotency, Gateway child route convergence, Worker child refresh, child traffic, observation completion을 `.dev/reports/p8-cadence-execution-smoke-latest.json` 및 `.dev/reports/p8-cadence-execution-ledger-latest.json`에 기록)
-  - `cargo xt dev p8-cadence-recovery-smoke [--actors 105]` (approved bounded P8 split publish 후 target Worker outage를 주입해 affected child route failures를 `recovery_required` observation으로 기록하고, 자동 rollback 없이 Worker restart로 operator-visible recovery가 되는지 `.dev/reports/p8-cadence-recovery-smoke-latest.json` 및 `.dev/reports/p8-cadence-recovery-ledger-latest.json`에 기록)
-  - `cargo xt dev p8-cadence-restart-smoke [--actors 105]` (approved bounded P8 split publish 후 Orchestrator를 재시작하고 operation ledger와 persisted child assignments가 복구되는지 확인한 뒤 Gateway child route/traffic observation을 `completed`로 닫으며 `.dev/reports/p8-cadence-restart-smoke-latest.json`, `.dev/reports/p8-cadence-restart-ledger-latest.json`, `.dev/reports/p8-cadence-restart-assignment-state-latest.json`에 기록)
-  - `cargo xt dev p8-cadence-soak-smoke [--actors 105] [--iterations 16] [--sleep-ms 10]` (approved bounded P8 split publish 후 child route별 Ping/Move load/soak을 돌려 route convergence, Worker child refresh, remote AOI frame, latency histogram, close counter, completed observation을 `.dev/reports/p8-cadence-soak-smoke-latest.json` 및 `.dev/reports/p8-cadence-soak-ledger-latest.json`에 기록)
-  - `cargo xt k8s p8-cadence-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-execution` (GitOps smoke window에서 Orchestrator의 `TESSERA_ORCH_OPERATION_EXECUTION=manual`, `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`, `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH`, P8 ledger/state path, budget/concurrency gate를 preflight하고, port-forward된 live Worker metrics를 Orchestrator PVC preview snapshot으로 materialize한 뒤 approval → bounded execution → repeat idempotency → child-route soak → observation evidence를 `.dev/reports/internal-microk8s-p8-cadence-smoke-latest.json`에 기록)
-  - `cargo xt k8s p8-cadence-cleanup-check --context microk8s-ts --namespace tessera --expected-image <new-tag>` (smoke 후 GitOps cleanup revision이 ArgoCD `Synced / Healthy` 상태에서 manual execution/activation env와 preview fixture env를 제거했는지 검증하고 internal P8 cadence report의 cleanup fields를 final 상태로 갱신)
-- P9 recommend-loop 스모크:
-  - `cargo xt dev p9-recommend-loop-soak [--ticks 4] [--sleep-ms 10]` (two-Worker full dev stack에서 live Worker metrics와 assignment snapshot을 반복 수집하고 split/merge/canonical multi-depth candidate batch를 durable recommend-only history로 남기며 `.dev/reports/p9-recommend-loop-soak-latest.json` 및 `.dev/reports/p9-recommend-history-latest.json`에 no assignment mutation/no execution evidence를 기록)
-  - `cargo xt dev p9-replay-audit [--history .dev/reports/p9-recommend-history-latest.json]` (durable recommend-only history를 독립 replay해 proposal hash와 operation id 안정성, process restart 이후 복구 가능성, no assignment mutation/no execution evidence를 `.dev/reports/p9-replay-audit-latest.json`에 기록)
-  - `cargo xt dev p9-policy-regression-smoke` (P8 cooldown/budget/concurrency/default-off gate cases를 다시 실행하고 explicit approval, deny evidence, default-off block, no automatic mutation을 `.dev/reports/p9-policy-regression-latest.json`에 기록)
-  - `cargo xt k8s p9-recommend-soak --context microk8s-ts --namespace tessera --expected-image <new-tag>` (internal MicroK8s runtime의 live Worker metrics와 Orchestrator assignment listing을 반복 샘플링하고, default-off 상태에서 durable recommend-only history와 replay evidence를 `.dev/reports/internal-microk8s-p9-recommend-soak-latest.json` 및 `.dev/reports/internal-microk8s-p9-recommend-history-latest.json`에 기록)
-  - `cargo xt k8s p9-controlled-spot-check-report --source-report .dev/reports/internal-microk8s-operation-smoke-latest.json --expected-image <new-tag>` (별도 승인된 controlled window에서 생성한 P7 operation restart smoke report를 P9 controlled spot-check evidence로 접고, 현재 runtime이 다시 default-off/preview-free 상태인지 검증해 `.dev/reports/internal-microk8s-p9-controlled-spot-check-latest.json`에 기록)
-- P7 operation loop 스모크:
-  - `cargo xt dev p7-operation-loop-smoke` (Orchestrator-only dev stack에서 registered two-Worker listing과 split/merge/canonical multi-depth preview candidate를 사용해 proposal → approval → default-off execution block을 재현하고, assignment mutation 없이 `.dev/reports/p7-operation-loop-smoke-latest.json` 및 `.dev/reports/p7-operation-loop-ledger-latest.json` 증거를 남김)
-  - `cargo xt dev p7-operation-execution-smoke` (Orchestrator-only dev stack에서 `TESSERA_ORCH_OPERATION_EXECUTION=manual`과 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`을 켜고 approved same-Worker merge operation이 parent assignment를 한 번 publish하며, 반복 execution은 `already_published` idempotent no-op으로 남는지 `.dev/reports/p7-operation-execution-smoke-latest.json` 및 `.dev/reports/p7-operation-execution-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-split-execution-smoke` (full dev stack에서 approved legacy split operation이 child assignments를 한 번 publish하고 parent assignment를 제거하며, 반복 execution은 `already_published` idempotent no-op으로 남는지 `.dev/reports/p7-operation-split-execution-smoke-latest.json` 및 `.dev/reports/p7-operation-split-execution-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-multi-depth-execution-smoke` (full dev stack에서 approved canonical multi-depth split operation이 explicit child assignments를 한 번 publish하고 canonical parent assignment를 제거하며, Gateway canonical child route convergence, stable-session child Move, remote AOI resync, 반복 execution idempotency를 `.dev/reports/p7-operation-multi-depth-execution-smoke-latest.json` 및 `.dev/reports/p7-operation-multi-depth-execution-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-multi-depth-observation-smoke` (full dev stack에서 approved canonical multi-depth split operation을 publish한 뒤 Gateway canonical child route convergence, Worker child actor refresh, stable-session child Move, remote AOI resync, latency/close-counter metrics를 확인하고 `POST /operations/observations`로 ledger를 `completed`까지 닫으며 `.dev/reports/p7-operation-multi-depth-observation-smoke-latest.json` 및 `.dev/reports/p7-operation-multi-depth-observation-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-multi-depth-recovery-smoke` (full dev stack에서 approved canonical multi-depth split publish 후 target Worker outage를 주입해 target canonical child Ping failure를 감지하고 `POST /operations/observations`로 ledger를 `recovery_required`로 닫은 뒤, operator Worker restart로 canonical child route/traffic이 복구되는지 `.dev/reports/p7-operation-multi-depth-recovery-smoke-latest.json` 및 `.dev/reports/p7-operation-multi-depth-recovery-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-multi-depth-restart-smoke` (full dev stack에서 approved canonical multi-depth split publish 후 Orchestrator를 재시작하고, operation ledger와 persisted canonical child assignment state가 복구되어 canonical child route/traffic, stable-session child Move, remote AOI resync, post-restart observation completion이 유지되는지 `.dev/reports/p7-operation-multi-depth-restart-smoke-latest.json` 및 `.dev/reports/p7-operation-multi-depth-restart-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-multi-depth-soak-smoke [--iterations 16] [--sleep-ms 10]` (full dev stack에서 approved canonical multi-depth split publish 후 네 canonical child route에 반복 Ping/Move traffic을 실행하고 route count, latency histogram, close counter, Worker child actor metrics, remote AOI frame을 확인한 뒤 observation을 `completed`로 닫으며 `.dev/reports/p7-operation-multi-depth-soak-smoke-latest.json` 및 `.dev/reports/p7-operation-multi-depth-soak-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-split-observation-smoke` (full dev stack에서 approved legacy split operation을 publish한 뒤 Gateway child route convergence, Worker child actor refresh, stable-session child Move, latency/close-counter metrics를 확인하고 `POST /operations/observations`로 ledger를 `completed`까지 닫으며 `.dev/reports/p7-operation-split-observation-smoke-latest.json` 및 `.dev/reports/p7-operation-split-observation-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-split-recovery-smoke` (full dev stack에서 approved legacy split publish 후 target Worker outage를 주입해 target child Ping failure를 감지하고 `POST /operations/observations`로 ledger를 `recovery_required`로 닫은 뒤, operator Worker restart로 child route/traffic이 복구되는지 `.dev/reports/p7-operation-split-recovery-smoke-latest.json` 및 `.dev/reports/p7-operation-split-recovery-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-split-restart-smoke` (full dev stack에서 approved legacy split publish 후 Orchestrator를 재시작하고, operation ledger와 persisted child assignment state가 복구되어 child route/traffic 및 post-restart observation completion이 유지되는지 `.dev/reports/p7-operation-split-restart-smoke-latest.json` 및 `.dev/reports/p7-operation-split-restart-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-split-soak-smoke [--iterations 16] [--sleep-ms 10]` (full dev stack에서 approved legacy split publish 후 네 child route에 반복 Ping/Move traffic을 실행하고 route count, latency histogram, close counter, Worker child actor metrics, remote AOI frame을 확인한 뒤 observation을 `completed`로 닫으며 `.dev/reports/p7-operation-split-soak-smoke-latest.json` 및 `.dev/reports/p7-operation-split-soak-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-observation-smoke` (full dev stack에서 approved same-Worker merge operation을 P7 HTTP proposal/approval/execution 경로로 publish한 뒤 Gateway route convergence, Worker parent actor refresh, stable-session parent Move, latency/close-counter metrics를 확인하고 `POST /operations/observations`로 ledger를 `completed`까지 닫으며 `.dev/reports/p7-operation-observation-smoke-latest.json` 및 `.dev/reports/p7-operation-observation-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-recovery-smoke` (full dev stack에서 approved same-Worker merge publish 후 owner Worker outage를 주입해 Gateway parent Ping failure를 감지하고 `POST /operations/observations`로 ledger를 `recovery_required`로 닫은 뒤, operator Worker restart로 parent route/traffic이 복구되는지 `.dev/reports/p7-operation-recovery-smoke-latest.json` 및 `.dev/reports/p7-operation-recovery-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-restart-smoke` (full dev stack에서 approved same-Worker merge publish 후 Orchestrator를 재시작하고, operation ledger와 persisted assignment state가 복구되어 parent route/traffic 및 post-restart observation completion이 유지되는지 `.dev/reports/p7-operation-restart-smoke-latest.json` 및 `.dev/reports/p7-operation-restart-ledger-latest.json`에 기록)
-  - `cargo xt dev p7-operation-soak-smoke [--iterations 16] [--sleep-ms 10]` (full dev stack에서 approved same-Worker merge publish 후 parent route에 반복 Ping/Move traffic을 실행하고 route count, latency histogram, close counter, Worker parent actor metric을 확인한 뒤 observation을 `completed`로 닫으며 `.dev/reports/p7-operation-soak-smoke-latest.json` 및 `.dev/reports/p7-operation-soak-ledger-latest.json`에 기록)
-- Merge activation 스모크:
-  - `cargo xt dev merge-activation-smoke` (네 depth-1 sibling이 같은 Worker에 있을 때 manual `SubmitMergeActivation`으로 parent assignment를 publish하고, Worker가 child actor/owner/root state를 parent로 coalesce하는지, Gateway가 parent route 1개로 수렴하는지, 기존 child session의 parent Move가 성공하는지 확인하며 `.dev/reports/merge-activation-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev canonical-merge-activation-smoke` (canonical `depth>0/sub=0` parent의 네 canonical child가 같은 Worker에 있을 때 manual `SubmitMergeActivation`으로 parent assignment를 publish하고, Worker canonical child coalescing, Gateway parent route convergence, stable-session parent Move를 검증하며 `.dev/reports/canonical-merge-activation-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev canonical-merge-activation-report-check` (latest canonical same-Worker merge report가 parent/child topology와 local success evidence contract를 충족하는지 검증)
-  - `cargo xt dev canonical-merge-activation-failure-smoke` (canonical same-Worker merge publish 후 owner Worker outage를 주입해 canonical parent route failure 감지, no automatic rollback, owner Worker 재기동 recovery를 `.dev/reports/canonical-merge-activation-failure-smoke-latest.json`에 기록)
-  - `cargo xt dev canonical-merge-activation-failure-report-check` (latest canonical same-Worker merge failure/recovery report가 recovery evidence contract를 충족하는지 검증)
-  - `cargo xt dev canonical-merge-activation-restart-smoke` (canonical same-Worker merge publish 후 persisted assignment state로 Orchestrator restart recovery, Gateway parent route, parent traffic을 `.dev/reports/canonical-merge-activation-restart-smoke-latest.json`에 기록)
-  - `cargo xt dev canonical-merge-activation-restart-report-check` (latest canonical same-Worker merge restart report가 restart evidence contract를 충족하는지 검증)
-  - `cargo xt dev canonical-merge-activation-soak [--iterations 32] [--sleep-ms 10]` (canonical same-Worker merge publish 후 parent route에 반복 Ping/Move traffic을 실행하고 route count, latency histogram, close counter를 `.dev/reports/canonical-merge-activation-soak-latest.json`에 기록)
-  - `cargo xt dev canonical-merge-activation-soak-report-check [--min-iterations 32]` (latest canonical same-Worker merge soak report가 load/soak evidence contract를 충족하는지 검증)
-  - `cargo xt dev merge-activation-cross-worker-smoke` (mixed-owner sibling family에서 owner Worker parent를 source별 replay operation으로 pre-stage하고, remote child Worker가 actor/owner state를 parent로 replay한 뒤 parent assignment publish, Gateway route convergence, local/remote stable-session parent Move를 확인하며 `.dev/reports/merge-activation-cross-worker-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev merge-activation-failure-smoke` (same-Worker merge publish 후 owner Worker outage를 주입해 parent route failure를 감지하고, parent assignment가 자동 rollback되지 않음을 확인한 뒤 owner Worker 재기동으로 parent route와 fresh Ping recovery를 검증하며 `.dev/reports/merge-activation-failure-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev merge-activation-restart-smoke` (same-Worker merge publish 후 persisted assignment state로 Orchestrator를 manual activation flag 없이 재시작하고, parent assignment listing, Gateway parent route, parent Ping/Move, Worker coalesced actor metrics가 유지되는지 확인하며 `.dev/reports/merge-activation-restart-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev merge-activation-soak [--iterations 32] [--sleep-ms 10]` (same-Worker merge publish 후 parent route에 반복 Ping/Move traffic을 실행하고, route count 유지, Join/Move/Ping latency histogram 증가, Gateway client close counter 0을 확인하며 `.dev/reports/merge-activation-soak-latest.json` 증거를 남김)
-  - `cargo xt dev merge-activation-soak-report-check [--min-iterations 32]` (latest same-Worker merge soak report가 local load/soak evidence contract를 충족하는지 검증)
-- Split activation 실패/복구 스모크:
-  - `cargo xt dev activation-failure-smoke` (manual split publish 후 target Worker 장애를 주입해 target child convergence 실패를 감지하고, child assignment가 자동 rollback되지 않음을 확인한 뒤 target Worker 재기동으로 convergence 복구를 검증하며 `.dev/reports/activation-failure-smoke-latest.json` 증거를 남김)
-- Split activation Orchestrator restart 복구 스모크:
-  - `cargo xt dev activation-restart-smoke` (manual split publish 후 `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`에 저장된 assignment state로 Orchestrator를 manual activation flag 없이 재시작하고, Worker 재등록/assignment refresh, Gateway child route 재수렴, child Ping, post-restart AOI resync를 확인하며 `.dev/reports/activation-restart-smoke-latest.json` 증거를 남김)
-- Split activation load/soak 스모크:
-  - `cargo xt dev activation-soak [--iterations 32] [--sleep-ms 10]` (manual split publish 후 child별 반복 Ping/Move를 실행하고, route count 유지, Join/Move/Ping latency histogram 증가, remote AOI frame 관측, Gateway client close counter 0을 확인하며 `.dev/reports/activation-soak-latest.json` 증거를 남김)
-- Split activation report 검증:
-  - `cargo xt dev activation-report-check` (latest local plan/success/failure/soak reports가 P5 local evidence와 rollback policy를 충족하는지 검증)
-  - `cargo xt dev activation-report-check --require-live-metrics-plan` (latest split activation plan report가 `live_worker_metrics:` source와 ready four-target map을 포함하는지 추가 검증)
-  - `cargo xt dev activation-report-check --restart-report .dev/reports/activation-restart-smoke-latest.json` (P6 persistent split restart smoke report까지 함께 검증)
-  - `cargo xt dev activation-report-check --merge-plan-report .dev/reports/merge-activation-plan-latest.json --merge-activation-report .dev/reports/merge-activation-smoke-latest.json --merge-cross-worker-report .dev/reports/merge-activation-cross-worker-smoke-latest.json --merge-failure-report .dev/reports/merge-activation-failure-smoke-latest.json --merge-restart-report .dev/reports/merge-activation-restart-smoke-latest.json --merge-soak-report .dev/reports/merge-activation-soak-latest.json --planner-mutation-report .dev/reports/planner-activation-latest.json --require-planner-live-metrics` (same-Worker/cross-Worker merge smoke와 failure/restart/soak report shape, manual merge rollback policy, policy-gated planner mutation evidence, live metrics 기반 split planner activation source를 함께 검증)
-- Multi-depth split activation 로컬 스모크:
-  - `cargo xt dev multi-depth-activation-smoke` (`CellId::leaf(0, -2, 3, 2)` parent를 canonical child leaf 네 개로 split publish하고 Gateway exact child route convergence, child Ping, stable-session post-split Move, remote AOI resync, route-change/relay metrics를 확인하며 `.dev/reports/multi-depth-activation-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev multi-depth-activation-report-check` (latest canonical explicit-child split smoke report가 local success evidence contract를 충족하는지 검증)
-  - `cargo xt dev multi-depth-activation-failure-smoke` (canonical child split publish 후 target Worker outage를 감지하고 parent/child assignment가 자동 rollback 없이 유지되는지, target Worker 재기동 뒤 exact child Ping convergence가 복구되는지 확인하며 `.dev/reports/multi-depth-activation-failure-smoke-latest.json` 증거를 남김)
-  - `cargo xt dev multi-depth-activation-failure-report-check` (latest canonical explicit-child split failure/recovery report가 local recovery evidence contract를 충족하는지 검증)
-  - `cargo xt dev multi-depth-activation-restart-smoke` (canonical child split publish를 assignment state에 persist한 뒤 Orchestrator를 manual activation flag 없이 재시작하고, persisted child listing, Worker refresh, Gateway route convergence, child Ping, remote AOI interest resync를 `.dev/reports/multi-depth-activation-restart-smoke-latest.json`에 남김)
-  - `cargo xt dev multi-depth-activation-restart-report-check` (latest canonical explicit-child split restart report가 local restart evidence contract를 충족하는지 검증)
-  - `cargo xt dev multi-depth-activation-soak [--iterations 32] [--sleep-ms 10]` (canonical child split publish 후 exact child별 반복 Ping/Move traffic, route convergence 유지, remote AOI frame 관측, Gateway latency histogram/close counter를 `.dev/reports/multi-depth-activation-soak-latest.json`에 남김)
-  - `cargo xt dev multi-depth-activation-soak-report-check [--min-iterations 32]` (latest canonical explicit-child split soak report가 local load/soak evidence contract를 충족하는지 검증)
-- Manual split activation helper:
-  - `cargo xt split-activation-plan --preview-addr 127.0.0.1:6100 --orch-addr 127.0.0.1:6000` (`GET /split-merge/preview` dry-run plan과 Orchestrator health/listing을 읽고, mutation 없이 operator review용 target map/submit command/evidence를 `.dev/reports/split-activation-plan-latest.json`에 기록)
-  - `cargo xt split-activation-plan --orch-addr 127.0.0.1:6000 --live-worker-metrics worker-a=127.0.0.1:5100 --live-worker-metrics worker-b=127.0.0.1:5101` (Worker `/metrics`의 per-cell actor/pending-move gauge를 live source로 사용해 preview fixture 없이 operator plan을 만든다. 기본 threshold는 conservative하며 `--live-actor-threshold`, `--live-move-threshold`, `--live-min-pressure-signals`로 조정 가능)
-  - `cargo xt split-activation --operation-id split-001 --target 0=worker-a --target 1=worker-b --target 2=worker-a --target 3=worker-b` (`--orch-addr`, `--world`, `--cx`, `--cy`로 legacy 대상 조정; Orchestrator는 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`이어야 publish 가능)
-  - canonical explicit child-cell split은 `cargo xt split-activation --operation-id split-nested --world 0 --cx -2 --cy 3 --depth 2 --target-cell 0,-4,6,3,0=worker-b --target-cell 0,-3,6,3,0=worker-b --target-cell 0,-4,7,3,0=worker-c --target-cell 0,-3,7,3,0=worker-c`처럼 `--target-cell world,cx,cy,depth,sub=worker-id` 네 개를 넘긴다.
-- Manual merge activation planning helper:
-  - `cargo xt merge-activation-plan --preview-addr 127.0.0.1:6100 --orch-addr 127.0.0.1:6000` (`GET /split-merge/preview`의 merge dry-run plan과 Orchestrator health/listing을 읽고, parent가 미발행이고 four sibling이 단일 registered owner를 공유하는지 mutation 없이 검증해 `.dev/reports/merge-activation-plan-latest.json`에 기록)
-  - `cargo xt merge-activation --operation-id merge-001 --owner-worker-id worker-a` (`--orch-addr`, `--world`, `--cx`, `--cy`, `--depth`로 대상 조정; Orchestrator는 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`이어야 publish 가능하며 same-Worker family는 refresh coalescing으로, mixed-owner family는 remote child replay 후 parent publish로 처리. `--depth > 0` parent는 canonical child family merge에 사용)
-- Policy-gated planner activation helper:
-  - `cargo xt planner-activation --kind split --live-worker-metrics worker-a=127.0.0.1:5100 --live-worker-metrics worker-b=127.0.0.1:5101 --live-min-pressure-signals 1 --orch-addr 127.0.0.1:6000` (Worker `/metrics`를 source로 split planner candidate를 선택하되 기본값은 `blocked_by_policy`이며 assignment mutation을 하지 않음; live metrics source는 현재 `--kind split`에서만 지원)
-  - `cargo xt planner-activation --kind split --live-worker-metrics worker-a=127.0.0.1:5100 --live-worker-metrics worker-b=127.0.0.1:5101 --live-min-pressure-signals 1 --allow-mutation --policy-id operator_approved_planner_mutation_v1 --orch-addr 127.0.0.1:6000` (명시 policy gate가 충족된 경우에만 live metrics selected split plan을 `SubmitSplitActivation`으로 제출하고 `.dev/reports/planner-activation-latest.json`에 `activation_mutated=true`와 `live_worker_metrics:` source evidence를 남김)
-  - `cargo xt planner-activation --kind merge --preview-addr 127.0.0.1:6100 --orch-addr 127.0.0.1:6000` (planner-selected ready plan을 report로 남기되 기본값은 `blocked_by_policy`이며 assignment mutation을 하지 않음)
-  - `cargo xt planner-activation --kind merge --allow-mutation --policy-id operator_approved_planner_mutation_v1 --preview-addr 127.0.0.1:6100 --orch-addr 127.0.0.1:6000` (명시 policy gate가 충족된 경우에만 selected split/merge plan을 `Submit*Activation`으로 제출하고 `.dev/reports/planner-activation-latest.json`에 `activation_mutated=true` evidence를 남김)
-- Internal MicroK8s activation smoke:
-  - `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --require-target-worker` (service port-forward를 열어 read-only plan을 만들고, target Worker deployment/image까지 mutation 전에 확인하며 `.dev/reports/internal-microk8s-activation-smoke-latest.json`에 plan/block evidence를 기록)
-  - `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --require-target-worker --use-live-worker-metrics --live-min-pressure-signals 1` (source/target Worker service `/metrics`를 port-forward하고 preview fixture 대신 live per-cell metrics로 read-only operator plan을 만든다. 새 image rollout 전에는 현재 live image가 해당 metric을 노출하지 않을 수 있으므로 `<new-tag>` evidence gate에서 사용)
-  - `cargo xt k8s activation-report-check --report .dev/reports/internal-microk8s-activation-smoke-latest.json --require-live-metrics-plan` (internal report의 plan source가 `live_worker_metrics:`이고 mutation-free ready target map을 포함하는지 검증)
-  - `cargo xt k8s activation-report-check --report .dev/reports/internal-microk8s-readiness-negative.json --expect-preflight-error tessera-worker-b` (blocked readiness report의 structured `preflight_errors[]`가 기대한 target Worker 누락을 담는지 검증)
-  - `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --require-target-worker --require-assignment-state-storage --out .dev/reports/internal-microk8s-restart-readiness-negative.json` (P6 restart rollout 전 read-only preflight로 two-Worker topology와 live Orchestrator Deployment의 PVC-backed assignment state storage 준비 여부를 확인)
-  - `cargo xt k8s activation-report-check --report .dev/reports/internal-microk8s-restart-readiness-negative.json --expect-preflight-error TESSERA_ORCH_ASSIGNMENT_STATE_PATH` (현재 live rollout이 아직 restart storage를 갖지 않는 기대 상태를 report로 검증)
-  - `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2 --allow-activation --with-failure --allow-scale` (승인된 two-Worker controlled-smoke topology와 preview fixture/metrics candidate에서 image tag, split publish, Gateway convergence, target Worker scale-down failure detection, scale-up recovery를 검증하고 `.dev/reports/internal-microk8s-activation-smoke-latest.json` 증거를 남김)
-  - `cargo xt k8s activation-report-check --require-published --require-failure --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.2` (internal smoke report가 ArgoCD Synced/Healthy, clean preflight, ready plan, image freshness, all-child success/recovery, target Worker plan map과 일치하는 failure evidence를 실제로 충족하는지 검증)
-  - P6 restart gate 초안: `cargo xt k8s activation-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-activation --with-restart --allow-rollout-restart` (승인된 image/GitOps rollout 뒤, live Orchestrator Deployment에 `TESSERA_ORCH_ASSIGNMENT_STATE_PATH=/var/lib/tessera/assignment-state.json`와 PVC `tessera-orch-state`가 설정됐는지 preflight로 확인하고, split publish 후 Orchestrator rollout restart, Worker 재등록, Gateway route convergence, child traffic, AOI resync를 검증)
-  - P6 restart verifier: `cargo xt k8s activation-report-check --require-published --require-restart --expected-image <new-tag>` 또는 full gate의 경우 `--require-failure --require-restart`를 함께 사용한다.
-  - Internal merge helper: `cargo xt k8s merge-activation-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag>` (기본값은 Orchestrator service port-forward로 merge operator plan을 만들고 ArgoCD/app image/owner Worker deployment preflight와 ready-plan evidence를 `.dev/reports/internal-microk8s-merge-activation-smoke-latest.json`에 기록한 뒤 mutation 전에 중단한다. 승인된 smoke window에서는 `--allow-activation --with-failure --allow-scale --with-restart --allow-rollout-restart --with-soak` 조합으로 merge publish/failure/restart/load-soak evidence를 같은 report schema에 기록한다)
-  - Internal merge verifier: `cargo xt k8s merge-activation-report-check --require-ready-plan --expected-image <new-tag>` (read-only internal merge report가 mutation 없이 ready plan과 owner Worker/submission evidence를 포함하는지 검증한다. 승인된 publish report가 생기면 `--require-published --require-failure --require-restart --require-soak`로 merge publish/failure/restart/load-soak evidence까지 검증한다)
-  - Internal multi-depth helper: `cargo xt k8s multi-depth-activation-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag>` (canonical parent `world=0,cx=-2,cy=3,depth=2,sub=0`와 explicit child target map을 live Orchestrator listing에 대해 검증하고 `.dev/reports/internal-microk8s-multi-depth-activation-smoke-latest.json`에 read-only plan/block evidence를 남긴다. 승인된 smoke window에서는 `--allow-activation --with-failure --allow-scale --with-restart --allow-rollout-restart --with-soak` 조합으로 canonical multi-depth publish/failure/restart/load-soak evidence를 같은 report schema에 기록한다)
-  - Internal multi-depth verifier: `cargo xt k8s multi-depth-activation-report-check --require-ready-plan --expected-image <new-tag>` (read-only internal canonical multi-depth report가 mutation 없이 ready parent/child target map과 `--target-cell` submission evidence를 포함하는지 검증한다. 승인된 publish report가 생기면 `--require-published --require-failure --require-restart --require-soak`로 canonical multi-depth publish/failure/restart/load-soak evidence까지 검증한다)
-  - Internal P7 operation helper: `cargo xt k8s operation-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag>` (P7 `/operations/proposals`를 port-forward로 실행해 durable merge operation record가 생기는지 read-only로 확인하고 `.dev/reports/internal-microk8s-p7-operation-smoke-latest.json`에 ArgoCD/image/ledger evidence를 남긴다. 승인된 smoke window에서는 `--allow-execution --with-soak`으로 approval → execution → Gateway parent route convergence → Worker parent refresh → traffic/counter evidence → observation completion을 기록하고, 별도 failure window에서는 `--allow-execution --with-failure --allow-scale`로 owner Worker scale-down failure, `recovery_required` observation, scale-up recovery를 기록한다. 별도 restart window에서는 `--allow-execution --with-restart --allow-rollout-restart --expected-assignment-state-path <path>`로 PVC-backed assignment state를 preflight하고 Orchestrator rollout restart 뒤 parent route/traffic 및 completed observation을 같은 schema에 기록한다. canonical multi-depth operation gate는 smoke window에서 `--operation-kind multi-depth-split --allow-execution --with-soak`을 사용해 `.dev/reports/internal-microk8s-p7-multi-depth-operation-smoke-latest.json`에 child-route soak/observation evidence를 남긴다)
-  - Internal P7 operation verifier: `cargo xt k8s operation-report-check --require-published-execution --require-completed-observation --require-soak --expected-image <new-tag>`, failure gate의 `cargo xt k8s operation-report-check --require-published-execution --require-recovery-required --expected-image <new-tag>`, restart gate의 `cargo xt k8s operation-report-check --require-published-execution --require-restart --expected-image <new-tag>`, 또는 multi-depth gate의 `cargo xt k8s operation-report-check --report .dev/reports/internal-microk8s-p7-multi-depth-operation-smoke-latest.json --require-published-execution --require-completed-observation --require-soak --expected-image <new-tag>` (internal P7 operation report가 approved execution, completed observation/soak, recovery-required owner-outage evidence, restart recovery, 또는 canonical multi-depth child-route soak evidence와 operation ledger transition을 실제로 담는지 검증한다)
-  - Internal P8 cadence helper: `cargo xt k8s p8-cadence-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-execution` (P8 smoke-window env가 GitOps로 켜진 상태에서 live Worker metrics 기반 preview snapshot을 Orchestrator PVC에 쓰고, policy-approved bounded split cadence를 한 번 publish한 뒤 repeat execution idempotency, child-route soak, completed observation, ledger summary를 internal P8 schema로 기록한다)
-  - Internal P8 cleanup verifier: `cargo xt k8s p8-cadence-cleanup-check --context microk8s-ts --namespace tessera --expected-image <new-tag>` (GitOps cleanup revision 뒤 manual execution/activation과 preview fixture env가 default-off로 돌아왔는지 확인하고 `.dev/reports/internal-microk8s-p8-cadence-smoke-latest.json`을 completion-audit용 final report로 갱신한다)
-  - Internal planner mutation report: `cargo xt k8s planner-activation-report --context microk8s-ts --namespace tessera --expected-image <new-tag> --blocked-report .dev/reports/planner-activation-blocked-latest.json --published-report .dev/reports/planner-activation-latest.json` (local planner mutation reports를 read-only ArgoCD/runtime deployment image preflight와 묶어 `.dev/reports/internal-microk8s-planner-activation-latest.json`을 작성한다. cluster preflight가 깨지면 incomplete report로 남는다)
-  - Internal planner mutation verifier: `cargo xt k8s planner-activation-report-check --expected-image <new-tag>` (internal planner mutation report가 default-off blocked report와 policy-approved published report를 모두 담고, ArgoCD/image evidence와 no automatic mutation check를 충족하는지 검증한다. live Worker metrics source까지 요구할 때는 `--require-live-metrics-plan`을 함께 사용한다)
-  - P6 rollout report: `cargo xt p6-rollout-report --context microk8s-ts --namespace tessera --image <new-tag> --rollout-revision <git-sha> --cleanup-revision <git-sha> --image-published --gitops-rollout-approved --post-smoke-default-off-cleanup --manual-activation-default-off --preview-fixture-removed` (read-only로 ArgoCD 상태와 runtime deployment image를 수집하고 `.dev/reports/p6-gitops-rollout-latest.json`을 쓴다. 승인/cleanup flag를 모두 주기 전에는 incomplete report로 남는다)
-  - P6 rollout verifier: `cargo xt p6-rollout-report-check --expected-image <new-tag>` (`.dev/reports/p6-gitops-rollout-latest.json`이 P6 image publish, 승인된 GitOps rollout, runtime deployment image 일치, ArgoCD `Synced / Healthy`, post-smoke default-off cleanup을 모두 기록하는지 검증한다)
-  - P6+ completion audit: `cargo xt p6-completion-audit --json` (P5 split baseline과 internal planner mutation policy report는 통과시키고, P6 internal restart/live-metrics/GitOps rollout/merge/multi-depth evidence가 모두 갖춰지기 전에는 nonzero로 남은 gate를 출력한다. GitOps rollout과 planner mutation gate는 각각 전용 report schema까지 검증한다)
-  - P7 completion audit: `cargo xt p7-completion-audit --json` (local default-off/execution/observation/recovery/restart/soak reports, P7 image GitOps rollout/default-off cleanup report, internal operation execution/soak, failure/recovery, and restart reports를 집계해 현재 operation-loop gate가 모두 실제 artifact로 닫혔는지 확인한다)
-  - 2026-05-02 완료 evidence: GitHub Actions가 `v2026.05.2` image를 publish했고, k8s GitOps controlled smoke revision에서 internal split publish/failure/recovery report verifier가 통과했다. 이후 별도 GitOps cleanup revision으로 manual activation flag와 preview fixture를 제거해 post-smoke 상태를 default-off로 되돌렸다.
-- Packaging 예시:
-  - 컨테이너 이미지: `docker build -t tessera:local .`
-  - Compose smoke: `docker compose -f deploy/docker-compose.yml up --build`
-  - Kubernetes sample: `deploy/kubernetes/tessera-sample.yaml`
-  - 상세: `docs/packaging.md`
-- 환경변수(옵션):
-  - `TESSERA_GW_ADDR` 기본 `127.0.0.1:4000`
-  - `TESSERA_GW_REFRESH_SECS` 기본 `5`초(Orchestrator 라우팅 스냅샷 재조회 주기)
-  - `TESSERA_GW_METRICS_ADDR` 기본 unset (설정 시 Gateway가 `GET /metrics` Prometheus text endpoint와 `GET /ready` readiness endpoint를 함께 노출, 예: `127.0.0.1:4100`)
-  - `TESSERA_WORKER_ADDR` 기본 `127.0.0.1:5001`
-  - `TESSERA_WORKER_ADVERTISE_ADDR` 기본 `TESSERA_WORKER_ADDR` (오케스트레이터에 등록할 워커 주소, `TESSERA_WORKER_ADDR`가 `0.0.0.0`/`::`인 경우 반드시 지정)
-  - `TESSERA_WORKER_ID` 기본 `worker-local`
-  - `TESSERA_WORKER_REFRESH_SECS` 기본 `5`초(Orchestrator 연결 실패 시 워커가 할당 재등록을 재시도하는 주기)
-  - `TESSERA_WORKER_METRICS_ADDR` 기본 unset (설정 시 Worker가 `GET /metrics` Prometheus text endpoint를 함께 노출, 예: `127.0.0.1:5100`)
-  - `TESSERA_WORKER_AOI_RADIUS_CELLS` 기본 `1` (현재 셀 기준 AOI ghost로 구독할 인접 셀 반경, `1`이면 3x3)
-  - `TESSERA_WORKER_AOI_CELL_SPAN_UNITS` 기본 `32` (경계 기반 AOI에서 사용할 셀 로컬 좌표 범위)
-  - `TESSERA_WORKER_AOI_EDGE_MARGIN_UNITS` 기본 unset (visibility radius가 unset일 때, root actor가 셀 경계에 가까울 때만 해당 방향 ghost 셀을 구독)
-  - `TESSERA_WORKER_AOI_VISIBILITY_RADIUS_UNITS` 기본 unset (설정 시 actor 위치에서 후보 셀 사각형까지의 거리 기반으로 ghost 셀을 구독)
-  - `TESSERA_WORKER_AOI_MAX_CELLS` 기본 `64` (actor별 AOI 후보 셀 cap, 가까운 셀 우선)
-  - `TESSERA_WORKER_HANDOVER_MOVE_BUFFER_CAPACITY` 기본 `128` (handover `Freeze`/`Diff` 중 source worker가 cell별로 보관할 client move 최대 개수)
-  - `TESSERA_WORKER_HANDOVER_MOVE_BUFFER_TTL_MS` 기본 `2000` (buffered move가 replay를 기다릴 수 있는 최대 시간)
-  - `TESSERA_ORCH_ADDR` 기본 `127.0.0.1:6000`
-  - `TESSERA_ORCH_METRICS_ADDR` 기본 unset (설정 시 Orchestrator가 `GET /metrics` Prometheus text endpoint를 함께 노출, 예: `127.0.0.1:6100`)
-  - `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON` 기본 unset (`GET /split-merge/preview` dry-run 입력 snapshot JSON, unset이면 현재 assignment를 zero-metric snapshot으로 preview)
-  - `TESSERA_ORCH_SPLIT_MERGE_PREVIEW_PATH` 기본 unset (`TESSERA_ORCH_SPLIT_MERGE_PREVIEW_JSON`이 unset일 때 dry-run 입력 snapshot 파일 경로)
-  - `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION` 기본 unset/disabled (`manual`로 설정한 경우에만 `SubmitSplitActivation`/`SubmitMergeActivation` gRPC가 replay/publish activation을 수행)
-  - `TESSERA_ORCH_ASSIGNMENT_STATE_PATH` 기본 unset/disabled (설정 시 Orchestrator가 handover/split publish 후 assignment map을 JSON으로 atomic write하고 재시작 시 config 초기 assignment 대신 저장된 assignment state를 로드)
-  - `TESSERA_ORCH_OPERATION_LEDGER_PATH` 기본 unset/disabled (설정 시 P7 operation ledger JSON을 초기화/로드하고 Orchestrator metrics HTTP endpoint의 `GET /operations` read-only snapshot, `POST /operations/proposals` planner proposal writer, `POST /operations/approvals?...` approval writer, `POST /operations/executions?...` default-off/manual execution writer, `POST /operations/observations?...` observation writer를 노출)
-  - `TESSERA_ORCH_OPERATION_COOLDOWN_ACTIVE_KEYS` 기본 unset (comma-separated cooldown key 목록, operation execution preflight에서 matching approval `cooldown_key`를 mutation 없이 block)
-  - `TESSERA_ORCH_OPERATION_BUDGET_LIMITS` 기본 unset (comma-separated `budget-key=limit` 목록, 같은 approval `budget_key`의 다른 non-failed records가 limit 이상이면 execution preflight를 mutation 없이 block)
-  - `TESSERA_ORCH_OPERATION_MAX_IN_FLIGHT_PER_BUDGET_KEY` 기본 unset (설정 시 같은 approval `budget_key`의 다른 executing/observing operation count가 limit 이상이면 execution preflight를 mutation 없이 block)
-  - `RUST_LOG` 기본 `info`
-- 게이트웨이는 Orchestrator 라우팅 스냅샷이 실패할 경우 `TESSERA_WORKER_ADVERTISE_ADDR`(설정 시) 또는 `TESSERA_WORKER_ADDR` 단일 워커로 폴백
-- 오케스트레이터 실행: `cargo run -p tessera-orch` (기본 `TESSERA_ORCH_ADDR=127.0.0.1:6000`)
-- 오케스트레이터 설정: 기본값은 `worker-local → CellId::grid(0, 0, 0)`이며, `TESSERA_ORCH_CONFIG`(파일 경로) 또는 `TESSERA_ORCH_CONFIG_JSON`(직접 JSON)으로 커스텀 매핑 가능
-- 설정 예시:
-```json
-{
-  "workers": [
-    {
-      "id": "worker-a",
-      "addr": "127.0.0.1:5001",
-      "cells": [
-        {"world": 0, "cx": 0, "cy": 0},
-        {"world": 0, "cx": 1, "cy": 0, "depth": 1, "sub": 0}
-      ]
-    }
-  ]
-}
+
+Start the local Worker + Gateway + Orchestrator stack:
+
+```sh
+cargo xt dev up --with-orch
+cargo run -p tessera-client -- ping --ts 123
+cargo xt dev down --with-orch
 ```
 
-## Test Client
-- Ping: `cargo run -p tessera-client -- ping --ts 123`
-- Join: `cargo run -p tessera-client -- join --actor 1 --x 0 --y 0`
-- Move: `cargo run -p tessera-client -- move --actor 1 --dx 1 --dy 0.5`
-- REPL: `cargo run -p tessera-client -- repl --actor 1` (history, `help` 명령 지원)
-- 스크립트: `cargo run -p tessera-client -- script ./script.txt --actor 1`
+Useful variants:
+
+- Logs: `cargo xt dev logs --target all --follow`
+- Gateway only smoke: `cargo xt dev up`, client ping, then `cargo xt dev down`
+- Metrics smoke: `cargo xt dev metrics-smoke`
+- Current P9 local audit lane:
+  - `cargo xt dev p9-recommend-loop-soak`
+  - `cargo xt dev p9-replay-audit`
+  - `cargo xt dev p9-policy-regression-smoke`
+  - `cargo xt p9-completion-audit --json`
+
+The longer smoke command catalog, internal MicroK8s commands, and historical
+P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
 
 ## Status Snapshot
 
-### ✅ Implemented (V0 scope)
-- Core 타입/프레이밍 및 Envelope 래핑(`CellId`, `ClientMsg/ServerMsg`, length-prefixed JSON)
-- Gateway↔Worker TCP 프록시 파이프라인 (Join/Move/Ping 처리)
-- Gateway: Orchestrator `WatchAssignments` 스트림으로 셀→워커 라우팅 즉시 반영(실패 시 단일 워커 폴백) + `ListAssignments` 주기 재조회(`TESSERA_GW_REFRESH_SECS`)
-- Worker: 부팅 시 `RegisterWorker`로 셀 소유권 스냅샷 취득 후 해당 셀만 처리, 셀별 이동 브로드캐스트를 actor별 최신 상태로 per-cell tick flush batch에서 처리하며 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하고 assignment refresh 및 root actor 이동 시 기존 연결의 AOI 구독도 재동기화한다. AOI는 cell radius, edge margin, visibility radius, max-cell cap으로 제한할 수 있으며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 `Subscribe/Unsubscribe/Snapshot/Delta/Despawn` ghost relay를 실제 TCP로 중계하며 peer-shared 세션/집계 구독과 remote actor cache로 fanout을 재사용하고 opt-in `/metrics`로 relay fanout/backpressure/reconnect 카운터를 노출
-- Orchestrator/Gateway: Orchestrator는 `RegisterWorker`/`GetAssignments`/`ListAssignments`/`WatchAssignments`와 `GetHealth`/`GetMetrics`/`SubmitHandoverCommand`/`SubmitSplitActivation`/`SubmitMergeActivation` gRPC 엔드포인트를 제공한다. `SubmitSplitActivation`은 default-off manual flag 뒤에서 split-only target map/depth/registration validation, target Worker split replay prepare, source Worker parent snapshot/buffered move partition replay, 모든 child replay 성공 후 parent removal + child assignment atomic publish를 수행하며, replay/prepare 실패 시 parent assignment를 유지하고 staged target payload를 abort한다.
-- `SubmitMergeActivation`은 같은 manual flag 뒤에서 parent가 미발행이고 네 depth-1 sibling이 registered Worker에 완전히 소유된 경우만 실행한다. same-Worker family는 parent assignment publish 후 Worker assignment refresh가 child actor/owner/root/pending state를 parent로 coalesce하고 child subscriptions를 정리한다. mixed-owner family는 owner Worker parent를 source-specific replay operation으로 pre-stage하고 remote child Worker가 actor/owner state를 parent로 replay한 뒤 parent assignment를 publish한다.
-- `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`가 설정되면 split/merge/handover assignment publish는 JSON state 파일에 먼저 atomic persist되고, persist 실패 시 publish 전 assignment map으로 되돌린다. 재시작한 Orchestrator는 저장된 assignment state를 config 초기 assignment 대신 로드하고, Worker 재등록이 복구된 assignment snapshot을 받는다. `cargo xt split-activation-plan`/`cargo xt merge-activation-plan`은 `GET /split-merge/preview` dry-run 결과와 Orchestrator health/listing을 읽어 activation mutation 없이 operator review용 target map/precondition/submit command 또는 merge precondition evidence를 기록하고, `cargo xt planner-activation`은 같은 plan을 policy gate가 충족될 때만 제출한다. `cargo xt dev activation-smoke`는 Gateway route convergence, source/target Worker child ownership refresh, stable Gateway session의 post-split Move, remote child AOI resync snapshot을 검증한다. `cargo xt dev planner-mutation-smoke`는 policy 없는 planner mutation이 blocked/no-op인지와 승인된 policy id에서만 publish되는지를 검증한다. `cargo xt dev merge-activation-smoke`는 same-Worker merge publish, Worker coalescing, Gateway parent route convergence, stable-session parent Move를 검증하고, canonical merge smoke/report-check 계열은 canonical `depth>0/sub=0` same-Worker merge의 success/failure/restart/soak을 같은 end-to-end path로 검증하며, `cargo xt dev merge-activation-cross-worker-smoke`는 mixed-owner child replay와 local/remote stable-session parent Move를 검증한다. `cargo xt dev merge-activation-failure-smoke`는 post-publish owner Worker outage 감지, no automatic rollback, owner Worker 재기동 후 parent route/fresh Ping recovery를 검증한다. `cargo xt dev merge-activation-restart-smoke`는 persisted parent assignment가 Orchestrator restart 뒤에도 복구되어 Gateway parent route와 parent traffic이 유지되는지 검증한다. `cargo xt dev activation-failure-smoke`는 post-publish target Worker outage 감지와 target Worker 재기동 복구를 검증한다. `cargo xt dev activation-restart-smoke`는 published split assignment state가 Orchestrator restart 뒤에도 복구되어 Worker assignment refresh, Gateway route convergence, child traffic, AOI resync가 다시 수렴하는지 검증한다. `cargo xt dev activation-soak`은 split publish 후 반복 child Ping/Move traffic, route convergence 유지, remote AOI frame 관측, Gateway latency histogram/close counter를 로컬 evidence로 기록한다. `cargo xt dev multi-depth-activation-soak`은 canonical explicit child-cell split publish 후 exact child traffic, route convergence 유지, remote AOI frame 관측, Gateway latency histogram/close counter를 로컬 evidence로 기록한다. `cargo xt k8s activation-smoke`는 승인된 internal two-Worker topology에서 split operator flow를 port-forward로 실행하고, 명시 flag 없이는 mutation 전 plan-only로 중단한다. P5 split activation의 rollback policy는 `operator_recovery_no_automatic_merge_rollback_v1`로 고정되어 automatic merge rollback은 하지 않고 target Worker 복구와 GitOps smoke slice backout을 운영자 절차로 검증한다. Orchestrator/Gateway 모두 opt-in Prometheus `/metrics` exporter를 제공하며 Orchestrator는 assignment 변경 없는 `GET /split-merge/preview` dry-run endpoint를 제공한다. Gateway는 route availability 기반 `/ready`, reconnect/close-reason counters, Ping/Pong round-trip latency histogram, request-id로 매칭된 Join/Move round-trip latency histogram을 노출
-- Handover runtime baseline: `PreCopy → Freeze → Diff → Commit`/`Abort` control-plane 상태머신과 validation을 제공하고, Orchestrator `ListAssignments`/`WatchAssignments`가 active handover status를 내려주며, source Worker는 `Freeze`/`Diff` 중 bounded buffer에 client move를 보관한다. `Abort`처럼 source가 계속 cell을 소유하면 buffered move를 FIFO로 로컬 replay하고, `Commit`은 target Worker 등록과 bounded retry budget을 확인한 뒤 assignment를 target으로 전환한다. source Worker는 commit release 시 actor snapshot, actor별 owner session manifest, buffered move를 target Worker에 `HandoverReplay` relay payload로 넘기며, target은 replay를 idempotent하게 적용하고 owner map을 즉시 구성한다.
-- 테스트 클라이언트(REPL/스크립트), `cargo xt` dev 툴킷
+### Implemented
 
-### 🚧 Planned / Upcoming
-- Worker 간 ghost relay와 request latency의 장기 scrape/tracing assertions
-- Container/Kubernetes packaging sample은 `docs/packaging.md`와 `deploy/`에 예시로 제공되며, 첫 internal-only production GitOps manifest slice는 k8s GitOps repo에서 ArgoCD sync와 runtime smoke까지 검증됐다.
-- GitHub Actions image publish workflow는 build/push only로 `v2026.05.8` Harbor image까지 발행했고, k8s GitOps repo에서 해당 tag로 promotion되어 ArgoCD `Synced / Healthy`, deployment image match, Gateway Ping smoke, P7 operation ledger persistence/proposal endpoint, approved merge success/failure/restart windows, canonical multi-depth child-route soak/observation smoke, P8 controlled cadence smoke, P9 internal recommend soak, P9 controlled operation restart spot-check, and post-smoke default-off cleanup까지 확인했다. P6 controlled smoke coverage는 `v2026.05.3`에서 internal split/merge/multi-depth activation success/failure/restart/soak smoke까지 통과했다.
-- P6+ durable/manual/default-off split, merge, and canonical multi-depth control plane은 `v2026.05.3` internal MicroK8s rollout까지 검증됐다. `cargo xt p6-completion-audit --json`는 현재 `.dev/reports` 기준 `complete=true`를 반환해야 하며, split restart/live-metrics, merge, multi-depth, GitOps rollout, post-smoke default-off cleanup evidence를 포함한다.
-- P7 operation loop는 `v2026.05.6` evidence set에서 완료됐다. 현재 local/dev evidence는 default-off split/merge/multi-depth operation loop, approved same-Worker merge execution, approved legacy split execution success/idempotency, approved canonical multi-depth split execution success/idempotency, approved canonical multi-depth observation/recovery/restart/soak, approved legacy split observation/recovery/restart/soak, merge observation/recovery/restart/soak까지다. Internal evidence는 operation ledger persistence/default-off rollout, approved merge execution/observation/soak, owner Worker failure/recovery, Orchestrator restart recovery, canonical multi-depth operation execution/observation/child-route soak, and post-smoke cleanup revisions에서 mutating flags와 preview fixture를 제거한 뒤 ArgoCD `Synced / Healthy`, Gateway parent Ping, completed/recovery-required/restart-completed operation ledger persistence를 확인했다. `cargo xt p7-completion-audit --json`은 현재 `.dev/reports` 기준 `complete=true`를 반환한다. 상세 목표와 prompt-to-artifact checklist는 `docs/p7-operation-loop.md`에 둔다.
-- P8 closed-loop operation cadence는 `v2026.05.7` evidence set에서 완료됐다. Local/dev evidence는 read-only cadence, split/merge/canonical multi-depth candidate coverage, proposal idempotency, approval/default-off preflight, cooldown/budget/concurrency gates, bounded execution, failure/recovery, Orchestrator restart recovery, and child-route soak까지 닫았고, internal evidence는 GitOps rollout/default-off report와 controlled cadence smoke/cleanup report까지 포함한다. `cargo xt p8-completion-audit --json`은 현재 `.dev/reports` 기준 `complete=true`를 반환한다. 목표와 완료 조건은 `docs/p8-closed-loop-operation-cadence.md`에 둔다.
-- P9 operation control-plane readiness는 `v2026.05.8` evidence set에서 완료됐다. Local/dev evidence는 durable recommend-only history, replay audit, policy regression을 포함하고, internal evidence는 P9 GitOps rollout/default-off report, live MicroK8s recommend soak, controlled P7 operation restart spot-check, cleanup revision, and Gateway Ping smoke까지 닫았다. `cargo xt p9-completion-audit --json`은 현재 `.dev/reports` 기준 `complete=true`를 반환한다. 목표와 완료 조건은 `docs/p9-operation-control-plane-readiness.md`에 둔다.
-- P0/P1/P2/P3/P4.1/P4.2 완료 기록은 `docs/completed-milestones.md`에 둔다.
-- 현재 milestone decision gate와 rollout follow-up은 `docs/todo-next.md`, `docs/p9-operation-control-plane-readiness.md`, `docs/p8-closed-loop-operation-cadence.md`, `docs/p7-operation-loop.md`, `docs/p6-completion-audit.md`, `docs/todo-p4-next-milestones.md`에 둔다.
-- P5 completion audit와 prompt-to-artifact checklist는 `docs/p5-completion-audit.md`에 둔다. P6+ completion audit는 `docs/p6-completion-audit.md`에 둔다.
+- Core envelope/framing and `CellId{world,cx,cy,depth,sub}` model.
+- Gateway to Worker TCP pipeline for Join/Move/Ping.
+- Gateway routing from Orchestrator `WatchAssignments` plus periodic
+  `ListAssignments` refresh.
+- Worker-owned cell processing, per-cell tick flush, same-worker AOI ghosting,
+  remote worker ghost relay, remote actor cache, and opt-in metrics.
+- Handover control plane with `PreCopy -> Freeze -> Diff -> Commit/Abort`,
+  bounded move buffering, idempotent target replay, and assignment switching.
+- Manual/default-off split and merge activation with replay, validation,
+  all-or-nothing publish, failure/recovery evidence, restart recovery, and
+  local plus internal smoke coverage.
+- Durable assignment state, operation ledger, policy-gated execution,
+  observation/recovery records, cooldown/budget/concurrency gates, and
+  completion audits through P9.
+- Kubernetes/GitOps rollout evidence through image
+  `harbor.1day1coding.com/1day1coding/tessera:v2026.05.8`, with final live
+  state restored to default-off after controlled smoke windows.
+
+### Current Open Boundary
+
+P9 is closed. `docs/todo-next.md` is the active open-work index and currently
+records that the next design boundary has not been selected. The next milestone
+should be chosen from the current runtime constraints, not by continuing P9 by
+default.
+
+Likely next area: long-running runtime observability, data-plane/ghost relay
+hardening, and soak evidence for request latency and traceability.
 
 ## Protocol Snapshot
-- Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`, `payload: ClientMsg|ServerMsg`
-- Request correlation: Gateway는 Join/Move `ClientEnvelope`에 optional `request_id`를 부여하고, Worker는 direct reply에만 같은 `request_id`를 echo한다. Broadcast `Snapshot`/`Delta`/`Despawn`에는 request id를 붙이지 않아 Gateway가 unrelated AOI traffic을 request latency로 세지 않는다.
-- Client ingress envelope: Gateway는 client connection별 stable `session` id를 Worker로 주입해 route switch 뒤에도 actor ownership을 이어간다. 직접 Worker로 들어오는 legacy client frame은 session 없이도 계속 허용된다.
-- 멱등·역전 처리의 기반으로 `seq/epoch` 사용(현재 워커는 응답 `seq` 증가)
-- 클라 옵션: `--world --cx --cy --epoch`로 Envelope 기본값 설정
-- Handover control-plane: `SubmitHandoverCommand`는 `PreCopy`, `Freeze`, `Diff`, `Commit`, `Abort`를 순서 검증하고, `Commit`은 registered target Worker로 assignment를 전환하며, `ListAssignments`/`WatchAssignments`는 active handover status와 최신 assignment를 함께 전달한다. Commit 전 target 미등록은 bounded retry budget 안에서 `Diffing`을 유지하고, budget 소진 시 assignment transfer 전에 abort한다. Commit 후 Worker `HandoverReplay`는 actor snapshot, owner session manifest, buffered move를 target으로 넘긴다. 자세한 정책은 `docs/handover.md`에 둔다.
-- Split activation control-plane: `SubmitSplitActivation`은 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`에서만 split-only 명령을 실행한다. legacy CLI/smoke publish 경로는 `depth=0/sub=0` parent와 `sub=0..3` 전체 target map을 유지하고, source ownership/registration, configured/registered target Worker, no-op source-only target map, active handover, 이미 published 된 child overlap, 이미 staged 된 split family를 검증한다. P6 multi-depth 준비로 `SplitChildTarget.cell` explicit child-cell request shape와 complete legacy/canonical family validation이 추가됐고, canonical explicit-child request도 default-off/manual gRPC 경로에서 replay ack 후 assignment publish와 persisted Orchestrator restart recovery까지 unit coverage가 있다. Worker split replay batch, Gateway listing route update, Worker ownership refresh/AOI helper는 canonical child `CellId`를 exact key로 다룰 수 있다. `cargo xt dev multi-depth-activation-smoke`는 canonical explicit-child split의 local Gateway convergence, child traffic, stable-session post-split Move, remote AOI resync, metrics evidence를 검증하고 전용 report checker로 확인한다. 성공 경로는 target Worker에 child replay를 pre-stage하고 source Worker에 parent snapshot/buffered move partition replay를 요청한 뒤, 모든 child replay ack가 성공할 때만 parent assignment 제거와 child assignment publish를 한 번에 수행한다. 실패 경로는 `assignments_changed=false`로 parent assignment를 유지하고 prepared child payload를 abort한다.
-- Merge activation control-plane: `SubmitMergeActivation`도 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`에서만 실행한다. 요청은 `sub=0` parent와 `owner_worker_id`를 요구하고, parent 미발행, complete legacy shallow 또는 canonical child family ownership, owner/source Worker configured/registered, active handover/staged split overlap 부재를 검증한다. 같은 Worker가 네 sibling을 모두 소유한 경우는 parent assignment publish 후 Worker assignment refresh가 legacy/canonical child actors/owners/client roots/pending moves를 parent cell로 coalesce한다. mixed-owner family는 owner Worker parent를 source별 replay operation으로 pre-stage하고 remote child Worker가 actor/owner state를 parent로 replay한 뒤 parent assignment를 publish하며, target Worker는 자신이 소유했던 child subset을 staged parent로 coalesce한다. owner Worker restart 후 actor runtime state는 `volatile_worker_actor_state_rejoin_required_v1` 정책으로 durable recovery 범위에서 제외하고, parent route convergence와 client rejoin/reseed를 recovery contract로 기록한다. Planner-selected mutation은 `cargo xt planner-activation`의 `--allow-mutation --policy-id operator_approved_planner_mutation_v1` gate가 있을 때만 local helper가 제출한다.
-- P7 operation loop: `TESSERA_ORCH_OPERATION_LEDGER_PATH`가 설정되면 Orchestrator metrics endpoint가 `GET /operations`, `POST /operations/proposals`, `POST /operations/approvals`, `POST /operations/executions`, `POST /operations/observations`를 제공한다. Proposal/approval은 assignment mutation 없이 durable ledger에 기록되고, execution은 proposal hash, approval TTL, policy id, cooldown, budget, `TESSERA_ORCH_OPERATION_EXECUTION=manual`, 기존 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual` gate를 모두 통과해야 runtime mutation을 시도한다. Observation은 `execution_published` 이후 route convergence, Worker refresh, traffic, close-counter evidence를 durable ledger에 기록해 `completed` 또는 `recovery_required`로 닫는다. 현재 manual executor coverage는 approved same-Worker merge publish, approved legacy split publish, approved canonical multi-depth split publish, repeat idempotency, local full-stack split/merge/canonical multi-depth observation completion, split/canonical multi-depth target-outage recovery-required smoke, split/canonical multi-depth Orchestrator restart recovery, split/canonical multi-depth child-route soak, owner-outage recovery-required smoke, restart recovery, soak, internal MicroK8s approved merge execution/observation/soak, owner Worker failure/recovery, Orchestrator restart recovery, internal MicroK8s canonical multi-depth execution/observation/child-route soak, and completion audit까지다.
+
+- Envelope: `cell: CellId`, `seq: u64`, `epoch: u32`,
+  `payload: ClientMsg|ServerMsg`
+- Gateway injects stable client `session` ids and optional request ids for
+  Join/Move latency correlation.
+- Broadcast AOI traffic does not reuse request ids, so Gateway latency metrics
+  only count direct correlated responses.
+- Handover, split, merge, and operation-loop mutations are all default-off
+  unless the explicit manual/operator policy gates are present.
+- Operation ledger endpoints are exposed only when
+  `TESSERA_ORCH_OPERATION_LEDGER_PATH` is configured.
 
 ## Troubleshooting
-- 포트 점유: `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`를 변경하거나 점유 프로세스 종료
-- 로그 확인: `cargo xt dev logs --target all --follow`
-- Orchestrator metrics 확인: `TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch` 후 `curl http://127.0.0.1:6100/metrics`
-- Split/merge dry-run preview 확인: `curl http://127.0.0.1:6100/split-merge/preview`
-- P7 operation ledger 확인: `TESSERA_ORCH_OPERATION_LEDGER_PATH=.dev/operation-ledger.json TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch` 후 `curl http://127.0.0.1:6100/operations`
-- P7 planner proposal 기록: 같은 Orchestrator metrics endpoint에서 `curl -X POST http://127.0.0.1:6100/operations/proposals` 실행. 현재 split/merge preview source의 후보를 stable operation id/proposal hash로 ledger에 append하며 assignment mutation은 하지 않음
-- P7 approval 기록: `curl -X POST 'http://127.0.0.1:6100/operations/approvals?operation_id=<id>&policy_id=<policy>&approver=<operator>&expected_proposal_hash=<hash>&ttl_secs=600&cooldown_key=<key>&budget_key=<key>'` 실행. 기존 proposal hash와 맞는 경우에만 durable approval record를 쓰며 assignment mutation은 하지 않음
-- P7 execution 기록: `curl -X POST 'http://127.0.0.1:6100/operations/executions?operation_id=<id>&expected_proposal_hash=<hash>&policy_id=<policy>'` 실행. 기본값은 runtime mutation 없이 `blocked_by_policy` phase/status를 남긴다. Controlled local execution window에서는 `TESSERA_ORCH_OPERATION_EXECUTION=manual`과 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`을 함께 설정해야 하며, 현재 approved same-Worker merge operation과 legacy split operation의 publish/idempotency success path가 검증됐다.
-- P7 observation 기록: `curl -X POST 'http://127.0.0.1:6100/operations/observations?operation_id=<id>&expected_proposal_hash=<hash>&observer=<operator>&route_converged=true&worker_refreshed=true&traffic_confirmed=true&counters_clean=true'` 실행. 이미 `execution_published` 된 operation만 관측 결과를 받을 수 있고, 네 evidence flag가 모두 true이면 `completed`, 하나라도 false이면 `recovery_required`로 ledger에 기록한다.
-- P7 local closed-loop smoke: `cargo xt dev p7-operation-loop-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-loop-ledger-latest.json --require-approval --require-blocked-execution`
-- P7 approved execution smoke: `cargo xt dev p7-operation-execution-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-execution-ledger-latest.json --require-approval --require-published-execution`
-- P7 approved split execution smoke: `cargo xt dev p7-operation-split-execution-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-split-execution-ledger-latest.json --require-approval --require-published-execution`
-- P7 approved canonical multi-depth execution smoke: `cargo xt dev p7-operation-multi-depth-execution-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-multi-depth-execution-ledger-latest.json --require-approval --require-published-execution`
-- P7 approved canonical multi-depth observation smoke: `cargo xt dev p7-operation-multi-depth-observation-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-multi-depth-observation-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 canonical multi-depth recovery smoke: `cargo xt dev p7-operation-multi-depth-recovery-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-multi-depth-recovery-ledger-latest.json --require-approval --require-published-execution --require-recovery-required`
-- P7 canonical multi-depth restart smoke: `cargo xt dev p7-operation-multi-depth-restart-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-multi-depth-restart-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 canonical multi-depth soak smoke: `cargo xt dev p7-operation-multi-depth-soak-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-multi-depth-soak-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 approved split observation smoke: `cargo xt dev p7-operation-split-observation-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-split-observation-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 split recovery smoke: `cargo xt dev p7-operation-split-recovery-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-split-recovery-ledger-latest.json --require-approval --require-published-execution --require-recovery-required`
-- P7 split restart smoke: `cargo xt dev p7-operation-split-restart-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-split-restart-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 split soak smoke: `cargo xt dev p7-operation-split-soak-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-split-soak-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 approved observation smoke: `cargo xt dev p7-operation-observation-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-observation-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 recovery smoke: `cargo xt dev p7-operation-recovery-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-recovery-ledger-latest.json --require-approval --require-published-execution --require-recovery-required`
-- P7 restart smoke: `cargo xt dev p7-operation-restart-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-restart-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- P7 soak smoke: `cargo xt dev p7-operation-soak-smoke` 후 `cargo xt p7-operation-ledger-check --ledger .dev/reports/p7-operation-soak-ledger-latest.json --require-approval --require-published-execution --require-completed-observation`
-- Gateway metrics/readiness 확인: `TESSERA_GW_METRICS_ADDR=127.0.0.1:4100 cargo run -p tessera-gateway` 후 `curl http://127.0.0.1:4100/metrics`, `curl http://127.0.0.1:4100/ready`
-- Worker metrics 확인: `TESSERA_WORKER_METRICS_ADDR=127.0.0.1:5100 cargo run -p tessera-worker` 후 `curl http://127.0.0.1:5100/metrics`
-- clippy 경고: `cargo xt`는 `-D warnings`로 엄격 체크. 경고 메시지에 따라 수정
-- 게이트웨이 라우팅/업스트림 실패가 반복되면 클라이언트 연결을 종료하므로, 클라는 재접속이 필요할 수 있음
+
+- Port conflict: adjust `TESSERA_GW_ADDR`, `TESSERA_WORKER_ADDR`, or
+  `TESSERA_ORCH_ADDR`.
+- Logs: `cargo xt dev logs --target all --follow`
+- Gateway readiness/metrics:
+  `TESSERA_GW_METRICS_ADDR=127.0.0.1:4100 cargo run -p tessera-gateway`
+- Worker metrics:
+  `TESSERA_WORKER_METRICS_ADDR=127.0.0.1:5100 cargo run -p tessera-worker`
+- Orchestrator metrics and preview:
+  `TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch`
+- Detailed smoke and audit commands: `docs/smoke-runbook.md`
 
 ## Automation Harness
-- 에이전트 기본 루프: `README.md`와 `AGENTS.md`를 읽고, 기존 패턴을 따라 구현한 뒤, `cargo xt`, `cargo test`, 필요 시 로컬 스모크로 검증한다.
-- `docs/quality.md`는 자율 수행 계약, feedback loop, crate boundary policy의 repo-local 기준 문서다.
-- `cargo xt harness`는 README/AGENTS/docs/CI discoverability와 내부 크레이트 의존 방향을 검사한다.
-- `cargo xt p6-completion-audit`는 `.dev/reports`의 internal report JSON을 모아 P6+ 완료 여부를 기계적으로 판정한다. 현재 P6+ 완료 상태에서는 `complete=true`가 정상이다. Internal planner mutation evidence는 `cargo xt k8s planner-activation-report`/`planner-activation-report-check` schema를 사용한다.
-- `cargo xt p7-completion-audit --json`는 P7 operation-loop의 local/default-off/execution/observation/recovery/restart/soak evidence, P7 image GitOps rollout/default-off cleanup, internal execution/soak, failure/recovery, restart, and canonical multi-depth operation reports를 집계한다. 현재 `v2026.05.6` evidence set에서는 `complete=true`가 정상이다.
-- `cargo xt p8-completion-audit --json`는 P8 cadence의 local read-only/proposal/approval/gate/execution/recovery/restart/soak evidence, split/merge/canonical multi-depth candidate coverage, P8 GitOps rollout/default-off report, and internal controlled cadence smoke를 집계한다. 현재 `v2026.05.7` evidence set에서는 `complete=true`가 정상이다.
-- `cargo xt p9-completion-audit --json`는 P9 operation control-plane readiness의 local recommend-only soak, durable history replay audit, policy regression, P9 GitOps rollout/default-off report, internal recommend soak, and controlled mutation spot-check evidence를 집계한다. P9 진행 중에는 아직 닫히지 않은 gate가 `complete=false`와 JSON `findings[]`로 표시되며, controlled spot-check까지 끝난 뒤에만 `complete=true`가 정상이다.
-- `cargo xt p7-operation-ledger-check --ledger .dev/operation-ledger.json --require-approval --require-blocked-execution`은 P7 ledger가 proposal, durable approval, default-off blocked execution evidence를 포함하는지 검증한다. Approved runtime execution ledger는 `--require-published-execution`으로 검증한다. 이 검증은 observation/recovery/internal rollout evidence를 대체하지 않는다.
-- 현재 기계적 crate boundary: `tessera-core`/`tessera-proto`는 내부 Tessera crate에 의존하지 않고, `tessera-gateway`/`tessera-worker`/`tessera-orch`는 `tessera-core`와 `tessera-proto`만 공유 의존성으로 사용하며 서로 직접 의존하지 않는다.
-- `cargo xt dev metrics-smoke`는 opt-in metrics exporter를 켠 dev stack을 올린 뒤 Gateway/Worker/Orchestrator `/metrics` 응답의 핵심 metric family와 numeric sample, Gateway `/ready`, Orchestrator `/split-merge/preview`의 fixture-backed non-empty dry-run plan, 실제 Ping/Pong 후 `tessera_gateway_ping_roundtrip_seconds` histogram 증가, 그리고 Join/Move 후 `tessera_gateway_request_roundtrip_seconds{kind="join|move"}` histogram 증가를 확인한다.
-- `cargo xt split-activation-plan`은 preview dry-run output 또는 `--live-worker-metrics worker-id=addr`로 scrape한 Worker per-cell metrics와 Orchestrator health/listing을 읽어 operator review용 `.dev/reports/split-activation-plan-latest.json`을 만든다. 이 report는 `activation_mutated=false`, 선택된 split candidate, registered worker 상태, 권장 `sub=worker-id` target map, precondition, `cargo xt split-activation ...` command template을 포함한다. `cargo xt merge-activation-plan`은 preview merge candidate와 Orchestrator health/listing을 읽어 legacy shallow 또는 canonical sibling family의 parent 미발행, four sibling 단일 owner, registered owner 상태를 검증하고 `.dev/reports/merge-activation-plan-latest.json`에 evidence를 남긴다. `cargo xt planner-activation`은 selected plan을 기본 `blocked_by_policy` report로 남기고, `--allow-mutation --policy-id operator_approved_planner_mutation_v1`이 함께 있을 때만 `SubmitSplitActivation`/`SubmitMergeActivation`을 호출한다. split planner activation은 `--live-worker-metrics worker-id=addr`를 받아 preview fixture 없이 live Worker metrics source를 기록할 수 있다. `cargo xt split-activation`/`cargo xt merge-activation`은 operator가 explicit target map 또는 owner id로 `SubmitSplitActivation`/`SubmitMergeActivation`을 호출하는 수동 실행 helper다. canonical merge parent는 `cargo xt merge-activation --depth <n>`으로 제출한다. `cargo xt dev activation-plan-smoke`는 preview candidate가 mutation 없이 ready operator plan으로 변환되는지 확인하고, `cargo xt dev activation-live-plan-smoke`는 실제 Worker metrics가 mutation 없이 ready operator plan으로 변환되는지 확인한다. `cargo xt dev activation-live-metrics-smoke`는 실제 Worker metrics plan target map으로 manual `SubmitSplitActivation`을 호출한 뒤 Gateway route convergence, stable-session post-split Move, remote AOI resync를 검증한다. `cargo xt dev activation-live-planner-mutation-smoke`는 같은 live metrics source가 기본값에서는 planner mutation no-op으로 막히고, 명시 policy id에서만 `SubmitSplitActivation` publish/Gateway convergence까지 진행되는지 기록한다. `cargo xt dev merge-plan-smoke`는 merge candidate가 mutation 없이 ready operator plan으로 변환되는지 확인한다. `cargo xt dev planner-mutation-smoke`는 planner-selected merge가 policy 없이 no-op으로 막히고 승인된 policy id에서만 publish되는지 `.dev/reports/planner-activation-latest.json`에 기록한다. `cargo xt dev merge-activation-smoke`는 same-Worker merge plan을 manual `SubmitMergeActivation`으로 publish하고, Worker coalescing, Gateway parent route convergence, stable-session parent Move를 `.dev/reports/merge-activation-smoke-latest.json`에 기록한다. Canonical merge local smoke는 `cargo xt dev canonical-merge-activation-smoke`, `cargo xt dev canonical-merge-activation-failure-smoke`, `cargo xt dev canonical-merge-activation-restart-smoke`, `cargo xt dev canonical-merge-activation-soak`과 각 report checker로 success/failure/restart/load-soak을 `.dev/reports/canonical-merge-activation-*-latest.json`에 기록하고 검증한다. `cargo xt dev merge-activation-cross-worker-smoke`는 mixed-owner child replay와 local/remote stable-session parent Move를 `.dev/reports/merge-activation-cross-worker-smoke-latest.json`에 기록한다. `cargo xt dev merge-activation-failure-smoke`는 post-publish owner Worker outage 감지, no automatic rollback observation, owner Worker restart 후 parent route/fresh Ping recovery를 `.dev/reports/merge-activation-failure-smoke-latest.json`에 기록한다. `cargo xt dev merge-activation-restart-smoke`는 같은 merge publish를 persisted assignment state로 Orchestrator 재시작 뒤 복구하고 `.dev/reports/merge-activation-restart-smoke-latest.json`에 기록한다. `cargo xt dev activation-smoke`는 별도 포트의 two-Worker dev stack에서 `TESSERA_ORCH_SPLIT_MERGE_ACTIVATION=manual`을 켜고 같은 RPC를 호출한 뒤, Orchestrator listing의 4-child publish, Gateway `/ready` route count 4, 각 child Ping, stable Gateway session route switch, target Worker relay replay metric, remote child AOI resync snapshot을 확인하고 `.dev/reports/activation-smoke-latest.json`에 evidence summary를 쓴다. `cargo xt dev activation-failure-smoke`는 post-publish target Worker outage, failed child convergence, no automatic rollback, target Worker restart recovery를 `.dev/reports/activation-failure-smoke-latest.json`에 기록한다. `cargo xt dev activation-restart-smoke`는 `TESSERA_ORCH_ASSIGNMENT_STATE_PATH`를 켠 상태로 split publish를 수행한 뒤 Orchestrator를 manual activation disabled 상태로 재시작하고, persisted child listing, Worker 재등록/assignment refresh, Gateway route convergence, child traffic, AOI resync를 `.dev/reports/activation-restart-smoke-latest.json`에 기록한다. `cargo xt dev activation-report-check --merge-plan-report ... --merge-activation-report ... --merge-cross-worker-report ... --merge-failure-report ... --merge-restart-report ... --planner-mutation-report ... --require-planner-live-metrics`는 merge plan/smoke/cross-worker/failure/restart report shape, manual merge rollback policy, policy-gated planner mutation report, live metrics planner activation source를 검증한다. `cargo xt dev activation-soak`은 child별 반복 Ping/Move traffic, remote AOI frame 관측, Gateway route/latency/close counter를 `.dev/reports/activation-soak-latest.json`에 기록한다. `cargo xt dev multi-depth-activation-soak`은 canonical exact child별 반복 Ping/Move traffic, remote AOI frame 관측, Gateway route/latency/close counter를 `.dev/reports/multi-depth-activation-soak-latest.json`에 기록한다. `cargo xt k8s activation-smoke`는 internal MicroK8s service port-forward, plan-only guard, optional live Worker metrics plan source, optional split publish, optional target Worker scale-down/up recovery, optional Orchestrator rollout restart recovery check를 `.dev/reports/internal-microk8s-activation-smoke-latest.json`에 기록한다. `cargo xt k8s activation-report-check --require-live-metrics-plan`은 internal report가 live Worker metrics 기반 read-only plan을 포함하는지 검증한다.
-- `docs/packaging.md`와 `deploy/`는 Docker/Compose/Kubernetes packaging sample을 제공한다. 실제 클러스터용 manifest는 k8s GitOps repo에서 target convention에 맞춰 관리한다.
-- CI는 push/PR에서 `cargo xt`, `cargo test`, `cargo xt dev up --with-orch` + `cargo run -p tessera-client -- ping --ts 123` 스모크를 실행한다.
+
+- 자동화 에이전트는 `README.md`, `AGENTS.md`, and `docs/quality.md`를 우선
+  읽고, 기존 패턴에 맞춰 구현, 검증, 문서화, VCS 정리까지 진행한다.
+- `cargo xt harness` checks README/AGENTS/docs/CI discoverability and internal
+  crate dependency boundaries.
+- `cargo xt` runs fmt, clippy, check, and harness.
+- `cargo test` remains the broad Rust test gate.
+- CI runs `cargo xt`, `cargo test`, and the local dev ping smoke with
+  `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`,
+  and `cargo xt dev down --with-orch`.
 
 ## Design Overview
-- 문제: 단일 프로세스/샤드 구조는 심리스 월드에서 병목과 끊김을 만든다. 목표는 셀 단위 분할/이동/분해로 부하를 흡수하고, 클라는 단일 소켓을 유지한다.
-- Goals: V0 고정 그리드+정적 매핑(구현), V1 셀 리밸런싱·Handover, V1 AOI/ghost 최적화, V2 동적 분할(쿼드트리) 등.
-- Non-goals(초기): 완성형 게임 서버 기능, 완전 무중단 마이그레이션, 멀티리전 일관성.
-- 핵심 개념: `CellId{world,cx,cy,depth,sub}` 단일-writer, Gateway는 Orchestrator watch/스냅샷 기반 라우팅, Worker는 틱 루프에서 셀별 이동 브로드캐스트를 actor별 최신 상태로 flush하고 동일 worker가 소유한 인접 셀의 `Snapshot/Delta/Despawn`를 AOI ghost로 전달하며 assignment refresh와 root actor 이동 때 기존 세션의 AOI 구독을 다시 맞춘다. AOI는 셀 반경, edge margin, actor-to-cell-rect visibility radius, max-cell cap으로 제한하며, Orchestrator listing으로 remote peer route와 remote AOI interest를 추적하고 worker 간 ghost `Subscribe/Unsubscribe/Snapshot/Delta/Despawn`를 TCP relay로 주고받되 route별 shared 세션과 remote actor cache로 fanout을 재사용하며, Orchestrator는 `cell→worker` 레지스트리.
-- 데이터 흐름: Gateway 입력 → 대상 셀 워커 전달 → Worker 틱/델타 → 클라·인접 워커 전파 → 필요 시 Handover(`PreCopy→Freeze→Diff/Commit→라우팅 교체`).
-- 운영 메모: 틱 20–30Hz, 셀 크기는 AOI의 2–3배 권장, 위험요소는 게이트웨이 병목·Handover 순서·분할/병합 플래핑·AOI 폭주(`TESSERA_WORKER_AOI_MAX_CELLS` cap 필요).
+
+- Problem: a single process or shard bottlenecks seamless worlds and causes
+  discontinuities during load shifts.
+- Goal: absorb load with cell-level ownership, routing, handover, split, merge,
+  operation review, and explicit audit evidence while keeping the client on a
+  stable gateway session.
+- Non-goals for the initial scope: finished game-server gameplay features,
+  complete zero-downtime migration, and multi-region consistency.
+- Key model: `CellId` is the ownership unit; Orchestrator owns assignment truth;
+  Gateway routes by assignment watch/snapshot; Worker owns tick/runtime state
+  for assigned cells and relays AOI/ghost state for nearby cells.
+- Operational defaults: runtime mutation is disabled by default, controlled
+  windows must be explicit, and GitOps cleanup must restore default-off state.
 
 ## Contributing & Workflow
-- 기본 브랜치 `main`; 커밋 메시지 포맷은 `type: summary`(예: `feat: refresh gateway routing`), 한 커밋에 명확한 변경 세트만 담습니다.
-- 코드 변경 시 문서/테스트를 함께 갱신하고, README의 ✅(구현)/🚧(계획) 구분을 유지합니다.
-- 제출 전 `cargo xt`와 `cargo test`를 실행합니다. `cargo xt`에는 `cargo xt harness`가 포함됩니다. 런타임/네트워크/dev helper 변경은 Run Locally의 로컬 스모크까지 확인합니다.
-- 자동화 에이전트는 목표와 제약이 충분하면 자율적으로 구현/검증/문서화를 진행하고, 파괴적 작업·published history rewrite·명시되지 않은 원격 bookmark 이동·외부 운영/비용 리스크처럼 되돌리기 어려운 경우에만 사용자 확인을 요청합니다.
-- 추가 지침과 에이전트 컨텍스트는 `AGENTS.md`를 참고하세요.
+
+- Primary bookmark: `main`
+- Local VCS workflow: use `jj status`, `jj diff`, `jj describe`, and
+  `jj git push`.
+- Commit message format: `<type>: <summary>`
+- Before publishing code changes, run `cargo xt` and `cargo test`; for runtime
+  changes also run the relevant local smoke from `docs/smoke-runbook.md`.
+- Additional agent instructions: `AGENTS.md`
