@@ -65,7 +65,7 @@ Recommended P9 slices:
 3. Done: `test: add p9 replay audit` - add `cargo xt dev p9-replay-audit` to replay
    durable history after restart and verify stable proposal hashes, stable
    operation ids, and no mutation.
-4. `test: add p9 policy regression smoke` - add a local verifier for
+4. Done: `test: add p9 policy regression smoke` - add a local verifier for
    default-off execution, explicit approval, deny evidence, cooldown, budget,
    and concurrency gates.
 5. `build: publish p9 control-plane runtime image` - publish the P9 image,

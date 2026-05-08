@@ -150,4 +150,7 @@ This document is the repo-local quality map for agents. It keeps the expected au
   `cargo xt dev p9-replay-audit` then reloads that durable history from disk,
   recomputes stable proposal hashes, verifies stable operation ids, and records
   `.dev/reports/p9-replay-audit-latest.json` without touching runtime state.
+  `cargo xt dev p9-policy-regression-smoke` reruns the default-off/cooldown/
+  budget/concurrency deny cases and folds explicit approval plus blocked
+  execution evidence into `.dev/reports/p9-policy-regression-latest.json`.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.
