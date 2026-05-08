@@ -80,6 +80,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit P10 runtime observability and soak hardening gates from report JSON
+    P10CompletionAudit {
+        /// Directory that contains smoke/report JSON files
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
     P7OperationLedgerCheck {
         /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
@@ -1482,6 +1491,9 @@ fn main() -> Result<()> {
         Cmd::P7CompletionAudit { report_dir, json } => run_p7_completion_audit(&report_dir, json)?,
         Cmd::P8CompletionAudit { report_dir, json } => run_p8_completion_audit(&report_dir, json)?,
         Cmd::P9CompletionAudit { report_dir, json } => run_p9_completion_audit(&report_dir, json)?,
+        Cmd::P10CompletionAudit { report_dir, json } => {
+            run_p10_completion_audit(&report_dir, json)?
+        }
         Cmd::P7OperationLedgerCheck {
             ledger,
             require_approval,
@@ -26968,6 +26980,272 @@ fn push_p9_json_gate<F>(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P10CompletionFinding {
+    gate: &'static str,
+    evidence: String,
+    missing: String,
+}
+
+fn run_p10_completion_audit(report_dir: &Path, json: bool) -> Result<()> {
+    let findings = p10_completion_findings(report_dir);
+    if json {
+        let body = serde_json::json!({
+            "schema": "tessera.p10_completion_audit.v1",
+            "complete": findings.is_empty(),
+            "report_dir": report_dir.display().to_string(),
+            "findings": findings.iter().map(|finding| {
+                serde_json::json!({
+                    "gate": finding.gate,
+                    "evidence": finding.evidence,
+                    "missing": finding.missing
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if findings.is_empty() {
+        println!(
+            "P10 completion audit passed: runtime observability and soak hardening gates are covered in {}",
+            report_dir.display()
+        );
+    } else {
+        println!(
+            "P10 completion audit incomplete: {} missing gate(s) in {}",
+            findings.len(),
+            report_dir.display()
+        );
+        for finding in &findings {
+            println!(
+                "- {}: evidence={} missing={}",
+                finding.gate, finding.evidence, finding.missing
+            );
+        }
+    }
+    if !findings.is_empty() {
+        bail!(
+            "P10 completion audit is incomplete: {} missing gate(s)",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+fn p10_completion_findings(report_dir: &Path) -> Vec<P10CompletionFinding> {
+    let mut findings = Vec::new();
+
+    push_p10_json_gate(
+        &mut findings,
+        report_dir,
+        "p10_local_observability_soak",
+        "p10-observability-soak-latest.json",
+        "local long-running observability soak covering Gateway, Worker, Orchestrator, request latency, ghost relay counters, assignments, operation/recommend histories, durable replayable report, route convergence, clean close counters, and default-off runtime state",
+        validate_p10_observability_soak_report,
+    );
+    push_p10_json_gate(
+        &mut findings,
+        report_dir,
+        "p10_local_ghost_relay_soak",
+        "p10-ghost-relay-soak-latest.json",
+        "local ghost relay soak covering fanout, backpressure, reconnect counters, route convergence, close-counter cleanliness, assignment stability, and no runtime mutation",
+        validate_p10_ghost_relay_soak_report,
+    );
+    push_p10_json_gate(
+        &mut findings,
+        report_dir,
+        "p10_local_replay_audit",
+        "p10-replay-audit-latest.json",
+        "durable P10 observability evidence replay with stable report hashes and no runtime mutation",
+        validate_p10_replay_audit_report,
+    );
+
+    let rollout_image = p10_gitops_rollout_image(report_dir, &mut findings);
+    let expected_image = rollout_image.as_deref();
+    push_p10_json_gate(
+        &mut findings,
+        report_dir,
+        "p10_internal_observability_soak",
+        "guarded-kubernetes-p10-observability-soak-latest.json",
+        "guarded Kubernetes observability soak covering GitOps-promoted image, ArgoCD health, Gateway smoke, durable report capture, default-off cleanup, and the same local observability contract",
+        |report| validate_internal_k8s_p10_observability_soak_report(report, expected_image),
+    );
+
+    findings
+}
+
+fn p10_gitops_rollout_image(
+    report_dir: &Path,
+    findings: &mut Vec<P10CompletionFinding>,
+) -> Option<String> {
+    let path = report_dir.join("p10-gitops-rollout-latest.json");
+    let report = match read_json_report(&path) {
+        Ok(report) => report,
+        Err(err) => {
+            findings.push(P10CompletionFinding {
+                gate: "p10_internal_gitops_rollout_default_off",
+                evidence: format!("{} unavailable: {err}", path.display()),
+                missing: "P10 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+            });
+            return None;
+        }
+    };
+    if let Err(err) = validate_p6_gitops_rollout_report(&report, None) {
+        findings.push(P10CompletionFinding {
+            gate: "p10_internal_gitops_rollout_default_off",
+            evidence: format!("{} failed verifier: {err}", path.display()),
+            missing: "P10 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+        });
+        return None;
+    }
+    match json_str(&report, &["image", "name"]) {
+        Ok(image) if image.ends_with(":v2026.05.8") => {
+            findings.push(P10CompletionFinding {
+                gate: "p10_internal_gitops_rollout_default_off",
+                evidence: format!("{} still references P9 image {}", path.display(), image),
+                missing: "new P10 runtime image promoted through GitOps".to_string(),
+            });
+            None
+        }
+        Ok(image) if !image.trim().is_empty() => Some(image.to_string()),
+        Ok(_) => {
+            findings.push(P10CompletionFinding {
+                gate: "p10_internal_gitops_rollout_default_off",
+                evidence: format!("{} has empty image.name", path.display()),
+                missing: "P10 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+        Err(err) => {
+            findings.push(P10CompletionFinding {
+                gate: "p10_internal_gitops_rollout_default_off",
+                evidence: format!("{} missing image.name: {err}", path.display()),
+                missing: "P10 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn push_p10_json_gate<F>(
+    findings: &mut Vec<P10CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    report_name: &str,
+    missing: &str,
+    validate: F,
+) where
+    F: FnOnce(&serde_json::Value) -> Result<()>,
+{
+    let path = report_dir.join(report_name);
+    match read_json_report(&path) {
+        Ok(report) => {
+            if let Err(err) = validate(&report) {
+                findings.push(P10CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P10CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
+fn validate_p10_observability_soak_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p10_observability_soak.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "gateway_metrics_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_metrics_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_metrics_sampled"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "request_latency_histograms_observed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "ghost_relay_counters_observed"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_snapshots_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "operation_history_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "recommend_history_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "durable_report_written"], true)?;
+    assert_json_bool_eq(report, &["checks", "replayable_report"], true)?;
+    assert_json_bool_eq(report, &["checks", "route_convergence_maintained"], true)?;
+    assert_json_bool_eq(report, &["checks", "close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_stability_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_execution_attempted"], true)?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    assert_json_number_at_least(report, &["latency", "request_samples"], 1.0)?;
+    Ok(())
+}
+
+fn validate_p10_ghost_relay_soak_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p10_ghost_relay_soak.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "ghost_relay_fanout_observed"], true)?;
+    assert_json_bool_eq(report, &["checks", "backpressure_counters_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "reconnect_counters_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "route_convergence_maintained"], true)?;
+    assert_json_bool_eq(report, &["checks", "close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_stability_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "durable_report_written"], true)?;
+    assert_json_bool_eq(report, &["checks", "replayable_report"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    Ok(())
+}
+
+fn validate_p10_replay_audit_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p10_replay_audit.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "evidence_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "metrics_snapshots_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_snapshots_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "operation_history_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "recommend_history_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "report_hashes_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_number_at_least(report, &["replay", "reports"], 1.0)?;
+    Ok(())
+}
+
+fn validate_internal_k8s_p10_observability_soak_report(
+    report: &serde_json::Value,
+    expected_image: Option<&str>,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.guarded_kubernetes_p10_observability_soak.v1",
+    )?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    if let Some(expected_image) = expected_image {
+        assert_json_str_eq(report, &["image", "name"], expected_image)?;
+    }
+    assert_json_bool_eq(report, &["checks", "argocd_synced_healthy"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_smoke_passed"], true)?;
+    assert_json_bool_eq(report, &["checks", "durable_report_captured"], true)?;
+    assert_json_bool_eq(report, &["checks", "default_off_cleanup_verified"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_metrics_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_metrics_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_metrics_sampled"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "request_latency_histograms_observed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "ghost_relay_counters_observed"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_snapshots_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "route_convergence_maintained"], true)?;
+    assert_json_bool_eq(report, &["checks", "close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "assignment_stability_checked"], true)?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    Ok(())
+}
+
 fn build_p9_replay_audit_report(
     history_path: &Path,
     history_report: &serde_json::Value,
@@ -37912,6 +38190,138 @@ demo_count 4
             "remaining_uncovered": []
         });
         validate_p9_policy_regression_report(&policy).expect("valid P9 policy report");
+    }
+
+    #[test]
+    fn p10_completion_audit_reports_missing_observability_gates() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p10-audit-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let findings = p10_completion_findings(&dir);
+
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p10_local_observability_soak"
+                && finding.missing.contains("long-running observability soak")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p10_local_ghost_relay_soak"
+                && finding.missing.contains("ghost relay soak")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p10_internal_gitops_rollout_default_off"
+                && finding.missing.contains("GitOps rollout")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p10_internal_observability_soak"
+                && finding
+                    .missing
+                    .contains("guarded Kubernetes observability soak")
+        }));
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
+    fn p10_report_validators_accept_complete_minimal_reports() {
+        let observability = serde_json::json!({
+            "schema": "tessera.p10_observability_soak.v1",
+            "status": "complete",
+            "checks": {
+                "gateway_metrics_sampled": true,
+                "worker_metrics_sampled": true,
+                "orchestrator_metrics_sampled": true,
+                "request_latency_histograms_observed": true,
+                "ghost_relay_counters_observed": true,
+                "assignment_snapshots_sampled": true,
+                "operation_history_sampled": true,
+                "recommend_history_sampled": true,
+                "durable_report_written": true,
+                "replayable_report": true,
+                "route_convergence_maintained": true,
+                "close_counters_clean": true,
+                "assignment_stability_checked": true,
+                "runtime_mutation_default_off": true,
+                "no_execution_attempted": true
+            },
+            "soak": {"iterations": 2},
+            "latency": {"request_samples": 1},
+            "remaining_uncovered": []
+        });
+        validate_p10_observability_soak_report(&observability)
+            .expect("valid P10 observability report");
+
+        let ghost = serde_json::json!({
+            "schema": "tessera.p10_ghost_relay_soak.v1",
+            "status": "complete",
+            "checks": {
+                "ghost_relay_fanout_observed": true,
+                "backpressure_counters_sampled": true,
+                "reconnect_counters_sampled": true,
+                "route_convergence_maintained": true,
+                "close_counters_clean": true,
+                "assignment_stability_checked": true,
+                "durable_report_written": true,
+                "replayable_report": true,
+                "runtime_mutation_default_off": true
+            },
+            "soak": {"iterations": 2},
+            "remaining_uncovered": []
+        });
+        validate_p10_ghost_relay_soak_report(&ghost).expect("valid P10 ghost report");
+
+        let replay = serde_json::json!({
+            "schema": "tessera.p10_replay_audit.v1",
+            "status": "complete",
+            "checks": {
+                "evidence_replayed": true,
+                "metrics_snapshots_replayed": true,
+                "assignment_snapshots_replayed": true,
+                "operation_history_replayed": true,
+                "recommend_history_replayed": true,
+                "report_hashes_stable": true,
+                "runtime_mutation_default_off": true
+            },
+            "replay": {"reports": 1},
+            "remaining_uncovered": []
+        });
+        validate_p10_replay_audit_report(&replay).expect("valid P10 replay report");
+
+        let internal = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_p10_observability_soak.v1",
+            "status": "complete",
+            "image": {"name": "registry.example.com/example/tessera:v2026.05.9"},
+            "checks": {
+                "argocd_synced_healthy": true,
+                "gateway_smoke_passed": true,
+                "durable_report_captured": true,
+                "default_off_cleanup_verified": true,
+                "runtime_mutation_default_off": true,
+                "gateway_metrics_sampled": true,
+                "worker_metrics_sampled": true,
+                "orchestrator_metrics_sampled": true,
+                "request_latency_histograms_observed": true,
+                "ghost_relay_counters_observed": true,
+                "assignment_snapshots_sampled": true,
+                "route_convergence_maintained": true,
+                "close_counters_clean": true,
+                "assignment_stability_checked": true
+            },
+            "soak": {"iterations": 2},
+            "remaining_uncovered": []
+        });
+        validate_internal_k8s_p10_observability_soak_report(
+            &internal,
+            Some("registry.example.com/example/tessera:v2026.05.9"),
+        )
+        .expect("valid internal P10 report");
     }
 
     #[test]
