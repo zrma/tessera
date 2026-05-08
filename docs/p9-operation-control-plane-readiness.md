@@ -43,7 +43,7 @@ P9 is complete only when all of these are true:
 8. A short controlled mutation spot-check proves the operation history can cover
    approval, bounded execution, observation, restart/replay, and cleanup.
 9. `cargo xt p9-completion-audit --json` maps every requirement above to
-   concrete reports and fails until all required evidence exists.
+   concrete reports and returns `complete=true` for the current evidence set.
 
 ## Prompt-To-Artifact Checklist
 
@@ -63,9 +63,10 @@ Current completion audit:
 cargo xt p9-completion-audit --json
 ```
 
-At P9 start this is intentionally incomplete. It should stay `complete=false`
-until the local recommend-loop/replay/policy reports, P9 rollout report, and
-internal MicroK8s recommend/controlled reports are all present and valid.
+P9 is complete as of the `v2026.05.8` evidence set. The current audit returns
+`complete=true` with local recommend-loop/replay/policy reports, P9 rollout
+report, internal MicroK8s recommend soak, controlled operation restart
+spot-check, and final default-off cleanup all present and valid.
 
 ## Initial Implementation Order
 

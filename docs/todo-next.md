@@ -19,37 +19,20 @@ Last reviewed: 2026-05-08
   with local read-only/proposal/approval/gate/execution/recovery/restart/soak
   evidence, split/merge/canonical multi-depth candidate coverage, P8 GitOps
   rollout/default-off evidence, and internal controlled cadence smoke/cleanup.
+- P9 operation control-plane readiness is complete as of the `v2026.05.8`
+  evidence set. `cargo xt p9-completion-audit --json` reports `complete=true`
+  with durable recommend-only history, replay audit, policy regression, P9
+  GitOps rollout/default-off evidence, internal recommend soak, controlled
+  operation restart spot-check, and final cleanup evidence.
 - The live Tessera GitOps cleanup revision keeps Orchestrator execution and
   split/merge activation default-off outside controlled smoke windows, removes
   preview fixtures after smoke, and leaves ArgoCD `tessera` `Synced / Healthy`.
-- The next active design boundary is
-  `docs/p9-operation-control-plane-readiness.md`.
+- The next active design boundary is not selected yet.
 
 ## Next
 
-The next milestone is P9: Operation Control-Plane Readiness.
-
-P9 should not enable automatic runtime mutation. The implementation track turns
-the completed P8 policy-governed cadence into a durable recommend/replay/control
-plane:
-
-1. Run long-lived recommend-only loops from live Worker metrics and assignment
-   snapshots, recording candidate decisions, skip/deny reasons, policy inputs,
-   cooldown/budget/concurrency state, and stable batch keys without assignment
-   mutation or execution.
-2. Persist replayable operation history so proposal hashes, operation ids,
-   approvals/denials, skipped execution, observation, recovery, and restart
-   records can be reconstructed after process restart.
-3. Keep split, merge, and canonical multi-depth candidate evidence under one
-   report/history contract.
-4. Verify default-off behavior and explicit approval/deny/policy gates with a
-   local regression report before any internal runtime work.
-5. Publish the P9 runtime image, promote it through the k8s GitOps repo, verify
-   ArgoCD `Synced / Healthy`, run internal recommend-mode soak, then run only a
-   short operator-approved controlled mutation spot-check before default-off
-   cleanup.
-6. Close with `cargo xt p9-completion-audit --json`, logical commits/pushes, CI
-   verification, live health checks, and final default-off state.
+P9 is closed. The next milestone should be selected from current runtime
+constraints rather than continuing P9 by default.
 
 Recommended P9 slices:
 
@@ -74,9 +57,9 @@ Recommended P9 slices:
 6. Done: `test: add internal p9 recommend soak` - run internal MicroK8s
    recommend-only soak against live Worker metrics and durable storage, then
    replay the history while keeping assignment state unchanged.
-7. `test: add internal p9 controlled spot-check` - open a short approved window,
-   execute one bounded operation, observe/replay it, clean mutating flags back
-   to default-off, and close the P9 audit.
+7. Done: `test: add internal p9 controlled spot-check` - open a short approved
+   window, execute one bounded operation, observe/replay it, clean mutating
+   flags back to default-off, and close the P9 audit.
 
 ## Guardrails
 

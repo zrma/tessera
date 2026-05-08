@@ -133,15 +133,15 @@ This document is the repo-local quality map for agents. It keeps the expected au
   coverage, P8 GitOps rollout/default-off evidence, and finalized internal
   controlled cadence smoke; the `v2026.05.7` evidence set returns
   `complete=true`.
-- P9 operation control-plane readiness starts with `cargo xt
-  p9-completion-audit --json`, which is intentionally incomplete until local
-  recommend-only soak, durable history replay audit, policy regression, P9
-  GitOps rollout/default-off cleanup, internal recommend soak, and a controlled
-  mutation spot-check all have machine-checkable reports. P9 keeps live runtime
-  mutation default-off; recommend-mode evidence must prove no assignment
-  mutation or execution attempt, while any runtime-affecting spot-check must
-  happen only inside an operator-approved controlled window followed by
-  default-off cleanup.
+- P9 operation control-plane readiness is complete as of the `v2026.05.8`
+  evidence set. `cargo xt p9-completion-audit --json` should return
+  `complete=true` with local recommend-only soak, durable history replay audit,
+  policy regression, P9 GitOps rollout/default-off cleanup, internal recommend
+  soak, and a controlled mutation spot-check all machine-checkable. P9 keeps
+  live runtime mutation default-off; recommend-mode evidence proves no
+  assignment mutation or execution attempt, while the runtime-affecting
+  spot-check happened only inside an operator-approved controlled window
+  followed by default-off cleanup.
   `cargo xt dev p9-recommend-loop-soak` is the first local gate: it runs the
   two-Worker dev stack, records repeated live Worker metrics and assignment
   snapshots, writes `.dev/reports/p9-recommend-history-latest.json`, and
