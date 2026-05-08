@@ -186,6 +186,29 @@ cargo xt k8s p9-controlled-spot-check-report \
 P9 is complete as of `v2026.05.8`. Use these commands for regression or when a
 later milestone intentionally reuses the recommend/replay evidence path.
 
+## P10 Observability And Soak
+
+The P10 audit exists first and fails closed until the required reports are
+implemented and captured:
+
+```sh
+cargo xt p10-completion-audit --json
+```
+
+Planned local gates:
+
+```sh
+cargo xt dev p10-observability-soak
+cargo xt dev p10-ghost-relay-soak
+cargo xt dev p10-replay-audit
+```
+
+Planned internal gate after image publish and GitOps promotion:
+
+```sh
+cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image <new-tag>
+```
+
 ## Internal MicroK8s Activation
 
 Read-only preflight:
@@ -216,6 +239,7 @@ cargo xt p6-completion-audit --json
 cargo xt p7-completion-audit --json
 cargo xt p8-completion-audit --json
 cargo xt p9-completion-audit --json
+cargo xt p10-completion-audit --json
 ```
 
 The audits are evidence aggregators. A green local smoke does not replace the

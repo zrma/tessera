@@ -9,8 +9,8 @@ skeleton for MMO-scale simulation, not a finished game server.
 
 - Runtime: Rust + Tokio
 - Deployment target: self-hosted and Kubernetes-friendly
-- Current state: P0 through P9 are complete; the next active design boundary is
-  intentionally not selected yet.
+- Current state: P0 through P9 are complete; P10 Runtime Observability and Soak
+  Hardening is the active design boundary.
 
 ## Workspace
 
@@ -29,7 +29,9 @@ skeleton for MMO-scale simulation, not a finished game server.
 - Full local quality gate: `cargo xt`
 - Harness only: `cargo xt harness`
 - Tests: `cargo test`
-- Current completion audit: `cargo xt p9-completion-audit --json`
+- Last completed audit: `cargo xt p9-completion-audit --json`
+- Active P10 audit: `cargo xt p10-completion-audit --json` (expected to fail
+  until P10 evidence exists)
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -48,11 +50,13 @@ Useful variants:
 - Logs: `cargo xt dev logs --target all --follow`
 - Gateway only smoke: `cargo xt dev up`, client ping, then `cargo xt dev down`
 - Metrics smoke: `cargo xt dev metrics-smoke`
-- Current P9 local audit lane:
+- Last completed P9 local audit lane:
   - `cargo xt dev p9-recommend-loop-soak`
   - `cargo xt dev p9-replay-audit`
   - `cargo xt dev p9-policy-regression-smoke`
   - `cargo xt p9-completion-audit --json`
+- Active P10 completion gate:
+  - `cargo xt p10-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical
 P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
@@ -81,13 +85,11 @@ P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
 
 ### Current Open Boundary
 
-P9 is closed. `docs/todo-next.md` is the active open-work index and currently
-records that the next design boundary has not been selected. The next milestone
-should be chosen from the current runtime constraints, not by continuing P9 by
-default.
-
-Likely next area: long-running runtime observability, data-plane/ghost relay
-hardening, and soak evidence for request latency and traceability.
+P9 is closed. `docs/todo-next.md` is the active open-work index and now points
+to P10 Runtime Observability and Soak Hardening. P10 keeps runtime mutation
+default-off and focuses on durable, replayable evidence for long-running
+Gateway/Worker/Orchestrator metrics, request latency, ghost relay behavior,
+route convergence, close-counter cleanliness, and assignment stability.
 
 ## Protocol Snapshot
 

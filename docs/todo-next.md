@@ -1,6 +1,6 @@
 # Tessera Next Todo
 
-Last reviewed: 2026-05-08
+Last reviewed: 2026-05-09
 
 ## Baseline
 
@@ -27,43 +27,41 @@ Last reviewed: 2026-05-08
 - The live Tessera GitOps cleanup revision keeps Orchestrator execution and
   split/merge activation default-off outside controlled smoke windows, removes
   preview fixtures after smoke, and leaves ArgoCD `tessera` `Synced / Healthy`.
-- The next active design boundary is not selected yet.
+- P10 Runtime Observability and Soak Hardening is the active design boundary.
 
 ## Next
 
-P9 is closed. The next milestone should be selected from current runtime
-constraints rather than continuing P9 by default.
+P9 is closed. P10 should harden the runtime evidence surface rather than add
+automatic mutation. The active contract is
+`docs/p10-runtime-observability-soak-hardening.md`.
 
-Recommended P9 slices:
+Recommended P10 slices:
 
-1. Done: `test: add p9 completion audit` - mark P8 complete in docs, add the P9
-   goal contract, and add a fail-closed `cargo xt p9-completion-audit --json`
-   skeleton requiring local recommend-loop, replay, policy, GitOps, internal
-   recommend soak, and controlled spot-check evidence.
-2. Done: `feat: add p9 recommend loop history` - add `cargo xt dev
-   p9-recommend-loop-soak` to collect repeated live Worker metrics and
-   assignment snapshots, write durable recommend-only history, prove stable
-   split/merge/canonical multi-depth candidate keys, and report
-   `no_assignment_mutation=true` plus `no_execution_attempted=true`.
-3. Done: `test: add p9 replay audit` - add `cargo xt dev p9-replay-audit` to replay
-   durable history after restart and verify stable proposal hashes, stable
-   operation ids, and no mutation.
-4. Done: `test: add p9 policy regression smoke` - add a local verifier for
-   default-off execution, explicit approval, deny evidence, cooldown, budget,
-   and concurrency gates.
-5. Done: `build: publish p9 control-plane runtime image` - publish the P9 image,
-   promote it through the k8s GitOps repo, verify ArgoCD `Synced / Healthy`, and
-   record `.dev/reports/p9-gitops-rollout-latest.json`.
-6. Done: `test: add internal p9 recommend soak` - run internal MicroK8s
-   recommend-only soak against live Worker metrics and durable storage, then
-   replay the history while keeping assignment state unchanged.
-7. Done: `test: add internal p9 controlled spot-check` - open a short approved
-   window, execute one bounded operation, observe/replay it, clean mutating
-   flags back to default-off, and close the P9 audit.
+1. Done: `test: add p10 completion audit` - mark P10 active in docs, add
+   the P10 goal contract, and add a fail-closed
+   `cargo xt p10-completion-audit --json` skeleton requiring local
+   observability soak, ghost relay soak, replay audit, GitOps rollout/default-off
+   cleanup, and internal MicroK8s observability soak evidence.
+2. Pending: `feat: add p10 observability soak` - add `cargo xt dev
+   p10-observability-soak` to sample Gateway, Worker, and Orchestrator metrics,
+   request latency histograms, ghost relay counters, assignment snapshots, and
+   operation/recommend histories into a durable replayable report.
+3. Pending: `test: add p10 ghost relay soak` - add focused local/dev coverage
+   for relay fanout, backpressure, reconnect counters, route convergence,
+   close-counter cleanliness, assignment stability, and default-off state.
+4. Pending: `test: add p10 replay audit` - replay durable P10 reports and prove
+   stable report hashes without touching runtime state.
+5. Pending: `build: publish p10 observability runtime image` - publish the P10
+   image only after local evidence is green, promote it through the k8s GitOps
+   repo, verify ArgoCD `Synced / Healthy`, and record
+   `.dev/reports/p10-gitops-rollout-latest.json`.
+6. Pending: `test: add internal p10 observability soak` - validate the promoted
+   image in internal MicroK8s with Gateway smoke, live metrics, durable report
+   capture, and final default-off cleanup.
 
 ## Guardrails
 
-- P9 recommend-mode code must remain mutation-free by default.
+- P10 observability code must remain mutation-free by default.
 - Runtime-affecting paths require local evidence first, then image publish,
   GitOps rollout, ArgoCD health, internal smoke, cleanup, and completion audit.
 - Controlled windows must be short-lived, explicit, and followed by default-off

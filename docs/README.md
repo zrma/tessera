@@ -22,7 +22,7 @@ find deeper runbooks.
 ## Active Planning
 
 `todo-next.md` is the active open-work index. As of this review, P9 is closed
-and the next active design boundary has not been selected.
+and P10 Runtime Observability and Soak Hardening is active.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -37,10 +37,12 @@ or completion audit.
 | P7 policy-gated operation loop | Complete as `v2026.05.6` | `p7-operation-loop.md` |
 | P8 closed-loop operation cadence | Complete as `v2026.05.7` | `p8-closed-loop-operation-cadence.md` |
 | P9 operation control-plane readiness | Complete as `v2026.05.8` | `p9-operation-control-plane-readiness.md` |
+| P10 runtime observability and soak hardening | Active; fail-closed audit skeleton added | `p10-runtime-observability-soak-hardening.md` |
 
 The P6/P7/P8/P9 documents are retained because they define evidence contracts,
-report shapes, and completion gates. They should not be treated as active TODO
-lists unless `todo-next.md` explicitly reopens a boundary.
+report shapes, and completion gates. P10 is the current active contract. Older
+milestone docs should not be treated as active TODO lists unless
+`todo-next.md` explicitly reopens a boundary.
 
 ## Design Notes
 

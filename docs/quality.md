@@ -25,6 +25,10 @@ This document is the repo-local quality map for agents. It keeps the expected au
 - `docs/README.md` is the document index, `docs/todo-next.md` is the active
   open-work source, and `docs/smoke-runbook.md` is the command catalog.
 - `cargo xt p6-completion-audit` is the machine gate for P6+ completion evidence. In the completed P6+ state it returns `complete=true` only when the internal MicroK8s reports cover restart recovery, live metrics, GitOps rollout, merge, canonical multi-depth gates, and post-smoke default-off cleanup.
+- `cargo xt p10-completion-audit --json` is the active P10 fail-closed gate for
+  runtime observability and soak hardening. It should stay incomplete until
+  local observability, ghost relay, replay, GitOps rollout, internal MicroK8s
+  soak, and default-off cleanup evidence are present.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
