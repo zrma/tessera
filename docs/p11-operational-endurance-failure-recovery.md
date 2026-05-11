@@ -61,7 +61,7 @@ P11 is complete only when all of these are true:
 | Local restart recovery | `cargo xt dev p11-restart-recovery-smoke` | `.dev/reports/p11-restart-recovery-latest.json` validates Gateway/Worker/Orchestrator restart recovery plus persisted assignment and operation state |
 | Local transient failure recovery | `cargo xt dev p11-transient-failure-recovery-smoke` | `.dev/reports/p11-transient-failure-recovery-latest.json` validates target Worker unavailability, controlled component failure, port-forward reconnect recovery, and post-recovery convergence |
 | GitOps rollout | k8s repo image promotion | `.dev/reports/p11-gitops-rollout-latest.json` records image publish, rollout rev, cleanup rev, ArgoCD health, image match, and default-off cleanup |
-| Internal endurance/recovery | `cargo xt k8s p11-endurance-recovery-smoke --allow-pod-restart --allow-scale` | `.dev/reports/internal-microk8s-p11-endurance-recovery-latest.json` validates the promoted image, ArgoCD health, pod restarts, controlled failures, Gateway smoke, operation ledger durability, route/assignment convergence, durable report capture, and default-off cleanup |
+| Internal endurance/recovery | `cargo xt k8s p11-endurance-recovery-smoke --allow-pod-restart --allow-controlled-failure` | `.dev/reports/internal-microk8s-p11-endurance-recovery-latest.json` validates the promoted image, ArgoCD health, GitOps self-heal-safe pod restarts, controlled failures, Gateway smoke, operation ledger durability, route/assignment convergence, durable report capture, and default-off cleanup |
 | Completion audit | `cargo xt p11-completion-audit --json` | audit returns `complete=true` only after every P11 gate has real evidence |
 
 Current completion audit:
@@ -95,7 +95,7 @@ exist and validate.
    `cargo xt p6-rollout-report --out .dev/reports/p11-gitops-rollout-latest.json`.
 6. **Internal endurance/recovery smoke**: validate the same contract in internal
    MicroK8s against the promoted image with explicit `--allow-pod-restart` and
-   `--allow-scale` gates, then restore/verify default-off cleanup.
+   `--allow-controlled-failure` gates, then restore/verify default-off cleanup.
 7. **Completion audit**: close with `cargo xt p11-completion-audit --json`,
    logical commits/pushes, CI verification, ArgoCD health, and final default-off
    state.

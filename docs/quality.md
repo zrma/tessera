@@ -191,6 +191,6 @@ This document is the repo-local quality map for agents. It keeps the expected au
   port-forward reconnect, and post-recovery route/assignment convergence
   evidence before it can close. The internal MicroK8s gate is
   `cargo xt k8s p11-endurance-recovery-smoke` and requires explicit
-  `--allow-pod-restart` plus `--allow-scale` for the bounded restart/failure
-  window.
+  `--allow-pod-restart` plus `--allow-controlled-failure` for the bounded,
+  GitOps self-heal-safe restart/failure window.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

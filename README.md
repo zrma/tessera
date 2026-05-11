@@ -65,7 +65,7 @@ Useful variants:
   - `cargo xt dev p11-endurance-soak`
   - `cargo xt dev p11-restart-recovery-smoke`
   - `cargo xt dev p11-transient-failure-recovery-smoke`
-  - `cargo xt k8s p11-endurance-recovery-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-pod-restart --allow-scale`
+  - `cargo xt k8s p11-endurance-recovery-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-pod-restart --allow-controlled-failure`
   - `cargo xt p11-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical

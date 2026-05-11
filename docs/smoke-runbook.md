@@ -278,7 +278,7 @@ cargo xt k8s p11-endurance-recovery-smoke \
   --namespace tessera \
   --expected-image <new-tag> \
   --allow-pod-restart \
-  --allow-scale
+  --allow-controlled-failure
 ```
 
 ## Internal MicroK8s Activation
