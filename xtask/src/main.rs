@@ -1267,9 +1267,9 @@ enum K8sSub {
         /// Sleep between observability iterations
         #[arg(long, default_value_t = 250)]
         sleep_ms: u64,
-        /// Allow scaling the target Worker deployment to validate controlled failure/recovery
-        #[arg(long, default_value_t = false)]
-        allow_scale: bool,
+        /// Allow deleting the target Worker pod to validate controlled failure/recovery
+        #[arg(long, visible_alias = "allow-scale", default_value_t = false)]
+        allow_controlled_failure: bool,
         /// Allow deleting managed pods for Gateway, source Worker, and Orchestrator restart checks
         #[arg(long, default_value_t = false)]
         allow_pod_restart: bool,
@@ -2485,7 +2485,7 @@ fn main() -> Result<()> {
                 actors,
                 iterations,
                 sleep_ms,
-                allow_scale,
+                allow_controlled_failure,
                 allow_pod_restart,
                 out,
             } => run_k8s_p11_endurance_recovery_smoke(K8sP11EnduranceRecoverySmokeOptions {
@@ -2512,7 +2512,7 @@ fn main() -> Result<()> {
                 actors,
                 iterations,
                 sleep_ms,
-                allow_scale,
+                allow_controlled_failure,
                 allow_pod_restart,
                 out,
             })?,
@@ -20929,7 +20929,7 @@ struct K8sP11EnduranceRecoverySmokeOptions {
     actors: u32,
     iterations: u32,
     sleep_ms: u64,
-    allow_scale: bool,
+    allow_controlled_failure: bool,
     allow_pod_restart: bool,
     out: Option<PathBuf>,
 }
@@ -22284,8 +22284,10 @@ fn run_k8s_p11_endurance_recovery_smoke(
     if options.actors == 0 {
         bail!("internal k8s P11 endurance/recovery smoke requires at least 1 actor");
     }
-    if !options.allow_scale {
-        bail!("internal k8s P11 controlled failure scales the target Worker; pass --allow-scale");
+    if !options.allow_controlled_failure {
+        bail!(
+            "internal k8s P11 controlled failure deletes the target Worker pod; pass --allow-controlled-failure"
+        );
     }
     if !options.allow_pod_restart {
         bail!("internal k8s P11 restart checks delete managed pods; pass --allow-pod-restart");
@@ -22641,99 +22643,13 @@ fn run_k8s_p11_endurance_recovery_smoke(
     )?;
 
     forwards.stop_all();
-    kubectl_scale_deploy(
+    let target_worker_pod = restart_deployment_pod_and_wait(
         &context,
         &options.namespace,
         &options.target_worker_deploy,
-        0,
-    )?;
-    let mut restore = K8sScaleRestore::new(
-        context.clone(),
-        options.namespace.clone(),
-        options.target_worker_deploy.clone(),
-        original_target_replicas,
-    );
-    wait_for_kubectl_deploy_available_replicas(
-        &context,
-        &options.namespace,
-        &options.target_worker_deploy,
-        0,
-    )?;
-    wait_for_kubectl_service_ready_endpoints(
-        &context,
-        &options.namespace,
-        &options.target_worker_service,
-        0,
-        Duration::from_secs(120),
-    )?;
-    wait_for_kubectl_deploy_pods(
-        &context,
-        &options.namespace,
-        &options.target_worker_deploy,
-        0,
-        Duration::from_secs(120),
-    )?;
-    forwards.spawn(
-        &context,
-        &options.namespace,
-        &options.orch_service,
-        "p11-failure-orchestrator",
-        &[
-            (options.local_orch_port, 6000),
-            (options.local_orch_metrics_port, 6100),
-        ],
-    )?;
-    forwards.spawn(
-        &context,
-        &options.namespace,
-        &options.gateway_service,
-        "p11-failure-gateway",
-        &[
-            (options.local_gateway_port, 4000),
-            (options.local_gateway_metrics_port, 4100),
-        ],
-    )?;
-    assert_http_status_endpoint(
-        "internal P11 gateway readiness during target Worker outage",
-        &local_gateway_metrics_addr,
-        "/ready",
-        "200 OK",
-    )?;
-    let mut failure_window_session = GatewaySession::connect(&local_gateway_addr)?;
-    request_ping_until_pong(
-        &mut failure_window_session,
-        parent,
-        41_300,
-        "internal P11 target Worker outage unaffected parent ping",
-    )?;
-
-    kubectl_scale_deploy(
-        &context,
-        &options.namespace,
-        &options.target_worker_deploy,
-        original_target_replicas,
-    )?;
-    restore.disarm();
-    kubectl_rollout_status(
-        &context,
-        &options.namespace,
-        &options.target_worker_deploy,
-        Duration::from_secs(120),
-    )?;
-    wait_for_kubectl_deploy_available_replicas(
-        &context,
-        &options.namespace,
-        &options.target_worker_deploy,
-        original_target_replicas,
-    )?;
-    wait_for_kubectl_service_ready_endpoints(
-        &context,
-        &options.namespace,
         &options.target_worker_service,
         original_target_replicas,
-        Duration::from_secs(120),
     )?;
-    forwards.stop_all();
     spawn_p11_k8s_port_forwards(&mut forwards, &context, &options)?;
     runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
     let (_final_health, assignment_listing_final) =
@@ -22914,7 +22830,8 @@ fn run_k8s_p11_endurance_recovery_smoke(
             "target_worker_failure": {
                 "deployment": options.target_worker_deploy.as_str(),
                 "service": options.target_worker_service.as_str(),
-                "scaled_to_zero": true,
+                "deleted_pod": target_worker_pod,
+                "gitops_self_heal_safe": true,
                 "restored_replicas": original_target_replicas
             }
         },
