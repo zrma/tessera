@@ -81,8 +81,10 @@ exist and validate.
 2. **Local endurance soak**: `cargo xt dev p11-endurance-soak` composes the P10
    observability and ghost-relay loops into repeated load, reconnect, routing,
    relay, assignment, ledger, latency, close-counter, and default-off evidence.
-3. **Restart recovery smokes**: add focused Gateway, Worker, and Orchestrator
-   restart recovery reports with persisted assignment and operation state.
+3. **Restart recovery smokes**: `cargo xt dev p11-restart-recovery-smoke`
+   composes a P7 operation restart source with a P11 component restart probe to
+   cover Gateway, Worker, and Orchestrator restart recovery plus persisted
+   assignment and operation state.
 4. **Transient failure recovery**: add target Worker unavailability and
    port-forward reconnect checks with post-recovery convergence evidence.
 5. **Image publish and GitOps rollout**: publish a P11 runtime image, promote it

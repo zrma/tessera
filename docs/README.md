@@ -38,7 +38,7 @@ or completion audit.
 | P8 closed-loop operation cadence | Complete as `v2026.05.7` | `p8-closed-loop-operation-cadence.md` |
 | P9 operation control-plane readiness | Complete as `v2026.05.8` | `p9-operation-control-plane-readiness.md` |
 | P10 runtime observability and soak hardening | Complete as `v2026.05.9` | `p10-runtime-observability-soak-hardening.md` |
-| P11 operational endurance and failure recovery | Active; fail-closed audit plus local endurance command added | `p11-operational-endurance-failure-recovery.md` |
+| P11 operational endurance and failure recovery | Active; local endurance and restart recovery commands added | `p11-operational-endurance-failure-recovery.md` |
 
 The P6/P7/P8/P9/P10 documents are retained because they define evidence
 contracts, report shapes, and completion gates. P11 is the current active

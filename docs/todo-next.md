@@ -50,7 +50,7 @@ Recommended P11 slices:
 2. Done: `feat: add local p11 endurance soak` - compose the P10 observability
    and ghost-relay loops into repeated load/reconnect evidence and write
    `.dev/reports/p11-endurance-soak-latest.json`.
-3. Pending: `test: add p11 restart recovery smokes` - cover Gateway, Worker,
+3. Done: `test: add p11 restart recovery smokes` - cover Gateway, Worker,
    and Orchestrator restart recovery with persisted assignment and operation
    state in `.dev/reports/p11-restart-recovery-latest.json`.
 4. Pending: `test: add p11 transient failure recovery` - cover target Worker

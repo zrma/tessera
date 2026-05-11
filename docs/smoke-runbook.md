@@ -236,9 +236,13 @@ cargo xt dev p11-restart-recovery-smoke
 cargo xt dev p11-transient-failure-recovery-smoke
 ```
 
-`p11-endurance-soak` is implemented first. It runs the P10 observability and
-ghost-relay dev smokes, validates both source reports, then writes
+`p11-endurance-soak` runs the P10 observability and ghost-relay dev smokes,
+validates both source reports, then writes
 `.dev/reports/p11-endurance-soak-latest.json`.
+
+`p11-restart-recovery-smoke` runs the P7 split operation restart smoke for
+persisted assignment/operation state evidence, adds a P11 Gateway/Worker restart
+probe, then writes `.dev/reports/p11-restart-recovery-latest.json`.
 
 Planned reports:
 
