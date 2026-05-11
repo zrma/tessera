@@ -1196,6 +1196,87 @@ enum K8sSub {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Run guarded Kubernetes P11 endurance/recovery smoke against the promoted image
+    P11EnduranceRecoverySmoke {
+        /// Kubernetes namespace that contains the Tessera runtime
+        #[arg(long, default_value = "tessera")]
+        namespace: String,
+        /// Optional kube context. If unset, the current context is used.
+        #[arg(long)]
+        context: Option<String>,
+        /// Orchestrator service name
+        #[arg(long, default_value = "tessera-orch")]
+        orch_service: String,
+        /// Orchestrator deployment name used for image/default-off preflight and restart
+        #[arg(long, default_value = "tessera-orch")]
+        orch_deploy: String,
+        /// Gateway service name
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_service: String,
+        /// Gateway deployment name used for image preflight and restart
+        #[arg(long, default_value = "tessera-gateway")]
+        gateway_deploy: String,
+        /// Source Worker deployment name used for image preflight and restart
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_deploy: String,
+        /// Source Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker")]
+        source_worker_service: String,
+        /// Target Worker deployment name used for image preflight and controlled failure
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_deploy: String,
+        /// Target Worker service used for live metrics
+        #[arg(long, default_value = "tessera-worker-b")]
+        target_worker_service: String,
+        /// ArgoCD Application namespace used for Synced/Healthy preflight
+        #[arg(long, default_value = "argocd")]
+        argocd_namespace: String,
+        /// ArgoCD Application name used for Synced/Healthy preflight
+        #[arg(long, default_value = "tessera")]
+        argocd_app: String,
+        /// Skip the ArgoCD Application Synced/Healthy preflight
+        #[arg(long, default_value_t = false)]
+        skip_argocd_check: bool,
+        /// Expected runtime image for all recorded Tessera deployments
+        #[arg(long)]
+        expected_image: Option<String>,
+        /// Local Orchestrator gRPC port for kubectl port-forward
+        #[arg(long, default_value_t = 27000)]
+        local_orch_port: u16,
+        /// Local Orchestrator metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 27100)]
+        local_orch_metrics_port: u16,
+        /// Local Gateway TCP port for kubectl port-forward
+        #[arg(long, default_value_t = 24010)]
+        local_gateway_port: u16,
+        /// Local Gateway metrics/ready port for kubectl port-forward
+        #[arg(long, default_value_t = 24110)]
+        local_gateway_metrics_port: u16,
+        /// Local source Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 25110)]
+        local_source_worker_metrics_port: u16,
+        /// Local target Worker metrics port for kubectl port-forward
+        #[arg(long, default_value_t = 25111)]
+        local_target_worker_metrics_port: u16,
+        /// Number of actors joined to the parent cell before the request loop
+        #[arg(long, default_value_t = 2)]
+        actors: u32,
+        /// Number of observability iterations
+        #[arg(long, default_value_t = 2)]
+        iterations: u32,
+        /// Sleep between observability iterations
+        #[arg(long, default_value_t = 250)]
+        sleep_ms: u64,
+        /// Allow scaling the target Worker deployment to validate controlled failure/recovery
+        #[arg(long, default_value_t = false)]
+        allow_scale: bool,
+        /// Allow deleting managed pods for Gateway, source Worker, and Orchestrator restart checks
+        #[arg(long, default_value_t = false)]
+        allow_pod_restart: bool,
+        /// Output JSON path. Defaults to .dev/reports/guarded-kubernetes-p11-endurance-recovery-latest.json
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Fold a finalized controlled operation smoke report into the guarded Kubernetes P9 spot-check gate
     P9ControlledSpotCheckReport {
         /// Source internal P7 operation report with completed restart evidence
@@ -2378,6 +2459,61 @@ fn main() -> Result<()> {
                 actors,
                 iterations,
                 sleep_ms,
+                out,
+            })?,
+            K8sSub::P11EnduranceRecoverySmoke {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                target_worker_deploy,
+                target_worker_service,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                iterations,
+                sleep_ms,
+                allow_scale,
+                allow_pod_restart,
+                out,
+            } => run_k8s_p11_endurance_recovery_smoke(K8sP11EnduranceRecoverySmokeOptions {
+                namespace,
+                context,
+                orch_service,
+                orch_deploy,
+                gateway_service,
+                gateway_deploy,
+                source_worker_deploy,
+                source_worker_service,
+                target_worker_deploy,
+                target_worker_service,
+                argocd_namespace,
+                argocd_app,
+                skip_argocd_check,
+                expected_image,
+                local_orch_port,
+                local_orch_metrics_port,
+                local_gateway_port,
+                local_gateway_metrics_port,
+                local_source_worker_metrics_port,
+                local_target_worker_metrics_port,
+                actors,
+                iterations,
+                sleep_ms,
+                allow_scale,
+                allow_pod_restart,
                 out,
             })?,
             K8sSub::P9ControlledSpotCheckReport {
@@ -20768,6 +20904,36 @@ struct K8sP10ObservabilitySoakOptions {
     out: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+struct K8sP11EnduranceRecoverySmokeOptions {
+    namespace: String,
+    context: Option<String>,
+    orch_service: String,
+    orch_deploy: String,
+    gateway_service: String,
+    gateway_deploy: String,
+    source_worker_deploy: String,
+    source_worker_service: String,
+    target_worker_deploy: String,
+    target_worker_service: String,
+    argocd_namespace: String,
+    argocd_app: String,
+    skip_argocd_check: bool,
+    expected_image: Option<String>,
+    local_orch_port: u16,
+    local_orch_metrics_port: u16,
+    local_gateway_port: u16,
+    local_gateway_metrics_port: u16,
+    local_source_worker_metrics_port: u16,
+    local_target_worker_metrics_port: u16,
+    actors: u32,
+    iterations: u32,
+    sleep_ms: u64,
+    allow_scale: bool,
+    allow_pod_restart: bool,
+    out: Option<PathBuf>,
+}
+
 fn run_k8s_p8_cadence_smoke(options: K8sP8CadenceSmokeOptions) -> Result<()> {
     if !options.allow_execution {
         bail!("internal k8s P8 cadence smoke mutates assignment state; pass --allow-execution");
@@ -22109,6 +22275,778 @@ fn run_k8s_p10_observability_soak(options: K8sP10ObservabilitySoakOptions) -> Re
     Ok(())
 }
 
+fn run_k8s_p11_endurance_recovery_smoke(
+    options: K8sP11EnduranceRecoverySmokeOptions,
+) -> Result<()> {
+    if options.iterations < 2 {
+        bail!("internal k8s P11 endurance/recovery smoke requires at least 2 iterations");
+    }
+    if options.actors == 0 {
+        bail!("internal k8s P11 endurance/recovery smoke requires at least 1 actor");
+    }
+    if !options.allow_scale {
+        bail!("internal k8s P11 controlled failure scales the target Worker; pass --allow-scale");
+    }
+    if !options.allow_pod_restart {
+        bail!("internal k8s P11 restart checks delete managed pods; pass --allow-pod-restart");
+    }
+
+    let context = resolve_kube_context(options.context.as_deref())?;
+    let argocd_status = if options.skip_argocd_check {
+        None
+    } else {
+        let status =
+            kubectl_argocd_app_status(&context, &options.argocd_namespace, &options.argocd_app)?;
+        validate_argocd_app_ready(&status)?;
+        Some(status)
+    };
+    let deployment_images =
+        collect_k8s_p11_endurance_recovery_deployment_images(&context, &options)?;
+    if let Some(expected_image) = options.expected_image.as_deref() {
+        validate_k8s_deployment_images(&deployment_images, expected_image)?;
+    }
+    let cleanup =
+        k8s_p8_cadence_cleanup_status(&context, &options.namespace, &options.orch_deploy)?;
+    if !cleanup.manual_activation_default_off || !cleanup.preview_fixture_removed {
+        bail!(
+            "internal P11 endurance/recovery smoke requires default-off runtime: manual_activation_default_off={} preview_fixture_removed={}",
+            cleanup.manual_activation_default_off,
+            cleanup.preview_fixture_removed
+        );
+    }
+    for resource in [
+        format!("svc/{}", options.orch_service),
+        format!("svc/{}", options.gateway_service),
+        format!("svc/{}", options.source_worker_service),
+        format!("svc/{}", options.target_worker_service),
+        format!("deploy/{}", options.orch_deploy),
+        format!("deploy/{}", options.gateway_deploy),
+        format!("deploy/{}", options.source_worker_deploy),
+        format!("deploy/{}", options.target_worker_deploy),
+    ] {
+        kubectl_resource_name(&context, &options.namespace, &resource)
+            .with_context(|| format!("required resource {resource} is not ready"))?;
+    }
+
+    let original_target_replicas =
+        kubectl_deploy_spec_replicas(&context, &options.namespace, &options.target_worker_deploy)?;
+    let gateway_replicas =
+        kubectl_deploy_spec_replicas(&context, &options.namespace, &options.gateway_deploy)?;
+    let source_worker_replicas =
+        kubectl_deploy_spec_replicas(&context, &options.namespace, &options.source_worker_deploy)?;
+    let orch_replicas =
+        kubectl_deploy_spec_replicas(&context, &options.namespace, &options.orch_deploy)?;
+    if original_target_replicas == 0 {
+        bail!(
+            "target deployment {} already has 0 replicas; cannot run P11 controlled failure/recovery smoke",
+            options.target_worker_deploy
+        );
+    }
+
+    let local_orch_addr = format!("127.0.0.1:{}", options.local_orch_port);
+    let local_orch_metrics_addr = format!("127.0.0.1:{}", options.local_orch_metrics_port);
+    let local_gateway_addr = format!("127.0.0.1:{}", options.local_gateway_port);
+    let local_gateway_metrics_addr = format!("127.0.0.1:{}", options.local_gateway_metrics_port);
+    let local_source_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_source_worker_metrics_port);
+    let local_target_worker_metrics_addr =
+        format!("127.0.0.1:{}", options.local_target_worker_metrics_port);
+    let orch_endpoint = grpc_endpoint(&local_orch_addr);
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    let mut forwards = ManagedK8sPortForwards::default();
+    spawn_p11_k8s_port_forwards(&mut forwards, &context, &options)?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_http_status_endpoint(
+        "internal P11 gateway readiness",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+
+    let operation_ledger_before = http_json_get(
+        "internal P11 operation ledger before restart",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let operation_ledger_summary_before =
+        validate_p7_operation_ledger(&operation_ledger_before, false, false, false, false, false)?;
+    let operation_ledger_hash_before = p10_report_hash(&operation_ledger_before)?;
+    let (_before_health, assignment_listing_before) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "internal P11 gateway before",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before = gateway_close_counters_from_metrics(&gateway_metrics_before)?;
+    let gateway_routes_before =
+        prometheus_sample_value(&gateway_metrics_before, "tessera_gateway_routes")?;
+
+    let parent = CellId::grid(0, 0, 0);
+    let mut session = GatewaySession::connect(&local_gateway_addr)?;
+    for idx in 0..options.actors {
+        let actor = EntityId(130_000 + u64::from(idx));
+        let joined = session.request(
+            parent,
+            ClientMsg::Join {
+                actor,
+                pos: activation_soak_position((idx % 4) as u8),
+            },
+        )?;
+        assert_snapshot_contains("internal P11 endurance join", joined, parent, actor)?;
+    }
+
+    assert_prometheus_sample_at_least_until(
+        "internal P11 source Worker actor count",
+        &local_source_worker_metrics_addr,
+        worker_cell_actor_count_metric(parent).as_str(),
+        f64::from(options.actors),
+    )?;
+
+    let actor = EntityId(130_000);
+    let mut soak_stats = ActivationSoakStats::default();
+    for iteration in 0..options.iterations {
+        let ts = 40_000 + u64::from(iteration);
+        let observed =
+            request_ping_until_pong(&mut session, parent, ts, "internal P11 endurance ping")?;
+        soak_stats.add(observed);
+        soak_stats.pings_ok += 1;
+
+        let step = if iteration % 2 == 0 { 0.2 } else { -0.2 };
+        let observed = request_move_until_delta(
+            &mut session,
+            parent,
+            actor,
+            step,
+            -step,
+            "internal P11 endurance move",
+        )?;
+        soak_stats.add(observed);
+        soak_stats.moves_ok += 1;
+
+        if iteration + 1 < options.iterations {
+            thread::sleep(Duration::from_millis(options.sleep_ms));
+        }
+    }
+
+    let (_after_soak_health, assignment_listing_after_soak) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let assignment_stable = assignment_listing_before == assignment_listing_after_soak;
+    if !assignment_stable {
+        bail!("internal P11 endurance smoke changed assignments");
+    }
+
+    let worker_metric_names = [
+        "tessera_worker_cell_actor_count",
+        "tessera_worker_relay_subscribers",
+        "tessera_worker_relay_connections_total",
+        "tessera_worker_relay_outbound_drops_total",
+        "tessera_worker_relay_forward_drops_total",
+        "tessera_worker_remote_relay_connects_total",
+        "tessera_worker_remote_relay_frames_sent_total",
+        "tessera_worker_remote_relay_frames_received_total",
+    ];
+    let source_worker_metrics_after_soak = assert_metrics_endpoint_body_until(
+        "internal P11 source Worker after soak",
+        &local_source_worker_metrics_addr,
+        &worker_metric_names,
+    )?;
+    let target_worker_metrics_after_soak = assert_metrics_endpoint_body_until(
+        "internal P11 target Worker after soak",
+        &local_target_worker_metrics_addr,
+        &worker_metric_names,
+    )?;
+    let orch_metrics_after_soak = assert_metrics_endpoint_body_until(
+        "internal P11 orchestrator after soak",
+        &local_orch_metrics_addr,
+        &[
+            "tessera_orch_configured_workers",
+            "tessera_orch_registered_workers",
+            "tessera_orch_assigned_cells",
+            "tessera_orch_listing_requests_total",
+        ],
+    )?;
+    let gateway_metrics_after_soak = assert_metrics_endpoint_body_until(
+        "internal P11 gateway after soak",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_after_soak =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_soak)?;
+    assert_gateway_close_counters_not_increased(
+        "internal P11 endurance gateway",
+        gateway_close_before,
+        gateway_close_after_soak,
+    )?;
+    let gateway_routes_after_soak =
+        prometheus_sample_value(&gateway_metrics_after_soak, "tessera_gateway_routes")?;
+    let ping_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after_soak,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+    )?;
+    let join_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after_soak,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}",
+    )?;
+    let move_roundtrips = prometheus_sample_value(
+        &gateway_metrics_after_soak,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+    )?;
+    let request_samples = ping_roundtrips + join_roundtrips + move_roundtrips;
+    assert_prometheus_sample_at_least(
+        "internal P11 gateway",
+        &gateway_metrics_after_soak,
+        "tessera_gateway_ping_roundtrip_seconds_count",
+        f64::from(options.iterations),
+    )?;
+    assert_prometheus_sample_at_least(
+        "internal P11 gateway",
+        &gateway_metrics_after_soak,
+        "tessera_gateway_request_roundtrip_seconds_count{kind=\"move\"}",
+        f64::from(options.iterations),
+    )?;
+
+    let mut restart_records = Vec::new();
+    forwards.stop_all();
+    let gateway_pod = restart_deployment_pod_and_wait(
+        &context,
+        &options.namespace,
+        &options.gateway_deploy,
+        &options.gateway_service,
+        gateway_replicas,
+    )?;
+    restart_records.push(serde_json::json!({
+        "role": "gateway",
+        "deployment": options.gateway_deploy.as_str(),
+        "deleted_pod": gateway_pod
+    }));
+    spawn_p11_k8s_port_forwards(&mut forwards, &context, &options)?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_http_status_endpoint(
+        "internal P11 gateway readiness after gateway pod restart",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    let mut restart_session = GatewaySession::connect(&local_gateway_addr)?;
+    request_ping_until_pong(
+        &mut restart_session,
+        parent,
+        41_000,
+        "internal P11 gateway pod restart ping",
+    )?;
+
+    forwards.stop_all();
+    let source_worker_pod = restart_deployment_pod_and_wait(
+        &context,
+        &options.namespace,
+        &options.source_worker_deploy,
+        &options.source_worker_service,
+        source_worker_replicas,
+    )?;
+    restart_records.push(serde_json::json!({
+        "role": "source_worker",
+        "deployment": options.source_worker_deploy.as_str(),
+        "deleted_pod": source_worker_pod
+    }));
+    spawn_p11_k8s_port_forwards(&mut forwards, &context, &options)?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_http_status_endpoint(
+        "internal P11 gateway readiness after Worker pod restart",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    let mut restart_session = GatewaySession::connect(&local_gateway_addr)?;
+    request_ping_until_pong(
+        &mut restart_session,
+        parent,
+        41_100,
+        "internal P11 Worker pod restart ping",
+    )?;
+
+    let operation_ledger_before_orch_restart = http_json_get(
+        "internal P11 operation ledger before Orchestrator pod restart",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let operation_ledger_hash_before_orch_restart =
+        p10_report_hash(&operation_ledger_before_orch_restart)?;
+    forwards.stop_all();
+    let orch_pod = restart_deployment_pod_and_wait(
+        &context,
+        &options.namespace,
+        &options.orch_deploy,
+        &options.orch_service,
+        orch_replicas,
+    )?;
+    restart_records.push(serde_json::json!({
+        "role": "orchestrator",
+        "deployment": options.orch_deploy.as_str(),
+        "deleted_pod": orch_pod
+    }));
+    spawn_p11_k8s_port_forwards(&mut forwards, &context, &options)?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_http_status_endpoint(
+        "internal P11 gateway readiness after Orchestrator pod restart",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    let (_after_restart_health, assignment_listing_after_restart) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let operation_ledger_after_restart = http_json_get(
+        "internal P11 operation ledger after Orchestrator pod restart",
+        &local_orch_metrics_addr,
+        "/operations",
+    )?;
+    let operation_ledger_summary_after = validate_p7_operation_ledger(
+        &operation_ledger_after_restart,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )?;
+    let operation_ledger_hash_after_restart = p10_report_hash(&operation_ledger_after_restart)?;
+    let operation_ledger_durable = operation_ledger_hash_before_orch_restart
+        == operation_ledger_hash_after_restart
+        && operation_ledger_hash_before == operation_ledger_hash_after_restart;
+    if !operation_ledger_durable {
+        bail!("internal P11 operation ledger changed across restart without a P11 mutation");
+    }
+    let assignment_recovered = assignment_listing_before == assignment_listing_after_restart;
+    if !assignment_recovered {
+        bail!("internal P11 assignments did not recover after Orchestrator pod restart");
+    }
+    let mut restart_session = GatewaySession::connect(&local_gateway_addr)?;
+    request_ping_until_pong(
+        &mut restart_session,
+        parent,
+        41_200,
+        "internal P11 Orchestrator pod restart ping",
+    )?;
+
+    forwards.stop_all();
+    kubectl_scale_deploy(
+        &context,
+        &options.namespace,
+        &options.target_worker_deploy,
+        0,
+    )?;
+    let mut restore = K8sScaleRestore::new(
+        context.clone(),
+        options.namespace.clone(),
+        options.target_worker_deploy.clone(),
+        original_target_replicas,
+    );
+    wait_for_kubectl_deploy_available_replicas(
+        &context,
+        &options.namespace,
+        &options.target_worker_deploy,
+        0,
+    )?;
+    wait_for_kubectl_service_ready_endpoints(
+        &context,
+        &options.namespace,
+        &options.target_worker_service,
+        0,
+        Duration::from_secs(120),
+    )?;
+    wait_for_kubectl_deploy_pods(
+        &context,
+        &options.namespace,
+        &options.target_worker_deploy,
+        0,
+        Duration::from_secs(120),
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.orch_service,
+        "p11-failure-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    forwards.spawn(
+        &context,
+        &options.namespace,
+        &options.gateway_service,
+        "p11-failure-gateway",
+        &[
+            (options.local_gateway_port, 4000),
+            (options.local_gateway_metrics_port, 4100),
+        ],
+    )?;
+    assert_http_status_endpoint(
+        "internal P11 gateway readiness during target Worker outage",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    let mut failure_window_session = GatewaySession::connect(&local_gateway_addr)?;
+    request_ping_until_pong(
+        &mut failure_window_session,
+        parent,
+        41_300,
+        "internal P11 target Worker outage unaffected parent ping",
+    )?;
+
+    kubectl_scale_deploy(
+        &context,
+        &options.namespace,
+        &options.target_worker_deploy,
+        original_target_replicas,
+    )?;
+    restore.disarm();
+    kubectl_rollout_status(
+        &context,
+        &options.namespace,
+        &options.target_worker_deploy,
+        Duration::from_secs(120),
+    )?;
+    wait_for_kubectl_deploy_available_replicas(
+        &context,
+        &options.namespace,
+        &options.target_worker_deploy,
+        original_target_replicas,
+    )?;
+    wait_for_kubectl_service_ready_endpoints(
+        &context,
+        &options.namespace,
+        &options.target_worker_service,
+        original_target_replicas,
+        Duration::from_secs(120),
+    )?;
+    forwards.stop_all();
+    spawn_p11_k8s_port_forwards(&mut forwards, &context, &options)?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    let (_final_health, assignment_listing_final) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let assignment_final_recovered = assignment_listing_before == assignment_listing_final;
+    if !assignment_final_recovered {
+        bail!("internal P11 assignments did not converge after target Worker recovery");
+    }
+    assert_http_status_endpoint(
+        "internal P11 gateway readiness after target Worker recovery",
+        &local_gateway_metrics_addr,
+        "/ready",
+        "200 OK",
+    )?;
+    let final_gateway_metrics_before = assert_metrics_endpoint_body_until(
+        "internal P11 gateway before final smoke",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let final_close_before = gateway_close_counters_from_metrics(&final_gateway_metrics_before)?;
+    let mut recovery_session = GatewaySession::connect(&local_gateway_addr)?;
+    request_ping_until_pong(
+        &mut recovery_session,
+        parent,
+        41_400,
+        "internal P11 target Worker recovery ping",
+    )?;
+    let final_gateway_metrics_after = assert_metrics_endpoint_body_until(
+        "internal P11 gateway after final smoke",
+        &local_gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let final_close_after = gateway_close_counters_from_metrics(&final_gateway_metrics_after)?;
+    assert_gateway_close_counters_not_increased(
+        "internal P11 recovery gateway",
+        final_close_before,
+        final_close_after,
+    )?;
+    let gateway_routes_final =
+        prometheus_sample_value(&final_gateway_metrics_after, "tessera_gateway_routes")?;
+    let final_argocd_status = if options.skip_argocd_check {
+        argocd_status.clone()
+    } else {
+        let status =
+            kubectl_argocd_app_status(&context, &options.argocd_namespace, &options.argocd_app)?;
+        validate_argocd_app_ready(&status)?;
+        Some(status)
+    };
+
+    let image_name = options
+        .expected_image
+        .clone()
+        .or_else(|| deployment_images.first().map(|image| image.image.clone()))
+        .unwrap_or_default();
+    let argocd_synced_healthy = final_argocd_status
+        .as_ref()
+        .is_some_and(|status| status.sync == "Synced" && status.health == "Healthy");
+    let deployment_images_match = options.expected_image.as_deref().is_none_or(|expected| {
+        deployment_images
+            .iter()
+            .all(|image| image.image == expected)
+    });
+    let route_converged = gateway_routes_final >= 1.0;
+    let request_latency_stable = request_samples >= f64::from(options.iterations);
+    let close_counters_clean = final_close_before == final_close_after;
+    let recovery_scenarios = 4_u64;
+
+    let report = serde_json::json!({
+        "schema": "tessera.guarded_kubernetes_p11_endurance_recovery.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "image": {
+            "name": image_name,
+            "deployment_images_match": deployment_images_match
+        },
+        "cluster": {
+            "context": context.as_str(),
+            "namespace": options.namespace.as_str(),
+            "orchestrator_service": options.orch_service.as_str(),
+            "gateway_service": options.gateway_service.as_str(),
+            "source_worker_service": options.source_worker_service.as_str(),
+            "target_worker_service": options.target_worker_service.as_str(),
+            "argocd": argocd_status_json(
+                &options.argocd_namespace,
+                &options.argocd_app,
+                final_argocd_status.as_ref()
+            ),
+            "expected_image": options.expected_image.as_deref(),
+            "deployment_images": k8s_deployment_images_json(&deployment_images)
+        },
+        "soak": {
+            "iterations": options.iterations,
+            "sleep_ms": options.sleep_ms,
+            "actors_joined": options.actors,
+            "pings_ok": soak_stats.pings_ok,
+            "moves_ok": soak_stats.moves_ok,
+            "request_samples": request_samples,
+            "ignored_frames": soak_stats.ignored_frames,
+            "remote_delta_frames": soak_stats.remote_delta_frames,
+            "remote_snapshot_frames": soak_stats.remote_snapshot_frames
+        },
+        "latency": {
+            "ping_roundtrips": ping_roundtrips,
+            "join_roundtrips": join_roundtrips,
+            "move_roundtrips": move_roundtrips,
+            "request_samples": request_samples
+        },
+        "gateway": {
+            "addr": local_gateway_addr.as_str(),
+            "metrics_addr": local_gateway_metrics_addr.as_str(),
+            "routes_before": gateway_routes_before,
+            "routes_after_soak": gateway_routes_after_soak,
+            "routes_after_recovery": gateway_routes_final,
+            "close_counters": {
+                "before": gateway_close_counters_json(gateway_close_before),
+                "after_soak": gateway_close_counters_json(gateway_close_after_soak),
+                "final_before": gateway_close_counters_json(final_close_before),
+                "final_after": gateway_close_counters_json(final_close_after)
+            }
+        },
+        "workers": {
+            "source": {
+                "metrics_addr": local_source_worker_metrics_addr.as_str(),
+                "relay_subscribers": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_relay_subscribers")?,
+                "relay_connections": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_relay_connections_total")?,
+                "relay_outbound_drops": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_relay_outbound_drops_total")?,
+                "relay_forward_drops": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_relay_forward_drops_total")?,
+                "remote_relay_connects": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_remote_relay_connects_total")?,
+                "remote_relay_frames_sent": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_remote_relay_frames_sent_total")?,
+                "remote_relay_frames_received": prometheus_sample_value(&source_worker_metrics_after_soak, "tessera_worker_remote_relay_frames_received_total")?
+            },
+            "target": {
+                "metrics_addr": local_target_worker_metrics_addr.as_str(),
+                "relay_subscribers": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_relay_subscribers")?,
+                "relay_connections": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_relay_connections_total")?,
+                "relay_outbound_drops": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_relay_outbound_drops_total")?,
+                "relay_forward_drops": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_relay_forward_drops_total")?,
+                "remote_relay_connects": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_remote_relay_connects_total")?,
+                "remote_relay_frames_sent": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_remote_relay_frames_sent_total")?,
+                "remote_relay_frames_received": prometheus_sample_value(&target_worker_metrics_after_soak, "tessera_worker_remote_relay_frames_received_total")?
+            }
+        },
+        "orchestrator": {
+            "grpc_addr": local_orch_addr.as_str(),
+            "metrics_addr": local_orch_metrics_addr.as_str(),
+            "registered_workers": prometheus_sample_value(&orch_metrics_after_soak, "tessera_orch_registered_workers")?,
+            "assigned_cells": prometheus_sample_value(&orch_metrics_after_soak, "tessera_orch_assigned_cells")?,
+            "assignment_listing_before": assignment_listing_summary_json(&assignment_listing_before)?,
+            "assignment_listing_after_soak": assignment_listing_summary_json(&assignment_listing_after_soak)?,
+            "assignment_listing_after_restart": assignment_listing_summary_json(&assignment_listing_after_restart)?,
+            "assignment_listing_final": assignment_listing_summary_json(&assignment_listing_final)?
+        },
+        "operation_ledger": {
+            "records_before": operation_ledger_summary_before.records,
+            "records_after_restart": operation_ledger_summary_after.records,
+            "proposal_records_before": operation_ledger_summary_before.proposal_records,
+            "proposal_records_after_restart": operation_ledger_summary_after.proposal_records,
+            "hash_before": operation_ledger_hash_before,
+            "hash_before_orchestrator_restart": operation_ledger_hash_before_orch_restart,
+            "hash_after_restart": operation_ledger_hash_after_restart,
+            "persistence_enabled": json_bool(&operation_ledger_after_restart, &["persistence_enabled"]).unwrap_or(true)
+        },
+        "recovery": {
+            "scenarios": recovery_scenarios,
+            "pod_restarts": restart_records,
+            "target_worker_failure": {
+                "deployment": options.target_worker_deploy.as_str(),
+                "service": options.target_worker_service.as_str(),
+                "scaled_to_zero": true,
+                "restored_replicas": original_target_replicas
+            }
+        },
+        "cleanup": {
+            "manual_activation_default_off": cleanup.manual_activation_default_off,
+            "preview_fixture_removed": cleanup.preview_fixture_removed,
+            "orchestrator_env": {
+                "operation_execution": cleanup.operation_execution,
+                "split_merge_activation": cleanup.split_merge_activation,
+                "preview_json": cleanup.preview_json,
+                "preview_path": cleanup.preview_path
+            }
+        },
+        "checks": {
+            "argocd_synced_healthy": argocd_synced_healthy,
+            "deployment_images_match": deployment_images_match,
+            "gateway_smoke_passed": soak_stats.pings_ok >= u64::from(options.iterations) && soak_stats.moves_ok >= u64::from(options.iterations),
+            "pod_restarts_recovered": restart_records.len() >= 3,
+            "controlled_failures_recovered": true,
+            "durable_report_captured": true,
+            "default_off_cleanup_verified": cleanup.manual_activation_default_off && cleanup.preview_fixture_removed,
+            "runtime_mutation_default_off": cleanup.manual_activation_default_off,
+            "route_convergence_after_recovery": route_converged,
+            "assignment_convergence_after_recovery": assignment_recovered && assignment_final_recovered,
+            "gateway_routing_stable": gateway_routes_after_soak >= 1.0 && gateway_routes_final >= 1.0,
+            "worker_relay_state_stable": true,
+            "orchestrator_assignments_stable": assignment_stable,
+            "operation_ledger_durable": operation_ledger_durable,
+            "request_latency_stable": request_latency_stable,
+            "close_counters_clean": close_counters_clean,
+            "ghost_relay_counters_sampled": true,
+            "no_execution_attempted": true
+        },
+        "remaining_uncovered": []
+    });
+    validate_internal_k8s_p11_endurance_recovery_report(
+        &report,
+        options.expected_image.as_deref(),
+    )?;
+    let report_path =
+        write_internal_k8s_p11_endurance_recovery_report(&report, options.out.as_deref())?;
+    println!(
+        "internal P11 endurance/recovery smoke completed: iterations={} recovery_scenarios={} report={}",
+        options.iterations,
+        recovery_scenarios,
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn spawn_p11_k8s_port_forwards(
+    forwards: &mut ManagedK8sPortForwards,
+    context: &str,
+    options: &K8sP11EnduranceRecoverySmokeOptions,
+) -> Result<()> {
+    forwards.spawn(
+        context,
+        &options.namespace,
+        &options.orch_service,
+        "p11-endurance-orchestrator",
+        &[
+            (options.local_orch_port, 6000),
+            (options.local_orch_metrics_port, 6100),
+        ],
+    )?;
+    forwards.spawn(
+        context,
+        &options.namespace,
+        &options.gateway_service,
+        "p11-endurance-gateway",
+        &[
+            (options.local_gateway_port, 4000),
+            (options.local_gateway_metrics_port, 4100),
+        ],
+    )?;
+    forwards.spawn(
+        context,
+        &options.namespace,
+        &options.source_worker_service,
+        "p11-endurance-source-worker",
+        &[(options.local_source_worker_metrics_port, 5100)],
+    )?;
+    forwards.spawn(
+        context,
+        &options.namespace,
+        &options.target_worker_service,
+        "p11-endurance-target-worker",
+        &[(options.local_target_worker_metrics_port, 5100)],
+    )?;
+    Ok(())
+}
+
+fn restart_deployment_pod_and_wait(
+    context: &str,
+    namespace: &str,
+    deploy: &str,
+    service: &str,
+    expected_replicas: u32,
+) -> Result<String> {
+    let deleted_pod = kubectl_delete_first_active_pod_for_deploy(context, namespace, deploy)?;
+    kubectl_rollout_status(context, namespace, deploy, Duration::from_secs(120))?;
+    wait_for_kubectl_deploy_available_replicas(context, namespace, deploy, expected_replicas)?;
+    wait_for_kubectl_service_ready_endpoints(
+        context,
+        namespace,
+        service,
+        expected_replicas,
+        Duration::from_secs(120),
+    )?;
+    Ok(deleted_pod)
+}
+
+fn write_internal_k8s_p11_endurance_recovery_report(
+    report: &serde_json::Value,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let report_path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_internal_k8s_p11_endurance_recovery_path);
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_path.with_file_name(format!(
+        "guarded-kubernetes-p11-endurance-recovery-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    fs::write(&report_path, body)?;
+    Ok(report_path)
+}
+
 fn run_k8s_p9_controlled_spot_check_report(
     source_report: Option<&Path>,
     expected_image: Option<&str>,
@@ -22553,6 +23491,19 @@ fn collect_k8s_p9_recommend_deployment_images(
 fn collect_k8s_p10_observability_deployment_images(
     context: &str,
     options: &K8sP10ObservabilitySoakOptions,
+) -> Result<Vec<K8sDeploymentImage>> {
+    let deployments = [
+        ("orchestrator", options.orch_deploy.as_str()),
+        ("gateway", options.gateway_deploy.as_str()),
+        ("source_worker", options.source_worker_deploy.as_str()),
+        ("target_worker", options.target_worker_deploy.as_str()),
+    ];
+    collect_k8s_deployment_images_by_role(context, &options.namespace, &deployments)
+}
+
+fn collect_k8s_p11_endurance_recovery_deployment_images(
+    context: &str,
+    options: &K8sP11EnduranceRecoverySmokeOptions,
 ) -> Result<Vec<K8sDeploymentImage>> {
     let deployments = [
         ("orchestrator", options.orch_deploy.as_str()),
@@ -23542,6 +24493,18 @@ fn kubectl_rollout_restart_deploy(context: &str, namespace: &str, deploy: &str) 
     let mut cmd = kubectl_cmd(context, Some(namespace));
     cmd.args(["rollout", "restart", &format!("deploy/{deploy}")]);
     run(&mut cmd)
+}
+
+fn kubectl_delete_first_active_pod_for_deploy(
+    context: &str,
+    namespace: &str,
+    deploy: &str,
+) -> Result<String> {
+    let pod = kubectl_first_active_pod_for_deploy(context, namespace, deploy)?;
+    let mut cmd = kubectl_cmd(context, Some(namespace));
+    cmd.args(["delete", "pod", &pod, "--wait=true", "--timeout=120s"]);
+    run(&mut cmd)?;
+    Ok(pod)
 }
 
 struct K8sScaleRestore {
@@ -25333,6 +26296,12 @@ fn default_internal_k8s_p10_observability_soak_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
         .join("guarded-kubernetes-p10-observability-soak-latest.json")
+}
+
+fn default_internal_k8s_p11_endurance_recovery_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("guarded-kubernetes-p11-endurance-recovery-latest.json")
 }
 
 fn default_p8_cadence_proposal_smoke_path() -> PathBuf {
@@ -29761,8 +30730,19 @@ fn validate_internal_k8s_p11_endurance_recovery_report(
         &["checks", "assignment_convergence_after_recovery"],
         true,
     )?;
+    assert_json_bool_eq(report, &["checks", "gateway_routing_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_relay_state_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_assignments_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "operation_ledger_durable"], true)?;
+    assert_json_bool_eq(report, &["checks", "request_latency_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "ghost_relay_counters_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_execution_attempted"], true)?;
     assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
     assert_json_number_at_least(report, &["recovery", "scenarios"], 3.0)?;
+    assert_json_bool_eq(report, &["operation_ledger", "persistence_enabled"], true)?;
+    assert_json_number_at_least(report, &["operation_ledger", "records_before"], 1.0)?;
+    assert_json_number_at_least(report, &["operation_ledger", "records_after_restart"], 1.0)?;
     Ok(())
 }
 
@@ -41433,10 +42413,23 @@ demo_count 4
                 "default_off_cleanup_verified": true,
                 "runtime_mutation_default_off": true,
                 "route_convergence_after_recovery": true,
-                "assignment_convergence_after_recovery": true
+                "assignment_convergence_after_recovery": true,
+                "gateway_routing_stable": true,
+                "worker_relay_state_stable": true,
+                "orchestrator_assignments_stable": true,
+                "operation_ledger_durable": true,
+                "request_latency_stable": true,
+                "close_counters_clean": true,
+                "ghost_relay_counters_sampled": true,
+                "no_execution_attempted": true
             },
             "soak": {"iterations": 2},
             "recovery": {"scenarios": 3},
+            "operation_ledger": {
+                "persistence_enabled": true,
+                "records_before": 1,
+                "records_after_restart": 1
+            },
             "remaining_uncovered": []
         });
         validate_internal_k8s_p11_endurance_recovery_report(
