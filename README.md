@@ -9,8 +9,8 @@ skeleton for MMO-scale simulation, not a finished game server.
 
 - Runtime: Rust + Tokio
 - Deployment target: self-hosted and Kubernetes-friendly
-- Current state: P0 through P9 are complete; P10 Runtime Observability and Soak
-  Hardening is the active design boundary.
+- Current state: P0 through P10 are complete; P11 Operational Endurance and
+  Failure Recovery is the active design boundary.
 
 ## Workspace
 
@@ -30,6 +30,8 @@ skeleton for MMO-scale simulation, not a finished game server.
 - Harness only: `cargo xt harness`
 - Tests: `cargo test`
 - Last completed audit: `cargo xt p10-completion-audit --json`
+- Active P11 audit: `cargo xt p11-completion-audit --json` (expected to fail
+  until P11 evidence exists)
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -59,6 +61,8 @@ Useful variants:
   - `cargo xt dev p10-replay-audit`
   - `cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.9`
   - `cargo xt p10-completion-audit --json`
+- Active P11 completion gate:
+  - `cargo xt p11-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical
 P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
@@ -87,9 +91,11 @@ P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
 
 ### Current Open Boundary
 
-P10 is closed as of the `v2026.05.9` evidence set. `docs/todo-next.md` is the
-active planning index for the next boundary; do not treat older milestone docs
-as open scope unless that file reopens them.
+P10 is closed as of the `v2026.05.9` evidence set. `docs/todo-next.md` now
+points to P11 Operational Endurance and Failure Recovery. P11 uses the P10
+observability loop as a baseline, keeps runtime mutation default-off, and
+focuses on long-duration load, reconnects, restarts, controlled component
+failures, route/assignment convergence, and durable recovery evidence.
 
 ## Protocol Snapshot
 

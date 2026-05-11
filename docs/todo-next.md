@@ -1,6 +1,6 @@
 # Tessera Next Todo
 
-Last reviewed: 2026-05-09
+Last reviewed: 2026-05-11
 
 ## Baseline
 
@@ -32,40 +32,42 @@ Last reviewed: 2026-05-09
 - The live Tessera GitOps cleanup revision keeps Orchestrator execution and
   split/merge activation default-off outside controlled smoke windows, removes
   preview fixtures after smoke, and leaves ArgoCD `tessera` `Synced / Healthy`.
-- The next design boundary is not opened yet.
+- P11 Operational Endurance and Failure Recovery is the active design boundary.
 
 ## Next
 
-P10 is closed. Keep this file as the planning index for the next milestone, and
-open a new contract before starting runtime-affecting P11 work.
+P10 is closed. P11 should prove that the P10 observability loop remains useful
+under longer load, reconnects, restarts, and controlled failure windows. The
+active contract is `docs/p11-operational-endurance-failure-recovery.md`.
 
-Completed P10 slices:
+Recommended P11 slices:
 
-1. Done: `test: add p10 completion audit` - mark P10 active in docs, add
-   the P10 goal contract, and add a fail-closed
-   `cargo xt p10-completion-audit --json` skeleton requiring local
-   observability soak, ghost relay soak, replay audit, GitOps rollout/default-off
-   cleanup, and internal MicroK8s observability soak evidence.
-2. Done: `feat: add p10 observability soak` - add `cargo xt dev
-   p10-observability-soak` to sample Gateway, Worker, and Orchestrator metrics,
-   request latency histograms, ghost relay counters, assignment snapshots, and
-   operation/recommend histories into a durable replayable report.
-3. Done: `test: add p10 ghost relay soak` - add focused local/dev coverage
-   for relay fanout, backpressure, reconnect counters, route convergence,
-   close-counter cleanliness, assignment stability, and default-off state.
-4. Done: `test: add p10 replay audit` - replay durable P10 reports and prove
-   stable report hashes without touching runtime state.
-5. Done: `build: publish p10 observability runtime image` - publish the P10
-   image only after local evidence is green, promote it through the k8s GitOps
-   repo, verify ArgoCD `Synced / Healthy`, and record
-   `.dev/reports/p10-gitops-rollout-latest.json`.
-6. Done: `test: add internal p10 observability soak` - validate the promoted
-   image in internal MicroK8s with Gateway smoke, live metrics, durable report
-   capture, and final default-off cleanup.
+1. Done: `test: add p11 completion audit` - mark P11 active in docs, add the
+   P11 goal contract, and add a fail-closed
+   `cargo xt p11-completion-audit --json` skeleton requiring local endurance,
+   restart recovery, transient failure/reconnect recovery, GitOps rollout,
+   internal MicroK8s endurance/recovery, and default-off cleanup evidence.
+2. Pending: `feat: add local p11 endurance soak` - extend the P10
+   observability loop with repeated load/reconnect evidence and write
+   `.dev/reports/p11-endurance-soak-latest.json`.
+3. Pending: `test: add p11 restart recovery smokes` - cover Gateway, Worker,
+   and Orchestrator restart recovery with persisted assignment and operation
+   state in `.dev/reports/p11-restart-recovery-latest.json`.
+4. Pending: `test: add p11 transient failure recovery` - cover target Worker
+   unavailability, controlled component failure, port-forward reconnect, and
+   post-recovery convergence in
+   `.dev/reports/p11-transient-failure-recovery-latest.json`.
+5. Pending: `build: publish p11 endurance runtime image` - publish only after
+   local evidence is green, promote it through GitOps, verify ArgoCD
+   `Synced / Healthy`, and record `.dev/reports/p11-gitops-rollout-latest.json`.
+6. Pending: `test: add internal p11 endurance recovery smoke` - validate the
+   promoted image in internal MicroK8s with pod restarts, controlled failures,
+   Gateway smoke, durable report capture, and final default-off cleanup.
 
 ## Guardrails
 
-- P10 observability code must remain mutation-free by default.
+- P11 endurance/recovery code must remain mutation-free by default unless an
+  explicit controlled window requires a bounded runtime action.
 - Runtime-affecting paths require local evidence first, then image publish,
   GitOps rollout, ArgoCD health, internal smoke, cleanup, and completion audit.
 - Controlled windows must be short-lived, explicit, and followed by default-off

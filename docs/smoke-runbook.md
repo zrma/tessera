@@ -1,6 +1,6 @@
 # Tessera Smoke Runbook
 
-Last reviewed: 2026-05-09
+Last reviewed: 2026-05-11
 
 This runbook holds the command catalog that used to make `README.md` hard to
 scan. Prefer the narrowest smoke that covers the changed surface, then close a
@@ -217,6 +217,37 @@ Internal gate after image publish and GitOps promotion:
 
 ```sh
 cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.9
+```
+
+## P11 Endurance And Recovery
+
+The P11 audit exists first and fails closed until the required endurance and
+recovery reports are implemented and captured:
+
+```sh
+cargo xt p11-completion-audit --json
+```
+
+Planned local gates:
+
+```sh
+cargo xt dev p11-endurance-soak
+cargo xt dev p11-restart-recovery-smoke
+cargo xt dev p11-transient-failure-recovery-smoke
+```
+
+Planned reports:
+
+- `.dev/reports/p11-endurance-soak-latest.json`
+- `.dev/reports/p11-restart-recovery-latest.json`
+- `.dev/reports/p11-transient-failure-recovery-latest.json`
+- `.dev/reports/p11-gitops-rollout-latest.json`
+- `.dev/reports/internal-microk8s-p11-endurance-recovery-latest.json`
+
+Planned internal gate after image publish and GitOps promotion:
+
+```sh
+cargo xt k8s p11-endurance-recovery-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag>
 ```
 
 ## Internal MicroK8s Activation

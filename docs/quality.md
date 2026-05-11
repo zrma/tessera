@@ -30,6 +30,11 @@ This document is the repo-local quality map for agents. It keeps the expected au
   returns `complete=true` only when local observability, ghost relay, replay,
   GitOps rollout, internal MicroK8s soak, and default-off cleanup evidence are
   present.
+- `cargo xt p11-completion-audit --json` is the active P11 fail-closed gate for
+  operational endurance and failure recovery. It should stay incomplete until
+  local endurance, restart recovery, transient failure/reconnect recovery,
+  GitOps rollout, internal MicroK8s endurance/recovery, and default-off cleanup
+  evidence are present.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
@@ -179,4 +184,10 @@ This document is the repo-local quality map for agents. It keeps the expected au
   ArgoCD `Synced / Healthy`, matching deployment images, Gateway smoke, sampled
   Gateway/Worker/Orchestrator metrics, assignment stability, and live
   default-off cleanup.
+- P11 operational endurance and failure recovery is the active boundary. It
+  keeps the P10 observability loop as the baseline, but must add repeated load,
+  reconnect, Gateway restart, Worker restart, Orchestrator restart with
+  persisted assignment/operation state, transient target Worker unavailability,
+  port-forward reconnect, and post-recovery route/assignment convergence
+  evidence before it can close.
 - `docs/completed-milestones.md` records completed P0/P1/P2/P3/P4.1 work; `docs/todo-next.md` is the current execution-plan index; `docs/todo-p4-next-milestones.md` records the current decision gates. Keep README's implemented/planned sections and detailed `docs/` notes in sync when a task spans multiple changes.

@@ -1,6 +1,6 @@
 # Tessera Documentation Index
 
-Last reviewed: 2026-05-09
+Last reviewed: 2026-05-11
 
 This directory separates current operating truth from historical milestone
 records. Start here when deciding what to read next.
@@ -21,8 +21,8 @@ find deeper runbooks.
 
 ## Active Planning
 
-`todo-next.md` is the active open-work index. As of this review, P9 is closed
-and P10 Runtime Observability and Soak Hardening is active.
+`todo-next.md` is the active open-work index. As of this review, P10 is closed
+and P11 Operational Endurance and Failure Recovery is active.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -38,10 +38,11 @@ or completion audit.
 | P8 closed-loop operation cadence | Complete as `v2026.05.7` | `p8-closed-loop-operation-cadence.md` |
 | P9 operation control-plane readiness | Complete as `v2026.05.8` | `p9-operation-control-plane-readiness.md` |
 | P10 runtime observability and soak hardening | Complete as `v2026.05.9` | `p10-runtime-observability-soak-hardening.md` |
+| P11 operational endurance and failure recovery | Active; fail-closed audit contract added | `p11-operational-endurance-failure-recovery.md` |
 
 The P6/P7/P8/P9/P10 documents are retained because they define evidence
-contracts, report shapes, and completion gates. Older milestone docs should not
-be treated as active TODO lists unless
+contracts, report shapes, and completion gates. P11 is the current active
+contract. Older milestone docs should not be treated as active TODO lists unless
 `todo-next.md` explicitly reopens a boundary.
 
 ## Design Notes
