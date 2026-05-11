@@ -78,8 +78,9 @@ exist and validate.
 
 1. **Contract and audit skeleton**: mark P11 active in docs, add this contract,
    and add fail-closed `cargo xt p11-completion-audit --json`.
-2. **Local endurance soak**: add `cargo xt dev p11-endurance-soak` from the P10
-   observability loop, then extend it with repeated load and reconnect evidence.
+2. **Local endurance soak**: `cargo xt dev p11-endurance-soak` composes the P10
+   observability and ghost-relay loops into repeated load, reconnect, routing,
+   relay, assignment, ledger, latency, close-counter, and default-off evidence.
 3. **Restart recovery smokes**: add focused Gateway, Worker, and Orchestrator
    restart recovery reports with persisted assignment and operation state.
 4. **Transient failure recovery**: add target Worker unavailability and

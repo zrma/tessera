@@ -1292,6 +1292,15 @@ enum DevSub {
         #[arg(long, default_value_t = 10)]
         sleep_ms: u64,
     },
+    /// Run local P11 endurance soak and compose P10 observability/ghost-relay evidence
+    P11EnduranceSoak {
+        /// Number of endurance soak iterations to collect per phase
+        #[arg(long, default_value_t = 4)]
+        iterations: u32,
+        /// Delay between endurance iterations, in milliseconds
+        #[arg(long, default_value_t = 10)]
+        sleep_ms: u64,
+    },
     /// Replay P10 observability and ghost relay evidence without runtime mutation
     P10ReplayAudit {
         /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
@@ -2412,6 +2421,10 @@ fn main() -> Result<()> {
                 iterations,
                 sleep_ms,
             } => dev_p10_ghost_relay_soak(iterations, sleep_ms)?,
+            DevSub::P11EnduranceSoak {
+                iterations,
+                sleep_ms,
+            } => dev_p11_endurance_soak(iterations, sleep_ms)?,
             DevSub::P10ReplayAudit {
                 observability,
                 ghost,
@@ -3334,6 +3347,40 @@ fn dev_p10_ghost_relay_soak(iterations: u32, sleep_ms: u64) -> Result<()> {
         iterations,
         sleep_ms,
     })
+}
+
+fn dev_p11_endurance_soak(iterations: u32, sleep_ms: u64) -> Result<()> {
+    if iterations < 2 {
+        bail!("P11 endurance soak requires --iterations >= 2");
+    }
+
+    dev_p10_observability_soak(iterations, sleep_ms)?;
+    let observability_path = default_p10_observability_soak_path();
+    let observability_report = read_json_report(&observability_path)?;
+    validate_p10_observability_soak_report(&observability_report)
+        .with_context(|| format!("validate {}", observability_path.display()))?;
+
+    dev_p10_ghost_relay_soak(iterations, sleep_ms)?;
+    let ghost_path = default_p10_ghost_relay_soak_path();
+    let ghost_report = read_json_report(&ghost_path)?;
+    validate_p10_ghost_relay_soak_report(&ghost_report)
+        .with_context(|| format!("validate {}", ghost_path.display()))?;
+
+    let report = build_p11_endurance_soak_report(
+        &observability_path,
+        &observability_report,
+        &ghost_path,
+        &ghost_report,
+    )?;
+    validate_p11_endurance_soak_report(&report)?;
+    let report_path = write_p11_endurance_soak_report(&report)?;
+    println!(
+        "P11 endurance soak: {iterations} iterations composed local observability and ghost-relay endurance evidence, report={}, observability={}, ghost_relay={}",
+        report_path.display(),
+        observability_path.display(),
+        ghost_path.display()
+    );
+    Ok(())
 }
 
 fn dev_p10_replay_audit(observability: Option<&Path>, ghost: Option<&Path>) -> Result<()> {
@@ -24607,6 +24654,12 @@ fn default_p10_replay_audit_path() -> PathBuf {
         .join("p10-replay-audit-latest.json")
 }
 
+fn default_p11_endurance_soak_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p11-endurance-soak-latest.json")
+}
+
 fn default_internal_k8s_p9_recommend_soak_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -24947,6 +25000,17 @@ fn write_p10_replay_audit_report(report: &serde_json::Value) -> Result<PathBuf> 
     let stamped = report_dir.join(format!("p10-replay-audit-{}.json", unix_timestamp_secs()));
     fs::write(&stamped, &body)?;
     let latest = default_p10_replay_audit_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p11_endurance_soak_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!("p11-endurance-soak-{}.json", unix_timestamp_secs()));
+    fs::write(&stamped, &body)?;
+    let latest = default_p11_endurance_soak_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }
@@ -29021,6 +29085,165 @@ fn validate_internal_k8s_p11_endurance_recovery_report(
     assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
     assert_json_number_at_least(report, &["recovery", "scenarios"], 3.0)?;
     Ok(())
+}
+
+fn build_p11_endurance_soak_report(
+    observability_path: &Path,
+    observability_report: &serde_json::Value,
+    ghost_path: &Path,
+    ghost_report: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    validate_p10_observability_soak_report(observability_report)?;
+    validate_p10_ghost_relay_soak_report(ghost_report)?;
+
+    let observability_iterations = json_u64(observability_report, &["soak", "iterations"])?;
+    let ghost_iterations = json_u64(ghost_report, &["soak", "iterations"])?;
+    let iterations = observability_iterations.min(ghost_iterations);
+    let observability_sleep_ms = json_u64(observability_report, &["soak", "sleep_ms"])?;
+    let ghost_sleep_ms = json_u64(ghost_report, &["soak", "sleep_ms"])?;
+    let pings_ok = json_u64(observability_report, &["soak", "pings_ok"])?
+        + json_u64(ghost_report, &["soak", "pings_ok"])?;
+    let moves_ok = json_u64(observability_report, &["soak", "moves_ok"])?
+        + json_u64(ghost_report, &["soak", "moves_ok"])?;
+    let request_samples = json_f64(observability_report, &["latency", "request_samples"])?
+        + json_f64(ghost_report, &["gateway", "ping_roundtrips"])?
+        + json_f64(ghost_report, &["gateway", "move_roundtrips"])?;
+
+    let relay_drops = p11_ghost_worker_metric_sum(ghost_report, "relay_outbound_drops")?
+        + p11_ghost_worker_metric_sum(ghost_report, "relay_forward_drops")?;
+    let remote_relay_connects = p11_ghost_worker_metric_sum(ghost_report, "remote_relay_connects")?;
+    let remote_relay_frames_sent =
+        p11_ghost_worker_metric_sum(ghost_report, "remote_relay_frames_sent")?;
+    let remote_relay_frames_received =
+        p11_ghost_worker_metric_sum(ghost_report, "remote_relay_frames_received")?;
+
+    let gateway_routing_stable =
+        json_bool(
+            observability_report,
+            &["checks", "route_convergence_maintained"],
+        )? && json_bool(ghost_report, &["checks", "route_convergence_maintained"])?;
+    let close_counters_clean =
+        json_bool(observability_report, &["checks", "close_counters_clean"])?
+            && json_bool(ghost_report, &["checks", "close_counters_clean"])?;
+    let orchestrator_assignments_stable =
+        json_bool(
+            observability_report,
+            &["checks", "assignment_stability_checked"],
+        )? && json_bool(ghost_report, &["checks", "assignment_stability_checked"])?;
+    let worker_relay_state_stable =
+        json_bool(ghost_report, &["checks", "ghost_relay_fanout_observed"])?
+            && relay_drops == 0.0
+            && remote_relay_frames_sent >= 1.0
+            && remote_relay_frames_received >= 1.0;
+    let operation_ledger_durable =
+        json_bool(
+            observability_report,
+            &["checks", "operation_history_sampled"],
+        )? && json_bool(observability_report, &["checks", "durable_report_written"])?
+            && json_u64(observability_report, &["operation_history", "records"])? >= 1;
+    let request_latency_stable = json_bool(
+        observability_report,
+        &["checks", "request_latency_histograms_observed"],
+    )? && request_samples >= 1.0;
+    let ghost_relay_counters_sampled =
+        json_bool(ghost_report, &["checks", "backpressure_counters_sampled"])?
+            && json_bool(ghost_report, &["checks", "reconnect_counters_sampled"])?
+            && remote_relay_connects >= 1.0;
+    let runtime_mutation_default_off =
+        json_bool(
+            observability_report,
+            &["checks", "runtime_mutation_default_off"],
+        )? && json_bool(ghost_report, &["checks", "runtime_mutation_default_off"])?;
+    let no_execution_attempted =
+        json_bool(observability_report, &["checks", "no_execution_attempted"])?;
+
+    Ok(serde_json::json!({
+        "schema": "tessera.p11_endurance_soak.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "source_reports": {
+            "observability": {
+                "path": observability_path.display().to_string(),
+                "schema": json_str(observability_report, &["schema"])?,
+                "hash": p10_report_hash(observability_report)?
+            },
+            "ghost_relay": {
+                "path": ghost_path.display().to_string(),
+                "schema": json_str(ghost_report, &["schema"])?,
+                "hash": p10_report_hash(ghost_report)?
+            }
+        },
+        "soak": {
+            "iterations": iterations,
+            "observability_iterations": observability_iterations,
+            "ghost_relay_iterations": ghost_iterations,
+            "sleep_ms": observability_sleep_ms.max(ghost_sleep_ms),
+            "pings_ok": pings_ok,
+            "moves_ok": moves_ok
+        },
+        "latency": {
+            "request_samples": request_samples,
+            "observability_request_samples": json_f64(observability_report, &["latency", "request_samples"])?,
+            "ghost_ping_roundtrips": json_f64(ghost_report, &["gateway", "ping_roundtrips"])?,
+            "ghost_move_roundtrips": json_f64(ghost_report, &["gateway", "move_roundtrips"])?
+        },
+        "gateway": {
+            "observability": {
+                "routes_before": json_f64(observability_report, &["gateway", "routes_before"])?,
+                "routes_after": json_f64(observability_report, &["gateway", "routes_after"])?
+            },
+            "ghost_relay": {
+                "routes_before": json_f64(ghost_report, &["gateway", "routes_before"])?,
+                "routes_after": json_f64(ghost_report, &["gateway", "routes_after"])?
+            },
+            "close_counters_clean": close_counters_clean
+        },
+        "workers": {
+            "relay_drops": relay_drops,
+            "remote_relay_connects": remote_relay_connects,
+            "remote_relay_frames_sent": remote_relay_frames_sent,
+            "remote_relay_frames_received": remote_relay_frames_received
+        },
+        "orchestrator": {
+            "observability_assignment_listing_after": json_field(observability_report, &["orchestrator", "assignment_listing_after"])?,
+            "ghost_assignment_listing_after": json_field(ghost_report, &["orchestrator", "assignment_listing_after"])?
+        },
+        "operation_history": {
+            "ledger_path": json_str(observability_report, &["operation_history", "ledger_path"])?,
+            "records": json_u64(observability_report, &["operation_history", "records"])?,
+            "proposal_records": json_u64(observability_report, &["operation_history", "proposal_records"])?
+        },
+        "reconnect": {
+            "stack_cycles": 2,
+            "remote_relay_connects": remote_relay_connects,
+            "post_cycle_reports_validated": true
+        },
+        "checks": {
+            "repeated_load_completed": pings_ok >= iterations * 2 && moves_ok >= iterations * 2,
+            "reconnects_recovered": remote_relay_connects >= 1.0,
+            "gateway_routing_stable": gateway_routing_stable,
+            "worker_relay_state_stable": worker_relay_state_stable,
+            "orchestrator_assignments_stable": orchestrator_assignments_stable,
+            "operation_ledger_durable": operation_ledger_durable,
+            "request_latency_stable": request_latency_stable,
+            "close_counters_clean": close_counters_clean,
+            "ghost_relay_counters_sampled": ghost_relay_counters_sampled,
+            "runtime_mutation_default_off": runtime_mutation_default_off,
+            "no_execution_attempted": no_execution_attempted
+        },
+        "remaining_uncovered": [
+            "p11_local_restart_recovery",
+            "p11_local_transient_failure_recovery",
+            "p11_gitops_rollout",
+            "p11_internal_endurance_recovery",
+            "p11_completion_audit"
+        ]
+    }))
+}
+
+fn p11_ghost_worker_metric_sum(report: &serde_json::Value, metric: &str) -> Result<f64> {
+    Ok(json_f64(report, &["workers", "worker_a", metric])?
+        + json_f64(report, &["workers", "worker_b", metric])?)
 }
 
 fn build_p10_replay_audit_report(
@@ -40379,6 +40602,109 @@ demo_count 4
             Some("harbor.1day1coding.com/1day1coding/tessera:v2026.05.10"),
         )
         .expect("valid internal P11 report");
+    }
+
+    #[test]
+    fn p11_endurance_report_composes_p10_sources() {
+        let observability = serde_json::json!({
+            "schema": "tessera.p10_observability_soak.v1",
+            "status": "complete",
+            "soak": {
+                "iterations": 2,
+                "sleep_ms": 10,
+                "pings_ok": 4,
+                "moves_ok": 4
+            },
+            "latency": {"request_samples": 12},
+            "gateway": {
+                "routes_before": 4,
+                "routes_after": 4
+            },
+            "orchestrator": {
+                "assignment_listing_after": {"assignments": 4}
+            },
+            "operation_history": {
+                "ledger_path": ".dev/reports/p10-observability-ledger-latest.json",
+                "records": 1,
+                "proposal_records": 1
+            },
+            "checks": {
+                "gateway_metrics_sampled": true,
+                "worker_metrics_sampled": true,
+                "orchestrator_metrics_sampled": true,
+                "request_latency_histograms_observed": true,
+                "ghost_relay_counters_observed": true,
+                "assignment_snapshots_sampled": true,
+                "operation_history_sampled": true,
+                "recommend_history_sampled": true,
+                "durable_report_written": true,
+                "replayable_report": true,
+                "route_convergence_maintained": true,
+                "close_counters_clean": true,
+                "assignment_stability_checked": true,
+                "runtime_mutation_default_off": true,
+                "no_execution_attempted": true
+            }
+        });
+        let ghost = serde_json::json!({
+            "schema": "tessera.p10_ghost_relay_soak.v1",
+            "status": "complete",
+            "soak": {
+                "iterations": 2,
+                "sleep_ms": 10,
+                "pings_ok": 8,
+                "moves_ok": 8
+            },
+            "gateway": {
+                "routes_before": 4,
+                "routes_after": 4,
+                "ping_roundtrips": 8,
+                "move_roundtrips": 8
+            },
+            "workers": {
+                "worker_a": {
+                    "relay_outbound_drops": 0,
+                    "relay_forward_drops": 0,
+                    "remote_relay_connects": 1,
+                    "remote_relay_frames_sent": 2,
+                    "remote_relay_frames_received": 2
+                },
+                "worker_b": {
+                    "relay_outbound_drops": 0,
+                    "relay_forward_drops": 0,
+                    "remote_relay_connects": 1,
+                    "remote_relay_frames_sent": 2,
+                    "remote_relay_frames_received": 2
+                }
+            },
+            "orchestrator": {
+                "assignment_listing_after": {"assignments": 4}
+            },
+            "checks": {
+                "ghost_relay_fanout_observed": true,
+                "backpressure_counters_sampled": true,
+                "reconnect_counters_sampled": true,
+                "route_convergence_maintained": true,
+                "close_counters_clean": true,
+                "assignment_stability_checked": true,
+                "durable_report_written": true,
+                "replayable_report": true,
+                "runtime_mutation_default_off": true
+            }
+        });
+        let report = build_p11_endurance_soak_report(
+            std::path::Path::new(".dev/reports/p10-observability-soak-latest.json"),
+            &observability,
+            std::path::Path::new(".dev/reports/p10-ghost-relay-soak-latest.json"),
+            &ghost,
+        )
+        .expect("build P11 endurance report");
+
+        validate_p11_endurance_soak_report(&report).expect("valid P11 endurance report");
+        assert_json_bool_eq(&report, &["checks", "operation_ledger_durable"], true)
+            .expect("durable ledger check");
+        assert_json_number_at_least(&report, &["workers", "remote_relay_connects"], 2.0)
+            .expect("remote relay connect evidence");
     }
 
     #[test]

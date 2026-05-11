@@ -47,8 +47,8 @@ Recommended P11 slices:
    `cargo xt p11-completion-audit --json` skeleton requiring local endurance,
    restart recovery, transient failure/reconnect recovery, GitOps rollout,
    internal MicroK8s endurance/recovery, and default-off cleanup evidence.
-2. Pending: `feat: add local p11 endurance soak` - extend the P10
-   observability loop with repeated load/reconnect evidence and write
+2. Done: `feat: add local p11 endurance soak` - compose the P10 observability
+   and ghost-relay loops into repeated load/reconnect evidence and write
    `.dev/reports/p11-endurance-soak-latest.json`.
 3. Pending: `test: add p11 restart recovery smokes` - cover Gateway, Worker,
    and Orchestrator restart recovery with persisted assignment and operation

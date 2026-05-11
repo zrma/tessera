@@ -228,13 +228,17 @@ recovery reports are implemented and captured:
 cargo xt p11-completion-audit --json
 ```
 
-Planned local gates:
+Local gates:
 
 ```sh
 cargo xt dev p11-endurance-soak
 cargo xt dev p11-restart-recovery-smoke
 cargo xt dev p11-transient-failure-recovery-smoke
 ```
+
+`p11-endurance-soak` is implemented first. It runs the P10 observability and
+ghost-relay dev smokes, validates both source reports, then writes
+`.dev/reports/p11-endurance-soak-latest.json`.
 
 Planned reports:
 
