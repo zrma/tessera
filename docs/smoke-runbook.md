@@ -244,6 +244,11 @@ validates both source reports, then writes
 persisted assignment/operation state evidence, adds a P11 Gateway/Worker restart
 probe, then writes `.dev/reports/p11-restart-recovery-latest.json`.
 
+`p11-transient-failure-recovery-smoke` creates a controlled target Worker
+outage, verifies Gateway failure observation, restores the Worker, and writes
+`.dev/reports/p11-transient-failure-recovery-latest.json` after clean
+post-recovery traffic.
+
 Planned reports:
 
 - `.dev/reports/p11-endurance-soak-latest.json`

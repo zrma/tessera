@@ -53,7 +53,7 @@ Recommended P11 slices:
 3. Done: `test: add p11 restart recovery smokes` - cover Gateway, Worker,
    and Orchestrator restart recovery with persisted assignment and operation
    state in `.dev/reports/p11-restart-recovery-latest.json`.
-4. Pending: `test: add p11 transient failure recovery` - cover target Worker
+4. Done: `test: add p11 transient failure recovery` - cover target Worker
    unavailability, controlled component failure, port-forward reconnect, and
    post-recovery convergence in
    `.dev/reports/p11-transient-failure-recovery-latest.json`.

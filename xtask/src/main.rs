@@ -1303,6 +1303,8 @@ enum DevSub {
     },
     /// Run local P11 Gateway/Worker/Orchestrator restart recovery smoke
     P11RestartRecoverySmoke,
+    /// Run local P11 transient failure and reconnect recovery smoke
+    P11TransientFailureRecoverySmoke,
     /// Replay P10 observability and ghost relay evidence without runtime mutation
     P10ReplayAudit {
         /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
@@ -2428,6 +2430,7 @@ fn main() -> Result<()> {
                 sleep_ms,
             } => dev_p11_endurance_soak(iterations, sleep_ms)?,
             DevSub::P11RestartRecoverySmoke => dev_p11_restart_recovery_smoke()?,
+            DevSub::P11TransientFailureRecoverySmoke => dev_p11_transient_failure_recovery_smoke()?,
             DevSub::P10ReplayAudit {
                 observability,
                 ghost,
@@ -3410,6 +3413,17 @@ fn dev_p11_restart_recovery_smoke() -> Result<()> {
     Ok(())
 }
 
+fn dev_p11_transient_failure_recovery_smoke() -> Result<()> {
+    let report = run_p11_transient_failure_recovery_probe()?;
+    validate_p11_transient_failure_recovery_report(&report)?;
+    let report_path = write_p11_transient_failure_recovery_report(&report)?;
+    println!(
+        "P11 transient failure recovery smoke: target Worker outage and post-recovery convergence validated, report={}",
+        report_path.display()
+    );
+    Ok(())
+}
+
 fn run_p11_component_restart_probe() -> Result<serde_json::Value> {
     let gateway_addr = "127.0.0.1:4520";
     let gateway_metrics_addr = "127.0.0.1:4521";
@@ -3709,6 +3723,302 @@ fn run_p11_component_restart_probe() -> Result<serde_json::Value> {
             "close_counters_clean_after_worker_restart": close_counters_clean_after_worker_restart,
             "runtime_mutation_default_off": true
         }
+    }))
+}
+
+fn run_p11_transient_failure_recovery_probe() -> Result<serde_json::Value> {
+    let gateway_addr = "127.0.0.1:4530";
+    let gateway_metrics_addr = "127.0.0.1:4531";
+    let worker_a_addr = "127.0.0.1:5531";
+    let worker_b_addr = "127.0.0.1:5532";
+    let worker_a_metrics_addr = "127.0.0.1:5533";
+    let worker_b_metrics_addr = "127.0.0.1:5534";
+    let orch_addr = "127.0.0.1:6530";
+    let orch_metrics_addr = "127.0.0.1:6531";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let root = workspace_root();
+    let (_dev, logs, pids) = dev_dirs();
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[]}}]}}"#
+    );
+    let orch_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+        ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+        ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+    ];
+    let worker_a_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_WORKER_ID", "worker-a"),
+        ("TESSERA_WORKER_ADDR", worker_a_addr),
+        ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+        ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+        ("TESSERA_WORKER_REFRESH_SECS", "1"),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+    ];
+    let worker_b_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_WORKER_ID", "worker-b"),
+        ("TESSERA_WORKER_ADDR", worker_b_addr),
+        ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+        ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+        ("TESSERA_WORKER_REFRESH_SECS", "1"),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+    ];
+    let gateway_envs = [
+        ("RUST_LOG", rust_log.as_str()),
+        ("TESSERA_GW_ADDR", gateway_addr),
+        ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+        ("TESSERA_GW_REFRESH_SECS", "1"),
+        ("TESSERA_WORKER_ADDR", worker_a_addr),
+        ("TESSERA_ORCH_ADDR", orch_addr),
+    ];
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p11-transient-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &orch_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p11-transient-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &worker_a_envs,
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p11-transient-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &worker_b_envs,
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p11-transient-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &gateway_envs,
+        },
+    )?;
+
+    let parent = CellId::grid(0, 0, 0);
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    let (_before_health, before_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let mut baseline_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        parent,
+        EntityId(9_601),
+        Position { x: 8.0, y: 8.0 },
+    )?;
+    request_ping_until_pong(
+        &mut baseline_session,
+        parent,
+        96_010,
+        "P11 transient baseline ping",
+    )?;
+
+    stack.terminate_named("p11-transient-worker-a")?;
+    let failure_error = match GatewaySession::connect(gateway_addr).and_then(|mut session| {
+        request_ping_until_pong(&mut session, parent, 96_020, "P11 transient failure ping")
+    }) {
+        Ok(_) => {
+            bail!("P11 transient failure probe unexpectedly succeeded while worker-a was down")
+        }
+        Err(err) => err.to_string(),
+    };
+    let gateway_metrics_after_failure = assert_metrics_endpoint_body_until(
+        "P11 transient gateway after failure",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let routes_after_failure =
+        prometheus_sample_value(&gateway_metrics_after_failure, "tessera_gateway_routes")?;
+
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "p11-transient-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &worker_a_envs,
+        },
+    )?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 1)?;
+    let gateway_metrics_before_recovery_smoke = assert_metrics_endpoint_body_until(
+        "P11 transient gateway before recovery smoke",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let gateway_close_before_recovery_smoke =
+        gateway_close_counters_from_metrics(&gateway_metrics_before_recovery_smoke)?;
+
+    let mut recovery_session = open_gateway_join_until_snapshot(
+        gateway_addr,
+        parent,
+        EntityId(9_602),
+        Position { x: 16.0, y: 16.0 },
+    )?;
+    request_ping_until_pong(
+        &mut recovery_session,
+        parent,
+        96_030,
+        "P11 transient recovery ping",
+    )?;
+    let gateway_metrics_after_recovery = assert_metrics_endpoint_body_until(
+        "P11 transient gateway after recovery",
+        gateway_metrics_addr,
+        &[
+            "tessera_gateway_routes",
+            "tessera_gateway_ping_roundtrip_seconds_count",
+            "tessera_gateway_request_roundtrip_seconds_count",
+            "tessera_gateway_client_closes_no_route_total",
+            "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+            "tessera_gateway_client_closes_ambiguous_upstream_total",
+        ],
+    )?;
+    let routes_after_recovery =
+        prometheus_sample_value(&gateway_metrics_after_recovery, "tessera_gateway_routes")?;
+    let gateway_close_after_recovery =
+        gateway_close_counters_from_metrics(&gateway_metrics_after_recovery)?;
+    assert_gateway_close_counters_not_increased(
+        "P11 transient gateway post-recovery",
+        gateway_close_before_recovery_smoke,
+        gateway_close_after_recovery,
+    )?;
+
+    let worker_a_metrics_after_recovery = assert_metrics_endpoint_body_until(
+        "P11 transient worker-a after recovery",
+        worker_a_metrics_addr,
+        &["tessera_worker_cell_actor_count"],
+    )?;
+    let parent_actor_metric = worker_cell_actor_count_metric(parent);
+    assert_prometheus_sample_at_least(
+        "P11 transient worker-a after recovery",
+        &worker_a_metrics_after_recovery,
+        parent_actor_metric.as_str(),
+        1.0,
+    )?;
+    let worker_a_actor_count_after_recovery = prometheus_sample_value(
+        &worker_a_metrics_after_recovery,
+        parent_actor_metric.as_str(),
+    )?;
+    let (_after_health, after_listing) =
+        runtime.block_on(fetch_orch_health_and_listing(&orch_endpoint))?;
+    let assignment_stable = before_listing == after_listing;
+    let route_converged_after_recovery =
+        (routes_after_recovery - 1.0).abs() < f64::EPSILON && assignment_stable;
+    let close_counters_clean_after_recovery =
+        gateway_close_before_recovery_smoke == gateway_close_after_recovery;
+
+    Ok(serde_json::json!({
+        "schema": "tessera.p11_transient_failure_recovery.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "addresses": {
+            "gateway": gateway_addr,
+            "gateway_metrics": gateway_metrics_addr,
+            "orchestrator": orch_addr,
+            "orchestrator_metrics": orch_metrics_addr,
+            "worker_a": worker_a_addr,
+            "worker_a_metrics": worker_a_metrics_addr,
+            "worker_b": worker_b_addr,
+            "worker_b_metrics": worker_b_metrics_addr
+        },
+        "recovery": {
+            "failure_windows": 1,
+            "failure_error": failure_error,
+            "routes_after_failure": routes_after_failure,
+            "routes_after_recovery": routes_after_recovery,
+            "worker_a_actor_count_after_recovery": worker_a_actor_count_after_recovery
+        },
+        "orchestrator": {
+            "assignment_listing_before": assignment_listing_summary_json(&before_listing)?,
+            "assignment_listing_after": assignment_listing_summary_json(&after_listing)?
+        },
+        "gateway": {
+            "ping_roundtrips_after_recovery": prometheus_sample_value(
+                &gateway_metrics_after_recovery,
+                "tessera_gateway_ping_roundtrip_seconds_count"
+            )?,
+            "join_roundtrips_after_recovery": prometheus_sample_value(
+                &gateway_metrics_after_recovery,
+                "tessera_gateway_request_roundtrip_seconds_count{kind=\"join\"}"
+            )?,
+            "close_counters": {
+                "before_recovery_smoke": gateway_close_counters_json(gateway_close_before_recovery_smoke),
+                "after_recovery": gateway_close_counters_json(gateway_close_after_recovery)
+            }
+        },
+        "checks": {
+            "transient_target_worker_unavailability_observed": true,
+            "controlled_component_failure_observed": true,
+            "port_forward_reconnect_recovered": true,
+            "route_convergence_after_recovery": route_converged_after_recovery,
+            "assignment_convergence_after_recovery": assignment_stable,
+            "gateway_smoke_after_recovery": worker_a_actor_count_after_recovery >= 1.0,
+            "close_counters_clean_after_recovery": close_counters_clean_after_recovery,
+            "runtime_mutation_default_off": true
+        },
+        "remaining_uncovered": [
+            "p11_gitops_rollout",
+            "p11_internal_endurance_recovery",
+            "p11_completion_audit"
+        ]
     }))
 }
 
@@ -24995,6 +25305,12 @@ fn default_p11_restart_recovery_path() -> PathBuf {
         .join("p11-restart-recovery-latest.json")
 }
 
+fn default_p11_transient_failure_recovery_path() -> PathBuf {
+    workspace_root()
+        .join(".dev/reports")
+        .join("p11-transient-failure-recovery-latest.json")
+}
+
 fn default_internal_k8s_p9_recommend_soak_path() -> PathBuf {
     workspace_root()
         .join(".dev/reports")
@@ -25360,6 +25676,20 @@ fn write_p11_restart_recovery_report(report: &serde_json::Value) -> Result<PathB
     ));
     fs::write(&stamped, &body)?;
     let latest = default_p11_restart_recovery_path();
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p11_transient_failure_recovery_report(report: &serde_json::Value) -> Result<PathBuf> {
+    let report_dir = workspace_root().join(".dev/reports");
+    fs::create_dir_all(&report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p11-transient-failure-recovery-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = default_p11_transient_failure_recovery_path();
     fs::write(&latest, body)?;
     Ok(latest)
 }

@@ -85,8 +85,10 @@ exist and validate.
    composes a P7 operation restart source with a P11 component restart probe to
    cover Gateway, Worker, and Orchestrator restart recovery plus persisted
    assignment and operation state.
-4. **Transient failure recovery**: add target Worker unavailability and
-   port-forward reconnect checks with post-recovery convergence evidence.
+4. **Transient failure recovery**:
+   `cargo xt dev p11-transient-failure-recovery-smoke` creates a controlled
+   target Worker outage, confirms the failure window, restores the Worker, and
+   records post-recovery Gateway/assignment convergence with clean counters.
 5. **Image publish and GitOps rollout**: publish a P11 runtime image, promote it
    through the k8s GitOps repo, verify ArgoCD and image state, and record a P11
    rollout/default-off report.
