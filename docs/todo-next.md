@@ -60,9 +60,15 @@ Recommended P11 slices:
 5. Pending: `build: publish p11 endurance runtime image` - publish only after
    local evidence is green, promote it through GitOps, verify ArgoCD
    `Synced / Healthy`, and record `.dev/reports/p11-gitops-rollout-latest.json`.
-6. Pending: `test: add internal p11 endurance recovery smoke` - validate the
-   promoted image in internal MicroK8s with pod restarts, controlled failures,
-   Gateway smoke, durable report capture, and final default-off cleanup.
+6. Done: `test: add internal p11 endurance recovery smoke` - add
+   `cargo xt k8s p11-endurance-recovery-smoke` with explicit
+   `--allow-pod-restart` and `--allow-scale` gates plus a strict internal P11
+   report verifier for pod restarts, controlled failures, Gateway smoke,
+   operation ledger durability, route/assignment convergence, durable report
+   capture, and final default-off cleanup.
+7. Pending: run the P11 image publish, GitOps rollout report, internal
+   MicroK8s endurance/recovery smoke, and final
+   `cargo xt p11-completion-audit --json` closeout against the promoted image.
 
 ## Guardrails
 

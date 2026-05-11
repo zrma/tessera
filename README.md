@@ -62,6 +62,10 @@ Useful variants:
   - `cargo xt k8s p10-observability-soak --context microk8s-ts --namespace tessera --expected-image harbor.1day1coding.com/1day1coding/tessera:v2026.05.9`
   - `cargo xt p10-completion-audit --json`
 - Active P11 completion gate:
+  - `cargo xt dev p11-endurance-soak`
+  - `cargo xt dev p11-restart-recovery-smoke`
+  - `cargo xt dev p11-transient-failure-recovery-smoke`
+  - `cargo xt k8s p11-endurance-recovery-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag> --allow-pod-restart --allow-scale`
   - `cargo xt p11-completion-audit --json`
 
 The longer smoke command catalog, internal MicroK8s commands, and historical

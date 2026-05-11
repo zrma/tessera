@@ -260,7 +260,25 @@ Planned reports:
 Planned internal gate after image publish and GitOps promotion:
 
 ```sh
-cargo xt k8s p11-endurance-recovery-smoke --context microk8s-ts --namespace tessera --expected-image <new-tag>
+cargo xt p6-rollout-report \
+  --context microk8s-ts \
+  --namespace tessera \
+  --image <new-tag> \
+  --rollout-revision <k8s-rollout-rev> \
+  --cleanup-revision <k8s-cleanup-rev> \
+  --image-published \
+  --gitops-rollout-approved \
+  --post-smoke-default-off-cleanup \
+  --manual-activation-default-off \
+  --preview-fixture-removed \
+  --out .dev/reports/p11-gitops-rollout-latest.json
+
+cargo xt k8s p11-endurance-recovery-smoke \
+  --context microk8s-ts \
+  --namespace tessera \
+  --expected-image <new-tag> \
+  --allow-pod-restart \
+  --allow-scale
 ```
 
 ## Internal MicroK8s Activation
