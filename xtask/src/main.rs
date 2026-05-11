@@ -89,6 +89,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit P11 operational endurance and failure recovery gates from report JSON
+    P11CompletionAudit {
+        /// Directory that contains smoke/report JSON files
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
     P7OperationLedgerCheck {
         /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
@@ -1595,6 +1604,9 @@ fn main() -> Result<()> {
         Cmd::P9CompletionAudit { report_dir, json } => run_p9_completion_audit(&report_dir, json)?,
         Cmd::P10CompletionAudit { report_dir, json } => {
             run_p10_completion_audit(&report_dir, json)?
+        }
+        Cmd::P11CompletionAudit { report_dir, json } => {
+            run_p11_completion_audit(&report_dir, json)?
         }
         Cmd::P7OperationLedgerCheck {
             ledger,
@@ -28707,6 +28719,310 @@ fn validate_internal_k8s_p10_observability_soak_report(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P11CompletionFinding {
+    gate: &'static str,
+    evidence: String,
+    missing: String,
+}
+
+fn run_p11_completion_audit(report_dir: &Path, json: bool) -> Result<()> {
+    let findings = p11_completion_findings(report_dir);
+    if json {
+        let body = serde_json::json!({
+            "schema": "tessera.p11_completion_audit.v1",
+            "complete": findings.is_empty(),
+            "report_dir": report_dir.display().to_string(),
+            "findings": findings.iter().map(|finding| {
+                serde_json::json!({
+                    "gate": finding.gate,
+                    "evidence": finding.evidence,
+                    "missing": finding.missing
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if findings.is_empty() {
+        println!(
+            "P11 completion audit passed: operational endurance and failure recovery gates are covered in {}",
+            report_dir.display()
+        );
+    } else {
+        println!(
+            "P11 completion audit incomplete: {} missing gate(s) in {}",
+            findings.len(),
+            report_dir.display()
+        );
+        for finding in &findings {
+            println!(
+                "- {}: evidence={} missing={}",
+                finding.gate, finding.evidence, finding.missing
+            );
+        }
+    }
+    if !findings.is_empty() {
+        bail!(
+            "P11 completion audit is incomplete: {} missing gate(s)",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+fn p11_completion_findings(report_dir: &Path) -> Vec<P11CompletionFinding> {
+    let mut findings = Vec::new();
+
+    push_p11_json_gate(
+        &mut findings,
+        report_dir,
+        "p11_local_endurance_soak",
+        "p11-endurance-soak-latest.json",
+        "local/dev endurance soak covering repeated load, reconnects, Gateway routing, Worker relay state, Orchestrator assignments, operation ledger durability, request latency, close counters, ghost relay counters, and default-off runtime state",
+        validate_p11_endurance_soak_report,
+    );
+    push_p11_json_gate(
+        &mut findings,
+        report_dir,
+        "p11_local_restart_recovery",
+        "p11-restart-recovery-latest.json",
+        "local/dev restart recovery covering Gateway restart, Worker restart, Orchestrator restart with persisted assignment and operation state, post-recovery route convergence, assignment convergence, clean close counters, and default-off runtime state",
+        validate_p11_restart_recovery_report,
+    );
+    push_p11_json_gate(
+        &mut findings,
+        report_dir,
+        "p11_local_transient_failure_recovery",
+        "p11-transient-failure-recovery-latest.json",
+        "local/dev transient failure recovery covering target Worker unavailability, port-forward reconnect behavior, controlled component failure, post-recovery route/assignment convergence, and default-off runtime state",
+        validate_p11_transient_failure_recovery_report,
+    );
+
+    let rollout_image = p11_gitops_rollout_image(report_dir, &mut findings);
+    let expected_image = rollout_image.as_deref();
+    push_p11_json_gate(
+        &mut findings,
+        report_dir,
+        "p11_internal_endurance_recovery",
+        "guarded-kubernetes-p11-endurance-recovery-latest.json",
+        "guarded Kubernetes endurance and failure recovery covering GitOps-promoted image, ArgoCD health, pod restarts, controlled component failures, Gateway smoke, durable report capture, default-off cleanup, and the same local recovery contract",
+        |report| validate_internal_k8s_p11_endurance_recovery_report(report, expected_image),
+    );
+
+    findings
+}
+
+fn p11_gitops_rollout_image(
+    report_dir: &Path,
+    findings: &mut Vec<P11CompletionFinding>,
+) -> Option<String> {
+    let path = report_dir.join("p11-gitops-rollout-latest.json");
+    let report = match read_json_report(&path) {
+        Ok(report) => report,
+        Err(err) => {
+            findings.push(P11CompletionFinding {
+                gate: "p11_internal_gitops_rollout_default_off",
+                evidence: format!("{} unavailable: {err}", path.display()),
+                missing: "P11 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+            });
+            return None;
+        }
+    };
+    if let Err(err) = validate_p6_gitops_rollout_report(&report, None) {
+        findings.push(P11CompletionFinding {
+            gate: "p11_internal_gitops_rollout_default_off",
+            evidence: format!("{} failed verifier: {err}", path.display()),
+            missing: "P11 image publish, approved GitOps rollout, ArgoCD Synced/Healthy, and post-smoke default-off cleanup report".to_string(),
+        });
+        return None;
+    }
+    match json_str(&report, &["image", "name"]) {
+        Ok(image) if image.ends_with(":v2026.05.9") => {
+            findings.push(P11CompletionFinding {
+                gate: "p11_internal_gitops_rollout_default_off",
+                evidence: format!("{} still references P10 image {}", path.display(), image),
+                missing: "new P11 runtime image promoted through GitOps".to_string(),
+            });
+            None
+        }
+        Ok(image) if !image.trim().is_empty() => Some(image.to_string()),
+        Ok(_) => {
+            findings.push(P11CompletionFinding {
+                gate: "p11_internal_gitops_rollout_default_off",
+                evidence: format!("{} has empty image.name", path.display()),
+                missing: "P11 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+        Err(err) => {
+            findings.push(P11CompletionFinding {
+                gate: "p11_internal_gitops_rollout_default_off",
+                evidence: format!("{} missing image.name: {err}", path.display()),
+                missing: "P11 image publish and runtime image evidence".to_string(),
+            });
+            None
+        }
+    }
+}
+
+fn push_p11_json_gate<F>(
+    findings: &mut Vec<P11CompletionFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    report_name: &str,
+    missing: &str,
+    validate: F,
+) where
+    F: FnOnce(&serde_json::Value) -> Result<()>,
+{
+    let path = report_dir.join(report_name);
+    match read_json_report(&path) {
+        Ok(report) => {
+            if let Err(err) = validate(&report) {
+                findings.push(P11CompletionFinding {
+                    gate,
+                    evidence: format!("{} failed verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P11CompletionFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
+fn validate_p11_endurance_soak_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p11_endurance_soak.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "repeated_load_completed"], true)?;
+    assert_json_bool_eq(report, &["checks", "reconnects_recovered"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_routing_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_relay_state_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_assignments_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "operation_ledger_durable"], true)?;
+    assert_json_bool_eq(report, &["checks", "request_latency_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "ghost_relay_counters_sampled"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_execution_attempted"], true)?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    assert_json_number_at_least(report, &["latency", "request_samples"], 1.0)?;
+    Ok(())
+}
+
+fn validate_p11_restart_recovery_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p11_restart_recovery.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "gateway_restart_recovered"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_restart_recovered"], true)?;
+    assert_json_bool_eq(report, &["checks", "orchestrator_restart_recovered"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "persisted_assignment_state_recovered"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "persisted_operation_ledger_recovered"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "route_convergence_after_recovery"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "assignment_convergence_after_recovery"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "close_counters_clean"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_number_at_least(report, &["recovery", "scenarios"], 3.0)?;
+    Ok(())
+}
+
+fn validate_p11_transient_failure_recovery_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.p11_transient_failure_recovery.v1",
+    )?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "transient_target_worker_unavailability_observed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "controlled_component_failure_observed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "port_forward_reconnect_recovered"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "route_convergence_after_recovery"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "assignment_convergence_after_recovery"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "gateway_smoke_after_recovery"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "close_counters_clean_after_recovery"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_number_at_least(report, &["recovery", "failure_windows"], 1.0)?;
+    Ok(())
+}
+
+fn validate_internal_k8s_p11_endurance_recovery_report(
+    report: &serde_json::Value,
+    expected_image: Option<&str>,
+) -> Result<()> {
+    assert_json_str_eq(
+        report,
+        &["schema"],
+        "tessera.guarded_kubernetes_p11_endurance_recovery.v1",
+    )?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    if let Some(expected_image) = expected_image {
+        assert_json_str_eq(report, &["image", "name"], expected_image)?;
+    }
+    assert_json_bool_eq(report, &["checks", "argocd_synced_healthy"], true)?;
+    assert_json_bool_eq(report, &["checks", "deployment_images_match"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_smoke_passed"], true)?;
+    assert_json_bool_eq(report, &["checks", "pod_restarts_recovered"], true)?;
+    assert_json_bool_eq(report, &["checks", "controlled_failures_recovered"], true)?;
+    assert_json_bool_eq(report, &["checks", "durable_report_captured"], true)?;
+    assert_json_bool_eq(report, &["checks", "default_off_cleanup_verified"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "route_convergence_after_recovery"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "assignment_convergence_after_recovery"],
+        true,
+    )?;
+    assert_json_number_at_least(report, &["soak", "iterations"], 2.0)?;
+    assert_json_number_at_least(report, &["recovery", "scenarios"], 3.0)?;
+    Ok(())
+}
+
 fn build_p10_replay_audit_report(
     observability_path: &Path,
     observability_report: &serde_json::Value,
@@ -39936,6 +40252,133 @@ demo_count 4
             Some("registry.example.com/example/tessera:v2026.05.9"),
         )
         .expect("valid internal P10 report");
+    }
+
+    #[test]
+    fn p11_completion_audit_reports_missing_endurance_gates() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p11-audit-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let findings = p11_completion_findings(&dir);
+
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p11_local_endurance_soak" && finding.missing.contains("endurance soak")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p11_local_restart_recovery"
+                && finding.missing.contains("restart recovery")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p11_local_transient_failure_recovery"
+                && finding.missing.contains("transient failure recovery")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p11_internal_gitops_rollout_default_off"
+                && finding.missing.contains("GitOps rollout")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p11_internal_endurance_recovery"
+                && finding.missing.contains("guarded Kubernetes endurance")
+        }));
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
+    fn p11_report_validators_accept_complete_minimal_reports() {
+        let endurance = serde_json::json!({
+            "schema": "tessera.p11_endurance_soak.v1",
+            "status": "complete",
+            "checks": {
+                "repeated_load_completed": true,
+                "reconnects_recovered": true,
+                "gateway_routing_stable": true,
+                "worker_relay_state_stable": true,
+                "orchestrator_assignments_stable": true,
+                "operation_ledger_durable": true,
+                "request_latency_stable": true,
+                "close_counters_clean": true,
+                "ghost_relay_counters_sampled": true,
+                "runtime_mutation_default_off": true,
+                "no_execution_attempted": true
+            },
+            "soak": {"iterations": 2},
+            "latency": {"request_samples": 1},
+            "remaining_uncovered": []
+        });
+        validate_p11_endurance_soak_report(&endurance).expect("valid P11 endurance report");
+
+        let restart = serde_json::json!({
+            "schema": "tessera.p11_restart_recovery.v1",
+            "status": "complete",
+            "checks": {
+                "gateway_restart_recovered": true,
+                "worker_restart_recovered": true,
+                "orchestrator_restart_recovered": true,
+                "persisted_assignment_state_recovered": true,
+                "persisted_operation_ledger_recovered": true,
+                "route_convergence_after_recovery": true,
+                "assignment_convergence_after_recovery": true,
+                "close_counters_clean": true,
+                "runtime_mutation_default_off": true
+            },
+            "recovery": {"scenarios": 3},
+            "remaining_uncovered": []
+        });
+        validate_p11_restart_recovery_report(&restart).expect("valid P11 restart report");
+
+        let transient = serde_json::json!({
+            "schema": "tessera.p11_transient_failure_recovery.v1",
+            "status": "complete",
+            "checks": {
+                "transient_target_worker_unavailability_observed": true,
+                "controlled_component_failure_observed": true,
+                "port_forward_reconnect_recovered": true,
+                "route_convergence_after_recovery": true,
+                "assignment_convergence_after_recovery": true,
+                "gateway_smoke_after_recovery": true,
+                "close_counters_clean_after_recovery": true,
+                "runtime_mutation_default_off": true
+            },
+            "recovery": {"failure_windows": 1},
+            "remaining_uncovered": []
+        });
+        validate_p11_transient_failure_recovery_report(&transient)
+            .expect("valid P11 transient report");
+
+        let internal = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_p11_endurance_recovery.v1",
+            "status": "complete",
+            "image": {"name": "registry.example.com/example/tessera:v2026.05.10"},
+            "checks": {
+                "argocd_synced_healthy": true,
+                "deployment_images_match": true,
+                "gateway_smoke_passed": true,
+                "pod_restarts_recovered": true,
+                "controlled_failures_recovered": true,
+                "durable_report_captured": true,
+                "default_off_cleanup_verified": true,
+                "runtime_mutation_default_off": true,
+                "route_convergence_after_recovery": true,
+                "assignment_convergence_after_recovery": true
+            },
+            "soak": {"iterations": 2},
+            "recovery": {"scenarios": 3},
+            "remaining_uncovered": []
+        });
+        validate_internal_k8s_p11_endurance_recovery_report(
+            &internal,
+            Some("registry.example.com/example/tessera:v2026.05.10"),
+        )
+        .expect("valid internal P11 report");
     }
 
     #[test]
