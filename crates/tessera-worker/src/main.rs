@@ -4086,7 +4086,7 @@ async fn on_tick(tick: Tick, state: &SharedState) {
     let batch = prepare_tick_pipeline(state).await;
     flush_tick_pipeline(state, &batch).await;
 
-    if tick.0 % 30 == 0 {
+    if tick.0.is_multiple_of(30) {
         info!(
             target: "worker",
             tick = tick.0,

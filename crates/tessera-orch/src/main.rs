@@ -2521,6 +2521,7 @@ impl OrchestratorService {
         )
     }
 
+    #[cfg(test)]
     fn try_new_with_persistence_operation_execution_and_gate_policy(
         config: Config,
         split_activation_mode: SplitActivationMode,
