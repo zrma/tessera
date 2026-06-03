@@ -186,6 +186,46 @@ fn load_operation_ledger_path() -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(trimmed)))
 }
 
+fn load_operator_token() -> Result<Option<String>> {
+    let Ok(raw) = std::env::var("TESSERA_ORCH_OPERATOR_TOKEN") else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn validate_operator_token_for_bindings(
+    grpc_addr: SocketAddr,
+    metrics_listener: Option<&TcpListener>,
+    operator_token: Option<&str>,
+) -> Result<()> {
+    if operator_token.is_some() {
+        return Ok(());
+    }
+    if !grpc_addr.ip().is_loopback() {
+        return Err(anyhow!(
+            "TESSERA_ORCH_OPERATOR_TOKEN is required when TESSERA_ORCH_ADDR is not loopback"
+        ));
+    }
+    if let Some(listener) = metrics_listener {
+        let metrics_addr = listener
+            .local_addr()
+            .context("read prometheus metrics listener addr")?;
+        if !metrics_addr.ip().is_loopback() {
+            return Err(anyhow!(
+                "TESSERA_ORCH_OPERATOR_TOKEN is required when TESSERA_ORCH_METRICS_ADDR is not loopback"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -201,22 +241,29 @@ async fn main() -> Result<()> {
         load_assignment_state_path().context("load orchestrator assignment state path")?;
     let operation_ledger_path =
         load_operation_ledger_path().context("load orchestrator operation ledger path")?;
+    let operator_token = load_operator_token().context("load orchestrator operator token")?;
     let addr_raw =
         std::env::var("TESSERA_ORCH_ADDR").unwrap_or_else(|_| "127.0.0.1:6000".to_string());
     let listen_addr = resolve_socket_addr(&addr_raw)
         .await
         .with_context(|| format!("resolve TESSERA_ORCH_ADDR={addr_raw}"))?;
+    let metrics_listener = load_metrics_listener().await?;
+    validate_operator_token_for_bindings(
+        listen_addr,
+        metrics_listener.as_ref(),
+        operator_token.as_deref(),
+    )?;
 
     let service =
-        OrchestratorService::try_new_with_persistence_operation_execution_and_gate_policy(
+        OrchestratorService::try_new_with_persistence_operation_execution_gate_policy_and_operator_token(
             config,
             split_activation_mode,
             operation_execution_mode,
             operation_gate_policy,
             assignment_state_path,
             operation_ledger_path,
+            operator_token,
         )?;
-    let metrics_listener = load_metrics_listener().await?;
     info!(target: "orch", %listen_addr, "tessera-orch listening");
 
     let grpc_server = Server::builder()
@@ -2405,6 +2452,7 @@ struct OrchestratorService {
     operation_gate_policy: OperationGatePolicy,
     assignment_state_path: Option<Arc<PathBuf>>,
     operation_ledger_path: Option<Arc<PathBuf>>,
+    operator_token: Option<Arc<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2481,6 +2529,26 @@ impl OrchestratorService {
         assignment_state_path: Option<PathBuf>,
         operation_ledger_path: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::try_new_with_persistence_operation_execution_gate_policy_and_operator_token(
+            config,
+            split_activation_mode,
+            operation_execution_mode,
+            operation_gate_policy,
+            assignment_state_path,
+            operation_ledger_path,
+            None,
+        )
+    }
+
+    fn try_new_with_persistence_operation_execution_gate_policy_and_operator_token(
+        config: Config,
+        split_activation_mode: SplitActivationMode,
+        operation_execution_mode: OperationExecutionMode,
+        operation_gate_policy: OperationGatePolicy,
+        assignment_state_path: Option<PathBuf>,
+        operation_ledger_path: Option<PathBuf>,
+        operator_token: Option<String>,
+    ) -> Result<Self> {
         let config = Arc::new(config);
         let initial_assignments =
             load_initial_assignments(&config, assignment_state_path.as_deref())?;
@@ -2508,7 +2576,23 @@ impl OrchestratorService {
             operation_gate_policy,
             assignment_state_path: assignment_state_path.map(Arc::new),
             operation_ledger_path,
+            operator_token: operator_token.map(Arc::new),
         })
+    }
+
+    #[cfg(test)]
+    fn with_operator_token(mut self, token: impl Into<String>) -> Self {
+        self.operator_token = Some(Arc::new(token.into()));
+        self
+    }
+
+    fn operator_request_authorized<T>(&self, request: &Request<T>) -> bool {
+        let Some(expected_token) = self.operator_token.as_deref() else {
+            return true;
+        };
+        request_operator_token(request)
+            .as_deref()
+            .is_some_and(|token| token == expected_token.as_str())
     }
 
     async fn snapshot_for(&self, worker_id: &str) -> AssignmentSnapshot {
@@ -4332,6 +4416,28 @@ fn required_query_param<'a>(
         .ok_or_else(|| format!("missing query parameter `{key}`"))
 }
 
+fn request_operator_token<T>(request: &Request<T>) -> Option<String> {
+    request
+        .metadata()
+        .get("x-tessera-operator-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(bearer_token)
+                .map(str::to_string)
+        })
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+}
+
 struct ParsedSplitActivation {
     operation_id: String,
     parent: CellId,
@@ -4802,6 +4908,9 @@ impl Orchestrator for OrchestratorService {
         &self,
         request: Request<HandoverCommandRequest>,
     ) -> Result<Response<HandoverCommandResponse>, Status> {
+        if !self.operator_request_authorized(&request) {
+            return Err(Status::unauthenticated("operator token required"));
+        }
         let response = self.apply_handover_command(request.into_inner()).await?;
         Ok(Response::new(response))
     }
@@ -4810,6 +4919,9 @@ impl Orchestrator for OrchestratorService {
         &self,
         request: Request<SplitActivationRequest>,
     ) -> Result<Response<SplitActivationResponse>, Status> {
+        if !self.operator_request_authorized(&request) {
+            return Err(Status::unauthenticated("operator token required"));
+        }
         let response = self.apply_split_activation(request.into_inner()).await?;
         Ok(Response::new(response))
     }
@@ -4818,6 +4930,9 @@ impl Orchestrator for OrchestratorService {
         &self,
         request: Request<MergeActivationRequest>,
     ) -> Result<Response<MergeActivationResponse>, Status> {
+        if !self.operator_request_authorized(&request) {
+            return Err(Status::unauthenticated("operator token required"));
+        }
         let response = self.apply_merge_activation(request.into_inner()).await?;
         Ok(Response::new(response))
     }
@@ -4950,6 +5065,22 @@ async fn handle_prometheus_metrics_request(
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
+
+    if operation_writer_path(method, path)
+        && !http_operator_authorized(
+            request,
+            service.operator_token.as_deref().map(String::as_str),
+        )
+    {
+        write_http_response(
+            &mut stream,
+            "401 Unauthorized",
+            "text/plain; charset=utf-8",
+            "operator token required\n",
+        )
+        .await?;
+        return Ok(());
+    }
 
     if method == "GET" && path == "/metrics" {
         let snapshot = service.metrics_snapshot().await;
@@ -5111,6 +5242,41 @@ async fn handle_prometheus_metrics_request(
 fn http_request_headers_complete(request: &[u8]) -> bool {
     request.windows(4).any(|window| window == b"\r\n\r\n")
         || request.windows(2).any(|window| window == b"\n\n")
+}
+
+fn operation_writer_path(method: &str, path: &str) -> bool {
+    method == "POST"
+        && matches!(
+            path,
+            "/operations/proposals"
+                | "/operations/approvals"
+                | "/operations/executions"
+                | "/operations/observations"
+        )
+}
+
+fn http_operator_authorized(request: &str, expected_token: Option<&str>) -> bool {
+    let Some(expected_token) = expected_token else {
+        return true;
+    };
+    http_header_value(request, "x-tessera-operator-token")
+        .or_else(|| http_header_value(request, "authorization").and_then(bearer_token))
+        .is_some_and(|token| token == expected_token)
+}
+
+fn http_header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    for line in request.lines().skip(1) {
+        if line.trim().is_empty() {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            return Some(value.trim());
+        }
+    }
+    None
 }
 
 async fn write_http_response(
@@ -8909,6 +9075,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handover_command_requires_operator_token_when_configured() {
+        let service =
+            OrchestratorService::new(two_worker_handover_config()).with_operator_token("secret");
+
+        let err = service
+            .submit_handover_command(Request::new(handover_request(HandoverCommand::PreCopy)))
+            .await
+            .expect_err("missing token should fail");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        let mut request = Request::new(handover_request(HandoverCommand::PreCopy));
+        request
+            .metadata_mut()
+            .insert("x-tessera-operator-token", "secret".parse().unwrap());
+        let response = service
+            .submit_handover_command(request)
+            .await
+            .expect("authorized handover")
+            .into_inner();
+        assert!(response.accepted);
+        assert_eq!(response.state, HandoverState::PreCopying as i32);
+    }
+
+    #[tokio::test]
     async fn handover_commands_follow_safe_skeleton_sequence() {
         let service = OrchestratorService::new(two_worker_handover_config());
 
@@ -9362,6 +9552,49 @@ mod tests {
         assert!(response.contains(r#""schema": "tessera.orch.operation_ledger.v1""#));
         assert!(response.contains(r#""persistence_enabled": true"#));
         assert!(response.contains(r#""records": []"#));
+        let _ = fs::remove_file(ledger_path);
+    }
+
+    #[tokio::test]
+    async fn operation_ledger_http_writer_requires_operator_token_when_configured() {
+        let ledger_path = unique_assignment_state_path("operation-ledger-http-auth");
+        let service = OrchestratorService::try_new_with_persistence(
+            two_worker_handover_config(),
+            SplitActivationMode::Disabled,
+            None,
+            Some(ledger_path.clone()),
+        )
+        .expect("construct service with operation ledger")
+        .with_operator_token("secret");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proposal listener");
+        let addr = listener.local_addr().expect("proposal listener addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept proposal request");
+            handle_prometheus_metrics_request(stream, server_service)
+                .await
+                .expect("handle proposal request");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect proposals");
+        client
+            .write_all(b"POST /operations/proposals HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write proposal request");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read proposal response");
+        server.await.expect("proposal server task");
+
+        let response = String::from_utf8(response).expect("utf8 proposal response");
+        assert!(response.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(response.contains("operator token required"));
+        let loaded = load_operation_ledger_file(&ledger_path).expect("load operation ledger");
+        assert!(loaded.records.is_empty());
         let _ = fs::remove_file(ledger_path);
     }
 

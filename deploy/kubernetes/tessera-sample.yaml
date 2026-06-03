@@ -53,6 +53,11 @@ spec:
               value: 0.0.0.0:6000
             - name: TESSERA_ORCH_METRICS_ADDR
               value: 0.0.0.0:6100
+            - name: TESSERA_ORCH_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tessera-runtime-auth
+                  key: operator-token
             - name: TESSERA_ORCH_CONFIG
               value: /etc/tessera/orch-config.json
           ports:
@@ -125,6 +130,11 @@ spec:
               value: tessera-worker:5001
             - name: TESSERA_WORKER_METRICS_ADDR
               value: 0.0.0.0:5100
+            - name: TESSERA_WORKER_RELAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tessera-runtime-auth
+                  key: worker-relay-token
           ports:
             - name: tcp
               containerPort: 5001

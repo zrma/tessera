@@ -8,6 +8,7 @@ services:
       RUST_LOG: info
       TESSERA_ORCH_ADDR: 0.0.0.0:6000
       TESSERA_ORCH_METRICS_ADDR: 0.0.0.0:6100
+      TESSERA_ORCH_OPERATOR_TOKEN: ${TESSERA_ORCH_OPERATOR_TOKEN:?set TESSERA_ORCH_OPERATOR_TOKEN}
       TESSERA_ORCH_CONFIG_JSON: >
         {"workers":[{"id":"worker-a","addr":"worker:5001","cells":[{"world":0,"cx":0,"cy":0}]}]}
     ports:
@@ -26,6 +27,7 @@ services:
       TESSERA_WORKER_ADDR: 0.0.0.0:5001
       TESSERA_WORKER_ADVERTISE_ADDR: worker:5001
       TESSERA_WORKER_METRICS_ADDR: 0.0.0.0:5100
+      TESSERA_WORKER_RELAY_TOKEN: ${TESSERA_WORKER_RELAY_TOKEN:?set TESSERA_WORKER_RELAY_TOKEN}
     ports:
       - "5001:5001"
       - "5100:5100"

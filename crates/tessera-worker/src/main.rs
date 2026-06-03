@@ -258,6 +258,7 @@ struct SharedState {
     aoi_max_cells: usize,
     handover_move_buffer_capacity: usize,
     handover_move_buffer_ttl: Duration,
+    relay_auth_token: Option<Arc<String>>,
 }
 
 impl SharedState {
@@ -327,7 +328,13 @@ impl SharedState {
             aoi_max_cells,
             handover_move_buffer_capacity,
             handover_move_buffer_ttl,
+            relay_auth_token: None,
         }
+    }
+
+    fn with_relay_auth_token(mut self, relay_auth_token: Option<String>) -> Self {
+        self.relay_auth_token = relay_auth_token.map(Arc::new);
+        self
     }
 
     fn new(aoi_radius_cells: i32) -> Self {
@@ -719,6 +726,34 @@ impl SharedState {
     async fn peer_route_for(&self, cell: CellId) -> Option<PeerRoute> {
         let peer_routes = self.peer_routes.read().await;
         peer_routes.get(&cell).cloned()
+    }
+
+    async fn validated_peer_route_for(
+        &self,
+        cell: CellId,
+        target_worker_id: &str,
+        target_addr: &str,
+        label: &str,
+    ) -> Result<PeerRoute, String> {
+        let Some(route) = self.peer_route_for(cell).await else {
+            return Err(format!(
+                "{label} target cell {:?} has no current peer route",
+                cell
+            ));
+        };
+        if route.worker_id != target_worker_id {
+            return Err(format!(
+                "{label} target cell {:?} route worker {} does not match requested worker {}",
+                cell, route.worker_id, target_worker_id
+            ));
+        }
+        if route.addr != target_addr {
+            return Err(format!(
+                "{label} target cell {:?} route addr {} does not match requested addr {}",
+                cell, route.addr, target_addr
+            ));
+        }
+        Ok(route)
     }
 
     async fn update_handover_policies(
@@ -1353,7 +1388,8 @@ impl SharedState {
                     cache.remove(cell);
                 }
             }
-            WorkerRelayMsg::Subscribe { .. }
+            WorkerRelayMsg::Auth { .. }
+            | WorkerRelayMsg::Subscribe { .. }
             | WorkerRelayMsg::Unsubscribe { .. }
             | WorkerRelayMsg::HandoverReplay { .. }
             | WorkerRelayMsg::HandoverReplayAck { .. }
@@ -1375,7 +1411,8 @@ impl SharedState {
             WorkerRelayMsg::Snapshot { cell, actors } => ServerMsg::Snapshot { cell, actors },
             WorkerRelayMsg::Delta { cell, moved } => ServerMsg::Delta { cell, moved },
             WorkerRelayMsg::Despawn { cell, actors } => ServerMsg::Despawn { cell, actors },
-            WorkerRelayMsg::Subscribe { .. }
+            WorkerRelayMsg::Auth { .. }
+            | WorkerRelayMsg::Subscribe { .. }
             | WorkerRelayMsg::Unsubscribe { .. }
             | WorkerRelayMsg::HandoverReplay { .. }
             | WorkerRelayMsg::HandoverReplayAck { .. }
@@ -1872,6 +1909,7 @@ async fn main() -> Result<()> {
     let addr = resolve_socket_addr(&addr_raw)
         .await
         .with_context(|| format!("resolve TESSERA_WORKER_ADDR={addr_raw}"))?;
+    let relay_auth_token = load_worker_relay_auth_token(addr)?;
     let advertise_addr = resolve_advertise_addr(addr)?;
     let worker_id =
         std::env::var("TESSERA_WORKER_ID").unwrap_or_else(|_| "worker-local".to_string());
@@ -1902,15 +1940,18 @@ async fn main() -> Result<()> {
         assignments.iter().copied().collect::<HashSet<_>>(),
     ));
 
-    let state = Arc::new(SharedState::with_runtime_config(
-        aoi_radius_cells,
-        aoi_cell_span_units,
-        aoi_edge_margin_units,
-        aoi_visibility_radius_units,
-        aoi_max_cells,
-        handover_move_buffer_capacity,
-        handover_move_buffer_ttl,
-    ));
+    let state = Arc::new(
+        SharedState::with_runtime_config(
+            aoi_radius_cells,
+            aoi_cell_span_units,
+            aoi_edge_margin_units,
+            aoi_visibility_radius_units,
+            aoi_max_cells,
+            handover_move_buffer_capacity,
+            handover_move_buffer_ttl,
+        )
+        .with_relay_auth_token(relay_auth_token),
+    );
     if let Some(listener) = load_metrics_listener().await? {
         let metrics_state = Arc::clone(&state);
         let metrics_addr = listener
@@ -2863,9 +2904,32 @@ async fn handle_merge_replay_request(
     }
 
     let replay_operation_id = merge_replay_operation_key(&operation_id, target.source_cell);
-    let route = PeerRoute {
-        worker_id: target.target_worker_id.clone(),
-        addr: target.target_addr.clone(),
+    let route = match state
+        .validated_peer_route_for(
+            target.parent,
+            target.target_worker_id.as_str(),
+            target.target_addr.as_str(),
+            "merge replay",
+        )
+        .await
+    {
+        Ok(route) => route,
+        Err(reason) => {
+            let _ = state.take_split_replay_plan(target.source_cell).await;
+            reject_replay_moves_unavailable(
+                target.source_cell,
+                &replay_failures,
+                "merge_replay_stale_route",
+            )
+            .await;
+            return MergeReplayOutcome {
+                operation_id,
+                parent: target.parent,
+                source_cell: Some(target.source_cell),
+                accepted: false,
+                reason,
+            };
+        }
     };
     match send_handover_replay_with_retry(
         state,
@@ -2923,6 +2987,18 @@ async fn build_split_replay_batches(
         .collect::<HashMap<_, _>>();
     if child_by_cell.len() != children.len() {
         return Err("split replay children contain duplicate cell targets".to_string());
+    }
+    let mut routes_by_cell = HashMap::new();
+    for child in children {
+        let route = state
+            .validated_peer_route_for(
+                child.cell,
+                child.target_worker_id.as_str(),
+                child.target_addr.as_str(),
+                "split replay",
+            )
+            .await?;
+        routes_by_cell.insert(child.cell, route);
     }
 
     let mut positions = {
@@ -3027,12 +3103,12 @@ async fn build_split_replay_batches(
         actors.sort_by_key(|actor| actor.id.0);
         let mut owners = owners_by_child.remove(&child.cell).unwrap_or_default();
         owners.sort_by_key(|owner| owner.actor.0);
+        let route = routes_by_cell
+            .remove(&child.cell)
+            .expect("validated split replay route");
         batches.push(SplitReplayBatch {
             cell: child.cell,
-            route: PeerRoute {
-                worker_id: child.target_worker_id.clone(),
-                addr: child.target_addr.clone(),
-            },
+            route,
             actors,
             owners,
         });
@@ -3100,6 +3176,7 @@ async fn send_handover_replay_with_retry(
             actors.clone(),
             owners.clone(),
             moves.clone(),
+            state.relay_auth_token.clone(),
         )
         .await
         {
@@ -3129,14 +3206,19 @@ async fn send_handover_replay_once(
     actors: Vec<ActorState>,
     owners: Vec<HandoverReplayOwner>,
     moves: Vec<HandoverReplayMove>,
+    relay_auth_token: Option<Arc<String>>,
 ) -> Result<()> {
     let stream = TcpStream::connect(route.addr.as_str())
         .await
         .with_context(|| format!("connect handover replay target {}", route.addr))?;
     let (mut reader, mut writer) = stream.into_split();
+    let mut seq_out = 0_u64;
+    if let Some(token) = relay_auth_token.as_deref() {
+        write_worker_relay_auth_frame(&mut writer, &mut seq_out, token).await?;
+    }
     let env_out = Envelope {
         cell,
-        seq: 0,
+        seq: seq_out,
         epoch: moves.iter().map(|moved| moved.epoch).max().unwrap_or(0),
         payload: WorkerRelayMsg::HandoverReplay {
             operation_id: operation_id.to_string(),
@@ -3187,6 +3269,30 @@ fn orchestrator_endpoint() -> String {
     } else {
         format!("http://{}", orchestrator_addr)
     }
+}
+
+fn load_worker_relay_auth_token(bind_addr: SocketAddr) -> Result<Option<String>> {
+    let token = load_optional_secret_env("TESSERA_WORKER_RELAY_TOKEN")?;
+    if token.is_none() && !bind_addr.ip().is_loopback() {
+        return Err(anyhow!(
+            "TESSERA_WORKER_RELAY_TOKEN is required when TESSERA_WORKER_ADDR is not loopback"
+        ));
+    }
+    Ok(token)
+}
+
+fn load_optional_secret_env(name: &str) -> Result<Option<String>> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn assignment_to_cell(assignment: Assignment) -> Result<CellId> {
@@ -4466,6 +4572,27 @@ fn decode_worker_relay_frame_from_bytes(frame: &BytesMut) -> Result<Envelope<Wor
     }
 }
 
+async fn write_worker_relay_auth_frame(
+    writer: &mut OwnedWriteHalf,
+    seq_out: &mut u64,
+    token: &str,
+) -> Result<()> {
+    let env_out = Envelope {
+        cell: CellId::grid(0, 0, 0),
+        seq: *seq_out,
+        epoch: 0,
+        payload: WorkerRelayMsg::Auth {
+            token: token.to_string(),
+        },
+    };
+    *seq_out = (*seq_out).wrapping_add(1);
+    let frame = encode_frame(&env_out);
+    writer
+        .write_all(&frame)
+        .await
+        .context("write worker relay auth frame")
+}
+
 async fn run_server(
     addr: SocketAddr,
     state: Arc<SharedState>,
@@ -4685,10 +4812,14 @@ async fn run_remote_peer_session(
     let (mut reader, writer) = stream.into_split();
     let (tx, mut rx) = channel::<RelayOutboundMsg>(OUTBOUND_CHANNEL_CAPACITY);
     let metrics = Arc::clone(&state.metrics);
+    let relay_auth_token = state.relay_auth_token.clone();
 
     let writer_task = tokio::spawn(async move {
         let mut seq_out: u64 = 0;
         let mut writer = writer;
+        if let Some(token) = relay_auth_token.as_deref() {
+            write_worker_relay_auth_frame(&mut writer, &mut seq_out, token).await?;
+        }
         while let Some((cell, epoch_override, msg)) = rx.recv().await {
             let env_out = Envelope {
                 cell,
@@ -4780,6 +4911,43 @@ async fn handle_worker_relay_inner(
     };
     let mut subscribed_cells: HashSet<CellId> = HashSet::new();
 
+    if let Some(expected_token) = state.relay_auth_token.as_deref() {
+        let env_in = if let Some(env_in) = first_env.take() {
+            env_in
+        } else {
+            let Some(frame) =
+                read_frame_bytes_or_disconnect(&mut reader, &mut disconnect_rx).await?
+            else {
+                return Ok(());
+            };
+            match decode_worker_relay_frame_from_bytes(&frame) {
+                Ok(env_in) => env_in,
+                Err(e) => {
+                    warn!(
+                        target: "worker",
+                        %peer,
+                        error = ?e,
+                        "failed to decode worker relay auth frame; closing connection"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        match env_in.payload {
+            WorkerRelayMsg::Auth { token } if token == expected_token.as_str() => {
+                epoch.store(env_in.epoch, Ordering::Relaxed);
+            }
+            _ => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "worker relay connection rejected: missing or invalid auth token"
+                );
+                return Ok(());
+            }
+        }
+    }
+
     if spawn_writer {
         tokio::spawn(async move {
             let mut seq_out: u64 = 0;
@@ -4831,6 +4999,13 @@ async fn handle_worker_relay_inner(
         epoch.store(env_in.epoch, Ordering::Relaxed);
 
         match env_in.payload {
+            WorkerRelayMsg::Auth { .. } => {
+                warn!(
+                    target: "worker",
+                    %peer,
+                    "unexpected worker relay auth frame after handshake"
+                );
+            }
             WorkerRelayMsg::Subscribe { cells } => {
                 state
                     .metrics
@@ -5863,6 +6038,102 @@ mod tests {
                 let _ = task.await;
             }
         })
+    }
+
+    #[tokio::test]
+    async fn worker_relay_requires_auth_when_token_configured() {
+        let cell = CellId::grid(0, 0, 0);
+        let state = Arc::new(
+            SharedState::default().with_relay_auth_token(Some("relay-secret".to_string())),
+        );
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay auth listener");
+        let addr = listener.local_addr().expect("relay auth listener addr");
+        let server =
+            spawn_incoming_test_server(listener, Arc::clone(&state), Arc::clone(&owned_cells), 1);
+
+        let mut client = TcpStream::connect(addr).await.expect("connect relay");
+        let subscribe = Envelope {
+            cell,
+            seq: 0,
+            epoch: 7,
+            payload: WorkerRelayMsg::Subscribe { cells: vec![cell] },
+        };
+        client
+            .write_all(&encode_frame(&subscribe))
+            .await
+            .expect("write unauthenticated relay frame");
+        client.shutdown().await.expect("shutdown relay client");
+        server.await.expect("relay auth server");
+
+        assert!(state.relay_subscribers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_relay_accepts_valid_auth_when_token_configured() {
+        let cell = CellId::grid(0, 0, 0);
+        let state = Arc::new(
+            SharedState::default().with_relay_auth_token(Some("relay-secret".to_string())),
+        );
+        {
+            let mut actors = state.actors.lock().await;
+            actors
+                .entry(cell)
+                .or_default()
+                .insert(EntityId(1), Position { x: 1.0, y: 2.0 });
+        }
+        let owned_cells = Arc::new(RwLock::new(HashSet::from([cell])));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay auth listener");
+        let addr = listener.local_addr().expect("relay auth listener addr");
+        let server =
+            spawn_incoming_test_server(listener, Arc::clone(&state), Arc::clone(&owned_cells), 1);
+
+        let client = TcpStream::connect(addr).await.expect("connect relay");
+        let (mut reader, mut writer) = client.into_split();
+        let auth = Envelope {
+            cell,
+            seq: 0,
+            epoch: 0,
+            payload: WorkerRelayMsg::Auth {
+                token: "relay-secret".to_string(),
+            },
+        };
+        let subscribe = Envelope {
+            cell,
+            seq: 1,
+            epoch: 7,
+            payload: WorkerRelayMsg::Subscribe { cells: vec![cell] },
+        };
+        writer
+            .write_all(&encode_frame(&auth))
+            .await
+            .expect("write relay auth frame");
+        writer
+            .write_all(&encode_frame(&subscribe))
+            .await
+            .expect("write authenticated relay subscribe frame");
+        let frame = timeout(Duration::from_secs(1), read_frame_bytes(&mut reader))
+            .await
+            .expect("relay snapshot timeout")
+            .expect("read relay snapshot")
+            .expect("relay snapshot frame");
+        let snapshot = decode_worker_relay_frame_from_bytes(&frame).expect("decode snapshot");
+        match snapshot.payload {
+            WorkerRelayMsg::Snapshot {
+                cell: snapshot_cell,
+                actors,
+            } => {
+                assert_eq!(snapshot_cell, cell);
+                assert_eq!(actors.len(), 1);
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+        writer.shutdown().await.expect("shutdown relay client");
+        server.await.expect("relay auth server");
     }
 
     #[test]
@@ -7404,6 +7675,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_replay_rejects_target_addr_outside_current_peer_route() {
+        let source_state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let source_cell = merge_child_cells(parent)[3];
+        source_state
+            .update_peer_routes(HashMap::from([(
+                parent,
+                PeerRoute {
+                    worker_id: "worker-a".to_string(),
+                    addr: "127.0.0.1:5001".to_string(),
+                },
+            )]))
+            .await;
+        {
+            let mut actors = source_state.actors.lock().await;
+            actors
+                .entry(source_cell)
+                .or_default()
+                .insert(EntityId(1), Position { x: 1.0, y: 2.0 });
+        }
+
+        let outcome = handle_merge_replay_request(
+            &source_state,
+            &HashSet::from([source_cell]),
+            "merge-op".to_string(),
+            MergeReplayTarget {
+                parent,
+                source_cell,
+                target_worker_id: "worker-a".to_string(),
+                target_addr: "127.0.0.1:1".to_string(),
+            },
+        )
+        .await;
+
+        assert!(!outcome.accepted);
+        assert!(outcome.reason.contains("route addr"));
+    }
+
+    #[tokio::test]
     async fn split_replay_partitions_parent_snapshot_and_buffered_moves_to_children() {
         let source_state = Arc::new(SharedState::with_runtime_config(
             0,
@@ -7502,6 +7812,22 @@ mod tests {
                 target_addr: target_addr.to_string(),
             })
             .collect::<Vec<_>>();
+        source_state
+            .update_peer_routes(
+                children
+                    .iter()
+                    .map(|cell| {
+                        (
+                            *cell,
+                            PeerRoute {
+                                worker_id: "worker-b".to_string(),
+                                addr: target_addr.to_string(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
         let outcome = handle_split_replay_request(
             &source_state,
             &source_owned_cells,
@@ -7544,6 +7870,59 @@ mod tests {
         assert_eq!(target_state.owner_for(&child3, &actor_b).await, Some(502));
         assert!(source_state.drain_buffered_moves(parent).await.is_empty());
         server.await.expect("target server task");
+    }
+
+    #[tokio::test]
+    async fn split_replay_rejects_target_addr_outside_current_peer_route() {
+        let source_state = Arc::new(SharedState::default());
+        let parent = CellId::grid(0, 0, 0);
+        let children = parent
+            .legacy_shallow_children()
+            .expect("legacy split children");
+        source_state
+            .update_peer_routes(
+                children
+                    .iter()
+                    .map(|cell| {
+                        (
+                            *cell,
+                            PeerRoute {
+                                worker_id: "worker-b".to_string(),
+                                addr: "127.0.0.1:5002".to_string(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
+        {
+            let mut actors = source_state.actors.lock().await;
+            actors
+                .entry(parent)
+                .or_default()
+                .insert(EntityId(1), Position { x: 1.0, y: 2.0 });
+        }
+        let targets = children
+            .iter()
+            .map(|cell| SplitReplayTarget {
+                cell: *cell,
+                target_worker_id: "worker-b".to_string(),
+                target_addr: "127.0.0.1:1".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let outcome = handle_split_replay_request(
+            &source_state,
+            &HashSet::from([parent]),
+            "split-op".to_string(),
+            parent,
+            targets,
+        )
+        .await;
+
+        assert!(!outcome.accepted);
+        assert!(outcome.reason.contains("route addr"));
+        assert!(source_state.actors.lock().await.contains_key(&parent));
     }
 
     #[tokio::test]
@@ -7608,6 +7987,22 @@ mod tests {
                 target_addr: "127.0.0.1:5002".to_string(),
             })
             .collect::<Vec<_>>();
+        source_state
+            .update_peer_routes(
+                children
+                    .iter()
+                    .map(|cell| {
+                        (
+                            *cell,
+                            PeerRoute {
+                                worker_id: "worker-b".to_string(),
+                                addr: "127.0.0.1:5002".to_string(),
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
 
         let batches = build_split_replay_batches(&source_state, parent, &targets)
             .await
