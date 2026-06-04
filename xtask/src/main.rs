@@ -1407,6 +1407,12 @@ enum DevSub {
         #[arg(long, default_value = ".dev/reports")]
         report_dir: PathBuf,
     },
+    /// Write a P12 read-only operator runbook drill report
+    P12RunbookDrill {
+        /// Report directory. Defaults to .dev/reports
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+    },
     /// Replay P10 observability and ghost relay evidence without runtime mutation
     P10ReplayAudit {
         /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
@@ -2595,6 +2601,7 @@ fn main() -> Result<()> {
             DevSub::P12SloAlertCandidates { report_dir } => {
                 dev_p12_slo_alert_candidates(&report_dir)?
             }
+            DevSub::P12RunbookDrill { report_dir } => dev_p12_runbook_drill(&report_dir)?,
             DevSub::P10ReplayAudit {
                 observability,
                 ghost,
@@ -4557,6 +4564,172 @@ fn dev_p12_slo_alert_candidates(report_dir: &Path) -> Result<()> {
         "P12 SLO and alert candidate report wrote {}",
         path.display()
     );
+    Ok(())
+}
+
+fn dev_p12_runbook_drill(report_dir: &Path) -> Result<()> {
+    let p11_findings = p11_completion_findings(report_dir);
+    if !p11_findings.is_empty() {
+        bail!(
+            "P12 runbook drill requires a complete P11 report set: {} missing gate(s)",
+            p11_findings.len()
+        );
+    }
+
+    let readiness_path = report_dir.join("p12-operator-readiness-latest.json");
+    let readiness = read_json_report(&readiness_path)?;
+    validate_p12_operator_readiness_report(&readiness)?;
+    let source_replay_path = report_dir.join("p12-source-replay-latest.json");
+    let source_replay = read_json_report(&source_replay_path)?;
+    validate_p12_source_replay_report(&source_replay)?;
+    let slo_path = report_dir.join("p12-slo-alert-candidates-latest.json");
+    let slo_alerts = read_json_report(&slo_path)?;
+    validate_p12_slo_alert_candidates_report(&slo_alerts)?;
+
+    let endurance_path = report_dir.join("p11-endurance-soak-latest.json");
+    let restart_path = report_dir.join("p11-restart-recovery-latest.json");
+    let transient_path = report_dir.join("p11-transient-failure-recovery-latest.json");
+    let internal_path = report_dir.join("guarded-kubernetes-p11-endurance-recovery-latest.json");
+
+    let endurance = read_json_report(&endurance_path)?;
+    validate_p11_endurance_soak_report(&endurance)?;
+    let restart = read_json_report(&restart_path)?;
+    validate_p11_restart_recovery_report(&restart)?;
+    let transient = read_json_report(&transient_path)?;
+    validate_p11_transient_failure_recovery_report(&transient)?;
+    let internal = read_json_report(&internal_path)?;
+    let image = json_str(&readiness, &["image", "name"])?;
+    validate_internal_k8s_p11_endurance_recovery_report(&internal, Some(image))?;
+
+    let gateway_checked = json_bool(&readiness, &["checks", "gateway_routing_reviewed"])?
+        && json_bool(&endurance, &["checks", "gateway_routing_stable"])?
+        && json_bool(&internal, &["checks", "gateway_routing_stable"])?;
+    let worker_checked = json_bool(&readiness, &["checks", "worker_relay_state_reviewed"])?
+        && json_bool(&endurance, &["checks", "worker_relay_state_stable"])?
+        && json_bool(&internal, &["checks", "worker_relay_state_stable"])?;
+    let orchestrator_checked =
+        json_bool(&readiness, &["checks", "orchestrator_assignments_reviewed"])?
+            && json_bool(&endurance, &["checks", "orchestrator_assignments_stable"])?
+            && json_bool(
+                &restart,
+                &["checks", "assignment_convergence_after_recovery"],
+            )?
+            && json_bool(
+                &transient,
+                &["checks", "assignment_convergence_after_recovery"],
+            )?
+            && json_bool(&internal, &["checks", "orchestrator_assignments_stable"])?;
+    let operation_ledger_checked = json_bool(&readiness, &["checks", "operation_ledger_reviewed"])?
+        && json_bool(&endurance, &["checks", "operation_ledger_durable"])?
+        && json_bool(&internal, &["checks", "operation_ledger_durable"])?;
+    let default_off_checked = json_bool(&readiness, &["checks", "default_off_verified"])?
+        && json_bool(&source_replay, &["checks", "runtime_mutation_default_off"])?;
+
+    let source_reports = serde_json::json!([
+        p12_source_report_entry(&readiness_path, &readiness)?,
+        p12_source_report_entry(&source_replay_path, &source_replay)?,
+        p12_source_report_entry(&slo_path, &slo_alerts)?,
+        p12_source_report_entry(&endurance_path, &endurance)?,
+        p12_source_report_entry(&restart_path, &restart)?,
+        p12_source_report_entry(&transient_path, &transient)?,
+        p12_source_report_entry(&internal_path, &internal)?,
+    ]);
+
+    let drill_steps = serde_json::json!([
+        {
+            "symptom": "gateway_not_ready_or_routes_missing",
+            "read_only_checks": [
+                "GET /ready on tessera-gateway",
+                "GET /metrics on tessera-gateway",
+                "check tessera_gateway_ready, tessera_gateway_routes, and tessera_gateway_routing_version"
+            ],
+            "expected_evidence": {
+                "gateway_routing_reviewed": json_bool(&readiness, &["checks", "gateway_routing_reviewed"])?,
+                "gateway_routing_stable": json_bool(&endurance, &["checks", "gateway_routing_stable"])?
+            },
+            "escalate_if": "gateway readiness is false, route count is zero, or route version stops changing after Orchestrator assignment updates"
+        },
+        {
+            "symptom": "client_disconnects_or_no_route_errors",
+            "read_only_checks": [
+                "GET /metrics on tessera-gateway",
+                "compare tessera_gateway_client_closes_* counters against last clean P11 report"
+            ],
+            "expected_evidence": {
+                "endurance_close_counters_clean": json_bool(&endurance, &["checks", "close_counters_clean"])?,
+                "restart_close_counters_clean": json_bool(&restart, &["checks", "close_counters_clean"])?,
+                "transient_close_counters_clean_after_recovery": json_bool(&transient, &["checks", "close_counters_clean_after_recovery"])?
+            },
+            "escalate_if": "close counters increase outside an approved failure-recovery drill"
+        },
+        {
+            "symptom": "cross_worker_aoi_or_relay_gap",
+            "read_only_checks": [
+                "GET /metrics on tessera-worker and tessera-worker-b",
+                "check tessera_worker_relay_connections_total, relay drop counters, and remote relay failure counters"
+            ],
+            "expected_evidence": {
+                "worker_relay_state_reviewed": json_bool(&readiness, &["checks", "worker_relay_state_reviewed"])?,
+                "worker_relay_state_stable": json_bool(&endurance, &["checks", "worker_relay_state_stable"])?,
+                "ghost_relay_counters_sampled": json_bool(&endurance, &["checks", "ghost_relay_counters_sampled"])?
+            },
+            "escalate_if": "relay drops or remote relay connect failures increase while Gateway routing and Orchestrator assignments are stable"
+        },
+        {
+            "symptom": "assignment_or_route_convergence_gap",
+            "read_only_checks": [
+                "call Orchestrator ListAssignments",
+                "GET /metrics on tessera-orch",
+                "check tessera_orch_registered_workers, tessera_orch_assigned_cells, tessera_orch_addr_mismatch_workers, and tessera_orch_listing_updates_total"
+            ],
+            "expected_evidence": {
+                "orchestrator_assignments_reviewed": json_bool(&readiness, &["checks", "orchestrator_assignments_reviewed"])?,
+                "restart_assignment_convergence": json_bool(&restart, &["checks", "assignment_convergence_after_recovery"])?,
+                "transient_assignment_convergence": json_bool(&transient, &["checks", "assignment_convergence_after_recovery"])?
+            },
+            "escalate_if": "registered worker count, assigned cell count, or assignment listing diverges from expected GitOps/runtime state"
+        },
+        {
+            "symptom": "unexpected_operation_or_runtime_mutation",
+            "read_only_checks": [
+                "GET /operations on tessera-orch",
+                "check operation ledger persistence and records",
+                "verify split/merge activation and operation execution remain default-off outside approved windows"
+            ],
+            "expected_evidence": {
+                "operation_ledger_reviewed": json_bool(&readiness, &["checks", "operation_ledger_reviewed"])?,
+                "operation_ledger_durable": json_bool(&endurance, &["checks", "operation_ledger_durable"])?,
+                "default_off_verified": default_off_checked
+            },
+            "escalate_if": "operation records move into executing/observing unexpectedly or default-off cleanup is absent"
+        }
+    ]);
+
+    let report = serde_json::json!({
+        "schema": "tessera.p12_runbook_drill.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "reason": "P12 mapped operator symptoms to read-only Gateway, Worker, Orchestrator, operation ledger, and default-off checks",
+        "source_reports": source_reports,
+        "drill_steps": drill_steps,
+        "checks": {
+            "symptoms_to_checks_mapped": true,
+            "gateway_readiness_checked": gateway_checked,
+            "worker_relay_checked": worker_checked,
+            "orchestrator_assignments_checked": orchestrator_checked,
+            "operation_ledger_checked": operation_ledger_checked,
+            "default_off_checked": default_off_checked,
+            "no_runtime_mutation_attempted": true
+        },
+        "remaining_uncovered": [
+            "p12_decision_packet",
+            "live_alert_wiring"
+        ]
+    });
+    validate_p12_runbook_drill_report(&report)?;
+
+    let path = write_p12_runbook_drill_report(report_dir, &report)?;
+    println!("P12 runbook drill report wrote {}", path.display());
     Ok(())
 }
 
@@ -26993,6 +27166,19 @@ fn write_p12_slo_alert_candidates_report(
     Ok(latest)
 }
 
+fn write_p12_runbook_drill_report(
+    report_dir: &Path,
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    fs::create_dir_all(report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!("p12-runbook-drill-{}.json", unix_timestamp_secs()));
+    fs::write(&stamped, &body)?;
+    let latest = report_dir.join("p12-runbook-drill-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
 fn write_internal_k8s_p9_recommend_soak_report(
     report: &serde_json::Value,
     out: Option<&Path>,
@@ -43328,6 +43514,19 @@ demo_count 4
                 .any(|finding| finding.gate == "p12_slo_alert_candidates")
         );
         assert_eq!(findings.len(), 2);
+
+        dev_p12_runbook_drill(&dir).expect("P12 runbook drill should pass");
+        let runbook = read_json_report(&dir.join("p12-runbook-drill-latest.json"))
+            .expect("read runbook drill");
+        validate_p12_runbook_drill_report(&runbook).expect("valid runbook drill report");
+
+        let findings = p12_readiness_findings(&dir);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.gate == "p12_runbook_drill")
+        );
+        assert_eq!(findings.len(), 1);
 
         fs::remove_dir_all(&dir).expect("remove temp report dir");
     }
