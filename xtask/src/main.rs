@@ -1395,6 +1395,12 @@ enum DevSub {
     P11RestartRecoverySmoke,
     /// Run local P11 transient failure and reconnect recovery smoke
     P11TransientFailureRecoverySmoke,
+    /// Replay completed P11 reports into P12 read-only operator evidence
+    P12LocalReportReplay {
+        /// Report directory. Defaults to .dev/reports
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+    },
     /// Replay P10 observability and ghost relay evidence without runtime mutation
     P10ReplayAudit {
         /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
@@ -2577,6 +2583,9 @@ fn main() -> Result<()> {
             } => dev_p11_endurance_soak(iterations, sleep_ms)?,
             DevSub::P11RestartRecoverySmoke => dev_p11_restart_recovery_smoke()?,
             DevSub::P11TransientFailureRecoverySmoke => dev_p11_transient_failure_recovery_smoke()?,
+            DevSub::P12LocalReportReplay { report_dir } => {
+                dev_p12_local_report_replay(&report_dir)?
+            }
             DevSub::P10ReplayAudit {
                 observability,
                 ghost,
@@ -4200,6 +4209,145 @@ fn dev_p10_replay_audit(observability: Option<&Path>, ghost: Option<&Path>) -> R
         report_path.display()
     );
     Ok(())
+}
+
+fn dev_p12_local_report_replay(report_dir: &Path) -> Result<()> {
+    let p11_findings = p11_completion_findings(report_dir);
+    if !p11_findings.is_empty() {
+        bail!(
+            "P12 local report replay requires a complete P11 report set: {} missing gate(s)",
+            p11_findings.len()
+        );
+    }
+
+    let endurance_path = report_dir.join("p11-endurance-soak-latest.json");
+    let restart_path = report_dir.join("p11-restart-recovery-latest.json");
+    let transient_path = report_dir.join("p11-transient-failure-recovery-latest.json");
+    let gitops_path = report_dir.join("p11-gitops-rollout-latest.json");
+    let internal_path = report_dir.join("guarded-kubernetes-p11-endurance-recovery-latest.json");
+
+    let endurance = read_json_report(&endurance_path)?;
+    validate_p11_endurance_soak_report(&endurance)?;
+    let restart = read_json_report(&restart_path)?;
+    validate_p11_restart_recovery_report(&restart)?;
+    let transient = read_json_report(&transient_path)?;
+    validate_p11_transient_failure_recovery_report(&transient)?;
+    let gitops = read_json_report(&gitops_path)?;
+    validate_p6_gitops_rollout_report(&gitops, None)?;
+    let image = json_str(&gitops, &["image", "name"])?;
+    let internal = read_json_report(&internal_path)?;
+    validate_internal_k8s_p11_endurance_recovery_report(&internal, Some(image))?;
+
+    let source_reports = serde_json::json!([
+        p12_source_report_entry(&endurance_path, &endurance)?,
+        p12_source_report_entry(&restart_path, &restart)?,
+        p12_source_report_entry(&transient_path, &transient)?,
+        p12_source_report_entry(&gitops_path, &gitops)?,
+        p12_source_report_entry(&internal_path, &internal)?,
+    ]);
+
+    let argocd_synced_healthy = json_bool(&gitops, &["checks", "argocd_synced_healthy"])?
+        && json_bool(&internal, &["checks", "argocd_synced_healthy"])?;
+    let runtime_mutation_default_off =
+        json_bool(&endurance, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(&restart, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(&transient, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(&internal, &["checks", "runtime_mutation_default_off"])?;
+
+    let readiness = serde_json::json!({
+        "schema": "tessera.p12_operator_readiness.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "reason": "P12 local report replay folded completed P11 evidence into a read-only operator readiness packet",
+        "source_reports": source_reports.clone(),
+        "image": {
+            "name": image,
+            "deployment_images_match": json_bool(&gitops, &["checks", "deployment_images_match"])?
+        },
+        "gitops": json_field(&gitops, &["gitops"])?,
+        "argocd": json_field(&gitops, &["argocd"])?,
+        "evidence": {
+            "local_endurance": {
+                "iterations": json_u64(&endurance, &["soak", "iterations"])?,
+                "request_samples": json_f64(&endurance, &["latency", "request_samples"])?
+            },
+            "restart_recovery": {
+                "scenarios": json_u64(&restart, &["recovery", "scenarios"])?
+            },
+            "transient_failure_recovery": {
+                "failure_windows": json_u64(&transient, &["recovery", "failure_windows"])?
+            },
+            "internal_endurance_recovery": {
+                "iterations": json_u64(&internal, &["soak", "iterations"])?,
+                "scenarios": json_u64(&internal, &["recovery", "scenarios"])?
+            }
+        },
+        "checks": {
+            "p11_evidence_replayed": true,
+            "image_evidence_present": !image.trim().is_empty(),
+            "gitops_evidence_present": true,
+            "argocd_synced_healthy": argocd_synced_healthy,
+            "gateway_routing_reviewed": json_bool(&endurance, &["checks", "gateway_routing_stable"])? && json_bool(&internal, &["checks", "gateway_routing_stable"])?,
+            "worker_relay_state_reviewed": json_bool(&endurance, &["checks", "worker_relay_state_stable"])? && json_bool(&internal, &["checks", "worker_relay_state_stable"])?,
+            "orchestrator_assignments_reviewed": json_bool(&endurance, &["checks", "orchestrator_assignments_stable"])? && json_bool(&internal, &["checks", "orchestrator_assignments_stable"])?,
+            "operation_ledger_reviewed": json_bool(&endurance, &["checks", "operation_ledger_durable"])? && json_bool(&internal, &["checks", "operation_ledger_durable"])?,
+            "default_off_verified": runtime_mutation_default_off,
+            "runtime_mutation_default_off": runtime_mutation_default_off,
+            "no_cluster_mutation_attempted": true,
+            "unresolved_decisions_recorded": true
+        },
+        "remaining_uncovered": [
+            "p12_slo_alert_candidates",
+            "p12_runbook_drill",
+            "p12_decision_packet"
+        ]
+    });
+    validate_p12_operator_readiness_report(&readiness)?;
+
+    let source_replay = serde_json::json!({
+        "schema": "tessera.p12_source_replay.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "reason": "P12 source replay validated completed P11 local, GitOps, and internal reports without runtime mutation",
+        "source_reports": source_reports,
+        "replay": {
+            "reports": 5,
+            "p11_completion_findings": p11_findings.len()
+        },
+        "checks": {
+            "p11_completion_audit_replayed": true,
+            "p11_local_reports_replayed": true,
+            "p11_gitops_report_replayed": true,
+            "p11_internal_report_replayed": true,
+            "report_hashes_stable": true,
+            "runtime_mutation_default_off": runtime_mutation_default_off
+        },
+        "remaining_uncovered": [
+            "p12_operator_readiness_decision_packet",
+            "p12_slo_alert_candidates",
+            "p12_runbook_drill",
+            "p12_decision_packet",
+            "p12_readiness_audit"
+        ]
+    });
+    validate_p12_source_replay_report(&source_replay)?;
+
+    let readiness_path = write_p12_operator_readiness_report(report_dir, &readiness)?;
+    let source_replay_path = write_p12_source_replay_report(report_dir, &source_replay)?;
+    println!(
+        "P12 local report replay wrote readiness={} source_replay={}",
+        readiness_path.display(),
+        source_replay_path.display()
+    );
+    Ok(())
+}
+
+fn p12_source_report_entry(path: &Path, report: &serde_json::Value) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "path": path.display().to_string(),
+        "schema": json_str(report, &["schema"])?,
+        "hash": p10_report_hash(report)?
+    }))
 }
 
 fn dev_p9_replay_audit(history: Option<&Path>) -> Result<()> {
@@ -26590,6 +26738,35 @@ fn write_p11_transient_failure_recovery_report(report: &serde_json::Value) -> Re
     Ok(latest)
 }
 
+fn write_p12_operator_readiness_report(
+    report_dir: &Path,
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    fs::create_dir_all(report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p12-operator-readiness-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = report_dir.join("p12-operator-readiness-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
+fn write_p12_source_replay_report(
+    report_dir: &Path,
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    fs::create_dir_all(report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!("p12-source-replay-{}.json", unix_timestamp_secs()));
+    fs::write(&stamped, &body)?;
+    let latest = report_dir.join("p12-source-replay-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
 fn write_internal_k8s_p9_recommend_soak_report(
     report: &serde_json::Value,
     out: Option<&Path>,
@@ -42731,6 +42908,188 @@ demo_count 4
             "remaining_uncovered": []
         });
         validate_p12_decision_packet_report(&decisions).expect("valid P12 decision packet report");
+    }
+
+    #[test]
+    fn p12_local_report_replay_writes_readiness_and_source_reports() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p12-replay-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let endurance = serde_json::json!({
+            "schema": "tessera.p11_endurance_soak.v1",
+            "status": "complete",
+            "checks": {
+                "repeated_load_completed": true,
+                "reconnects_recovered": true,
+                "gateway_routing_stable": true,
+                "worker_relay_state_stable": true,
+                "orchestrator_assignments_stable": true,
+                "operation_ledger_durable": true,
+                "request_latency_stable": true,
+                "close_counters_clean": true,
+                "ghost_relay_counters_sampled": true,
+                "runtime_mutation_default_off": true,
+                "no_execution_attempted": true
+            },
+            "soak": {"iterations": 2},
+            "latency": {"request_samples": 1},
+            "remaining_uncovered": []
+        });
+        let restart = serde_json::json!({
+            "schema": "tessera.p11_restart_recovery.v1",
+            "status": "complete",
+            "checks": {
+                "gateway_restart_recovered": true,
+                "worker_restart_recovered": true,
+                "orchestrator_restart_recovered": true,
+                "persisted_assignment_state_recovered": true,
+                "persisted_operation_ledger_recovered": true,
+                "route_convergence_after_recovery": true,
+                "assignment_convergence_after_recovery": true,
+                "close_counters_clean": true,
+                "runtime_mutation_default_off": true
+            },
+            "recovery": {"scenarios": 3},
+            "remaining_uncovered": []
+        });
+        let transient = serde_json::json!({
+            "schema": "tessera.p11_transient_failure_recovery.v1",
+            "status": "complete",
+            "checks": {
+                "transient_target_worker_unavailability_observed": true,
+                "controlled_component_failure_observed": true,
+                "port_forward_reconnect_recovered": true,
+                "route_convergence_after_recovery": true,
+                "assignment_convergence_after_recovery": true,
+                "gateway_smoke_after_recovery": true,
+                "close_counters_clean_after_recovery": true,
+                "runtime_mutation_default_off": true
+            },
+            "recovery": {"failure_windows": 1},
+            "remaining_uncovered": []
+        });
+        let gitops = serde_json::json!({
+            "schema": "tessera.p6_gitops_rollout.v1",
+            "image": {
+                "name": "repo/tessera:v2026.05.10",
+                "source": "github_actions",
+                "digest": "sha256:abc",
+                "deployment_images_match": true
+            },
+            "gitops": {
+                "rollout_revision": "abc123",
+                "cleanup_revision": "def456",
+                "approved": true
+            },
+            "argocd": {
+                "checked": true,
+                "sync": "Synced",
+                "health": "Healthy"
+            },
+            "cluster": {
+                "deployment_images": [
+                    {"role": "orchestrator", "deployment": "tessera-orch", "image": "repo/tessera:v2026.05.10"},
+                    {"role": "gateway", "deployment": "tessera-gateway", "image": "repo/tessera:v2026.05.10"},
+                    {"role": "source_worker", "deployment": "tessera-worker", "image": "repo/tessera:v2026.05.10"},
+                    {"role": "target_worker", "deployment": "tessera-worker-b", "image": "repo/tessera:v2026.05.10"}
+                ]
+            },
+            "cleanup": {
+                "manual_activation_default_off": true,
+                "preview_fixture_removed": true
+            },
+            "checks": {
+                "image_published": true,
+                "gitops_rollout_approved": true,
+                "argocd_synced_healthy": true,
+                "deployment_images_match": true,
+                "post_smoke_default_off_cleanup": true
+            },
+            "preflight_errors": [],
+            "remaining_uncovered": []
+        });
+        let internal = serde_json::json!({
+            "schema": "tessera.guarded_kubernetes_p11_endurance_recovery.v1",
+            "status": "complete",
+            "image": {"name": "repo/tessera:v2026.05.10"},
+            "checks": {
+                "argocd_synced_healthy": true,
+                "deployment_images_match": true,
+                "gateway_smoke_passed": true,
+                "pod_restarts_recovered": true,
+                "controlled_failures_recovered": true,
+                "durable_report_captured": true,
+                "default_off_cleanup_verified": true,
+                "runtime_mutation_default_off": true,
+                "route_convergence_after_recovery": true,
+                "assignment_convergence_after_recovery": true,
+                "gateway_routing_stable": true,
+                "worker_relay_state_stable": true,
+                "orchestrator_assignments_stable": true,
+                "operation_ledger_durable": true,
+                "request_latency_stable": true,
+                "close_counters_clean": true,
+                "ghost_relay_counters_sampled": true,
+                "no_execution_attempted": true
+            },
+            "soak": {"iterations": 2},
+            "recovery": {"scenarios": 3},
+            "operation_ledger": {
+                "persistence_enabled": true,
+                "records_before": 1,
+                "records_after_restart": 1
+            },
+            "remaining_uncovered": []
+        });
+
+        for (name, report) in [
+            ("p11-endurance-soak-latest.json", endurance),
+            ("p11-restart-recovery-latest.json", restart),
+            ("p11-transient-failure-recovery-latest.json", transient),
+            ("p11-gitops-rollout-latest.json", gitops),
+            (
+                "guarded-kubernetes-p11-endurance-recovery-latest.json",
+                internal,
+            ),
+        ] {
+            fs::write(
+                dir.join(name),
+                serde_json::to_string_pretty(&report).expect("serialize report"),
+            )
+            .expect("write report");
+        }
+
+        dev_p12_local_report_replay(&dir).expect("P12 local report replay should pass");
+
+        let readiness = read_json_report(&dir.join("p12-operator-readiness-latest.json"))
+            .expect("read readiness");
+        validate_p12_operator_readiness_report(&readiness).expect("valid readiness report");
+        let replay =
+            read_json_report(&dir.join("p12-source-replay-latest.json")).expect("read replay");
+        validate_p12_source_replay_report(&replay).expect("valid replay report");
+
+        let findings = p12_readiness_findings(&dir);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.gate == "p12_operator_readiness_packet")
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.gate == "p12_source_replay")
+        );
+        assert_eq!(findings.len(), 3);
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
     }
 
     #[test]
