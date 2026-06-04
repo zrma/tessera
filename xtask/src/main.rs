@@ -1401,6 +1401,12 @@ enum DevSub {
         #[arg(long, default_value = ".dev/reports")]
         report_dir: PathBuf,
     },
+    /// Derive P12 SLO and alert candidate recommendations without provisioning alerts
+    P12SloAlertCandidates {
+        /// Report directory. Defaults to .dev/reports
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+    },
     /// Replay P10 observability and ghost relay evidence without runtime mutation
     P10ReplayAudit {
         /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
@@ -2585,6 +2591,9 @@ fn main() -> Result<()> {
             DevSub::P11TransientFailureRecoverySmoke => dev_p11_transient_failure_recovery_smoke()?,
             DevSub::P12LocalReportReplay { report_dir } => {
                 dev_p12_local_report_replay(&report_dir)?
+            }
+            DevSub::P12SloAlertCandidates { report_dir } => {
+                dev_p12_slo_alert_candidates(&report_dir)?
             }
             DevSub::P10ReplayAudit {
                 observability,
@@ -4348,6 +4357,207 @@ fn p12_source_report_entry(path: &Path, report: &serde_json::Value) -> Result<se
         "schema": json_str(report, &["schema"])?,
         "hash": p10_report_hash(report)?
     }))
+}
+
+fn dev_p12_slo_alert_candidates(report_dir: &Path) -> Result<()> {
+    let p11_findings = p11_completion_findings(report_dir);
+    if !p11_findings.is_empty() {
+        bail!(
+            "P12 SLO and alert candidates require a complete P11 report set: {} missing gate(s)",
+            p11_findings.len()
+        );
+    }
+
+    let readiness_path = report_dir.join("p12-operator-readiness-latest.json");
+    let readiness = read_json_report(&readiness_path)?;
+    validate_p12_operator_readiness_report(&readiness)?;
+    let source_replay_path = report_dir.join("p12-source-replay-latest.json");
+    let source_replay = read_json_report(&source_replay_path)?;
+    validate_p12_source_replay_report(&source_replay)?;
+
+    let endurance_path = report_dir.join("p11-endurance-soak-latest.json");
+    let restart_path = report_dir.join("p11-restart-recovery-latest.json");
+    let transient_path = report_dir.join("p11-transient-failure-recovery-latest.json");
+    let internal_path = report_dir.join("guarded-kubernetes-p11-endurance-recovery-latest.json");
+
+    let endurance = read_json_report(&endurance_path)?;
+    validate_p11_endurance_soak_report(&endurance)?;
+    let restart = read_json_report(&restart_path)?;
+    validate_p11_restart_recovery_report(&restart)?;
+    let transient = read_json_report(&transient_path)?;
+    validate_p11_transient_failure_recovery_report(&transient)?;
+    let internal = read_json_report(&internal_path)?;
+    let image = json_str(&readiness, &["image", "name"])?;
+    validate_internal_k8s_p11_endurance_recovery_report(&internal, Some(image))?;
+
+    let runtime_mutation_default_off =
+        json_bool(&endurance, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(&restart, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(&transient, &["checks", "runtime_mutation_default_off"])?
+            && json_bool(&internal, &["checks", "runtime_mutation_default_off"])?;
+
+    let source_reports = serde_json::json!([
+        p12_source_report_entry(&readiness_path, &readiness)?,
+        p12_source_report_entry(&source_replay_path, &source_replay)?,
+        p12_source_report_entry(&endurance_path, &endurance)?,
+        p12_source_report_entry(&restart_path, &restart)?,
+        p12_source_report_entry(&transient_path, &transient)?,
+        p12_source_report_entry(&internal_path, &internal)?,
+    ]);
+
+    let candidates = serde_json::json!([
+        {
+            "name": "gateway_request_latency",
+            "type": "slo_and_alert_candidate",
+            "source_metrics": [
+                "tessera_gateway_ping_roundtrip_seconds",
+                "tessera_gateway_request_roundtrip_seconds"
+            ],
+            "source_evidence": [
+                "p11-endurance-soak-latest.json",
+                "guarded-kubernetes-p11-endurance-recovery-latest.json"
+            ],
+            "baseline": {
+                "local_request_samples": json_f64(&endurance, &["latency", "request_samples"])?,
+                "internal_request_samples": json_f64(&internal, &["soak", "request_samples"])?
+            },
+            "candidate_condition": "operator-approved p95 or p99 request round-trip threshold exceeded for a sustained window",
+            "current_evidence": {
+                "local_request_latency_stable": json_bool(&endurance, &["checks", "request_latency_stable"])?,
+                "internal_request_latency_stable": json_bool(&internal, &["checks", "request_latency_stable"])?
+            },
+            "known_gap": "threshold and evaluation window require operator approval before paging"
+        },
+        {
+            "name": "gateway_close_counters",
+            "type": "alert_candidate",
+            "source_metrics": [
+                "tessera_gateway_client_closes_no_route_total",
+                "tessera_gateway_client_closes_upstream_retry_exhausted_total",
+                "tessera_gateway_client_closes_pending_ping_route_change_total",
+                "tessera_gateway_client_closes_ambiguous_upstream_total"
+            ],
+            "source_evidence": [
+                "p11-endurance-soak-latest.json",
+                "p11-restart-recovery-latest.json",
+                "p11-transient-failure-recovery-latest.json",
+                "guarded-kubernetes-p11-endurance-recovery-latest.json"
+            ],
+            "candidate_condition": "client close counters increase outside an approved maintenance or failure-recovery drill window",
+            "current_evidence": {
+                "local_endurance_clean": json_bool(&endurance, &["checks", "close_counters_clean"])?,
+                "restart_recovery_clean": json_bool(&restart, &["checks", "close_counters_clean"])?,
+                "transient_recovery_clean": json_bool(&transient, &["checks", "close_counters_clean_after_recovery"])?,
+                "internal_clean": json_bool(&internal, &["checks", "close_counters_clean"])?
+            },
+            "known_gap": "maintenance-window suppression policy is not wired"
+        },
+        {
+            "name": "worker_relay_state",
+            "type": "alert_candidate",
+            "source_metrics": [
+                "tessera_worker_relay_connections_total",
+                "tessera_worker_relay_forward_drops_total",
+                "tessera_worker_remote_relay_connect_failures_total",
+                "tessera_worker_remote_relay_frames_received_total"
+            ],
+            "source_evidence": [
+                "p11-endurance-soak-latest.json",
+                "guarded-kubernetes-p11-endurance-recovery-latest.json"
+            ],
+            "candidate_condition": "relay drops or remote relay connect failures increase while cross-worker route evidence is expected to be stable",
+            "current_evidence": {
+                "local_worker_relay_state_stable": json_bool(&endurance, &["checks", "worker_relay_state_stable"])?,
+                "internal_worker_relay_state_stable": json_bool(&internal, &["checks", "worker_relay_state_stable"])?,
+                "ghost_relay_counters_sampled": json_bool(&endurance, &["checks", "ghost_relay_counters_sampled"])?
+            },
+            "known_gap": "per-cell relay volume baseline is candidate-only"
+        },
+        {
+            "name": "orchestrator_assignment_state",
+            "type": "alert_candidate",
+            "source_metrics": [
+                "tessera_orch_registered_workers",
+                "tessera_orch_assigned_cells",
+                "tessera_orch_addr_mismatch_workers",
+                "tessera_orch_listing_updates_total"
+            ],
+            "source_evidence": [
+                "p11-endurance-soak-latest.json",
+                "p11-restart-recovery-latest.json",
+                "p11-transient-failure-recovery-latest.json",
+                "guarded-kubernetes-p11-endurance-recovery-latest.json"
+            ],
+            "candidate_condition": "registered workers, assigned cells, route convergence, or assignment listing diverges from expected stable state",
+            "current_evidence": {
+                "local_assignments_stable": json_bool(&endurance, &["checks", "orchestrator_assignments_stable"])?,
+                "restart_assignment_converged": json_bool(&restart, &["checks", "assignment_convergence_after_recovery"])?,
+                "transient_assignment_converged": json_bool(&transient, &["checks", "assignment_convergence_after_recovery"])?,
+                "internal_assignments_stable": json_bool(&internal, &["checks", "orchestrator_assignments_stable"])?
+            },
+            "known_gap": "production expected worker/cell cardinality source of truth is not wired"
+        },
+        {
+            "name": "operation_default_off",
+            "type": "alert_candidate",
+            "source_metrics": [
+                "tessera_orch_assigned_cells",
+                "tessera_orch_listing_updates_total"
+            ],
+            "source_apis": [
+                "GET /operations"
+            ],
+            "source_evidence": [
+                "p12-operator-readiness-latest.json",
+                "p12-source-replay-latest.json"
+            ],
+            "candidate_condition": "runtime mutation mode becomes enabled or operation execution state changes without an approved operator decision",
+            "current_evidence": {
+                "readiness_default_off_verified": json_bool(&readiness, &["checks", "default_off_verified"])?,
+                "source_replay_default_off": json_bool(&source_replay, &["checks", "runtime_mutation_default_off"])?,
+                "p11_runtime_mutation_default_off": runtime_mutation_default_off
+            },
+            "known_gap": "live alert wiring and approval policy ownership require explicit operator decision"
+        }
+    ]);
+
+    let report = serde_json::json!({
+        "schema": "tessera.p12_slo_alert_candidates.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "reason": "P12 mapped source metrics to SLO and alert candidates without provisioning external alert resources",
+        "source_reports": source_reports,
+        "candidates": candidates,
+        "policy": {
+            "external_alert_backend": null,
+            "notification_target": null,
+            "thresholds": "candidate_only_operator_approval_required",
+            "live_alert_wiring": "not_performed"
+        },
+        "checks": {
+            "source_metrics_mapped": true,
+            "gateway_latency_candidate_recorded": true,
+            "gateway_close_counter_candidate_recorded": true,
+            "worker_relay_candidate_recorded": true,
+            "orchestrator_assignment_candidate_recorded": true,
+            "default_off_candidate_recorded": true,
+            "external_alert_backend_unset": true,
+            "no_alerts_provisioned": true
+        },
+        "remaining_uncovered": [
+            "p12_runbook_drill",
+            "p12_decision_packet",
+            "live_alert_wiring"
+        ]
+    });
+    validate_p12_slo_alert_candidates_report(&report)?;
+
+    let path = write_p12_slo_alert_candidates_report(report_dir, &report)?;
+    println!(
+        "P12 SLO and alert candidate report wrote {}",
+        path.display()
+    );
+    Ok(())
 }
 
 fn dev_p9_replay_audit(history: Option<&Path>) -> Result<()> {
@@ -26767,6 +26977,22 @@ fn write_p12_source_replay_report(
     Ok(latest)
 }
 
+fn write_p12_slo_alert_candidates_report(
+    report_dir: &Path,
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    fs::create_dir_all(report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p12-slo-alert-candidates-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = report_dir.join("p12-slo-alert-candidates-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
 fn write_internal_k8s_p9_recommend_soak_report(
     report: &serde_json::Value,
     out: Option<&Path>,
@@ -42468,7 +42694,7 @@ demo_count 4
                 "no_assignment_mutation": true,
                 "no_execution_attempted": true
             },
-            "soak": {"iterations": 2},
+            "soak": {"iterations": 2, "request_samples": 1},
             "history": {"records": 1},
             "remaining_uncovered": []
         });
@@ -42567,7 +42793,7 @@ demo_count 4
                 "runtime_mutation_default_off": true,
                 "no_execution_attempted": true
             },
-            "soak": {"iterations": 2},
+            "soak": {"iterations": 2, "request_samples": 1},
             "latency": {"request_samples": 1},
             "remaining_uncovered": []
         });
@@ -42764,7 +42990,7 @@ demo_count 4
                 "ghost_relay_counters_sampled": true,
                 "no_execution_attempted": true
             },
-            "soak": {"iterations": 2},
+            "soak": {"iterations": 2, "request_samples": 1},
             "recovery": {"scenarios": 3},
             "operation_ledger": {
                 "persistence_enabled": true,
@@ -43040,7 +43266,7 @@ demo_count 4
                 "ghost_relay_counters_sampled": true,
                 "no_execution_attempted": true
             },
-            "soak": {"iterations": 2},
+            "soak": {"iterations": 2, "request_samples": 1},
             "recovery": {"scenarios": 3},
             "operation_ledger": {
                 "persistence_enabled": true,
@@ -43088,6 +43314,20 @@ demo_count 4
                 .any(|finding| finding.gate == "p12_source_replay")
         );
         assert_eq!(findings.len(), 3);
+
+        dev_p12_slo_alert_candidates(&dir).expect("P12 SLO candidates should pass");
+        let slo_alerts = read_json_report(&dir.join("p12-slo-alert-candidates-latest.json"))
+            .expect("read SLO alert candidates");
+        validate_p12_slo_alert_candidates_report(&slo_alerts)
+            .expect("valid SLO alert candidates report");
+
+        let findings = p12_readiness_findings(&dir);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.gate == "p12_slo_alert_candidates")
+        );
+        assert_eq!(findings.len(), 2);
 
         fs::remove_dir_all(&dir).expect("remove temp report dir");
     }
