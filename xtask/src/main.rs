@@ -1413,6 +1413,12 @@ enum DevSub {
         #[arg(long, default_value = ".dev/reports")]
         report_dir: PathBuf,
     },
+    /// Write a P12 unresolved decision packet without external wiring
+    P12DecisionPacket {
+        /// Report directory. Defaults to .dev/reports
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+    },
     /// Replay P10 observability and ghost relay evidence without runtime mutation
     P10ReplayAudit {
         /// Observability soak JSON path. Defaults to .dev/reports/p10-observability-soak-latest.json
@@ -2602,6 +2608,7 @@ fn main() -> Result<()> {
                 dev_p12_slo_alert_candidates(&report_dir)?
             }
             DevSub::P12RunbookDrill { report_dir } => dev_p12_runbook_drill(&report_dir)?,
+            DevSub::P12DecisionPacket { report_dir } => dev_p12_decision_packet(&report_dir)?,
             DevSub::P10ReplayAudit {
                 observability,
                 ghost,
@@ -4730,6 +4737,112 @@ fn dev_p12_runbook_drill(report_dir: &Path) -> Result<()> {
 
     let path = write_p12_runbook_drill_report(report_dir, &report)?;
     println!("P12 runbook drill report wrote {}", path.display());
+    Ok(())
+}
+
+fn dev_p12_decision_packet(report_dir: &Path) -> Result<()> {
+    let p11_findings = p11_completion_findings(report_dir);
+    if !p11_findings.is_empty() {
+        bail!(
+            "P12 decision packet requires a complete P11 report set: {} missing gate(s)",
+            p11_findings.len()
+        );
+    }
+
+    let readiness_path = report_dir.join("p12-operator-readiness-latest.json");
+    let readiness = read_json_report(&readiness_path)?;
+    validate_p12_operator_readiness_report(&readiness)?;
+    let source_replay_path = report_dir.join("p12-source-replay-latest.json");
+    let source_replay = read_json_report(&source_replay_path)?;
+    validate_p12_source_replay_report(&source_replay)?;
+    let slo_path = report_dir.join("p12-slo-alert-candidates-latest.json");
+    let slo_alerts = read_json_report(&slo_path)?;
+    validate_p12_slo_alert_candidates_report(&slo_alerts)?;
+    let runbook_path = report_dir.join("p12-runbook-drill-latest.json");
+    let runbook = read_json_report(&runbook_path)?;
+    validate_p12_runbook_drill_report(&runbook)?;
+
+    let source_reports = serde_json::json!([
+        p12_source_report_entry(&readiness_path, &readiness)?,
+        p12_source_report_entry(&source_replay_path, &source_replay)?,
+        p12_source_report_entry(&slo_path, &slo_alerts)?,
+        p12_source_report_entry(&runbook_path, &runbook)?,
+    ]);
+
+    let decisions = serde_json::json!([
+        {
+            "key": "alert_backend",
+            "status": "unresolved",
+            "required_before": "creating or provisioning alert resources",
+            "current_position": "P12 records candidate metrics only; no external alert backend is selected",
+            "escalation": "operator must choose backend and ownership before live alert wiring"
+        },
+        {
+            "key": "notification_target",
+            "status": "unresolved",
+            "required_before": "sending notifications, adding webhook URLs, or paging humans",
+            "current_position": "no notification target, webhook, channel, or credential is stored in Tessera reports",
+            "escalation": "operator must provide the target and credential handling rule"
+        },
+        {
+            "key": "slo_thresholds",
+            "status": "unresolved",
+            "required_before": "treating candidate conditions as production SLOs or alerts",
+            "current_position": "candidate reports list source metrics and gaps but do not set paging thresholds",
+            "escalation": "operator must approve threshold, window, severity, and maintenance suppression policy"
+        },
+        {
+            "key": "retention_policy",
+            "status": "unresolved",
+            "required_before": "persisting or exporting report history beyond local .dev/reports convention",
+            "current_position": "reports are local evidence artifacts with stamped/latest files",
+            "escalation": "operator must choose retention location, duration, and cleanup policy"
+        },
+        {
+            "key": "production_manifest_ownership",
+            "status": "unresolved",
+            "required_before": "changing GitOps, Kubernetes, ArgoCD, or production observability manifests",
+            "current_position": "P12 helpers are read-only or local report writers; no production manifests changed",
+            "escalation": "operator must name the owning repo/path and approval path for manifest changes"
+        },
+        {
+            "key": "live_alert_wiring",
+            "status": "unresolved",
+            "required_before": "turning candidate metrics into active live alerts",
+            "current_position": "P12 closes at recommendation, runbook, and decision-packet evidence unless live wiring is separately approved",
+            "escalation": "operator must explicitly approve live wiring as a separate controlled slice"
+        }
+    ]);
+
+    let report = serde_json::json!({
+        "schema": "tessera.p12_decision_packet.v1",
+        "status": "complete",
+        "unix_secs": unix_timestamp_secs(),
+        "reason": "P12 recorded unresolved external observability and production-manifest choices without performing external wiring",
+        "source_reports": source_reports,
+        "decisions": decisions,
+        "checks": {
+            "alert_backend_decision_listed": true,
+            "notification_target_decision_listed": true,
+            "slo_threshold_decision_listed": true,
+            "retention_policy_decision_listed": true,
+            "production_manifest_ownership_decision_listed": true,
+            "live_alert_wiring_decision_listed": true,
+            "no_external_wiring_performed": true
+        },
+        "remaining_uncovered": [
+            "external_alert_backend_selection",
+            "notification_target_selection",
+            "production_slo_threshold_approval",
+            "report_retention_policy",
+            "production_manifest_ownership",
+            "live_alert_wiring"
+        ]
+    });
+    validate_p12_decision_packet_report(&report)?;
+
+    let path = write_p12_decision_packet_report(report_dir, &report)?;
+    println!("P12 decision packet report wrote {}", path.display());
     Ok(())
 }
 
@@ -27179,6 +27292,22 @@ fn write_p12_runbook_drill_report(
     Ok(latest)
 }
 
+fn write_p12_decision_packet_report(
+    report_dir: &Path,
+    report: &serde_json::Value,
+) -> Result<PathBuf> {
+    fs::create_dir_all(report_dir)?;
+    let body = format!("{}\n", serde_json::to_string_pretty(report)?);
+    let stamped = report_dir.join(format!(
+        "p12-decision-packet-{}.json",
+        unix_timestamp_secs()
+    ));
+    fs::write(&stamped, &body)?;
+    let latest = report_dir.join("p12-decision-packet-latest.json");
+    fs::write(&latest, body)?;
+    Ok(latest)
+}
+
 fn write_internal_k8s_p9_recommend_soak_report(
     report: &serde_json::Value,
     out: Option<&Path>,
@@ -43527,6 +43656,14 @@ demo_count 4
                 .any(|finding| finding.gate == "p12_runbook_drill")
         );
         assert_eq!(findings.len(), 1);
+
+        dev_p12_decision_packet(&dir).expect("P12 decision packet should pass");
+        let decisions = read_json_report(&dir.join("p12-decision-packet-latest.json"))
+            .expect("read decision packet");
+        validate_p12_decision_packet_report(&decisions).expect("valid decision packet report");
+
+        let findings = p12_readiness_findings(&dir);
+        assert!(findings.is_empty());
 
         fs::remove_dir_all(&dir).expect("remove temp report dir");
     }
