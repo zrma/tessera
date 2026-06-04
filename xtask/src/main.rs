@@ -98,6 +98,15 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit P12 operator readiness and alert handoff gates from report JSON
+    P12ReadinessAudit {
+        /// Directory that contains smoke/report JSON files
+        #[arg(long, default_value = ".dev/reports")]
+        report_dir: PathBuf,
+        /// Print machine-readable JSON instead of text
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Validate a P7 operation ledger JSON for proposal/approval/execution evidence
     P7OperationLedgerCheck {
         /// Operation ledger JSON path. Defaults to .dev/operation-ledger.json
@@ -1702,6 +1711,7 @@ fn main() -> Result<()> {
         Cmd::P11CompletionAudit { report_dir, json } => {
             run_p11_completion_audit(&report_dir, json)?
         }
+        Cmd::P12ReadinessAudit { report_dir, json } => run_p12_readiness_audit(&report_dir, json)?,
         Cmd::P7OperationLedgerCheck {
             ledger,
             require_approval,
@@ -30663,6 +30673,243 @@ fn validate_internal_k8s_p11_endurance_recovery_report(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct P12ReadinessFinding {
+    gate: &'static str,
+    evidence: String,
+    missing: String,
+}
+
+fn run_p12_readiness_audit(report_dir: &Path, json: bool) -> Result<()> {
+    let findings = p12_readiness_findings(report_dir);
+    if json {
+        let body = serde_json::json!({
+            "schema": "tessera.p12_readiness_audit.v1",
+            "complete": findings.is_empty(),
+            "report_dir": report_dir.display().to_string(),
+            "findings": findings.iter().map(|finding| {
+                serde_json::json!({
+                    "gate": finding.gate,
+                    "evidence": finding.evidence,
+                    "missing": finding.missing
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else if findings.is_empty() {
+        println!(
+            "P12 readiness audit passed: operator readiness and alert handoff gates are covered in {}",
+            report_dir.display()
+        );
+    } else {
+        println!(
+            "P12 readiness audit incomplete: {} missing gate(s) in {}",
+            findings.len(),
+            report_dir.display()
+        );
+        for finding in &findings {
+            println!(
+                "- {}: evidence={} missing={}",
+                finding.gate, finding.evidence, finding.missing
+            );
+        }
+    }
+    if !findings.is_empty() {
+        bail!(
+            "P12 readiness audit is incomplete: {} missing gate(s)",
+            findings.len()
+        );
+    }
+    Ok(())
+}
+
+fn p12_readiness_findings(report_dir: &Path) -> Vec<P12ReadinessFinding> {
+    let mut findings = Vec::new();
+
+    push_p12_json_gate(
+        &mut findings,
+        report_dir,
+        "p12_operator_readiness_packet",
+        "p12-operator-readiness-latest.json",
+        "read-only operator readiness packet replaying P11 image, GitOps, ArgoCD, route, assignment, latency, close-counter, ledger, and default-off evidence",
+        validate_p12_operator_readiness_report,
+    );
+    push_p12_json_gate(
+        &mut findings,
+        report_dir,
+        "p12_slo_alert_candidates",
+        "p12-slo-alert-candidates-latest.json",
+        "SLO and alert candidate report derived from Gateway, Worker, and Orchestrator metrics without provisioning external alerts",
+        validate_p12_slo_alert_candidates_report,
+    );
+    push_p12_json_gate(
+        &mut findings,
+        report_dir,
+        "p12_runbook_drill",
+        "p12-runbook-drill-latest.json",
+        "read-only operator runbook drill covering Gateway readiness/routes, Worker relay state, Orchestrator assignments, operation ledger durability, and default-off verification",
+        validate_p12_runbook_drill_report,
+    );
+    push_p12_json_gate(
+        &mut findings,
+        report_dir,
+        "p12_source_replay",
+        "p12-source-replay-latest.json",
+        "source-of-truth replay evidence for P11 completion, local, GitOps, and internal reports with stable hashes and no runtime mutation",
+        validate_p12_source_replay_report,
+    );
+    push_p12_json_gate(
+        &mut findings,
+        report_dir,
+        "p12_decision_packet",
+        "p12-decision-packet-latest.json",
+        "explicit unresolved decision packet for alert backend, notification target, SLO thresholds, retention policy, production manifest ownership, and live alert wiring",
+        validate_p12_decision_packet_report,
+    );
+
+    findings
+}
+
+fn push_p12_json_gate<F>(
+    findings: &mut Vec<P12ReadinessFinding>,
+    report_dir: &Path,
+    gate: &'static str,
+    report_name: &str,
+    missing: &str,
+    validate: F,
+) where
+    F: FnOnce(&serde_json::Value) -> Result<()>,
+{
+    let path = report_dir.join(report_name);
+    match read_json_report(&path) {
+        Ok(report) => {
+            if let Err(err) = validate(&report) {
+                findings.push(P12ReadinessFinding {
+                    gate,
+                    evidence: format!("{} failed verifier: {err}", path.display()),
+                    missing: missing.to_string(),
+                });
+            }
+        }
+        Err(err) => findings.push(P12ReadinessFinding {
+            gate,
+            evidence: format!("{} unavailable: {err}", path.display()),
+            missing: missing.to_string(),
+        }),
+    }
+}
+
+fn validate_p12_operator_readiness_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p12_operator_readiness.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "p11_evidence_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "image_evidence_present"], true)?;
+    assert_json_bool_eq(report, &["checks", "gitops_evidence_present"], true)?;
+    assert_json_bool_eq(report, &["checks", "argocd_synced_healthy"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_routing_reviewed"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_relay_state_reviewed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "orchestrator_assignments_reviewed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "operation_ledger_reviewed"], true)?;
+    assert_json_bool_eq(report, &["checks", "default_off_verified"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_cluster_mutation_attempted"], true)?;
+    assert_json_bool_eq(report, &["checks", "unresolved_decisions_recorded"], true)?;
+    assert_json_array_nonempty(report, &["source_reports"])?;
+    Ok(())
+}
+
+fn validate_p12_slo_alert_candidates_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p12_slo_alert_candidates.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "source_metrics_mapped"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "gateway_latency_candidate_recorded"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "gateway_close_counter_candidate_recorded"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "worker_relay_candidate_recorded"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "orchestrator_assignment_candidate_recorded"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "default_off_candidate_recorded"], true)?;
+    assert_json_bool_eq(report, &["checks", "external_alert_backend_unset"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_alerts_provisioned"], true)?;
+    assert_json_array_nonempty(report, &["candidates"])?;
+    Ok(())
+}
+
+fn validate_p12_runbook_drill_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p12_runbook_drill.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "symptoms_to_checks_mapped"], true)?;
+    assert_json_bool_eq(report, &["checks", "gateway_readiness_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "worker_relay_checked"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "orchestrator_assignments_checked"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "operation_ledger_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "default_off_checked"], true)?;
+    assert_json_bool_eq(report, &["checks", "no_runtime_mutation_attempted"], true)?;
+    assert_json_array_nonempty(report, &["drill_steps"])?;
+    Ok(())
+}
+
+fn validate_p12_source_replay_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p12_source_replay.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "p11_completion_audit_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "p11_local_reports_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "p11_gitops_report_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "p11_internal_report_replayed"], true)?;
+    assert_json_bool_eq(report, &["checks", "report_hashes_stable"], true)?;
+    assert_json_bool_eq(report, &["checks", "runtime_mutation_default_off"], true)?;
+    assert_json_number_at_least(report, &["replay", "reports"], 5.0)?;
+    Ok(())
+}
+
+fn validate_p12_decision_packet_report(report: &serde_json::Value) -> Result<()> {
+    assert_json_str_eq(report, &["schema"], "tessera.p12_decision_packet.v1")?;
+    assert_json_str_eq(report, &["status"], "complete")?;
+    assert_json_bool_eq(report, &["checks", "alert_backend_decision_listed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "notification_target_decision_listed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "slo_threshold_decision_listed"], true)?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "retention_policy_decision_listed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "production_manifest_ownership_decision_listed"],
+        true,
+    )?;
+    assert_json_bool_eq(
+        report,
+        &["checks", "live_alert_wiring_decision_listed"],
+        true,
+    )?;
+    assert_json_bool_eq(report, &["checks", "no_external_wiring_performed"], true)?;
+    assert_json_array_nonempty(report, &["decisions"])?;
+    Ok(())
+}
+
 fn build_p11_endurance_soak_report(
     observability_path: &Path,
     observability_report: &serde_json::Value,
@@ -42354,6 +42601,136 @@ demo_count 4
             Some("registry.example.com/example/tessera:v2026.05.10"),
         )
         .expect("valid internal P11 report");
+    }
+
+    #[test]
+    fn p12_readiness_audit_reports_missing_operator_gates() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tessera-p12-audit-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp report dir");
+
+        let findings = p12_readiness_findings(&dir);
+
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p12_operator_readiness_packet"
+                && finding.missing.contains("operator readiness")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p12_slo_alert_candidates" && finding.missing.contains("SLO and alert")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p12_runbook_drill" && finding.missing.contains("runbook drill")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p12_source_replay"
+                && finding.missing.contains("source-of-truth replay")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding.gate == "p12_decision_packet" && finding.missing.contains("unresolved decision")
+        }));
+
+        fs::remove_dir_all(&dir).expect("remove temp report dir");
+    }
+
+    #[test]
+    fn p12_report_validators_accept_complete_minimal_reports() {
+        let readiness = serde_json::json!({
+            "schema": "tessera.p12_operator_readiness.v1",
+            "status": "complete",
+            "source_reports": ["p11-completion-audit"],
+            "checks": {
+                "p11_evidence_replayed": true,
+                "image_evidence_present": true,
+                "gitops_evidence_present": true,
+                "argocd_synced_healthy": true,
+                "gateway_routing_reviewed": true,
+                "worker_relay_state_reviewed": true,
+                "orchestrator_assignments_reviewed": true,
+                "operation_ledger_reviewed": true,
+                "default_off_verified": true,
+                "runtime_mutation_default_off": true,
+                "no_cluster_mutation_attempted": true,
+                "unresolved_decisions_recorded": true
+            },
+            "remaining_uncovered": []
+        });
+        validate_p12_operator_readiness_report(&readiness).expect("valid P12 readiness report");
+
+        let slo_alerts = serde_json::json!({
+            "schema": "tessera.p12_slo_alert_candidates.v1",
+            "status": "complete",
+            "candidates": ["gateway_request_latency"],
+            "checks": {
+                "source_metrics_mapped": true,
+                "gateway_latency_candidate_recorded": true,
+                "gateway_close_counter_candidate_recorded": true,
+                "worker_relay_candidate_recorded": true,
+                "orchestrator_assignment_candidate_recorded": true,
+                "default_off_candidate_recorded": true,
+                "external_alert_backend_unset": true,
+                "no_alerts_provisioned": true
+            },
+            "remaining_uncovered": []
+        });
+        validate_p12_slo_alert_candidates_report(&slo_alerts)
+            .expect("valid P12 SLO and alert candidate report");
+
+        let runbook = serde_json::json!({
+            "schema": "tessera.p12_runbook_drill.v1",
+            "status": "complete",
+            "drill_steps": ["gateway_ready"],
+            "checks": {
+                "symptoms_to_checks_mapped": true,
+                "gateway_readiness_checked": true,
+                "worker_relay_checked": true,
+                "orchestrator_assignments_checked": true,
+                "operation_ledger_checked": true,
+                "default_off_checked": true,
+                "no_runtime_mutation_attempted": true
+            },
+            "remaining_uncovered": []
+        });
+        validate_p12_runbook_drill_report(&runbook).expect("valid P12 runbook drill report");
+
+        let replay = serde_json::json!({
+            "schema": "tessera.p12_source_replay.v1",
+            "status": "complete",
+            "checks": {
+                "p11_completion_audit_replayed": true,
+                "p11_local_reports_replayed": true,
+                "p11_gitops_report_replayed": true,
+                "p11_internal_report_replayed": true,
+                "report_hashes_stable": true,
+                "runtime_mutation_default_off": true
+            },
+            "replay": {"reports": 5},
+            "remaining_uncovered": []
+        });
+        validate_p12_source_replay_report(&replay).expect("valid P12 source replay report");
+
+        let decisions = serde_json::json!({
+            "schema": "tessera.p12_decision_packet.v1",
+            "status": "complete",
+            "decisions": ["alert_backend"],
+            "checks": {
+                "alert_backend_decision_listed": true,
+                "notification_target_decision_listed": true,
+                "slo_threshold_decision_listed": true,
+                "retention_policy_decision_listed": true,
+                "production_manifest_ownership_decision_listed": true,
+                "live_alert_wiring_decision_listed": true,
+                "no_external_wiring_performed": true
+            },
+            "remaining_uncovered": []
+        });
+        validate_p12_decision_packet_report(&decisions).expect("valid P12 decision packet report");
     }
 
     #[test]
