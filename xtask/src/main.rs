@@ -2860,7 +2860,7 @@ fn check_harness_docs(root: &Path) -> Result<()> {
             "docs/quality.md",
             &[
                 "# Tessera Quality Harness",
-                "Last verified: 2026-05-03",
+                "Last verified:",
                 "Autonomy contract",
                 "Feedback loops",
                 "Crate boundary policy",
