@@ -41,8 +41,8 @@ grep -Fq -- '- Structure ID: `agent-harness-v1`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md structure ID is missing or stale"
 grep -Fq -- '- Baseline ID: `openai-gpt-5.6-2026-07-10`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md baseline ID is missing or stale"
-grep -Eq '^- Convergence stage: `(bridge|normalized|canonical)`\.$' docs/agent-harness.md ||
-  fail "docs/agent-harness.md convergence stage is invalid"
+grep -Fq -- '- Convergence stage: `canonical`.' docs/agent-harness.md ||
+  fail "docs/agent-harness.md convergence stage must be canonical"
 grep -Fq -- '- Target stage: `canonical`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md target stage must remain canonical"
 grep -Fq -- '- Canonical check: `scripts/check-agent-harness-interface.sh`.' docs/agent-harness.md ||
