@@ -2849,12 +2849,12 @@ fn check_harness_docs(root: &Path) -> Result<()> {
             "AGENTS.md",
             &[
                 "docs/agent-harness.md",
-                "## 자율 수행 원칙",
-                "기본값은 자율 진행",
-                "사용자를 호출하는 경우",
-                "cargo xt harness",
+                "## First Read",
+                "## Project Overlay",
+                "openai-gpt-5.6-2026-07-10",
+                "cargo xt",
                 "cargo test",
-                "jj status",
+                "jj",
             ],
         ),
         (

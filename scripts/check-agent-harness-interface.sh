@@ -23,6 +23,20 @@ grep -Fq 'Baseline ID: `openai-gpt-5.6-2026-07-10`.' AGENTS.md ||
 grep -Fq 'docs/agent-harness.md' AGENTS.md ||
   fail "AGENTS.md must route to docs/agent-harness.md"
 
+expected_agents_headings=$(cat <<'HEADINGS'
+## First Read
+## Agent Harness Baseline (GPT-5.6)
+## Project Overlay
+HEADINGS
+)
+actual_agents_headings=$(sed -n 's/^\(## .*\)$/\1/p' AGENTS.md)
+
+if [ "$actual_agents_headings" != "$expected_agents_headings" ]; then
+  printf 'expected AGENTS.md headings:\n%s\n' "$expected_agents_headings" >&2
+  printf 'actual AGENTS.md headings:\n%s\n' "$actual_agents_headings" >&2
+  fail "AGENTS.md section order differs from the compact agent-harness-v1 map"
+fi
+
 grep -Fq -- '- Structure ID: `agent-harness-v1`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md structure ID is missing or stale"
 grep -Fq -- '- Baseline ID: `openai-gpt-5.6-2026-07-10`.' docs/agent-harness.md ||
