@@ -2848,6 +2848,7 @@ fn check_harness_docs(root: &Path) -> Result<()> {
         (
             "AGENTS.md",
             &[
+                "docs/agent-harness.md",
                 "## 자율 수행 원칙",
                 "기본값은 자율 진행",
                 "사용자를 호출하는 경우",
@@ -2855,6 +2856,21 @@ fn check_harness_docs(root: &Path) -> Result<()> {
                 "cargo test",
                 "jj status",
             ],
+        ),
+        (
+            "docs/agent-harness.md",
+            &[
+                "# Agent Harness",
+                "agent-harness-v1",
+                "openai-gpt-5.6-2026-07-10",
+                "## Convergence",
+                "## Project Overlay",
+                "scripts/check-agent-harness-interface.sh",
+            ],
+        ),
+        (
+            "scripts/check-agent-harness-interface.sh",
+            &["agent-harness-v1", "openai-gpt-5.6-2026-07-10"],
         ),
         (
             "docs/quality.md",
