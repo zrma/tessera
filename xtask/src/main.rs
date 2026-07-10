@@ -2825,6 +2825,7 @@ struct CrateBoundary<'a> {
 fn harness() -> Result<()> {
     let root = workspace_root();
     check_harness_docs(&root)?;
+    run(Command::new("python3").arg("scripts/check-publication-boundary.py"))?;
     check_crate_boundaries(&root)?;
     println!("harness: docs, CI, and crate dependency guardrails are valid");
     Ok(())
@@ -2851,7 +2852,7 @@ fn check_harness_docs(root: &Path) -> Result<()> {
                 "docs/agent-harness.md",
                 "## First Read",
                 "## Project Overlay",
-                "openai-gpt-5.6-2026-07-10",
+                "openai-gpt-5.6-2026-07-11",
                 "cargo xt",
                 "cargo test",
                 "jj",
@@ -2862,15 +2863,20 @@ fn check_harness_docs(root: &Path) -> Result<()> {
             &[
                 "# Agent Harness",
                 "agent-harness-v1",
-                "openai-gpt-5.6-2026-07-10",
+                "openai-gpt-5.6-2026-07-11",
                 "## Convergence",
                 "## Project Overlay",
                 "scripts/check-agent-harness-interface.sh",
+                "scripts/check-publication-boundary.py",
             ],
         ),
         (
             "scripts/check-agent-harness-interface.sh",
-            &["agent-harness-v1", "openai-gpt-5.6-2026-07-10"],
+            &["agent-harness-v1", "openai-gpt-5.6-2026-07-11"],
+        ),
+        (
+            "scripts/check-publication-boundary.py",
+            &["Publication class", "same-owner-repository-url"],
         ),
         (
             "docs/quality.md",

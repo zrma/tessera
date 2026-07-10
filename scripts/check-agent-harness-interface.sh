@@ -9,7 +9,7 @@ fail() {
   exit 1
 }
 
-for required_file in AGENTS.md docs/agent-harness.md; do
+for required_file in AGENTS.md docs/agent-harness.md scripts/check-publication-boundary.py; do
   [ -s "$required_file" ] || fail "missing or empty $required_file"
 done
 
@@ -18,7 +18,7 @@ baseline_end=$(grep -Fc '<!-- agent-harness-baseline:end -->' AGENTS.md || true)
 [ "$baseline_start" -eq 1 ] || fail "AGENTS.md must contain exactly one baseline start marker"
 [ "$baseline_end" -eq 1 ] || fail "AGENTS.md must contain exactly one baseline end marker"
 
-grep -Fq 'Baseline ID: `openai-gpt-5.6-2026-07-10`.' AGENTS.md ||
+grep -Fq 'Baseline ID: `openai-gpt-5.6-2026-07-11`.' AGENTS.md ||
   fail "AGENTS.md baseline ID is missing or stale"
 grep -Fq 'docs/agent-harness.md' AGENTS.md ||
   fail "AGENTS.md must route to docs/agent-harness.md"
@@ -39,7 +39,7 @@ fi
 
 grep -Fq -- '- Structure ID: `agent-harness-v1`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md structure ID is missing or stale"
-grep -Fq -- '- Baseline ID: `openai-gpt-5.6-2026-07-10`.' docs/agent-harness.md ||
+grep -Fq -- '- Baseline ID: `openai-gpt-5.6-2026-07-11`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md baseline ID is missing or stale"
 grep -Fq -- '- Convergence stage: `canonical`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md convergence stage must be canonical"
@@ -47,6 +47,11 @@ grep -Fq -- '- Target stage: `canonical`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md target stage must remain canonical"
 grep -Fq -- '- Canonical check: `scripts/check-agent-harness-interface.sh`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md canonical check path is missing or stale"
+publication_class_count=$(grep -Ec '^- Publication class: `(public|internal)`\.$' docs/agent-harness.md || true)
+[ "$publication_class_count" -eq 1 ] ||
+  fail "docs/agent-harness.md must declare exactly one publication class"
+grep -Fq -- '- Publication boundary check: `scripts/check-publication-boundary.py`.' docs/agent-harness.md ||
+  fail "docs/agent-harness.md publication boundary check path is missing or stale"
 grep -Fq -- '- 단계 전환은 현재 저장소의 Structure ID, 섹션 순서, canonical check 결과로 검증하며 다른 저장소의 이름·개수·로컬 경로·공개 여부를 전제하지 않는다.' docs/agent-harness.md ||
   fail "docs/agent-harness.md repository-boundary contract is missing or stale"
 
@@ -82,4 +87,6 @@ if grep -Eiq '[0-9]+개 저장소|[0-9]+ repositories|all[[:space:]]+repositorie
   fail "harness docs must not expose a repository portfolio"
 fi
 
-printf 'agent harness interface is valid: agent-harness-v1 / openai-gpt-5.6-2026-07-10\n'
+scripts/check-publication-boundary.py
+
+printf 'agent harness interface is valid: agent-harness-v1 / openai-gpt-5.6-2026-07-11\n'
