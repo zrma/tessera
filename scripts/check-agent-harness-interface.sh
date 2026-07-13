@@ -22,6 +22,8 @@ grep -Fq 'Baseline ID: `openai-gpt-5.6-2026-07-11`.' AGENTS.md ||
   fail "AGENTS.md baseline ID is missing or stale"
 grep -Fq 'docs/agent-harness.md' AGENTS.md ||
   fail "AGENTS.md must route to docs/agent-harness.md"
+grep -Fq -- '- Tracked-artifact privacy:' AGENTS.md ||
+  fail "AGENTS.md tracked-artifact privacy contract is missing"
 
 expected_agents_headings=$(cat <<'HEADINGS'
 ## First Read
@@ -52,6 +54,8 @@ publication_class_count=$(grep -Ec '^- Publication class: `(public|internal)`\.$
   fail "docs/agent-harness.md must declare exactly one publication class"
 grep -Fq -- '- Publication boundary check: `scripts/check-publication-boundary.py`.' docs/agent-harness.md ||
   fail "docs/agent-harness.md publication boundary check path is missing or stale"
+grep -Fq -- 'Tracked artifact contract:' docs/agent-harness.md ||
+  fail "docs/agent-harness.md tracked-artifact contract is missing"
 grep -Fq -- '- 단계 전환은 현재 저장소의 Structure ID, 섹션 순서, canonical check 결과로 검증하며 다른 저장소의 이름·개수·로컬 경로·공개 여부를 전제하지 않는다.' docs/agent-harness.md ||
   fail "docs/agent-harness.md repository-boundary contract is missing or stale"
 
