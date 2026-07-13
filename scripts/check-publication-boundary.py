@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -12,14 +13,36 @@ from pathlib import Path
 from typing import Iterable
 
 
-EXCLUDED_PATHS = {
-    "scripts/check-agent-harness-interface.sh",
-    "scripts/check-publication-boundary.py",
+FORBIDDEN_PUBLIC_PATHS = {
+    ".github/workflows/tessera.build-push.yml": "private-registry-publication-workflow",
 }
 
 SAFE_OPERATION_ENDPOINTS = {"registry.example.com"}
-SAFE_KUBERNETES_CONTEXTS = {"example-cluster"}
+SAFE_HOME_USERS = {"example", "local-user", "me", "runner", "tester", "user", "you"}
+SAFE_KUBERNETES_CONTEXTS = {"example", "example-cluster", "kind", "minikube", "test", "test-cluster"}
 NON_CONTEXT_TOKENS = {"must"}
+
+DOCUMENTATION_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+)
+
+SAFE_NETWORK_LITERALS = {
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+}
+
+RAW_EVIDENCE_NAME = (
+    r"(?:[a-z0-9][a-z0-9._-]*[-_])?"
+    r"(?:healthcheck|diagnostic|support-bundle|cluster-dump)[-_]"
+    r"[0-9]{8}(?:[-_][0-9]{4,6})?"
+)
+RAW_EVIDENCE_PATH = re.compile(rf"(?i)(?:^|/){RAW_EVIDENCE_NAME}(?:/|$)")
+RAW_EVIDENCE_REFERENCE = re.compile(
+    rf"(?i)(?<![a-z0-9._/-]){RAW_EVIDENCE_NAME}(?:/|$)"
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -116,7 +139,7 @@ def text_files(root: Path) -> Iterable[tuple[str, str]]:
         files.update(item for item in run_git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0") if item)
     except RuntimeError:
         pass
-    for relative in sorted(files - EXCLUDED_PATHS):
+    for relative in sorted(files):
         path = root / relative
         if not path.is_file():
             continue
@@ -129,8 +152,19 @@ def text_files(root: Path) -> Iterable[tuple[str, str]]:
 def fixed_patterns(owner: str, repository: str) -> list[tuple[str, re.Pattern[str]]]:
     return [
         (
+            "private-registry-secret-contract",
+            re.compile(r"(?i)\bPRIVATE_REGISTRY_(?:URL|HOST|USERNAME|PASSWORD|TOKEN)\b"),
+        ),
+        (
+            "private-registry-log-output",
+            re.compile(r"(?i)\b(?:echo|printf)\b[^\r\n]{0,80}\bregistry\b[^\r\n]{0,80}\$\{"),
+        ),
+        (
             "portfolio-disclosure",
-            re.compile(r"(?i)(?:\b[0-9]+\s*(?:repositories|repos)\b|[0-9]+개\s*저장소|all\s+repositories|cross-repository\s+agent-harness)"),
+            re.compile(
+                r"(?i)(?:\b[0-9]+\s*(?:repositories|repos)\b|[0-9]+개\s*저장소|"
+                r"all\s+repositories|cross-repository\s+agent-harness)"
+            ),
         ),
         (
             "cross-repository-revision",
@@ -167,15 +201,30 @@ def scan_text(
 ) -> set[Finding]:
     findings: set[Finding] = set()
     path_pattern = re.compile(r"(?<![A-Za-z0-9_.<>-])([A-Za-z0-9_.-]+)/(?=(?:apps|manifests|argocd|common|infra|deploy|charts)/)", re.IGNORECASE)
+    home_pattern = re.compile(r"(?<![A-Za-z0-9_.-])/(?:Users|home)/([A-Za-z0-9._-]+)")
+    windows_home_pattern = re.compile(r"(?i)(?<![A-Za-z0-9_.-])[A-Z]:\\Users\\([A-Za-z0-9._-]+)")
+    ipv4_pattern = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
+    private_hostname_pattern = re.compile(
+        r"(?i)\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)*\."
+        r"(?:local|internal|lan|home\.arpa|ts\.net)\b"
+    )
     operation_endpoint_pattern = re.compile(
-        r"(?i)(?<![A-Za-z0-9_.-])registry\.[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}\b"
+        r"(?i)(?<![A-Za-z0-9_.-])[a-z0-9-]*registry[a-z0-9-]*\."
+        r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}\b"
     )
     kubernetes_context_pattern = re.compile(
         r"(?i)--context(?:=|\s+)[`'\"]?([a-z0-9][a-z0-9._-]*)"
     )
     hardcoded_registry_project_pattern = re.compile(
-        r"\$\{\{\s*steps\.private-registry\.outputs\.registry\s*\}\}/(?!\$\{\{)[A-Za-z0-9_.-]+/"
+        r"\$\{\{\s*steps\.[A-Za-z0-9_.-]*registry[A-Za-z0-9_.-]*\.outputs\.registry\s*\}\}/"
+        r"(?!\$\{\{)[A-Za-z0-9_.-]+/"
     )
+    record_like = Path(relative.split("@", 1)[0]).suffix.lower() in {".log", ".md", ".txt"}
+    if RAW_EVIDENCE_PATH.search(relative):
+        findings.add(Finding(relative, 1, "raw-runtime-evidence-path"))
+    for match in RAW_EVIDENCE_REFERENCE.finditer(text):
+        line_no = text.count("\n", 0, match.start()) + 1
+        findings.add(Finding(relative, line_no, "raw-runtime-evidence-reference"))
     for kind, pattern in patterns:
         for match in pattern.finditer(text):
             line_no = text.count("\n", 0, match.start()) + 1
@@ -184,6 +233,12 @@ def scan_text(
         for match in path_pattern.finditer(line):
             if match.group(1) not in top_levels:
                 findings.add(Finding(relative, line_no, "external-repository-path"))
+        for match in home_pattern.finditer(line):
+            if match.group(1).lower() not in SAFE_HOME_USERS:
+                findings.add(Finding(relative, line_no, "machine-local-home-path"))
+        for match in windows_home_pattern.finditer(line):
+            if match.group(1).lower() not in SAFE_HOME_USERS:
+                findings.add(Finding(relative, line_no, "machine-local-home-path"))
         for match in operation_endpoint_pattern.finditer(line):
             if match.group(0).lower() not in SAFE_OPERATION_ENDPOINTS:
                 findings.add(Finding(relative, line_no, "private-operations-endpoint"))
@@ -191,15 +246,33 @@ def scan_text(
             context = match.group(1).lower()
             if context not in SAFE_KUBERNETES_CONTEXTS | NON_CONTEXT_TOKENS:
                 findings.add(Finding(relative, line_no, "machine-kubernetes-context"))
+        if record_like and private_hostname_pattern.search(line):
+            findings.add(Finding(relative, line_no, "private-operations-hostname"))
+        if record_like:
+            for match in ipv4_pattern.finditer(line):
+                try:
+                    address = ipaddress.ip_address(match.group(0))
+                except ValueError:
+                    continue
+                suffix = re.match(r"/[0-9]{1,3}", line[match.end() :])
+                if suffix and f"{address}{suffix.group(0)}" in SAFE_NETWORK_LITERALS:
+                    continue
+                if address.is_loopback or address.is_unspecified or any(address in network for network in DOCUMENTATION_NETWORKS):
+                    continue
+                findings.add(Finding(relative, line_no, "specific-network-address"))
         if hardcoded_registry_project_pattern.search(line):
             findings.add(Finding(relative, line_no, "hardcoded-private-registry-project"))
     return findings
 
 
 def check_tree(root: Path, owner: str, repository: str) -> set[Finding]:
-    top_levels = {path.split("/", 1)[0] for path in tracked_files(root)}
+    tracked = tracked_files(root)
+    top_levels = {path.split("/", 1)[0] for path in tracked}
     patterns = fixed_patterns(owner, repository)
     findings: set[Finding] = set()
+    for relative, kind in FORBIDDEN_PUBLIC_PATHS.items():
+        if relative in tracked and (root / relative).is_file():
+            findings.add(Finding(relative, 1, kind))
     for relative, text in text_files(root):
         findings.update(scan_text(relative, text, patterns, top_levels))
     return findings
@@ -208,6 +281,14 @@ def check_tree(root: Path, owner: str, repository: str) -> set[Finding]:
 def self_test() -> int:
     patterns = fixed_patterns("example", "public-app")
     top_levels = {"docs", "scripts", "src"}
+    registry_variable = "_".join(("PRIVATE", "REGISTRY", "URL"))
+    registry_log = " ".join(
+        (
+            "echo",
+            '"Using registry host:',
+            '${REGISTRY}"',
+        )
+    )
     private_repository = "-".join(("private", "source"))
     private_revision = "".join(("dead", "beef"))
     local_state = " ".join(
@@ -218,35 +299,55 @@ def self_test() -> int:
         )
     )
     operation_endpoint = ".".join(("registry", "private", "invalid"))
-    private_context = "-".join(("homelab", "admin"))
+    private_context = "-".join(("private", "cluster"))
     registry_step = "-".join(("private", "registry"))
     registry_expression = "${{ steps." + registry_step + ".outputs.registry }}/private/tessera:latest"
-    registry_secret = "_".join(("PRIVATE", "REGISTRY", "USERNAME"))
-    safe_registry_expression = (
-        "${{ steps.private-registry.outputs.registry }}/${{ secrets." + registry_secret + " }}/tessera:latest"
-    )
+    unix_home = "/" + "/".join(("Users", "local-account", "src", "public-app"))
+    windows_home = "C:\\" + "\\".join(("Users", "local-account", "src", "public-app"))
+    private_address = str(ipaddress.ip_network("100.64.0.0/10").network_address + 10)
+    evidence_path = f"cluster-healthcheck-{'0' * 8}-{'0' * 6}/SUMMARY.txt"
     unsafe = [
-        f"See https://github.com/example/{private_repository} for details.",
-        f"Apply {private_repository}" + "/apps/service/manifests.",
-        f"GitOps revision {private_revision} was promoted.",
-        local_state,
-        f"Use {operation_endpoint}/private/tessera for production.",
-        f"Run kubectl --context {private_context} get pods.",
-        registry_expression,
+        ("fixture", f"Read {registry_variable} before publishing."),
+        ("fixture", registry_log),
+        ("fixture", f"See https://github.com/example/{private_repository} for details."),
+        ("fixture", f"Apply {private_repository}" + "/apps/service/manifests."),
+        ("fixture", f"GitOps revision {private_revision} was promoted."),
+        ("fixture", local_state),
+        ("fixture", f"Use {operation_endpoint}/private/tessera for production."),
+        ("fixture", f"Run kubectl --context {private_context} get pods."),
+        ("fixture", registry_expression),
+        ("fixture", f"Built from {unix_home}."),
+        ("fixture", f"Built from {windows_home}."),
+        ("docs/HANDOFF.md", f"The target was {private_address}."),
+        (evidence_path, "ready"),
+        ("docs/HANDOFF.md", f"Read {evidence_path} before publishing."),
     ]
     safe = [
-        "See https://github.com/example/public-app/releases.",
-        "The private deployment source of truth owns promotion.",
-        "Use docs/deploy/checklist.md for the local contract.",
-        "Use registry.example.com/example/tessera in documentation.",
-        "Run kubectl --context example-cluster get pods.",
-        safe_registry_expression,
+        ("fixture", "See https://github.com/example/public-app/releases."),
+        ("fixture", "The private deployment source of truth owns promotion."),
+        ("fixture", "Use docs/deploy/checklist.md for the local contract."),
+        ("fixture", "Use registry.example.com/example/tessera in documentation."),
+        ("fixture", "Run kubectl --context example-cluster get pods."),
+        ("fixture", "Build tessera:local without publishing it."),
+        ("fixture", "Use <home>/<repo-root> and <private-host>."),
+        ("docs/HANDOFF.md", "Use 192.0.2.10 in documentation."),
+        ("docs/HANDOFF.md", "The shared carrier-grade network is 100.64.0.0/10."),
     ]
-    if any(not scan_text("fixture", text, patterns, top_levels) for text in unsafe):
+    if any(not scan_text(path, text, patterns, top_levels) for path, text in unsafe):
         print("self-test failed: expected unsafe fixture was not detected", file=sys.stderr)
         return 1
-    if any(scan_text("fixture", text, patterns, top_levels) for text in safe):
+    if any(scan_text(path, text, patterns, top_levels) for path, text in safe):
         print("self-test failed: safe fixture was rejected", file=sys.stderr)
+        return 1
+    checker_path = Path(__file__)
+    checker_findings = scan_text(
+        "scripts/check-publication-boundary.py",
+        checker_path.read_text(encoding="utf-8"),
+        patterns,
+        top_levels,
+    )
+    if checker_findings:
+        print("self-test failed: checker source violates its own publication boundary", file=sys.stderr)
         return 1
     print("publication boundary repository gate self-test passed")
     return 0
@@ -255,6 +356,8 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate the repository-owned publication boundary contract.")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--stdin", action="store_true", help="scan candidate text from stdin instead of the working tree")
+    parser.add_argument("--label", default="candidate", help="redacted location label used with --stdin")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
@@ -274,7 +377,11 @@ def main() -> int:
             return 0
 
         owner, repository = repository_identity(root)
-        findings = check_tree(root, owner, repository)
+        if args.stdin:
+            top_levels = {path.split("/", 1)[0] for path in tracked_files(root)}
+            findings = scan_text(args.label, sys.stdin.read(), fixed_patterns(owner, repository), top_levels)
+        else:
+            findings = check_tree(root, owner, repository)
         if findings:
             for finding in sorted(findings):
                 print(

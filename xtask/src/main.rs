@@ -29857,7 +29857,8 @@ fn p6_completion_findings(report_dir: &Path) -> Vec<P6CompletionFinding> {
         }),
     }
 
-    let internal_planner_path = report_dir.join("guarded-kubernetes-planner-activation-latest.json");
+    let internal_planner_path =
+        report_dir.join("guarded-kubernetes-planner-activation-latest.json");
     match read_json_report(&internal_planner_path) {
         Ok(report) => {
             if let Err(err) = validate_internal_k8s_planner_activation_report(&report, None, false)
@@ -34491,7 +34492,10 @@ fn validate_internal_k8s_operation_report(
         }
         let ledger = json_field(report, &["ledger", "snapshot"])?;
         validate_p7_operation_ledger(ledger, true, false, true, true, false)?;
-        assert_remaining_uncovered_absent(report, "guarded_kubernetes_operation_observation_smoke")?;
+        assert_remaining_uncovered_absent(
+            report,
+            "guarded_kubernetes_operation_observation_smoke",
+        )?;
     }
 
     if requirements.require_soak {
