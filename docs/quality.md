@@ -1,6 +1,6 @@
 # Tessera Quality Harness
 
-Last verified: 2026-07-10
+Last verified: 2026-07-14
 
 This document is the repo-local quality map for agents. It keeps the expected autonomy, feedback loops, and crate boundaries visible without requiring external chat history.
 
@@ -39,10 +39,12 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   read-only operator evidence. It returns `complete=true`
   when read-only operator readiness, metric candidates, runbook drill, source
   replay, and explicit decision packet reports are present.
-- P13 Kubernetes packaging does not have a dedicated render gate yet. Until it
-  does, packaging changes must run `cargo xt harness` plus
-  `scripts/check-publication-boundary.py`; code changes still require `cargo xt`
-  and `cargo test`.
+- `scripts/check-k8s-packaging.py` is the P13 render gate. It runs Helm lint,
+  proves deterministic default and scale-out renders, validates object,
+  namespace, topology, persistence, credential-reference, probe, and
+  default-off mutation policy, and exercises fail-closed negative cases.
+  `cargo xt harness` and CI run it automatically; code changes still require
+  `cargo xt` and `cargo test`.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
@@ -57,7 +59,11 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 
 - `scripts/check-agent-harness-interface.sh` verifies this repository's canonical `agent-harness-v1` structure and GPT-5.6 baseline.
 - `scripts/check-publication-boundary.py` rejects concrete private registry endpoints, machine-specific Kubernetes contexts, hardcoded private registry projects, and cross-repository state from public trees.
-- `cargo xt harness` verifies this document, README/AGENTS discoverability, CI smoke coverage, and crate dependency boundaries.
+- `scripts/check-k8s-packaging.py` validates the portable Helm chart without a
+  live cluster.
+- `cargo xt harness` verifies this document, README/AGENTS discoverability, CI
+  smoke coverage, Kubernetes packaging, publication policy, and crate
+  dependency boundaries.
 - If an intentional architecture edge fails the harness, update `README.md` Design Overview, this document, and the `xtask` rule in the same change.
 - Keep implemented, historical, and planned work separate: `README.md` is the
   front door, `docs/todo-next.md` is the current status/open-work source, and
@@ -66,8 +72,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 ## Known gaps
 
 - Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, Gateway has a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram, and Join/Move request latency is covered by request-id correlation histograms. Long-running scrape/tracing assertions are not covered yet.
-- Docker/Compose/Kubernetes sample packaging exists. The active packaging gap is
-  a reusable chart/template with render validation; cluster-specific live
+- Docker/Compose/Kubernetes sample packaging and the portable Helm chart exist.
+  The remaining packaging gap is the operator-facing example runbook;
+  cluster-specific live
   operations policy remains outside this repository.
 - Orchestrator has an inactive split/merge planner skeleton, dry-run preview endpoint, planner-to-operator `cargo xt split-activation-plan` and `cargo xt merge-activation-plan` helpers, policy-gated `cargo xt planner-activation` with live Worker metrics support for split, default-off manual split activation, same-Worker merge activation, cross-Worker merge replay activation, canonical merge sibling detection for `depth>0/sub=0` parents, and an opt-in persistent assignment state path for P6 restart recovery.
 - Local split evidence includes `cargo xt dev activation-plan-smoke`, `cargo xt dev activation-live-plan-smoke`, `cargo xt dev activation-live-metrics-smoke`, `cargo xt dev activation-live-planner-mutation-smoke`, `cargo xt dev activation-smoke`, `cargo xt dev activation-failure-smoke`, `cargo xt dev activation-restart-smoke`, and `cargo xt dev activation-soak`; the reports cover mutation-free planning, live Worker metrics planning, manual submission, policy-gated live metrics planner mutation with default no-op, Gateway route convergence, Worker assignment refresh, target relay replay, stable-session Move, AOI resync, failure/recovery, restart recovery, load/soak, and Gateway close-counter checks. `cargo xt dev activation-report-check --planner-mutation-report ... --require-planner-live-metrics` verifies the live metrics planner activation evidence source.
@@ -210,7 +217,7 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   out-of-scope decision evidence. The machine gate is
   `cargo xt p12-readiness-audit --json`.
 - P13 Kubernetes packaging template is the active planning boundary. It should
-  provide portable chart/template artifacts and validation for the
+  finish portable chart/template documentation for the
   containerized Gateway/Worker/Orchestrator architecture without owning a
   specific live service's alerting, ingress, registry, secret, certificate,
   incident, or production rollout policy.

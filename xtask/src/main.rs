@@ -2825,6 +2825,7 @@ struct CrateBoundary<'a> {
 fn harness() -> Result<()> {
     let root = workspace_root();
     check_harness_docs(&root)?;
+    run(Command::new("python3").arg("scripts/check-k8s-packaging.py"))?;
     run(Command::new("python3").arg("scripts/check-publication-boundary.py"))?;
     check_crate_boundaries(&root)?;
     println!("harness: docs, CI, and crate dependency guardrails are valid");
@@ -2879,6 +2880,14 @@ fn check_harness_docs(root: &Path) -> Result<()> {
             &["Publication class", "same-owner-repository-url"],
         ),
         (
+            "scripts/check-k8s-packaging.py",
+            &[
+                "helm",
+                "scale-out-values.yaml",
+                "deterministic default and scale-out renders",
+            ],
+        ),
+        (
             "docs/quality.md",
             &[
                 "# Tessera Quality Harness",
@@ -2892,6 +2901,8 @@ fn check_harness_docs(root: &Path) -> Result<()> {
         (
             ".github/workflows/ci.yml",
             &[
+                "azure/setup-helm@v5.0.1",
+                "version: v3.21.3",
                 "cargo xt",
                 "cargo test",
                 "cargo xt dev up --with-orch",

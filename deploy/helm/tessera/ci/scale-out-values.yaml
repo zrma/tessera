@@ -1,0 +1,34 @@
+gateway:
+  replicaCount: 2
+
+workers:
+  - name: worker-a
+    id: worker-west
+    cells:
+      - world: 0
+        cx: 0
+        cy: 0
+        depth: 0
+        sub: 0
+  - name: worker-b
+    id: worker-center
+    cells:
+      - world: 0
+        cx: 1
+        cy: 0
+        depth: 0
+        sub: 0
+  - name: worker-c
+    id: worker-east
+    cells:
+      - world: 0
+        cx: 2
+        cy: 0
+        depth: 0
+        sub: 0
+
+persistence:
+  enabled: true
+  type: dynamicClaim
+  retain: true
+  size: 2Gi

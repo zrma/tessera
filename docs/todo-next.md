@@ -60,14 +60,14 @@ Recommended P13 slices:
    Gateway, Worker, and Orchestrator workloads and Services with probes,
    metrics, ConfigMap wiring, existing-secret references, and optional state
    mounts.
-3. Pending: `test: add k8s render policy check` - validate rendered manifests
-   for deterministic output, publication-boundary compliance, and absence of
-   private inventory or credentials.
+3. Complete: `test: add k8s render policy check` - the repo-native gate proves
+   deterministic default and scale-out renders, validates portable object and
+   safety policy, and is part of `cargo xt harness` and CI.
 4. Pending: `docs: update packaging runbook` - document render/apply/smoke
    commands for an example namespace without implying production ownership.
-5. Pending: `refactor: generalize topology values` - make worker identity,
-   assignment seed config, advertised addresses, and scale-out topology
-   explicit reusable inputs.
+5. Complete: `refactor: generalize topology values` - the Worker list drives
+   identity, deterministic advertised Services, Orchestrator assignment seeds,
+   and the committed three-Worker render case.
 
 Runtime hardening queue:
 

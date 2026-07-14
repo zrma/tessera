@@ -49,11 +49,14 @@ The target is a portable chart/template contract for:
    Worker, and Orchestrator Deployments and `ClusterIP` Services with probes,
    optional metrics, ConfigMap wiring, existing-secret references, fail-closed
    values validation, and optional Orchestrator state storage.
-3. **Topology values**: model worker roles, worker replica/identity policy,
-   Gateway routing inputs, Orchestrator assignment seed config, and optional
-   state mounts without hardcoding private topology.
-4. **Render validation**: add a repo-native render check that verifies generated
-   manifests are deterministic, placeholder-safe, and publication-boundary clean.
+3. **Topology values (complete)**: the Worker list drives identity,
+   deterministic advertised Services, Gateway fallback routing, Orchestrator
+   assignment seeds, and optional state mounts; the scale-out fixture covers
+   three Workers without private topology.
+4. **Render validation (complete)**: `scripts/check-k8s-packaging.py` proves
+   deterministic default and scale-out output, validates the portable object
+   and safety contract, and exercises fail-closed negative cases from
+   `cargo xt harness` and CI.
 5. **Container smoke docs**: document how to render/apply the template in an
    example namespace and run Gateway ping/readiness checks without requiring any
    live production cluster.
