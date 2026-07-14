@@ -34,58 +34,58 @@ Last reviewed: 2026-06-04
   `complete=true` with local endurance, restart recovery, transient
   failure/reconnect recovery, P11 deployment rollout/default-off evidence, and
   guarded Kubernetes endurance/recovery.
-- The live Tessera deployment cleanup revision keeps Orchestrator execution and
-  split/merge activation default-off outside controlled smoke windows, removes
-  preview fixtures after smoke, and leaves deployment controller `tessera` `Synced / Healthy`.
-- P12 read-only Operator Readiness and Alert Handoff is complete. The open
-  boundary is optional read-only Kubernetes snapshot evidence or explicit
-  operator decisions for external observability/live alert wiring.
+- Prior guarded Kubernetes evidence proves the runtime can be exercised in a
+  containerized environment, but cluster-specific inventory and live operations
+  policy remain outside this repository.
+- P12 read-only operator evidence is complete as a historical support packet.
+  The active boundary is P13 Kubernetes packaging templates
+  plus continued cell-orchestration/runtime hardening.
 
 ## Next
 
-P12 closes the P11 runtime evidence loop as an operator-ready, read-only
-handoff while keeping mutation default-off and avoiding external observability
-or production-manifest assumptions until explicitly approved. The planning and
-decision source is `docs/todo-p12-ops-readiness.md`.
+Tessera's main direction is still seamless-cell orchestration: stable packet
+handling, cell ownership, handover, split/merge, generalized routing/state data
+structures, and a horizontally deployable container architecture. Kubernetes
+work in this repository should stop at a reusable chart/template boundary, not
+expand into owning a specific live service's operations stack.
 
-Recommended P12 slices:
+The active planning source is `docs/todo-p13-k8s-packaging.md`.
 
-1. Done: `docs: plan p12 operator readiness` - add the P12 goal,
-   evidence map, guardrails, and escalation points.
-2. Done: `test: add p12 readiness audit skeleton` - add a fail-closed
-   `cargo xt p12-readiness-audit --json` gate that requires a read-only
-   operator readiness report, SLO/alert candidate report, runbook drill report,
-   source-of-truth replay evidence, and explicit unresolved decision list.
-3. Done: `test: add p12 local report replay` - replay P11 local, deployment,
-   and internal reports into a compact operator packet without touching
-   runtime state.
-4. Done: `test: add p12 slo alert candidates` - derive Gateway latency,
-   Gateway close-counter, Worker relay, Orchestrator assignment, and
-   default-off alert candidates from existing metrics and P11/P12 report
-   evidence without provisioning external alerts.
-5. Done: `test: add p12 runbook drill` - map operator symptoms to exact
-   read-only checks for Gateway routing, Worker relay state, Orchestrator
-   assignment state, operation ledger durability, and default-off
-   verification.
-6. Pending: `test: add p12 read-only k8s snapshot` - collect deployment controller,
-   deployment image, readiness, metrics, assignment, and default-off state from
-   guarded Kubernetes without pod restarts, scale changes, or activation.
-7. Done: `test: add p12 decision packet` - record unresolved choices for alert
-   backend, notification target, SLO thresholds, report retention, production
-   manifest ownership, and live alert wiring without external wiring.
-8. Escalated: external observability decisions - choose the
-   decision gates for alert backend, SLO thresholds, notification route,
-   production manifest ownership, and retention policy before any external
-   wiring is implemented.
+Recommended P13 slices:
+
+1. Pending: `docs: define p13 packaging contract` - make the chart/template
+   boundary explicit, including placeholders, values, render checks, and
+   non-goals.
+2. Pending: `build: add k8s packaging template` - add reusable Gateway, Worker,
+   and Orchestrator Kubernetes templates with Services, probes, metrics ports,
+   ConfigMap wiring, and optional persistent state mounts.
+3. Pending: `test: add k8s render policy check` - validate rendered manifests
+   for deterministic output, publication-boundary compliance, and absence of
+   private inventory or credentials.
+4. Pending: `docs: update packaging runbook` - document render/apply/smoke
+   commands for an example namespace without implying production ownership.
+5. Pending: `refactor: generalize topology values` - make worker identity,
+   assignment seed config, advertised addresses, and scale-out topology
+   explicit reusable inputs.
+
+Runtime hardening queue:
+
+1. Pending: packet pipeline backpressure and partial-frame stress coverage.
+2. Pending: route convergence behavior under worker scale-out/identity changes.
+3. Pending: assignment-state compatibility rules for generalized topology.
+4. Pending: load-based split/merge planner quality beyond current guarded
+   operator evidence.
 
 ## Guardrails
 
-- P12 defaults to read-only evidence. Runtime mutation, pod restarts, scale
-  changes, alert backend creation, and production manifest changes require a
-  separate explicit approval.
-- P12 should use the completed P11 report set as source evidence instead of
-  rerunning controlled failure windows unless a regression requires it.
-- External observability choices must be captured as decisions before code,
-  manifests, or credentials are introduced.
+- Repository-owned Kubernetes work stops at portable chart/template artifacts,
+  render validation, and example smoke instructions.
+- Cluster-specific live operations, alerting, paging, credentials, ingress,
+  certificate, registry, and incident policy are outside this repository unless
+  explicitly introduced as placeholders or documented non-goals.
+- Runtime mutation, pod restarts, scale changes, and controlled failure windows
+  remain guarded helper paths, not default packaging behavior.
+- P12 metric/readiness evidence is historical support material, not the next
+  product direction.
 - Each logical slice should be committed and pushed separately before moving to
   the next gate.

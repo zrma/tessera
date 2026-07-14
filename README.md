@@ -5,12 +5,14 @@ Cell-based world orchestration for real-time servers in Rust.
 **Tessera** divides a seamless open world into cells and provides the control
 plane for ownership handover, AOI/ghost synchronization, dynamic split/merge,
 and operator-governed runtime operations. The target is the basic runtime
-skeleton for MMO-scale simulation, not a finished game server.
+skeleton for MMO-scale simulation, not a finished game server or a live-service
+operations stack.
 
 - Runtime: Rust + Tokio
-- Deployment target: self-hosted and Kubernetes-friendly
-- Current state: P0 through P12 read-only Operator Readiness and Alert Handoff
-  are complete; live alert wiring remains an explicit decision boundary.
+- Deployment target: container-first and Kubernetes-template friendly
+- Current state: P0 through P12 runtime/evidence gates are complete. The active
+  boundary is P13 Kubernetes packaging templates plus continued cell
+  orchestration/runtime hardening.
 
 ## Workspace
 
@@ -31,7 +33,8 @@ skeleton for MMO-scale simulation, not a finished game server.
 - Tests: `cargo test`
 - Last completed audit: `cargo xt p12-readiness-audit --json`
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
-- P12 decision/guardrail plan: `docs/todo-p12-ops-readiness.md`
+- Active plan: `docs/todo-next.md`
+- Kubernetes packaging boundary: `docs/todo-p13-k8s-packaging.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -75,8 +78,9 @@ Useful variants:
   - `cargo xt p12-readiness-audit --json`
   - `docs/todo-p12-ops-readiness.md`
 
-The longer smoke command catalog, guarded Kubernetes commands, and historical
-P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
+The longer smoke command catalog, guarded Kubernetes commands, historical
+P6/P7/P8 lanes, and packaging-template boundary are kept in
+`docs/smoke-runbook.md` and `docs/packaging.md`.
 
 ## Status Snapshot
 
@@ -95,18 +99,19 @@ P6/P7/P8 lanes are kept in `docs/smoke-runbook.md`.
   local plus guarded deployment smoke coverage.
 - Durable assignment state, operation ledger, policy-gated execution,
   observation/recovery records, cooldown/budget/concurrency gates, runtime
-  observability/soak evidence, operational endurance/failure recovery, and
-  completion audits through P11.
-- Private deployment verification through P11, with environment identity,
-  image coordinates, rollout revisions, and live topology retained outside
-  this public repository.
+  metrics, soak evidence, failure recovery, and completion audits through P12.
+- Container and guarded Kubernetes verification evidence through P12, with
+  environment identity, image coordinates, rollout revisions, and cluster
+  topology retained outside this public repository.
 
 ### Current Open Boundary
 
-P12 read-only Operator Readiness and Alert Handoff is closed against the
-current local evidence set. `docs/todo-next.md` now points to optional
-read-only Kubernetes snapshot evidence and the explicit escalation gates for
-external observability or production manifest decisions.
+P13 should turn the existing sample deployment surface into a reusable
+Kubernetes chart/template boundary for Gateway, Worker, and Orchestrator. The
+repository owns portable packaging shape, probes, config, service topology,
+state mounts, and render validation. It does not own cluster-specific live
+service operations, alert routing, paging thresholds, credentials, or production
+incident process.
 
 ## Protocol Snapshot
 
@@ -151,13 +156,18 @@ external observability or production manifest decisions.
 - Problem: a single process or shard bottlenecks seamless worlds and causes
   discontinuities during load shifts.
 - Goal: absorb load with cell-level ownership, routing, handover, split, merge,
-  operation review, and explicit audit evidence while keeping the client on a
-  stable gateway session.
+  packet/replay robustness, generalized topology data structures, and explicit
+  evidence while keeping the client on a stable gateway session.
 - Non-goals for the initial scope: finished game-server gameplay features,
-  complete zero-downtime migration, and multi-region consistency.
+  complete zero-downtime migration, multi-region consistency, and complete
+  live-service operations.
 - Key model: `CellId` is the ownership unit; Orchestrator owns assignment truth;
   Gateway routes by assignment watch/snapshot; Worker owns tick/runtime state
   for assigned cells and relays AOI/ghost state for nearby cells.
+- Deployment boundary: this repository should provide portable container and
+  Kubernetes chart/template artifacts that a hosting environment can adopt. It
+  should not encode private cluster inventory, credentials, alert routes, or
+  site-specific operations policy.
 - Operational defaults: runtime mutation is disabled by default, controlled
   windows must be explicit, and deployment cleanup must restore default-off state.
 

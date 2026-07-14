@@ -23,9 +23,8 @@ find deeper runbooks.
 ## Active Planning
 
 `todo-next.md` is the active open-work index. As of this review, P12 read-only
-Operator Readiness and Alert Handoff is closed; the remaining boundary is
-optional read-only Kubernetes snapshot evidence or explicit operator decisions
-for external observability/live alert wiring.
+operator evidence is closed. The active boundary is P13 Kubernetes packaging
+templates plus continued cell-orchestration/runtime hardening.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -42,13 +41,14 @@ or completion audit.
 | P9 operation control-plane readiness | Complete as `v2026.05.8` | `p9-operation-control-plane-readiness.md` |
 | P10 runtime observability and soak hardening | Complete as `v2026.05.9` | `p10-runtime-observability-soak-hardening.md` |
 | P11 operational endurance and failure recovery | Complete as `v2026.05.10` | `p11-operational-endurance-failure-recovery.md` |
-| P12 operator readiness and alert handoff | Complete read-only handoff; external wiring unresolved | `todo-p12-ops-readiness.md` |
+| P12 read-only operator evidence | Complete support packet; live operations out of scope | `todo-p12-ops-readiness.md` |
+| P13 Kubernetes packaging template | Active planning boundary | `todo-p13-k8s-packaging.md` |
 
 The P6/P7/P8/P9/P10/P11 documents are retained because they define evidence
-contracts, report shapes, and completion gates. P12 records the current
-read-only operator handoff and unresolved external decisions. Older milestone
-docs should not be treated as active TODO lists unless `todo-next.md` explicitly
-reopens a boundary.
+contracts, report shapes, and completion gates. P12 records a completed
+read-only support packet. P13 owns the current Kubernetes packaging boundary.
+Older milestone docs should not be treated as active TODO lists unless
+`todo-next.md` explicitly reopens a boundary.
 
 ## Design Notes
 
@@ -59,6 +59,7 @@ reopens a boundary.
 | Handover runtime baseline | `handover.md` |
 | P6 durable assignment state details | `p6-durable-split-state.md` |
 | Public packaging and Kubernetes samples | `packaging.md` |
+| P13 packaging template plan | `todo-p13-k8s-packaging.md` |
 
 These files contain useful implementation detail and evidence history, but
 new work should read them through the current status in `todo-next.md`.

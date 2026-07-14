@@ -36,9 +36,13 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   transient failure/reconnect recovery, deployment rollout, guarded Kubernetes
   endurance/recovery, and default-off cleanup evidence are present.
 - `cargo xt p12-readiness-audit --json` is the completed P12 machine gate for
-  read-only operator readiness and alert handoff. It returns `complete=true`
-  when read-only operator readiness, SLO/alert candidates, runbook drill,
-  source replay, and explicit decision packet reports are present.
+  read-only operator evidence. It returns `complete=true`
+  when read-only operator readiness, metric candidates, runbook drill, source
+  replay, and explicit decision packet reports are present.
+- P13 Kubernetes packaging does not have a dedicated render gate yet. Until it
+  does, packaging changes must run `cargo xt harness` plus
+  `scripts/check-publication-boundary.py`; code changes still require `cargo xt`
+  and `cargo test`.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
@@ -62,7 +66,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 ## Known gaps
 
 - Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, Gateway has a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram, and Join/Move request latency is covered by request-id correlation histograms. Long-running scrape/tracing assertions are not covered yet.
-- Docker/Compose/Kubernetes sample packaging exists, but production manifests are intentionally deferred until target cluster conventions are known.
+- Docker/Compose/Kubernetes sample packaging exists. The active packaging gap is
+  a reusable chart/template with render validation; cluster-specific live
+  operations policy remains outside this repository.
 - Orchestrator has an inactive split/merge planner skeleton, dry-run preview endpoint, planner-to-operator `cargo xt split-activation-plan` and `cargo xt merge-activation-plan` helpers, policy-gated `cargo xt planner-activation` with live Worker metrics support for split, default-off manual split activation, same-Worker merge activation, cross-Worker merge replay activation, canonical merge sibling detection for `depth>0/sub=0` parents, and an opt-in persistent assignment state path for P6 restart recovery.
 - Local split evidence includes `cargo xt dev activation-plan-smoke`, `cargo xt dev activation-live-plan-smoke`, `cargo xt dev activation-live-metrics-smoke`, `cargo xt dev activation-live-planner-mutation-smoke`, `cargo xt dev activation-smoke`, `cargo xt dev activation-failure-smoke`, `cargo xt dev activation-restart-smoke`, and `cargo xt dev activation-soak`; the reports cover mutation-free planning, live Worker metrics planning, manual submission, policy-gated live metrics planner mutation with default no-op, Gateway route convergence, Worker assignment refresh, target relay replay, stable-session Move, AOI resync, failure/recovery, restart recovery, load/soak, and Gateway close-counter checks. `cargo xt dev activation-report-check --planner-mutation-report ... --require-planner-live-metrics` verifies the live metrics planner activation evidence source.
 - Local merge evidence includes `cargo xt dev merge-plan-smoke`, `cargo xt dev planner-mutation-smoke`, `cargo xt dev merge-activation-smoke`, `cargo xt dev canonical-merge-activation-smoke`, `cargo xt dev canonical-merge-activation-report-check`, `cargo xt dev canonical-merge-activation-failure-smoke`, `cargo xt dev canonical-merge-activation-failure-report-check`, `cargo xt dev canonical-merge-activation-restart-smoke`, `cargo xt dev canonical-merge-activation-restart-report-check`, `cargo xt dev canonical-merge-activation-soak`, `cargo xt dev canonical-merge-activation-soak-report-check`, `cargo xt dev merge-activation-cross-worker-smoke`, `cargo xt dev merge-activation-failure-smoke`, `cargo xt dev merge-activation-restart-smoke`, `cargo xt dev merge-activation-soak`, and `cargo xt dev activation-report-check --merge-plan-report ... --merge-activation-report ... --merge-cross-worker-report ... --merge-failure-report ... --merge-restart-report ... --merge-soak-report ... --planner-mutation-report ...`; the reports cover policy-gated merge planner mutation, same-Worker coalescing, canonical `depth>0/sub=0` same-Worker coalescing, mixed-owner remote child replay into the owner parent, Gateway parent route convergence, stable-session parent Moves, owner outage detection/recovery, Orchestrator restart recovery, load/soak, manual rollback policy, and the explicit volatile actor-state recovery boundary. Internal merge publish/recovery/restart/soak evidence is covered by the P6+ completion audit.
@@ -199,12 +205,15 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   `cargo xt k8s p11-endurance-recovery-smoke` and requires explicit
   `--allow-pod-restart` plus `--allow-controlled-failure` for the bounded,
   deployment self-heal-safe restart/failure window.
-- P12 operator readiness and alert handoff is complete as a read-only handoff.
-  It turns the P11 report set into operator-facing SLO, alert, runbook drill,
-  replay, and escalation evidence before any external observability stack or
-  production manifest decision is treated as implementation scope. The machine
-  gate is `cargo xt p12-readiness-audit --json`; live alert wiring requires a
-  separate explicit approval.
+- P12 read-only operator evidence is complete as support material. It turns the
+  P11 report set into operator-facing metrics, runbook drill, replay, and
+  out-of-scope decision evidence. The machine gate is
+  `cargo xt p12-readiness-audit --json`.
+- P13 Kubernetes packaging template is the active planning boundary. It should
+  provide portable chart/template artifacts and validation for the
+  containerized Gateway/Worker/Orchestrator architecture without owning a
+  specific live service's alerting, ingress, registry, secret, certificate,
+  incident, or production rollout policy.
 - `docs/completed-milestones.md` records completed P0 through P4 work and
   `docs/todo-next.md` is the current execution-plan index. Keep README's
   implemented/planned sections and detailed `docs/` notes in sync when a task
