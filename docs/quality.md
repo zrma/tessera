@@ -50,6 +50,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   oversized-prefix rejection before upstream connect, ordered pipelined bursts,
   fixed pending correlation limits, and separate Ping/request tracking-eviction
   counters.
+- Gateway route-convergence coverage exercises active-session scale-out through
+  watch listings, stable Worker identity with an address replacement through
+  snapshot refresh, and stale-refresh rejection after newer watch updates.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

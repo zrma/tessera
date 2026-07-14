@@ -74,8 +74,9 @@ P14 runtime hardening queue:
 
 1. Complete: packet pipeline backpressure and partial-frame stress coverage,
    including observable bounded correlation tracking.
-2. Active: route convergence behavior under worker scale-out/identity changes.
-3. Pending: assignment-state compatibility rules for generalized topology.
+2. Complete: route convergence under worker scale-out/identity changes through
+   both watch and refresh paths while a Gateway session remains active.
+3. Active: assignment-state compatibility rules for generalized topology.
 4. Pending: load-based split/merge planner quality beyond current guarded
    operator evidence.
 

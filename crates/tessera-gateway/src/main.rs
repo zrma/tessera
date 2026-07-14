@@ -2958,6 +2958,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scale_out_watch_routes_new_cell_on_active_session() {
+        let worker_a_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker a");
+        let worker_a_addr = worker_a_listener.local_addr().expect("worker a addr");
+        let worker_b_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind worker b");
+        let worker_b_addr = worker_b_listener.local_addr().expect("worker b addr");
+
+        let (a_tx, a_rx) = oneshot::channel();
+        let (b_tx, b_rx) = oneshot::channel();
+        let mut worker_a_task =
+            tokio::spawn(run_ping_worker_expect_close(worker_a_listener, 1, a_tx));
+        let mut worker_b_task = tokio::spawn(run_ping_worker_once(worker_b_listener, 2, b_tx));
+
+        let cell_a = CellId::grid(0, 0, 0);
+        let cell_b = CellId::grid(0, 1, 0);
+        let mut routes = HashMap::new();
+        routes.insert(
+            CellKey(cell_a),
+            WorkerRoute {
+                worker_id: "worker-a".to_string(),
+                addr: worker_a_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(routes);
+        let (gateway_addr, mut gateway_task) = spawn_gateway_once(routing.clone()).await;
+        let mut client = TcpStream::connect(gateway_addr)
+            .await
+            .expect("connect gateway");
+
+        send_ping_and_expect_pong(&mut client, cell_a, 0, 1).await;
+
+        let scale_out_listing = AssignmentListing {
+            workers: vec![
+                AssignmentBundle {
+                    worker_id: "worker-a".to_string(),
+                    addr: worker_a_addr.to_string(),
+                    cells: vec![cell_to_assignment(&cell_a)],
+                },
+                AssignmentBundle {
+                    worker_id: "worker-b".to_string(),
+                    addr: worker_b_addr.to_string(),
+                    cells: vec![cell_to_assignment(&cell_b)],
+                },
+            ],
+            handovers: vec![],
+        };
+        apply_listing_stream(
+            routing.clone(),
+            iter(vec![Ok::<_, tonic::Status>(scale_out_listing)]),
+        )
+        .await
+        .expect("apply scale-out watch listing");
+
+        assert_eq!(routing.len().await, 2);
+        send_ping_and_expect_pong(&mut client, cell_b, 1, 2).await;
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.routing_version, 1);
+        assert_eq!(metrics.upstream_route_changes, 1);
+
+        timeout(Duration::from_millis(500), a_rx)
+            .await
+            .expect("worker a timeout")
+            .expect("worker a ack");
+        timeout(Duration::from_millis(500), b_rx)
+            .await
+            .expect("worker b timeout")
+            .expect("worker b ack");
+        drop(client);
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker-a", &mut worker_a_task).await;
+        wait_task("worker-b", &mut worker_b_task).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_replaces_worker_address_on_active_session() {
+        let original_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind original worker");
+        let original_addr = original_listener
+            .local_addr()
+            .expect("original worker addr");
+        let replacement_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replacement worker");
+        let replacement_addr = replacement_listener
+            .local_addr()
+            .expect("replacement worker addr");
+
+        let (original_tx, original_rx) = oneshot::channel();
+        let (replacement_tx, replacement_rx) = oneshot::channel();
+        let mut original_task = tokio::spawn(run_ping_worker_expect_close(
+            original_listener,
+            1,
+            original_tx,
+        ));
+        let mut replacement_task = tokio::spawn(run_ping_worker_once(
+            replacement_listener,
+            2,
+            replacement_tx,
+        ));
+
+        let cell = CellId::grid(0, 0, 0);
+        let mut routes = HashMap::new();
+        routes.insert(
+            CellKey(cell),
+            WorkerRoute {
+                worker_id: "worker-stable".to_string(),
+                addr: original_addr.to_string(),
+            },
+        );
+        let routing = RoutingTable::new(routes);
+        let (gateway_addr, mut gateway_task) = spawn_gateway_once(routing.clone()).await;
+        let mut client = TcpStream::connect(gateway_addr)
+            .await
+            .expect("connect gateway");
+
+        send_ping_and_expect_pong(&mut client, cell, 0, 1).await;
+
+        let start_version = routing.version.load(Ordering::Relaxed);
+        let mut refreshed_routes = HashMap::new();
+        refreshed_routes.insert(
+            CellKey(cell),
+            WorkerRoute {
+                worker_id: "worker-stable".to_string(),
+                addr: replacement_addr.to_string(),
+            },
+        );
+        assert_eq!(
+            try_apply_refresh(&routing, start_version, refreshed_routes).await,
+            RefreshOutcome::Applied { new_len: 1 }
+        );
+
+        send_ping_and_expect_pong(&mut client, cell, 1, 2).await;
+        let route = routing.lookup(&cell).await.expect("replacement route");
+        assert_eq!(route.worker_id, "worker-stable");
+        assert_eq!(route.addr, replacement_addr.to_string());
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.routing_version, 1);
+        assert_eq!(metrics.upstream_route_changes, 1);
+
+        timeout(Duration::from_millis(500), original_rx)
+            .await
+            .expect("original worker timeout")
+            .expect("original worker ack");
+        timeout(Duration::from_millis(500), replacement_rx)
+            .await
+            .expect("replacement worker timeout")
+            .expect("replacement worker ack");
+        drop(client);
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("original worker", &mut original_task).await;
+        wait_task("replacement worker", &mut replacement_task).await;
+    }
+
+    #[tokio::test]
     async fn route_change_after_non_ping_reconnects_with_stable_session() {
         let worker_a_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -4090,6 +4250,21 @@ mod tests {
                 .expect("handle gateway client");
         });
         (address, task)
+    }
+
+    async fn send_ping_and_expect_pong(client: &mut TcpStream, cell: CellId, seq: u64, ts: u64) {
+        client
+            .write_all(&encode_frame(&Envelope {
+                cell,
+                seq,
+                epoch: 0,
+                payload: ClientMsg::Ping { ts },
+            }))
+            .await
+            .expect("send ping");
+        let reply = read_env_with_timeout(client, Duration::from_millis(500)).await;
+        assert_eq!(reply.cell, cell);
+        assert_eq!(reply.payload, ServerMsg::Pong { ts });
     }
 
     async fn run_stub_worker(listener: TcpListener) {

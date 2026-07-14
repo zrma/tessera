@@ -55,11 +55,14 @@ ownership boundaries and default-off mutation gates.
      correlation-tracking eviction without reporting it as packet loss.
    - Existing Worker saturation and mid-frame disconnect coverage remained
      green, so no Worker behavior change was needed.
-2. **Route convergence under topology changes (active)**
-   - Exercise Worker identity/address replacement and scale-out assignment
-     listings while a Gateway session remains active.
-   - Prove convergence from both watch updates and periodic snapshot refresh.
-3. **Assignment-state compatibility**
+2. **Route convergence under topology changes (complete)**
+   - An active Gateway session follows a watch-delivered scale-out listing to a
+     newly assigned cell without reconnecting the client.
+   - A periodic refresh replaces a Worker's address while retaining its stable
+     identity, and the active session reconnects to the replacement endpoint.
+   - Existing identity replacement and stale-refresh guards remain green, so
+     watch updates cannot be overwritten by an older snapshot.
+3. **Assignment-state compatibility (active)**
    - Define compatibility for Worker additions/removals and persisted
      assignment state without silently adopting unknown identities.
    - Cover restart and rejected-incompatible-state behavior.
@@ -91,6 +94,14 @@ Packet ingress stress is covered by:
 - `pending_correlation_queues_evict_oldest_at_fixed_capacity`
 - `tessera_gateway_pending_ping_tracking_evictions_total`
 - `tessera_gateway_pending_request_tracking_evictions_total`
+
+Route convergence is covered by:
+
+- `scale_out_watch_routes_new_cell_on_active_session`
+- `refresh_replaces_worker_address_on_active_session`
+- `route_change_reconnects_to_new_worker`
+- `route_change_after_non_ping_reconnects_with_stable_session`
+- `refresh_skips_stale_snapshot_after_watch_update`
 
 ## Completion Boundary
 
