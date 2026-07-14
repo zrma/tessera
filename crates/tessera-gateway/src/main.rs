@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tessera_core::{
-    CellId, ClientEnvelope, ClientMsg, MAX_FRAME_LEN, ServerEnvelope, ServerMsg, encode_frame,
+    CellId, ClientEnvelope, ClientMsg, MAX_FRAME_LEN, RUNTIME_LOG_FORMAT_ENV, RuntimeLogFormat,
+    ServerEnvelope, ServerMsg, encode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -304,7 +305,7 @@ impl RoutingTable {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    init_tracing()?;
 
     let addr_raw =
         std::env::var("TESSERA_GW_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
@@ -1382,13 +1383,24 @@ fn assignment_to_cell(assignment: &Assignment) -> Result<CellId> {
     })
 }
 
-fn init_tracing() {
+fn init_tracing() -> Result<()> {
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .compact()
-        .init();
+    let raw_format = std::env::var(RUNTIME_LOG_FORMAT_ENV).ok();
+    let format = RuntimeLogFormat::parse(raw_format.as_deref())
+        .map_err(|error| anyhow!("{RUNTIME_LOG_FORMAT_ENV} {error}"))?;
+    match format {
+        RuntimeLogFormat::Compact => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .compact()
+            .try_init(),
+        RuntimeLogFormat::Json => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .json()
+            .try_init(),
+    }
+    .map_err(|error| anyhow!("initialize tracing subscriber: {error}"))
 }
 
 async fn resolve_socket_addr(raw: &str) -> Result<SocketAddr> {

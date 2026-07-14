@@ -68,6 +68,23 @@ sessions. It then restarts the second Worker on a new local advertised address
 with the same identity and cell, waits for Orchestrator and Gateway convergence,
 and requires the exact deterministic profile to pass again before teardown.
 
+## Runtime Logging
+
+Gateway, Worker, and Orchestrator use compact logs by default. Set the shared
+format contract to exact lowercase `json` when a local diagnostic or bounded
+smoke needs machine-readable events:
+
+```sh
+TESSERA_LOG_FORMAT=json cargo xt dev up --with-orch
+cargo xt dev logs --target all --follow
+cargo xt dev down --with-orch
+```
+
+Exact `compact` is also accepted; empty, differently cased, or unsupported
+values fail before runtime startup. Raw JSON logs are local-only diagnostics
+and can contain runtime inventory. Do not copy them into tracked reports; P17
+smoke evidence retains only bounded aggregate counts and verdicts.
+
 ## Metrics And Readiness
 
 ```sh

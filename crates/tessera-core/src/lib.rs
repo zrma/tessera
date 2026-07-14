@@ -2,6 +2,37 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+pub const RUNTIME_LOG_FORMAT_ENV: &str = "TESSERA_LOG_FORMAT";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeLogFormat {
+    #[default]
+    Compact,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedRuntimeLogFormat;
+
+impl RuntimeLogFormat {
+    pub fn parse(raw: Option<&str>) -> Result<Self, UnsupportedRuntimeLogFormat> {
+        match raw {
+            None | Some("compact") => Ok(Self::Compact),
+            Some("json") => Ok(Self::Json),
+            Some(_) => Err(UnsupportedRuntimeLogFormat),
+        }
+    }
+}
+
+impl fmt::Display for UnsupportedRuntimeLogFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("must be unset, compact, or json")
+    }
+}
+
+impl std::error::Error for UnsupportedRuntimeLogFormat {}
 
 // ---------- Basic Types ----------
 
@@ -426,6 +457,34 @@ pub fn try_decode_frame<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_log_format_defaults_to_compact() {
+        assert_eq!(RuntimeLogFormat::parse(None), Ok(RuntimeLogFormat::Compact));
+        assert_eq!(RuntimeLogFormat::default(), RuntimeLogFormat::Compact);
+    }
+
+    #[test]
+    fn runtime_log_format_accepts_only_canonical_values() {
+        assert_eq!(
+            RuntimeLogFormat::parse(Some("compact")),
+            Ok(RuntimeLogFormat::Compact)
+        );
+        assert_eq!(
+            RuntimeLogFormat::parse(Some("json")),
+            Ok(RuntimeLogFormat::Json)
+        );
+    }
+
+    #[test]
+    fn runtime_log_format_rejects_unsupported_values() {
+        for raw in ["", "JSON", "pretty", " json "] {
+            assert_eq!(
+                RuntimeLogFormat::parse(Some(raw)),
+                Err(UnsupportedRuntimeLogFormat)
+            );
+        }
+    }
 
     #[test]
     fn cellid_helpers() {

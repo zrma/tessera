@@ -69,6 +69,7 @@ development check needs them. These thresholds are not production SLOs.
 Useful variants:
 
 - Logs: `cargo xt dev logs --target all --follow`
+- Structured local logs: `TESSERA_LOG_FORMAT=json cargo xt dev up --with-orch`
 - Gateway only smoke: `cargo xt dev up`, client ping, then `cargo xt dev down`
 - Metrics smoke: `cargo xt dev metrics-smoke`
 - Two-Worker simulator smoke: `cargo xt dev distributed-simulation-smoke`
@@ -163,6 +164,8 @@ next boundary is tracked in `docs/todo-next.md`.
   `TESSERA_WORKER_METRICS_ADDR=127.0.0.1:5100 cargo run -p tessera-worker`
 - Orchestrator metrics and preview:
   `TESSERA_ORCH_METRICS_ADDR=127.0.0.1:6100 cargo run -p tessera-orch`
+- Runtime log format: leave `TESSERA_LOG_FORMAT` unset for compact output or set
+  it to `json`; unsupported values fail startup.
 - Detailed smoke and audit commands: `docs/smoke-runbook.md`
 
 ## Automation Harness

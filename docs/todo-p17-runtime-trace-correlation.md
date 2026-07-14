@@ -33,12 +33,16 @@ correlation regression lane.
 
 ## Milestone Queue
 
-1. **Opt-in structured runtime logging**
+1. **Complete: opt-in structured runtime logging**
    - Add one shared `compact|json` configuration contract with compact as the
      default and fail-closed rejection of unsupported values.
    - Apply the same initializer behavior to Gateway, Worker, and Orchestrator.
    - Cover defaults, valid values, invalid values, and parseable startup JSON
      without retaining machine inventory in tracked artifacts.
+   - Evidence: `RuntimeLogFormat` is shared through `tessera-core`; focused
+     tests cover the exact configuration states; all three runtime crates
+     reject unsupported values before binding and emitted parseable JSON during
+     the bounded metrics smoke.
 2. **Stable request lifecycle events**
    - Emit bounded Gateway forward/response and Worker receive/response events
      for request-id-bearing Join and Move operations.

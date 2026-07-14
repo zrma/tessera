@@ -120,8 +120,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, Gateway has
   a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram,
   and Join/Move request latency is covered by request-id correlation
-  histograms. P17 owns the still-open structured lifecycle trace and bounded
-  correlation assertions; P10 remains the long-running scrape/report owner.
+  histograms. All three runtimes share a fail-closed `TESSERA_LOG_FORMAT`
+  contract with compact default and opt-in JSON output. P17 still owns the
+  stable lifecycle events and bounded correlation assertions; P10 remains the
+  long-running scrape/report owner.
 - Docker/Compose/Kubernetes sample packaging, the portable Helm chart, and the
   operator-facing example runbook exist. Cluster-specific live operations
   policy remains outside this repository.

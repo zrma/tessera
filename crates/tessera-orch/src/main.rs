@@ -11,8 +11,8 @@ use std::sync::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tessera_core::{
-    CellChildFamilyKind, CellId, Envelope, MAX_FRAME_LEN, MergeReplayTarget, SplitReplayTarget,
-    WorkerRelayMsg, encode_frame,
+    CellChildFamilyKind, CellId, Envelope, MAX_FRAME_LEN, MergeReplayTarget,
+    RUNTIME_LOG_FORMAT_ENV, RuntimeLogFormat, SplitReplayTarget, WorkerRelayMsg, encode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_server::{Orchestrator, OrchestratorServer};
 use tessera_proto::orch::v1::{
@@ -228,7 +228,7 @@ fn validate_operator_token_for_bindings(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    init_tracing()?;
 
     let config = load_config().context("load orchestrator config")?;
     let split_activation_mode =
@@ -5014,13 +5014,24 @@ fn assignment_to_cell_ref(assignment: &Assignment) -> Result<CellId> {
     })
 }
 
-fn init_tracing() {
+fn init_tracing() -> Result<()> {
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .compact()
-        .init();
+    let raw_format = std::env::var(RUNTIME_LOG_FORMAT_ENV).ok();
+    let format = RuntimeLogFormat::parse(raw_format.as_deref())
+        .map_err(|error| anyhow!("{RUNTIME_LOG_FORMAT_ENV} {error}"))?;
+    match format {
+        RuntimeLogFormat::Compact => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .compact()
+            .try_init(),
+        RuntimeLogFormat::Json => tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .json()
+            .try_init(),
+    }
+    .map_err(|error| anyhow!("initialize tracing subscriber: {error}"))
 }
 
 async fn resolve_socket_addr(raw: &str) -> Result<SocketAddr> {
