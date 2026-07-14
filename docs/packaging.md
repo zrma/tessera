@@ -94,8 +94,8 @@ kubectl -n tessera-sample port-forward svc/tessera-gateway 4100:4100
 curl http://127.0.0.1:4100/ready
 ```
 
-P13 should promote this sample into a reusable chart/template boundary. The
-repository-owned template should cover:
+P13 promotes this sample into the reusable Helm chart at
+`deploy/helm/tessera`. The repository-owned template covers:
 
 - Gateway, Worker, and Orchestrator workloads.
 - Services for client ingress, internal component traffic, and optional
@@ -105,8 +105,10 @@ repository-owned template should cover:
 - Gateway readiness, TCP liveness probes, and optional metrics annotations.
 - Optional state mounts for Orchestrator assignment state and operation ledger
   files.
-- Render validation that keeps private inventory, credentials, concrete
-  hostnames, and site-specific operations policy out of tracked artifacts.
+- Schema validation for supported values and template validation that keeps
+  private inventory, credentials, concrete hostnames, and site-specific
+  operations policy out of tracked artifacts. The dedicated deterministic
+  render/policy check is the next P13 slice.
 
 Cluster-specific live-service manifests belong outside this repository or in a
 separate environment-owned layer. That layer should decide ingress, Service

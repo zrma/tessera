@@ -45,8 +45,10 @@ The target is a portable chart/template contract for:
    `deploy/helm/tessera`, caller-owned namespace, existing-secret references,
    default-off mutation, values schema, and a cluster-free two-case render
    matrix are defined in `docs/packaging.md`.
-2. **Template structure**: add reusable Gateway, Worker, and Orchestrator
-   workload templates with Services, probes, metrics ports, and config wiring.
+2. **Template structure (complete)**: the Helm chart renders reusable Gateway,
+   Worker, and Orchestrator Deployments and `ClusterIP` Services with probes,
+   optional metrics, ConfigMap wiring, existing-secret references, fail-closed
+   values validation, and optional Orchestrator state storage.
 3. **Topology values**: model worker roles, worker replica/identity policy,
    Gateway routing inputs, Orchestrator assignment seed config, and optional
    state mounts without hardcoding private topology.

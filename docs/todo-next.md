@@ -56,9 +56,10 @@ Recommended P13 slices:
 1. Complete: `docs: define p13 packaging contract` - Helm v3 chart shape,
    caller-owned namespace, existing-secret references, values validation,
    cluster-free render checks, and non-goals are explicit.
-2. Pending: `build: add k8s packaging template` - add reusable Gateway, Worker,
-   and Orchestrator Kubernetes templates with Services, probes, metrics ports,
-   ConfigMap wiring, and optional persistent state mounts.
+2. Complete: `build: add k8s packaging template` - the Helm chart renders
+   Gateway, Worker, and Orchestrator workloads and Services with probes,
+   metrics, ConfigMap wiring, existing-secret references, and optional state
+   mounts.
 3. Pending: `test: add k8s render policy check` - validate rendered manifests
    for deterministic output, publication-boundary compliance, and absence of
    private inventory or credentials.

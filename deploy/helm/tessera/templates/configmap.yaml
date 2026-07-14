@@ -1,0 +1,17 @@
+{{- include "tessera.validate" . -}}
+{{- $root := . -}}
+{{- $configuredWorkers := list -}}
+{{- range .Values.workers -}}
+{{- $address := printf "%s:%v" (include "tessera.workerName" (dict "root" $root "worker" .)) $root.Values.worker.servicePort -}}
+{{- $configuredWorkers = append $configuredWorkers (dict "id" .id "addr" $address "cells" .cells) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tessera.fullname" . }}-orchestrator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tessera.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+data:
+  orch-config.json: {{ dict "workers" $configuredWorkers | toJson | quote }}

@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "image",
+    "logLevel",
+    "auth",
+    "gateway",
+    "orchestrator",
+    "worker",
+    "workers",
+    "metrics",
+    "probes",
+    "runtime",
+    "persistence"
+  ],
+  "properties": {
+    "nameOverride": {
+      "type": "string",
+      "maxLength": 31,
+      "pattern": "^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "maxLength": 31,
+      "pattern": "^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "logLevel": {
+      "type": "string",
+      "minLength": 1
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["existingSecret", "operatorTokenKey", "workerRelayTokenKey"],
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+        },
+        "operatorTokenKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "workerRelayTokenKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        }
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["replicaCount", "servicePort", "metricsPort"],
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "servicePort": {
+          "$ref": "#/definitions/port"
+        },
+        "metricsPort": {
+          "$ref": "#/definitions/port"
+        }
+      }
+    },
+    "orchestrator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["servicePort", "metricsPort"],
+      "properties": {
+        "servicePort": {
+          "$ref": "#/definitions/port"
+        },
+        "metricsPort": {
+          "$ref": "#/definitions/port"
+        }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["servicePort", "metricsPort", "refreshSeconds"],
+      "properties": {
+        "servicePort": {
+          "$ref": "#/definitions/port"
+        },
+        "metricsPort": {
+          "$ref": "#/definitions/port"
+        },
+        "refreshSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        }
+      }
+    },
+    "workers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "id", "cells"],
+        "properties": {
+          "name": {
+            "$ref": "#/definitions/dnsLabel"
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "$ref": "#/definitions/cell"
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "prometheusAnnotations"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "prometheusAnnotations": {
+          "type": "boolean"
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initialDelaySeconds",
+        "periodSeconds",
+        "timeoutSeconds",
+        "failureThreshold"
+      ],
+      "properties": {
+        "initialDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "failureThreshold": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["splitMergeActivation", "operationExecution"],
+      "properties": {
+        "splitMergeActivation": {
+          "type": "string",
+          "enum": ["disabled", "manual"]
+        },
+        "operationExecution": {
+          "type": "string",
+          "enum": ["disabled", "manual"]
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "type",
+        "retain",
+        "existingClaim",
+        "size",
+        "accessModes",
+        "storageClass"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["emptyDir", "existingClaim", "dynamicClaim"]
+        },
+        "retain": {
+          "type": "boolean"
+        },
+        "existingClaim": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+        },
+        "size": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(Ei|Pi|Ti|Gi|Mi|Ki)$"
+        },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
+          }
+        },
+        "storageClass": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "dnsLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 30,
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+    },
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["world", "cx", "cy"],
+      "properties": {
+        "world": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "cx": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "cy": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "sub": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        }
+      }
+    }
+  }
+}

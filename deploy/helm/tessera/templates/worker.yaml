@@ -1,0 +1,104 @@
+{{- $root := . -}}
+{{- range $index, $worker := .Values.workers }}
+{{- if $index }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tessera.workerName" (dict "root" $root "worker" $worker) }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "tessera.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: worker
+    tessera.dev/worker-id: {{ $worker.id | quote }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "tessera.selectorLabels" (merge (dict "component" (printf "worker-%s" $worker.name)) $root) | nindent 4 }}
+  ports:
+    - name: runtime
+      port: {{ $root.Values.worker.servicePort }}
+      targetPort: runtime
+    {{- if $root.Values.metrics.enabled }}
+    - name: metrics
+      port: {{ $root.Values.worker.metricsPort }}
+      targetPort: metrics
+    {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tessera.workerName" (dict "root" $root "worker" $worker) }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "tessera.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: worker
+    tessera.dev/worker-id: {{ $worker.id | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "tessera.selectorLabels" (merge (dict "component" (printf "worker-%s" $worker.name)) $root) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tessera.selectorLabels" (merge (dict "component" (printf "worker-%s" $worker.name)) $root) | nindent 8 }}
+        tessera.dev/worker-id: {{ $worker.id | quote }}
+      {{- if and $root.Values.metrics.enabled $root.Values.metrics.prometheusAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $root.Values.worker.metricsPort | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: worker
+          image: {{ include "tessera.image" $root | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["tessera-worker"]
+          env:
+            - name: RUST_LOG
+              value: {{ $root.Values.logLevel | quote }}
+            - name: TESSERA_ORCH_ADDR
+              value: {{ printf "%s-orchestrator:%v" (include "tessera.fullname" $root) $root.Values.orchestrator.servicePort | quote }}
+            - name: TESSERA_WORKER_ID
+              value: {{ $worker.id | quote }}
+            - name: TESSERA_WORKER_ADDR
+              value: {{ printf "0.0.0.0:%v" $root.Values.worker.servicePort | quote }}
+            - name: TESSERA_WORKER_ADVERTISE_ADDR
+              value: {{ printf "%s:%v" (include "tessera.workerName" (dict "root" $root "worker" $worker)) $root.Values.worker.servicePort | quote }}
+            - name: TESSERA_WORKER_REFRESH_SECS
+              value: {{ $root.Values.worker.refreshSeconds | quote }}
+            - name: TESSERA_WORKER_RELAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.auth.existingSecret }}
+                  key: {{ $root.Values.auth.workerRelayTokenKey }}
+            {{- if $root.Values.metrics.enabled }}
+            - name: TESSERA_WORKER_METRICS_ADDR
+              value: {{ printf "0.0.0.0:%v" $root.Values.worker.metricsPort | quote }}
+            {{- end }}
+          ports:
+            - name: runtime
+              containerPort: {{ $root.Values.worker.servicePort }}
+            {{- if $root.Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ $root.Values.worker.metricsPort }}
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: runtime
+            initialDelaySeconds: {{ $root.Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ $root.Values.probes.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.probes.failureThreshold }}
+          livenessProbe:
+            tcpSocket:
+              port: runtime
+            initialDelaySeconds: {{ $root.Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ $root.Values.probes.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.probes.timeoutSeconds }}
+            failureThreshold: {{ $root.Values.probes.failureThreshold }}
+{{- end }}

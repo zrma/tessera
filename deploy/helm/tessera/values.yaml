@@ -1,0 +1,62 @@
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/example/tessera
+  tag: dev
+  pullPolicy: IfNotPresent
+
+logLevel: info
+
+auth:
+  existingSecret: tessera-runtime-auth
+  operatorTokenKey: operator-token
+  workerRelayTokenKey: worker-relay-token
+
+gateway:
+  replicaCount: 1
+  servicePort: 4000
+  metricsPort: 4100
+
+orchestrator:
+  servicePort: 6000
+  metricsPort: 6100
+
+worker:
+  servicePort: 5001
+  metricsPort: 5100
+  refreshSeconds: 2
+
+workers:
+  - name: worker-a
+    id: worker-a
+    cells:
+      - world: 0
+        cx: 0
+        cy: 0
+        depth: 0
+        sub: 0
+
+metrics:
+  enabled: true
+  prometheusAnnotations: true
+
+probes:
+  initialDelaySeconds: 1
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 6
+
+runtime:
+  splitMergeActivation: disabled
+  operationExecution: disabled
+
+persistence:
+  enabled: false
+  type: emptyDir
+  retain: true
+  existingClaim: ""
+  size: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  storageClass: ""
