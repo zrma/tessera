@@ -378,14 +378,15 @@ P13 portable Helm packaging is complete. Its cluster-free gate is part of
 `cargo xt harness`:
 
 ```sh
-scripts/check-k8s-packaging.py
+python3 scripts/check-k8s-packaging.py
 cargo xt harness
 ```
 
 Render inspection and the caller-owned example install/smoke/cleanup flow are
-documented in `docs/packaging.md`. The chart does not own private registry,
-host, ingress, certificate, alert, credential, namespace, or production
-rollout policy.
+documented in `docs/packaging.md`. P18 extends the same gate across Helm,
+Compose, and static-sample compact/JSON configuration parity. The chart does
+not own private registry, host, ingress, certificate, alert, credential,
+namespace, telemetry backend, or production rollout policy.
 
 ## Guarded Kubernetes Activation
 

@@ -10,10 +10,9 @@ operations stack.
 
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
-- Current state: P0 through P17 runtime/evidence/packaging, hardening,
+- Current state: P0 through P18 runtime/evidence/packaging, hardening,
   deterministic simulation, distributed topology convergence, and bounded
-  runtime trace-correlation gates are complete. P18 packaged log-format parity
-  is active in `docs/todo-next.md`.
+  runtime trace-correlation plus packaged log-format parity gates are complete.
 
 ## Workspace
 
@@ -36,8 +35,7 @@ operations stack.
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
-- Latest completed milestone: `docs/todo-p17-runtime-trace-correlation.md`
-- Active milestone: `docs/todo-p18-packaged-log-format.md`
+- Latest completed milestone: `docs/todo-p18-packaged-log-format.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -134,12 +132,12 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
 
 ### Latest Closed Boundary
 
-P17 adds a shared fail-closed compact/JSON logging contract and stable,
-privacy-bounded Join/Move lifecycle events across Gateway and Worker. The
-isolated `cargo xt dev trace-correlation-smoke` proves 12 requests produce 48
-exact lifecycle stages on the correct two cell owners, removes command-scoped
-raw artifacts, and runs twice in CI. Its completed evidence map is in
-`docs/todo-p17-runtime-trace-correlation.md`; the next boundary is tracked in
+P18 carries P17's fail-closed `compact|json` logging contract through Helm,
+Docker Compose, and the static Kubernetes sample. The chart defaults to compact
+output, validates an opt-in JSON render across every runtime Deployment, and
+rejects unsupported values; the packaging gate also prevents example-surface
+drift. Its completed evidence map is in
+`docs/todo-p18-packaged-log-format.md`; the next boundary is tracked in
 `docs/todo-next.md`.
 
 ## Protocol Snapshot

@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-14
 
-Status: active
+Status: complete
 
 ## Objective
 
@@ -52,11 +52,14 @@ collector, retention policy, or environment-specific inventory.
    - Evidence: Compose maps one caller override with compact fallback into all
      three services; the static manifest sets compact explicitly in all three
      Deployments; the packaging gate asserts both exact counts.
-4. **Runbook and closeout**
+4. **Complete: runbook and closeout**
    - Document Helm, Compose, and static-manifest configuration without
      presenting JSON output as a production policy.
    - Run packaging, harness, repository, and publication gates; close P18 only
      after remote CI validates the updated deployment contract.
+   - Evidence: the runbook documents exact Helm and Compose opt-in commands,
+     keeps the static sample compact by default, and preserves the raw-log and
+     production-policy boundary; repository gates and remote CI are green.
 
 ## Verification
 
@@ -64,7 +67,7 @@ Every implementation slice requires the narrow packaging gate plus repository
 defaults:
 
 ```text
-scripts/check-k8s-packaging.py
+python3 scripts/check-k8s-packaging.py
 cargo xt harness
 cargo xt
 cargo test

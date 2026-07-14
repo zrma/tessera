@@ -26,7 +26,8 @@ find deeper runbooks.
 P13 portable Kubernetes packaging, P14 runtime hardening, and P15 deterministic
 simulation harness work are closed. P16 distributed simulation and topology
 convergence is also closed. P17 runtime trace correlation is closed; the next
-open boundary is P18 packaged log-format parity in `todo-next.md`.
+boundary, P18 packaged log-format parity, is also closed. The next open boundary
+remains in `todo-next.md`.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -49,7 +50,7 @@ or completion audit.
 | P15 deterministic simulation harness | Complete; plans, bounded execution, result gates, and CI smoke | `todo-p15-simulation-harness.md` |
 | P16 distributed simulation and topology convergence | Complete; cell coverage, two-Worker workload, address convergence, and CI gate | `todo-p16-distributed-simulation.md` |
 | P17 runtime trace correlation | Complete; structured logs, lifecycle events, two-Worker trace smoke, and repeated CI gate | `todo-p17-runtime-trace-correlation.md` |
-| P18 packaged log-format parity | Active; Helm schema/render and example-surface parity | `todo-p18-packaged-log-format.md` |
+| P18 packaged log-format parity | Complete; Helm schema/render and example-surface parity | `todo-p18-packaged-log-format.md` |
 
 The P6/P7/P8/P9/P10/P11 documents are retained because they define evidence
 contracts, report shapes, and completion gates. P12 records a completed
@@ -57,8 +58,9 @@ read-only support packet. P13 records the completed portable packaging
 boundary, P14 records the completed runtime-hardening evidence, and P15 records
 the completed simulator contract. P16 records the completed distributed
 simulator evidence, and P17 records the completed runtime trace-correlation
-gate. Older milestone docs should not be treated as active TODO lists unless
-`todo-next.md` explicitly reopens a boundary.
+gate. P18 records the completed deployment-surface log-format contract. Older
+milestone docs should not be treated as active TODO lists unless `todo-next.md`
+explicitly reopens a boundary.
 
 ## Design Notes
 

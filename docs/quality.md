@@ -97,6 +97,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   per planned Join/Move on the correct cell owner, and emits only aggregate
   counts. Its temporary structured logs are removed after validation. CI runs
   the profile exactly twice, and the harness enforces that explicit bound.
+- The packaging gate maps the shared compact/JSON contract into every Helm
+  runtime Deployment, validates default compact and opt-in JSON renders, and
+  prevents Docker Compose or static Kubernetes sample drift.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy
@@ -131,8 +134,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   Worker response and back to the client. P17 closes the bounded two-Worker
   correlation assertion; P10 remains the long-running scrape/report owner.
 - Docker/Compose/Kubernetes sample packaging, the portable Helm chart, and the
-  operator-facing example runbook exist. Cluster-specific live operations
-  policy remains outside this repository.
+  operator-facing example runbook expose one shared compact-default log-format
+  contract. Cluster-specific telemetry and live operations policy remain
+  outside this repository.
 - Orchestrator has an inactive split/merge planner skeleton, dry-run preview endpoint, planner-to-operator `cargo xt split-activation-plan` and `cargo xt merge-activation-plan` helpers, policy-gated `cargo xt planner-activation` with live Worker metrics support for split, default-off manual split activation, same-Worker merge activation, cross-Worker merge replay activation, canonical merge sibling detection for `depth>0/sub=0` parents, and an opt-in persistent assignment state path for P6 restart recovery.
 - Local split evidence includes `cargo xt dev activation-plan-smoke`, `cargo xt dev activation-live-plan-smoke`, `cargo xt dev activation-live-metrics-smoke`, `cargo xt dev activation-live-planner-mutation-smoke`, `cargo xt dev activation-smoke`, `cargo xt dev activation-failure-smoke`, `cargo xt dev activation-restart-smoke`, and `cargo xt dev activation-soak`; the reports cover mutation-free planning, live Worker metrics planning, manual submission, policy-gated live metrics planner mutation with default no-op, Gateway route convergence, Worker assignment refresh, target relay replay, stable-session Move, AOI resync, failure/recovery, restart recovery, load/soak, and Gateway close-counter checks. `cargo xt dev activation-report-check --planner-mutation-report ... --require-planner-live-metrics` verifies the live metrics planner activation evidence source.
 - Local merge evidence includes `cargo xt dev merge-plan-smoke`, `cargo xt dev planner-mutation-smoke`, `cargo xt dev merge-activation-smoke`, `cargo xt dev canonical-merge-activation-smoke`, `cargo xt dev canonical-merge-activation-report-check`, `cargo xt dev canonical-merge-activation-failure-smoke`, `cargo xt dev canonical-merge-activation-failure-report-check`, `cargo xt dev canonical-merge-activation-restart-smoke`, `cargo xt dev canonical-merge-activation-restart-report-check`, `cargo xt dev canonical-merge-activation-soak`, `cargo xt dev canonical-merge-activation-soak-report-check`, `cargo xt dev merge-activation-cross-worker-smoke`, `cargo xt dev merge-activation-failure-smoke`, `cargo xt dev merge-activation-restart-smoke`, `cargo xt dev merge-activation-soak`, and `cargo xt dev activation-report-check --merge-plan-report ... --merge-activation-report ... --merge-cross-worker-report ... --merge-failure-report ... --merge-restart-report ... --merge-soak-report ... --planner-mutation-report ...`; the reports cover policy-gated merge planner mutation, same-Worker coalescing, canonical `depth>0/sub=0` same-Worker coalescing, mixed-owner remote child replay into the owner parent, Gateway parent route convergence, stable-session parent Moves, owner outage detection/recovery, Orchestrator restart recovery, load/soak, manual rollback policy, and the explicit volatile actor-state recovery boundary. Internal merge publish/recovery/restart/soak evidence is covered by the P6+ completion audit.
@@ -275,8 +279,8 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   `cargo xt p12-readiness-audit --json`.
 - P13 Kubernetes packaging is complete with a portable chart, deterministic
   default/scale-out render validation, and a caller-owned install/smoke
-  runbook. P14 through P17 are complete. P18 packaged log-format parity is the
-  active planning boundary; it must not expand this repository into owning a
+  runbook. P14 through P18 are complete. The next planning boundary must come
+  from `docs/todo-next.md` and must not expand this repository into owning a
   specific live service's telemetry backend, alerting, ingress, registry,
   secret, certificate, incident, or production rollout policy.
 - `docs/completed-milestones.md` records completed P0 through P4 work and

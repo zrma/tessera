@@ -52,6 +52,17 @@ with metrics endpoints enabled:
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
+All three services use compact logs by default. After supplying the existing
+runtime authentication environment variables, opt into JSON for a bounded
+local diagnostic with one shared override:
+
+```sh
+TESSERA_LOG_FORMAT=json docker compose -f deploy/docker-compose.yml up --build
+```
+
+The override accepts only the runtime's exact lowercase `compact|json`
+contract; unsupported values make each runtime fail startup.
+
 Useful local checks:
 
 ```sh
@@ -78,6 +89,11 @@ sample. It shows:
 - Prometheus scrape annotations for each component metrics endpoint
 - Gateway readiness via `GET /ready`
 - TCP liveness probes for runtime ports
+- explicit compact log format for all three runtime Deployments
+
+The tracked static sample intentionally stays compact. For a bounded local JSON
+diagnostic, change all three `TESSERA_LOG_FORMAT` values together in a temporary
+copy; do not commit that diagnostic override or its raw output.
 
 Apply it only after replacing `ghcr.io/example/tessera:dev` with an image that
 exists in the target registry:
@@ -130,7 +146,8 @@ The chart contract is:
   authentication `Secret`. The chart never creates credentials or embeds token
   values.
 - Gateway, Worker, and Orchestrator ports, probes, metrics annotations, log
-  level, image coordinates, and replica counts are values-backed.
+  level, `compact|json` log format, image coordinates, and replica counts are
+  values-backed.
 - Worker identity and advertised addresses are deterministic Kubernetes DNS
   names. Initial cell assignments are explicit values and must refer to a
   declared Worker identity.
@@ -160,6 +177,9 @@ helm template tessera-example deploy/helm/tessera \
 helm template tessera-scale deploy/helm/tessera \
   --namespace tessera-scale \
   --values deploy/helm/tessera/ci/scale-out-values.yaml > <rendered-output>
+helm template tessera-json deploy/helm/tessera \
+  --namespace tessera-json \
+  --set-string logFormat=json > <rendered-output>
 ```
 
 Repository validation must render each case twice, prove byte-stable output,
@@ -172,7 +192,7 @@ Helm v3 is required for the chart gate. Run the repository-owned gate from the
 repository root:
 
 ```sh
-scripts/check-k8s-packaging.py
+python3 scripts/check-k8s-packaging.py
 cargo xt harness
 ```
 
@@ -187,7 +207,8 @@ kubectl apply --dry-run=client --validate=false -f <rendered-output>
 `deploy/helm/tessera/ci/scale-out-values.yaml` is a committed validation fixture,
 not a production values file. It proves that independent Worker ids, advertised
 Service addresses, assignment seeds, Gateway replicas, and state persistence
-render coherently.
+render coherently. It also opts into JSON so the render matrix proves both the
+default compact and explicit JSON contracts across every runtime Deployment.
 
 ## Example Install And Smoke
 
@@ -213,6 +234,12 @@ helm upgrade --install tessera-example deploy/helm/tessera \
   --set-string image.repository='<image-repository>' \
   --set-string image.tag='<image-tag>'
 ```
+
+For a caller-owned structured-log integration, add
+`--set-string logFormat=json`. This changes runtime output only; collectors,
+sampling, retention, indexing, and alerting remain environment-owned. Raw JSON
+logs are local-only unless the owning environment applies its own reviewed data
+handling policy.
 
 Check the three default workloads, then forward the Gateway client and metrics
 ports in a separate terminal:
