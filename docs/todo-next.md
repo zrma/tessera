@@ -1,6 +1,6 @@
 # Tessera Next Todo
 
-Last reviewed: 2026-06-04
+Last reviewed: 2026-07-14
 
 ## Baseline
 
@@ -38,8 +38,9 @@ Last reviewed: 2026-06-04
   containerized environment, but cluster-specific inventory and live operations
   policy remain outside this repository.
 - P12 read-only operator evidence is complete as a historical support packet.
-  The active boundary is P13 Kubernetes packaging templates
-  plus continued cell-orchestration/runtime hardening.
+  P13 portable Kubernetes packaging is also complete with deterministic
+  default/scale-out render validation. The active boundary is P14 runtime
+  hardening.
 
 ## Next
 
@@ -49,9 +50,9 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-The active planning source is `docs/todo-p13-k8s-packaging.md`.
+The active planning source is `docs/todo-p14-runtime-hardening.md`.
 
-Recommended P13 slices:
+P13 closure:
 
 1. Complete: `docs: define p13 packaging contract` - Helm v3 chart shape,
    caller-owned namespace, existing-secret references, values validation,
@@ -63,15 +64,15 @@ Recommended P13 slices:
 3. Complete: `test: add k8s render policy check` - the repo-native gate proves
    deterministic default and scale-out renders, validates portable object and
    safety policy, and is part of `cargo xt harness` and CI.
-4. Pending: `docs: update packaging runbook` - document render/apply/smoke
-   commands for an example namespace without implying production ownership.
+4. Complete: `docs: update packaging runbook` - render, caller-owned
+   install/readiness/ping, retained-state, and cleanup boundaries are explicit.
 5. Complete: `refactor: generalize topology values` - the Worker list drives
    identity, deterministic advertised Services, Orchestrator assignment seeds,
    and the committed three-Worker render case.
 
-Runtime hardening queue:
+P14 runtime hardening queue:
 
-1. Pending: packet pipeline backpressure and partial-frame stress coverage.
+1. Active: packet pipeline backpressure and partial-frame stress coverage.
 2. Pending: route convergence behavior under worker scale-out/identity changes.
 3. Pending: assignment-state compatibility rules for generalized topology.
 4. Pending: load-based split/merge planner quality beyond current guarded

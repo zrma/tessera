@@ -2,6 +2,8 @@
 
 Last reviewed: 2026-07-14
 
+Status: complete
+
 ## Objective
 
 P13 turns Tessera's container-oriented Gateway, Worker, and Orchestrator runtime
@@ -57,12 +59,12 @@ The target is a portable chart/template contract for:
    deterministic default and scale-out output, validates the portable object
    and safety contract, and exercises fail-closed negative cases from
    `cargo xt harness` and CI.
-5. **Container smoke docs**: document how to render/apply the template in an
-   example namespace and run Gateway ping/readiness checks without requiring any
-   live production cluster.
-6. **Runtime follow-up map**: capture remaining cell-orchestration hardening
-   work that packaging exposes, such as packet backpressure, route convergence,
-   assignment-state compatibility, and scale-out worker identity.
+5. **Container smoke docs (complete)**: `docs/packaging.md` documents
+   cluster-free render validation plus caller-owned example
+   install/readiness/ping/cleanup commands with credential-file placeholders.
+6. **Runtime follow-up map (complete)**:
+   `docs/todo-p14-runtime-hardening.md` owns packet pressure, route convergence,
+   assignment compatibility, and planner-quality follow-up work.
 
 ## Selected Contract
 
@@ -95,6 +97,22 @@ P13 can close when:
    private inventory or credentials.
 4. `cargo xt harness` and the publication boundary check pass.
 5. Runtime code changes, if any, also pass `cargo xt` and `cargo test`.
+
+## Completion Evidence
+
+- The Helm chart renders the exact Gateway, Worker, Orchestrator, ConfigMap,
+  Service, probe, credential-reference, and optional persistence surfaces
+  defined by the contract.
+- `scripts/check-k8s-packaging.py` passes deterministic default and three-Worker
+  scale-out renders plus invalid-values, duplicate-worker, duplicate-cell,
+  namespace, default-off, and persistence policy checks.
+- `cargo xt`, `cargo test`, `cargo xt harness`, the repository publication gate,
+  and the public-repository private-inventory gate passed before the closing
+  change.
+- The GitHub Actions run for the render-policy change passed with Helm v3,
+  workspace verification, tests, and the local runtime smoke.
+- No live cluster mutation or production operations decision was required to
+  close P13.
 
 ## Guardrails
 

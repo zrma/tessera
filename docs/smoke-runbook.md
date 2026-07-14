@@ -304,18 +304,18 @@ Implemented P12 reports:
 
 ## P13 Kubernetes Packaging Template
 
-P13 should add render/template validation for portable Gateway, Worker, and
-Orchestrator Kubernetes packaging. Until a dedicated render check exists, use
-the public sample and publication boundary gate:
+P13 portable Helm packaging is complete. Its cluster-free gate is part of
+`cargo xt harness`:
 
 ```sh
-kubectl apply --dry-run=client -f deploy/kubernetes/tessera-sample.yaml
-scripts/check-publication-boundary.py
+scripts/check-k8s-packaging.py
 cargo xt harness
 ```
 
-P13 packaging checks should not require a live cluster and should not encode
-private registry, host, ingress, certificate, alert, or credential policy.
+Render inspection and the caller-owned example install/smoke/cleanup flow are
+documented in `docs/packaging.md`. The chart does not own private registry,
+host, ingress, certificate, alert, credential, namespace, or production
+rollout policy.
 
 ## Guarded Kubernetes Activation
 

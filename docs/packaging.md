@@ -107,8 +107,8 @@ P13 promotes this sample into the reusable Helm chart at
   files.
 - Schema validation for supported values and template validation that keeps
   private inventory, credentials, concrete hostnames, and site-specific
-  operations policy out of tracked artifacts. The dedicated deterministic
-  render/policy check is the next P13 slice.
+  operations policy out of tracked artifacts. The deterministic render/policy
+  check is `scripts/check-k8s-packaging.py`.
 
 Cluster-specific live-service manifests belong outside this repository or in a
 separate environment-owned layer. That layer should decide ingress, Service
@@ -162,3 +162,80 @@ helm template tessera-scale deploy/helm/tessera \
 Repository validation must render each case twice, prove byte-stable output,
 validate the Kubernetes object shape, and run the publication-boundary checks.
 It must not contact a live cluster.
+
+## Render And Validate
+
+Helm v3 is required for the chart gate. Run the repository-owned gate from the
+repository root:
+
+```sh
+scripts/check-k8s-packaging.py
+cargo xt harness
+```
+
+To inspect a default render without contacting a cluster:
+
+```sh
+helm template tessera-example deploy/helm/tessera \
+  --namespace tessera-example > <rendered-output>
+kubectl apply --dry-run=client --validate=false -f <rendered-output>
+```
+
+`deploy/helm/tessera/ci/scale-out-values.yaml` is a committed validation fixture,
+not a production values file. It proves that independent Worker ids, advertised
+Service addresses, assignment seeds, Gateway replicas, and state persistence
+render coherently.
+
+## Example Install And Smoke
+
+The following is an example namespace flow, not a production rollout contract.
+The caller must supply a reachable image and runtime authentication material.
+Keep token files and environment-specific values outside the repository.
+
+Create the caller-owned namespace and Secret from local files:
+
+```sh
+kubectl create namespace tessera-example
+kubectl -n tessera-example create secret generic tessera-runtime-auth \
+  --from-file=operator-token=<operator-token-file> \
+  --from-file=worker-relay-token=<worker-relay-token-file>
+```
+
+Install with an explicit image. Use an environment-owned values file for any
+topology or persistence overrides:
+
+```sh
+helm upgrade --install tessera-example deploy/helm/tessera \
+  --namespace tessera-example \
+  --set-string image.repository='<image-repository>' \
+  --set-string image.tag='<image-tag>'
+```
+
+Check the three default workloads, then forward the Gateway client and metrics
+ports in a separate terminal:
+
+```sh
+kubectl -n tessera-example rollout status deployment/tessera-example-orchestrator
+kubectl -n tessera-example rollout status deployment/tessera-example-worker-a
+kubectl -n tessera-example rollout status deployment/tessera-example-gateway
+kubectl -n tessera-example port-forward service/tessera-example-gateway 4000:4000 4100:4100
+```
+
+With the port-forward active:
+
+```sh
+curl -fsS http://127.0.0.1:4100/ready
+cargo run -p tessera-client -- --addr 127.0.0.1:4000 ping --ts 123
+```
+
+The chart does not create a `Namespace` or Secret and does not delete either on
+uninstall. A chart-created state claim is retained by default. Cleanup therefore
+has two explicit ownership steps:
+
+```sh
+helm uninstall tessera-example --namespace tessera-example
+kubectl -n tessera-example get persistentvolumeclaim
+```
+
+Delete a retained claim, the runtime Secret, or the namespace only when the
+environment owner has separately approved destroying that state.

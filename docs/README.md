@@ -1,6 +1,6 @@
 # Tessera Documentation Index
 
-Last reviewed: 2026-06-04
+Last reviewed: 2026-07-14
 
 This directory separates current operating truth from historical milestone
 records. Start here when deciding what to read next.
@@ -22,9 +22,9 @@ find deeper runbooks.
 
 ## Active Planning
 
-`todo-next.md` is the active open-work index. As of this review, P12 read-only
-operator evidence is closed. The active boundary is P13 Kubernetes packaging
-templates plus continued cell-orchestration/runtime hardening.
+`todo-next.md` is the active open-work index. P12 read-only operator evidence
+and P13 portable Kubernetes packaging are closed. The active boundary is P14
+runtime hardening.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -42,13 +42,15 @@ or completion audit.
 | P10 runtime observability and soak hardening | Complete as `v2026.05.9` | `p10-runtime-observability-soak-hardening.md` |
 | P11 operational endurance and failure recovery | Complete as `v2026.05.10` | `p11-operational-endurance-failure-recovery.md` |
 | P12 read-only operator evidence | Complete support packet; live operations out of scope | `todo-p12-ops-readiness.md` |
-| P13 Kubernetes packaging template | Active planning boundary | `todo-p13-k8s-packaging.md` |
+| P13 Kubernetes packaging template | Complete; portable chart and render gate | `todo-p13-k8s-packaging.md` |
+| P14 runtime hardening | Active planning boundary | `todo-p14-runtime-hardening.md` |
 
 The P6/P7/P8/P9/P10/P11 documents are retained because they define evidence
 contracts, report shapes, and completion gates. P12 records a completed
-read-only support packet. P13 owns the current Kubernetes packaging boundary.
-Older milestone docs should not be treated as active TODO lists unless
-`todo-next.md` explicitly reopens a boundary.
+read-only support packet. P13 records the completed portable packaging
+boundary. P14 owns current runtime hardening. Older milestone docs should not
+be treated as active TODO lists unless `todo-next.md` explicitly reopens a
+boundary.
 
 ## Design Notes
 
@@ -60,6 +62,7 @@ Older milestone docs should not be treated as active TODO lists unless
 | P6 durable assignment state details | `p6-durable-split-state.md` |
 | Public packaging and Kubernetes samples | `packaging.md` |
 | P13 packaging template plan | `todo-p13-k8s-packaging.md` |
+| P14 runtime hardening plan | `todo-p14-runtime-hardening.md` |
 
 These files contain useful implementation detail and evidence history, but
 new work should read them through the current status in `todo-next.md`.

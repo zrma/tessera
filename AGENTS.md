@@ -6,7 +6,8 @@
 
 - 공통 하네스 인터페이스와 distributed-runtime overlay: `docs/agent-harness.md`.
 - 현재 상태와 architecture: `README.md`; 품질 정책: `docs/quality.md`.
-- 다음 작업과 runbook 지도: `docs/todo-next.md`, `docs/todo-p13-k8s-packaging.md`, `docs/README.md`.
+- 다음 작업과 runbook 지도: `docs/todo-next.md`,
+  `docs/todo-p14-runtime-hardening.md`, `docs/README.md`.
 
 <!-- agent-harness-baseline:start -->
 ## Agent Harness Baseline (GPT-5.6)

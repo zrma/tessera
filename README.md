@@ -10,9 +10,9 @@ operations stack.
 
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
-- Current state: P0 through P12 runtime/evidence gates are complete. The active
-  boundary is P13 Kubernetes packaging templates plus continued cell
-  orchestration/runtime hardening.
+- Current state: P0 through P13 runtime/evidence/packaging gates are complete.
+  The active boundary is P14 packet, route-convergence, and generalized
+  topology runtime hardening.
 
 ## Workspace
 
@@ -34,7 +34,8 @@ operations stack.
 - Last completed audit: `cargo xt p12-readiness-audit --json`
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
-- Kubernetes packaging boundary: `docs/todo-p13-k8s-packaging.md`
+- Kubernetes packaging runbook: `docs/packaging.md`
+- Active runtime milestone: `docs/todo-p14-runtime-hardening.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -103,15 +104,17 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
 - Container and guarded Kubernetes verification evidence through P12, with
   environment identity, image coordinates, rollout revisions, and cluster
   topology retained outside this public repository.
+- Portable P13 Helm packaging for Gateway, Worker, and Orchestrator with
+  schema-checked values, deterministic default/scale-out renders, explicit
+  namespace and Secret-reference boundaries, probes, and optional state mounts.
 
 ### Current Open Boundary
 
-P13 should turn the existing sample deployment surface into a reusable
-Kubernetes chart/template boundary for Gateway, Worker, and Orchestrator. The
-repository owns portable packaging shape, probes, config, service topology,
-state mounts, and render validation. It does not own cluster-specific live
-service operations, alert routing, paging thresholds, credentials, or production
-incident process.
+P14 hardens runtime behavior exposed by horizontal packaging: fragmented and
+bursty packet ingress, bounded pending/outbound pressure, route convergence when
+Worker identity changes, assignment-state compatibility, and planner quality.
+The active contract and first executable slice are in
+`docs/todo-p14-runtime-hardening.md`.
 
 ## Protocol Snapshot
 

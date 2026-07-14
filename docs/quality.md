@@ -216,11 +216,12 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   P11 report set into operator-facing metrics, runbook drill, replay, and
   out-of-scope decision evidence. The machine gate is
   `cargo xt p12-readiness-audit --json`.
-- P13 Kubernetes packaging template is the active planning boundary. It should
-  finish portable chart/template documentation for the
-  containerized Gateway/Worker/Orchestrator architecture without owning a
-  specific live service's alerting, ingress, registry, secret, certificate,
-  incident, or production rollout policy.
+- P13 Kubernetes packaging is complete with a portable chart, deterministic
+  default/scale-out render validation, and a caller-owned install/smoke
+  runbook. P14 runtime hardening is the active planning boundary; it must not
+  expand this repository into owning a specific live service's alerting,
+  ingress, registry, secret, certificate, incident, or production rollout
+  policy.
 - `docs/completed-milestones.md` records completed P0 through P4 work and
   `docs/todo-next.md` is the current execution-plan index. Keep README's
   implemented/planned sections and detailed `docs/` notes in sync when a task
