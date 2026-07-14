@@ -64,7 +64,9 @@ non-zero exit after writing the result to stdout.
 Gateway, and two-Worker stack. It assigns two root cells to distinct Worker
 identities, runs the fixed four-client profile across both cells, validates
 canonical complete cell coverage, and proves both Workers accepted the planned
-sessions before tearing the stack down.
+sessions. It then restarts the second Worker on a new local advertised address
+with the same identity and cell, waits for Orchestrator and Gateway convergence,
+and requires the exact deterministic profile to pass again before teardown.
 
 ## Metrics And Readiness
 

@@ -3351,6 +3351,8 @@ fn dev_distributed_simulation_smoke() -> Result<()> {
     let worker_b_addr = "127.0.0.1:5742";
     let worker_a_metrics_addr = "127.0.0.1:5743";
     let worker_b_metrics_addr = "127.0.0.1:5744";
+    let worker_b_replacement_addr = "127.0.0.1:5745";
+    let worker_b_replacement_metrics_addr = "127.0.0.1:5746";
     let orch_addr = "127.0.0.1:6740";
     let orch_metrics_addr = "127.0.0.1:6741";
     let orch_endpoint = format!("http://{orch_addr}");
@@ -3478,8 +3480,8 @@ fn dev_distributed_simulation_smoke() -> Result<()> {
         "tessera_worker_accepted_connections_total",
     )?;
 
-    let result = run_simulation_smoke_profile(gateway_addr, 2)?;
-    validate_distributed_simulation_smoke_result(&result)?;
+    let first_result = run_simulation_smoke_profile(gateway_addr, 2)?;
+    validate_distributed_simulation_smoke_result(&first_result)?;
 
     assert_prometheus_sample_at_least_until(
         "distributed simulation worker-a",
@@ -3494,7 +3496,90 @@ fn dev_distributed_simulation_smoke() -> Result<()> {
         worker_b_connections_before + 2.0,
     )?;
 
-    println!("distributed simulation smoke: two cells completed through distinct Worker owners");
+    let gateway_before_replacement = assert_metrics_endpoint_body(
+        "distributed simulation gateway",
+        gateway_metrics_addr,
+        &["tessera_gateway_routing_version"],
+    )?;
+    let routing_version_before_replacement = prometheus_sample_value(
+        &gateway_before_replacement,
+        "tessera_gateway_routing_version",
+    )?;
+    stack.terminate_named("distributed-simulation-worker-b")?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "distributed-simulation-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_replacement_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_replacement_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_replacement_addr),
+                (
+                    "TESSERA_WORKER_METRICS_ADDR",
+                    worker_b_replacement_metrics_addr,
+                ),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    runtime.block_on(wait_for_worker_listing(
+        &orch_endpoint,
+        "worker-b",
+        worker_b_replacement_addr,
+        &[CellId::grid(0, 1, 0)],
+    ))?;
+    assert_prometheus_sample_at_least_until(
+        "distributed simulation gateway",
+        gateway_metrics_addr,
+        "tessera_gateway_routing_version",
+        routing_version_before_replacement + 1.0,
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 2)?;
+
+    let worker_a_before_second = assert_metrics_endpoint_body(
+        "distributed simulation worker-a",
+        worker_a_metrics_addr,
+        &["tessera_worker_accepted_connections_total"],
+    )?;
+    let worker_b_before_second = assert_metrics_endpoint_body(
+        "distributed simulation replacement worker-b",
+        worker_b_replacement_metrics_addr,
+        &["tessera_worker_accepted_connections_total"],
+    )?;
+    let worker_a_connections_before_second = prometheus_sample_value(
+        &worker_a_before_second,
+        "tessera_worker_accepted_connections_total",
+    )?;
+    let worker_b_connections_before_second = prometheus_sample_value(
+        &worker_b_before_second,
+        "tessera_worker_accepted_connections_total",
+    )?;
+
+    let second_result = run_simulation_smoke_profile(gateway_addr, 2)?;
+    validate_distributed_simulation_smoke_result(&second_result)?;
+    validate_same_simulation_plan(&first_result, &second_result)?;
+    assert_prometheus_sample_at_least_until(
+        "distributed simulation worker-a",
+        worker_a_metrics_addr,
+        "tessera_worker_accepted_connections_total",
+        worker_a_connections_before_second + 2.0,
+    )?;
+    assert_prometheus_sample_at_least_until(
+        "distributed simulation replacement worker-b",
+        worker_b_replacement_metrics_addr,
+        "tessera_worker_accepted_connections_total",
+        worker_b_connections_before_second + 2.0,
+    )?;
+
+    println!(
+        "distributed simulation smoke: two cells completed before and after stable Worker identity address convergence"
+    );
     Ok(())
 }
 
@@ -3627,6 +3712,28 @@ fn validate_distributed_simulation_smoke_result(result: &serde_json::Value) -> R
                     "distributed simulation smoke cell {expected_cx} field {field} expected {expected}, got {actual}"
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_same_simulation_plan(
+    first: &serde_json::Value,
+    second: &serde_json::Value,
+) -> Result<()> {
+    for path in [
+        &["plan_schema_version"][..],
+        &["seed"][..],
+        &["client_count"][..],
+        &["cell_count"][..],
+        &["operations_planned"][..],
+        &["cell_coverage"][..],
+    ] {
+        if json_field(first, path)? != json_field(second, path)? {
+            bail!(
+                "distributed simulation rerun changed deterministic plan field {}",
+                path.join(".")
+            );
         }
     }
     Ok(())
@@ -18678,6 +18785,59 @@ async fn wait_for_orchestrator_registered(endpoint: &str, expected_registered: u
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn wait_for_worker_listing(
+    endpoint: &str,
+    worker_id: &str,
+    expected_addr: &str,
+    expected_cells: &[CellId],
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match worker_listing_matches(endpoint, worker_id, expected_addr, expected_cells).await {
+            Ok(true) => return Ok(()),
+            Ok(false) | Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(false) => bail!(
+                "orchestrator listing did not converge for Worker identity {worker_id} before timeout"
+            ),
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn worker_listing_matches(
+    endpoint: &str,
+    worker_id: &str,
+    expected_addr: &str,
+    expected_cells: &[CellId],
+) -> Result<bool> {
+    let mut client = OrchestratorClient::connect(endpoint.to_string()).await?;
+    let listing = client
+        .list_assignments(tonic::Request::new(ListAssignmentsRequest {}))
+        .await?
+        .into_inner();
+    let Some(bundle) = listing
+        .workers
+        .iter()
+        .find(|bundle| bundle.worker_id == worker_id)
+    else {
+        return Ok(false);
+    };
+    if bundle.addr != expected_addr {
+        return Ok(false);
+    }
+    let mut actual_cells = bundle
+        .cells
+        .iter()
+        .map(proto_assignment_to_cell)
+        .collect::<Result<Vec<_>>>()?;
+    let mut expected_cells = expected_cells.to_vec();
+    sort_cells(&mut actual_cells);
+    sort_cells(&mut expected_cells);
+    Ok(actual_cells == expected_cells)
 }
 
 #[derive(Debug)]
@@ -40216,6 +40376,24 @@ mod tests {
         let err = validate_distributed_simulation_smoke_result(&reordered)
             .expect_err("reordered cell coverage must be rejected");
         assert!(err.to_string().contains("canonical"));
+    }
+
+    #[test]
+    fn distributed_simulation_rerun_requires_the_same_deterministic_plan() {
+        let first = complete_distributed_simulation_smoke_result();
+        validate_same_simulation_plan(&first, &first).expect("identical plan");
+
+        let mut changed_seed = first.clone();
+        changed_seed["seed"] = serde_json::json!(8);
+        let err = validate_same_simulation_plan(&first, &changed_seed)
+            .expect_err("changed seed must be rejected");
+        assert!(err.to_string().contains("seed"));
+
+        let mut changed_cell = first.clone();
+        changed_cell["cell_coverage"][1]["cell"]["cx"] = serde_json::json!(2);
+        let err = validate_same_simulation_plan(&first, &changed_cell)
+            .expect_err("changed cell plan must be rejected");
+        assert!(err.to_string().contains("cell_coverage"));
     }
 
     #[test]

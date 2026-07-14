@@ -50,12 +50,15 @@ execution, or live-service operations policy.
    - Before/after Worker metrics require each owner to accept at least its two
      planned client sessions; focused validator fixtures reject incomplete or
      reordered cell coverage.
-3. **Advertised-address convergence under workload**
-   - Replace the second Worker's local address while retaining its identity and
-     assigned cell, wait for Orchestrator/Gateway convergence, and rerun the
-     exact deterministic plan.
-   - Prove the second run has the same plan identity and complete cell coverage
-     without using split/merge mutation.
+3. **Advertised-address convergence under workload (complete)**
+   - The smoke replaces the second Worker's local bind, metrics, and advertised
+     addresses while retaining `worker-b` and its root-cell ownership.
+   - It waits for the Orchestrator listing to expose the new address with the
+     unchanged cell and for the Gateway routing version to advance while two
+     routes remain ready.
+   - The exact seed, schema, client/cell/operation counts, and canonical cell
+     coverage pass again, and both owners accept their second-phase clients
+     without split/merge mutation.
 4. **Repository gate and closeout**
    - Add the bounded distributed profile to CI and `cargo xt harness`, document
      the command and evidence boundary, and close P16 only after remote CI is
