@@ -121,9 +121,11 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram,
   and Join/Move request latency is covered by request-id correlation
   histograms. All three runtimes share a fail-closed `TESSERA_LOG_FORMAT`
-  contract with compact default and opt-in JSON output. P17 still owns the
-  stable lifecycle events and bounded correlation assertions; P10 remains the
-  long-running scrape/report owner.
+  contract with compact default and opt-in JSON output. Join/Move lifecycle
+  events now use stable privacy-bounded fields from Gateway forwarding through
+  Worker response and back to the client. P17 still owns the bounded
+  two-Worker correlation assertion; P10 remains the long-running scrape/report
+  owner.
 - Docker/Compose/Kubernetes sample packaging, the portable Helm chart, and the
   operator-facing example runbook exist. Cluster-specific live operations
   policy remains outside this repository.

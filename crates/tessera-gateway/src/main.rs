@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tessera_core::{
-    CellId, ClientEnvelope, ClientMsg, MAX_FRAME_LEN, RUNTIME_LOG_FORMAT_ENV, RuntimeLogFormat,
-    ServerEnvelope, ServerMsg, encode_frame,
+    CellId, ClientEnvelope, ClientMsg, MAX_FRAME_LEN, REQUEST_LIFECYCLE_TARGET,
+    RUNTIME_LOG_FORMAT_ENV, RequestLifecycleEvent, RequestOperation, RequestTraceContext,
+    RuntimeLogFormat, ServerEnvelope, ServerMsg, encode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -175,26 +176,9 @@ struct PendingPing {
     sent_at: Instant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingRequestKind {
-    Join,
-    Move,
-}
-
-impl PendingRequestKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Join => "join",
-            Self::Move => "move",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct PendingRequest {
-    cell: CellId,
-    request_id: u64,
-    kind: PendingRequestKind,
+    trace: RequestTraceContext,
     sent_at: Instant,
 }
 
@@ -532,6 +516,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                         loop {
                             match try_take_frame(&mut conn.read_buf) {
                                 Ok(Some(frame)) => {
+                                    let mut response_trace = None;
                                     if !pending_pings.is_empty()
                                         || !pending_requests.is_empty()
                                     {
@@ -558,7 +543,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                                     .observe(sent_at.elapsed());
                                             }
                                             if let Some(request_id) = request_id
-                                                && let Some((kind, sent_at)) =
+                                                && let Some((trace, sent_at)) =
                                                     acknowledge_pending_request(
                                                         &mut pending_requests,
                                                         cell,
@@ -567,9 +552,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             {
                                                 observe_request_latency(
                                                     routing.metrics.as_ref(),
-                                                    kind,
+                                                    trace.operation,
                                                     sent_at.elapsed(),
                                                 );
+                                                response_trace = Some(trace);
                                             }
                                         }
                                     }
@@ -586,6 +572,12 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                             "failed to write reply frame to client; closing connection"
                                         );
                                         break 'conn_loop Ok(());
+                                    }
+                                    if let Some(trace) = response_trace {
+                                        emit_request_lifecycle(
+                                            RequestLifecycleEvent::GatewayResponseForwarded,
+                                            trace,
+                                        );
                                     }
                                 }
                                 Ok(None) => break,
@@ -804,17 +796,15 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                 _ => None,
                             };
                             let ping_sent_at = ping_ts.map(|_| Instant::now());
-                            let request_kind = match &env_in.payload {
-                                ClientMsg::Join { .. } => Some(PendingRequestKind::Join),
-                                ClientMsg::Move { .. } => Some(PendingRequestKind::Move),
-                                ClientMsg::Ping { .. } => None,
-                            };
-                            let request_id = request_kind.map(|_| {
+                            let request_operation =
+                                RequestOperation::from_client_message(&env_in.payload);
+                            let request_id = request_operation.map(|_| {
                                 NEXT_GATEWAY_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
                             });
-                            let request_sent_at = request_id.map(|_| Instant::now());
                             env_in.session = Some(session_id);
                             env_in.request_id = request_id;
+                            let request_trace = RequestTraceContext::from_client_envelope(&env_in);
+                            let request_sent_at = request_trace.map(|_| Instant::now());
                             let frame = encode_frame(&env_in);
                             last_cell = Some(cell);
 
@@ -1027,22 +1017,21 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                         .pending_ping_tracking_evictions
                                         .fetch_add(evicted as u64, Ordering::Relaxed);
                                 } else {
-                                    if let (Some(kind), Some(request_id), Some(sent_at)) =
-                                        (request_kind, request_id, request_sent_at)
+                                    if let (Some(trace), Some(sent_at)) =
+                                        (request_trace, request_sent_at)
                                     {
                                         let evicted = push_pending_request(
                                             &mut pending_requests,
-                                            PendingRequest {
-                                                cell,
-                                                request_id,
-                                                kind,
-                                                sent_at,
-                                            },
+                                            PendingRequest { trace, sent_at },
                                         );
                                         routing
                                             .metrics
                                             .pending_request_tracking_evictions
                                             .fetch_add(evicted as u64, Ordering::Relaxed);
+                                        emit_request_lifecycle(
+                                            RequestLifecycleEvent::GatewayRequestForwarded,
+                                            trace,
+                                        );
                                     }
                                     conn.has_non_ping_traffic = true;
                                 }
@@ -1238,14 +1227,14 @@ fn acknowledge_pending_request(
     pending_requests: &mut VecDeque<PendingRequest>,
     cell: CellId,
     request_id: u64,
-) -> Option<(PendingRequestKind, Instant)> {
+) -> Option<(RequestTraceContext, Instant)> {
     if let Some(index) = pending_requests
         .iter()
-        .position(|pending| pending.cell == cell && pending.request_id == request_id)
+        .position(|pending| pending.trace.cell == cell && pending.trace.request_id == request_id)
     {
         return pending_requests
             .remove(index)
-            .map(|pending| (pending.kind, pending.sent_at));
+            .map(|pending| (pending.trace, pending.sent_at));
     }
     None
 }
@@ -1275,13 +1264,29 @@ fn push_pending_request(
 
 fn observe_request_latency(
     metrics: &GatewayMetricsCounters,
-    kind: PendingRequestKind,
+    operation: RequestOperation,
     elapsed: Duration,
 ) {
-    match kind {
-        PendingRequestKind::Join => metrics.join_roundtrip_latency.observe(elapsed),
-        PendingRequestKind::Move => metrics.move_roundtrip_latency.observe(elapsed),
+    match operation {
+        RequestOperation::Join => metrics.join_roundtrip_latency.observe(elapsed),
+        RequestOperation::Move => metrics.move_roundtrip_latency.observe(elapsed),
     }
+}
+
+fn emit_request_lifecycle(event: RequestLifecycleEvent, trace: RequestTraceContext) {
+    info!(
+        target: REQUEST_LIFECYCLE_TARGET,
+        event = event.as_str(),
+        component = event.component(),
+        operation = trace.operation.as_str(),
+        session_id = trace.session_id,
+        request_id = trace.request_id,
+        cell_world = trace.cell.world,
+        cell_cx = trace.cell.cx,
+        cell_cy = trace.cell.cy,
+        cell_depth = trace.cell.depth,
+        cell_sub = trace.cell.sub,
+    );
 }
 
 fn try_take_frame(buf: &mut BytesMut) -> Result<Option<BytesMut>> {
@@ -1700,12 +1705,12 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
         &[
             (
                 "kind",
-                PendingRequestKind::Join.as_str(),
+                RequestOperation::Join.as_str(),
                 &metrics.join_roundtrip_latency,
             ),
             (
                 "kind",
-                PendingRequestKind::Move.as_str(),
+                RequestOperation::Move.as_str(),
                 &metrics.move_roundtrip_latency,
             ),
         ],
@@ -4094,12 +4099,15 @@ mod tests {
             let evicted = push_pending_request(
                 &mut requests,
                 PendingRequest {
-                    cell,
-                    request_id: index as u64,
-                    kind: if index % 2 == 0 {
-                        PendingRequestKind::Join
-                    } else {
-                        PendingRequestKind::Move
+                    trace: RequestTraceContext {
+                        operation: if index % 2 == 0 {
+                            RequestOperation::Join
+                        } else {
+                            RequestOperation::Move
+                        },
+                        session_id: 7,
+                        request_id: index as u64,
+                        cell,
                     },
                     sent_at,
                 },
@@ -4118,13 +4126,27 @@ mod tests {
             requests
                 .front()
                 .expect("oldest retained request")
+                .trace
                 .request_id,
             3
         );
         assert_eq!(
-            requests.back().expect("newest retained request").request_id,
+            requests
+                .back()
+                .expect("newest retained request")
+                .trace
+                .request_id,
             (MAX_PENDING_REQUESTS + 2) as u64
         );
+
+        let expected_trace = requests.front().expect("request trace").trace;
+        let (acknowledged_trace, _) = acknowledge_pending_request(
+            &mut requests,
+            expected_trace.cell,
+            expected_trace.request_id,
+        )
+        .expect("correlated request");
+        assert_eq!(acknowledged_trace, expected_trace);
     }
 
     #[tokio::test]

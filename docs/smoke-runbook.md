@@ -85,6 +85,21 @@ values fail before runtime startup. Raw JSON logs are local-only diagnostics
 and can contain runtime inventory. Do not copy them into tracked reports; P17
 smoke evidence retains only bounded aggregate counts and verdicts.
 
+Request-id-bearing Join and Move operations emit the following ordered event
+contract under the `tessera.request.lifecycle` target:
+
+```text
+gateway.request.forwarded
+worker.request.received
+worker.response.sent
+gateway.response.forwarded
+```
+
+Each event contains only `event`, `component`, `operation`, `session_id`,
+`request_id`, and the scalar `cell_world`, `cell_cx`, `cell_cy`, `cell_depth`,
+and `cell_sub` fields. Actor ids, peer or Worker addresses, payloads, and raw
+errors are not part of this event contract.
+
 ## Metrics And Readiness
 
 ```sh

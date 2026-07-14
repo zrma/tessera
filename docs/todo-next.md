@@ -115,7 +115,7 @@ P17 runtime trace correlation queue:
 
 1. Complete: shared compact/JSON runtime logging contract with fail-closed
    configuration and parseable startup evidence for all three runtimes.
-2. Pending: stable privacy-bounded Gateway/Worker Join and Move lifecycle
+2. Complete: stable privacy-bounded Gateway/Worker Join and Move lifecycle
    events using existing session and request ids.
 3. Pending: two-Worker trace correlation smoke with aggregate-only verdict.
 4. Pending: bounded repetition, CI/harness integration, documentation, and

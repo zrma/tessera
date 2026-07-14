@@ -43,13 +43,18 @@ correlation regression lane.
      tests cover the exact configuration states; all three runtime crates
      reject unsupported values before binding and emitted parseable JSON during
      the bounded metrics smoke.
-2. **Stable request lifecycle events**
+2. **Complete: stable request lifecycle events**
    - Emit bounded Gateway forward/response and Worker receive/response events
      for request-id-bearing Join and Move operations.
    - Carry stable event name, component, operation kind, session id, request id,
      and cell coordinates while excluding actor, peer, address, payload, and raw
      error fields.
    - Add focused event-shape and direct-reply correlation tests.
+   - Evidence: `tessera-core` owns the exact event and operation vocabulary plus
+     the privacy-bounded trace context; Gateway pending correlation preserves
+     that context; Worker responses emit only after a direct reply is written.
+     Focused tests and an opt-in JSON metrics smoke proved one ordered lifecycle
+     per Join/Move request with the exact allowed field set.
 3. **Two-Worker trace correlation smoke**
    - Add `cargo xt dev trace-correlation-smoke` with an isolated two-cell and
      two-Worker topology plus opt-in JSON logs.

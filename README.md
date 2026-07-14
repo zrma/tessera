@@ -146,6 +146,9 @@ next boundary is tracked in `docs/todo-next.md`.
   `payload: ClientMsg|ServerMsg`
 - Gateway injects stable client `session` ids and optional request ids for
   Join/Move latency correlation.
+- Opt-in JSON logging emits privacy-bounded `gateway.request.forwarded`,
+  `worker.request.received`, `worker.response.sent`, and
+  `gateway.response.forwarded` lifecycle events for those direct requests.
 - Broadcast AOI traffic does not reuse request ids, so Gateway latency metrics
   only count direct correlated responses.
 - Handover, split, merge, and operation-loop mutations are all default-off

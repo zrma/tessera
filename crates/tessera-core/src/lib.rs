@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const RUNTIME_LOG_FORMAT_ENV: &str = "TESSERA_LOG_FORMAT";
+pub const REQUEST_LIFECYCLE_TARGET: &str = "tessera.request.lifecycle";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RuntimeLogFormat {
@@ -33,6 +34,55 @@ impl fmt::Display for UnsupportedRuntimeLogFormat {
 }
 
 impl std::error::Error for UnsupportedRuntimeLogFormat {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOperation {
+    Join,
+    Move,
+}
+
+impl RequestOperation {
+    pub fn from_client_message(message: &ClientMsg) -> Option<Self> {
+        match message {
+            ClientMsg::Join { .. } => Some(Self::Join),
+            ClientMsg::Move { .. } => Some(Self::Move),
+            ClientMsg::Ping { .. } => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Join => "join",
+            Self::Move => "move",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestLifecycleEvent {
+    GatewayRequestForwarded,
+    WorkerRequestReceived,
+    WorkerResponseSent,
+    GatewayResponseForwarded,
+}
+
+impl RequestLifecycleEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GatewayRequestForwarded => "gateway.request.forwarded",
+            Self::WorkerRequestReceived => "worker.request.received",
+            Self::WorkerResponseSent => "worker.response.sent",
+            Self::GatewayResponseForwarded => "gateway.response.forwarded",
+        }
+    }
+
+    pub const fn component(self) -> &'static str {
+        match self {
+            Self::GatewayRequestForwarded | Self::GatewayResponseForwarded => "gateway",
+            Self::WorkerRequestReceived | Self::WorkerResponseSent => "worker",
+        }
+    }
+}
 
 // ---------- Basic Types ----------
 
@@ -377,6 +427,25 @@ pub struct ClientEnvelope {
     pub payload: ClientMsg,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTraceContext {
+    pub operation: RequestOperation,
+    pub session_id: u64,
+    pub request_id: u64,
+    pub cell: CellId,
+}
+
+impl RequestTraceContext {
+    pub fn from_client_envelope(envelope: &ClientEnvelope) -> Option<Self> {
+        Some(Self {
+            operation: RequestOperation::from_client_message(&envelope.payload)?,
+            session_id: envelope.session?,
+            request_id: envelope.request_id?,
+            cell: envelope.cell,
+        })
+    }
+}
+
 impl From<Envelope<ClientMsg>> for ClientEnvelope {
     fn from(env: Envelope<ClientMsg>) -> Self {
         Self {
@@ -484,6 +553,83 @@ mod tests {
                 Err(UnsupportedRuntimeLogFormat)
             );
         }
+    }
+
+    #[test]
+    fn request_lifecycle_event_contract_is_stable_and_component_scoped() {
+        let events = [
+            RequestLifecycleEvent::GatewayRequestForwarded,
+            RequestLifecycleEvent::WorkerRequestReceived,
+            RequestLifecycleEvent::WorkerResponseSent,
+            RequestLifecycleEvent::GatewayResponseForwarded,
+        ];
+        assert_eq!(
+            events.map(RequestLifecycleEvent::as_str),
+            [
+                "gateway.request.forwarded",
+                "worker.request.received",
+                "worker.response.sent",
+                "gateway.response.forwarded",
+            ]
+        );
+        assert_eq!(
+            events.map(RequestLifecycleEvent::component),
+            ["gateway", "worker", "worker", "gateway"]
+        );
+    }
+
+    #[test]
+    fn request_trace_context_keeps_only_correlation_fields() {
+        let cell = CellId::leaf(7, -2, 3, 4);
+        let join = ClientEnvelope {
+            cell,
+            seq: 9,
+            epoch: 11,
+            session: Some(13),
+            request_id: Some(17),
+            payload: ClientMsg::Join {
+                actor: EntityId(19),
+                pos: Position::new(1.0, 2.0),
+            },
+        };
+        assert_eq!(
+            RequestTraceContext::from_client_envelope(&join),
+            Some(RequestTraceContext {
+                operation: RequestOperation::Join,
+                session_id: 13,
+                request_id: 17,
+                cell,
+            })
+        );
+
+        let mut move_request = join.clone();
+        move_request.payload = ClientMsg::Move {
+            actor: EntityId(23),
+            dx: 3.0,
+            dy: 4.0,
+        };
+        assert_eq!(
+            RequestTraceContext::from_client_envelope(&move_request)
+                .expect("move trace context")
+                .operation,
+            RequestOperation::Move
+        );
+
+        move_request.payload = ClientMsg::Ping { ts: 29 };
+        assert_eq!(
+            RequestTraceContext::from_client_envelope(&move_request),
+            None
+        );
+        move_request.payload = ClientMsg::Move {
+            actor: EntityId(23),
+            dx: 3.0,
+            dy: 4.0,
+        };
+        move_request.session = None;
+        assert_eq!(
+            RequestTraceContext::from_client_envelope(&move_request),
+            None
+        );
     }
 
     #[test]

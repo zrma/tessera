@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use tessera_core::{
     ActorState, CellChildFamilyKind, CellId, ClientEnvelope, ClientMsg, EntityId, Envelope,
     HandoverReplayMove, HandoverReplayOwner, MAX_FRAME_LEN, MergeReplayTarget, Position,
-    RUNTIME_LOG_FORMAT_ENV, RuntimeLogFormat, ServerEnvelope, ServerMsg, SplitReplayTarget, Tick,
-    WorkerRelayMsg, encode_frame, try_decode_frame,
+    REQUEST_LIFECYCLE_TARGET, RUNTIME_LOG_FORMAT_ENV, RequestLifecycleEvent, RequestTraceContext,
+    RuntimeLogFormat, ServerEnvelope, ServerMsg, SplitReplayTarget, Tick, WorkerRelayMsg,
+    encode_frame, try_decode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -109,6 +110,7 @@ struct OutboundMsg {
     cell: CellId,
     epoch_override: Option<u32>,
     request_id: Option<u64>,
+    request_trace: Option<RequestTraceContext>,
     payload: ServerMsg,
 }
 
@@ -123,6 +125,27 @@ impl OutboundMsg {
             cell,
             epoch_override,
             request_id,
+            request_trace: None,
+            payload,
+        }
+    }
+
+    fn direct_response(
+        cell: CellId,
+        epoch_override: Option<u32>,
+        request_id: Option<u64>,
+        request_trace: Option<RequestTraceContext>,
+        payload: ServerMsg,
+    ) -> Self {
+        debug_assert!(
+            request_trace
+                .is_none_or(|trace| { trace.cell == cell && Some(trace.request_id) == request_id })
+        );
+        Self {
+            cell,
+            epoch_override,
+            request_id,
+            request_trace,
             payload,
         }
     }
@@ -231,6 +254,7 @@ struct BufferedMove {
     dy: f32,
     epoch: u32,
     request_id: Option<u64>,
+    request_trace: Option<RequestTraceContext>,
     buffered_at: Instant,
 }
 
@@ -366,6 +390,7 @@ impl SharedState {
         subscriber: &CellSubscriber,
         epoch: u32,
         request_id: Option<u64>,
+        request_trace: Option<RequestTraceContext>,
         preserve_existing_actor: bool,
     ) -> Result<bool, ()> {
         let mut actors = self.actors.lock().await;
@@ -403,10 +428,11 @@ impl SharedState {
 
         if subscriber
             .tx
-            .try_send(OutboundMsg::new(
+            .try_send(OutboundMsg::direct_response(
                 cell,
                 Some(epoch),
                 request_id,
+                request_trace,
                 ServerMsg::Snapshot {
                     cell,
                     actors: snapshot,
@@ -2537,11 +2563,12 @@ async fn flush_buffered_moves_for_cells(
         for buffered in buffered_moves {
             if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
                 expired += 1;
-                if enqueue_error(
+                if enqueue_request_error(
                     &buffered.subscriber.tx,
                     cell,
                     buffered.epoch,
                     buffered.request_id,
+                    buffered.request_trace,
                     "handover_move_expired",
                     "move rejected: handover move buffer entry expired",
                 )
@@ -2554,11 +2581,12 @@ async fn flush_buffered_moves_for_cells(
 
             if !owned_cells.contains(&cell) {
                 cell_not_owned += 1;
-                if enqueue_error(
+                if enqueue_request_error(
                     &buffered.subscriber.tx,
                     cell,
                     buffered.epoch,
                     buffered.request_id,
+                    buffered.request_trace,
                     "handover_cell_not_owned",
                     "move rejected: cell is no longer owned by this worker",
                 )
@@ -2585,6 +2613,7 @@ async fn flush_buffered_moves_for_cells(
                 buffered.dy,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
             )
             .await
             {
@@ -2659,11 +2688,12 @@ async fn replay_handover_to_target(
     for buffered in buffered_moves {
         if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
             expired += 1;
-            if enqueue_error(
+            if enqueue_request_error(
                 &buffered.subscriber.tx,
                 cell,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "handover_move_expired",
                 "move rejected: handover move buffer entry expired",
             )
@@ -2684,6 +2714,7 @@ async fn replay_handover_to_target(
             buffered.subscriber.clone(),
             buffered.epoch,
             buffered.request_id,
+            buffered.request_trace,
         ));
         replay_moves.push(replay);
     }
@@ -2909,14 +2940,16 @@ async fn handle_merge_replay_request(
             buffered.subscriber.clone(),
             buffered.epoch,
             buffered.request_id,
+            buffered.request_trace,
         ));
         if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
             let _ = state.take_split_replay_plan(target.source_cell).await;
-            let _ = enqueue_error(
+            let _ = enqueue_request_error(
                 &buffered.subscriber.tx,
                 target.source_cell,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "merge_replay_move_expired",
                 "move rejected: merge replay move buffer entry expired",
             );
@@ -2930,11 +2963,12 @@ async fn handle_merge_replay_request(
         }
         if !delta_is_finite(buffered.dx, buffered.dy) {
             let _ = state.take_split_replay_plan(target.source_cell).await;
-            let _ = enqueue_error(
+            let _ = enqueue_request_error(
                 &buffered.subscriber.tx,
                 target.source_cell,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "merge_replay_invalid_delta",
                 "move rejected: merge replay delta is invalid",
             );
@@ -3070,33 +3104,36 @@ async fn build_split_replay_batches(
 
     for buffered in buffered_moves {
         if buffered.buffered_at.elapsed() > state.handover_move_buffer_ttl {
-            let _ = enqueue_error(
+            let _ = enqueue_request_error(
                 &buffered.subscriber.tx,
                 parent,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "split_replay_move_expired",
                 "move rejected: split replay move buffer entry expired",
             );
             return Err("split replay buffered move expired before publish".to_string());
         }
         if !delta_is_finite(buffered.dx, buffered.dy) {
-            let _ = enqueue_error(
+            let _ = enqueue_request_error(
                 &buffered.subscriber.tx,
                 parent,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "split_replay_invalid_delta",
                 "move rejected: split replay delta is invalid",
             );
             return Err("split replay buffered move contains invalid delta".to_string());
         }
         let Some(pos) = positions.get_mut(&buffered.actor) else {
-            let _ = enqueue_error(
+            let _ = enqueue_request_error(
                 &buffered.subscriber.tx,
                 parent,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "split_replay_missing_actor",
                 "move rejected: split replay actor is missing from parent snapshot",
             );
@@ -3105,11 +3142,12 @@ async fn build_split_replay_batches(
         let new_x = pos.x + buffered.dx;
         let new_y = pos.y + buffered.dy;
         if !(new_x.is_finite() && new_y.is_finite()) {
-            let _ = enqueue_error(
+            let _ = enqueue_request_error(
                 &buffered.subscriber.tx,
                 parent,
                 buffered.epoch,
                 buffered.request_id,
+                buffered.request_trace,
                 "split_replay_position_overflow",
                 "move rejected: split replay position overflow",
             );
@@ -3204,15 +3242,21 @@ fn split_child_for_position(
 
 async fn reject_replay_moves_unavailable(
     cell: CellId,
-    moves: &[(CellSubscriber, u32, Option<u64>)],
+    moves: &[(
+        CellSubscriber,
+        u32,
+        Option<u64>,
+        Option<RequestTraceContext>,
+    )],
     code: &str,
 ) {
-    for (subscriber, epoch, request_id) in moves {
-        let _ = enqueue_error(
+    for (subscriber, epoch, request_id, request_trace) in moves {
+        let _ = enqueue_request_error(
             &subscriber.tx,
             cell,
             *epoch,
             *request_id,
+            *request_trace,
             code,
             "move rejected: handover replay target unavailable",
         );
@@ -4474,21 +4518,39 @@ fn make_error(code: &str, message: impl Into<String>) -> ServerMsg {
     }
 }
 
-fn enqueue_error(
+fn enqueue_request_error(
     tx: &Sender<OutboundMsg>,
     cell: CellId,
     epoch: u32,
     request_id: Option<u64>,
+    request_trace: Option<RequestTraceContext>,
     code: &str,
     message: impl Into<String>,
 ) -> Result<(), ()> {
-    tx.try_send(OutboundMsg::new(
+    tx.try_send(OutboundMsg::direct_response(
         cell,
         Some(epoch),
         request_id,
+        request_trace,
         make_error(code, message),
     ))
     .map_err(|_| ())
+}
+
+fn emit_request_lifecycle(event: RequestLifecycleEvent, trace: RequestTraceContext) {
+    info!(
+        target: REQUEST_LIFECYCLE_TARGET,
+        event = event.as_str(),
+        component = event.component(),
+        operation = trace.operation.as_str(),
+        session_id = trace.session_id,
+        request_id = trace.request_id,
+        cell_world = trace.cell.world,
+        cell_cx = trace.cell.cx,
+        cell_cy = trace.cell.cy,
+        cell_depth = trace.cell.depth,
+        cell_sub = trace.cell.sub,
+    );
 }
 
 fn init_tracing() -> Result<()> {
@@ -5413,6 +5475,7 @@ async fn apply_client_move(
     dy: f32,
     epoch: u32,
     request_id: Option<u64>,
+    request_trace: Option<RequestTraceContext>,
 ) -> MoveApplyOutcome {
     if !delta_is_finite(dx, dy) {
         warn!(
@@ -5422,11 +5485,12 @@ async fn apply_client_move(
             actor = actor.0,
             "move rejected: non-finite delta"
         );
-        return if enqueue_error(
+        return if enqueue_request_error(
             tx,
             cell,
             epoch,
             request_id,
+            request_trace,
             "invalid_delta",
             "move rejected: invalid delta",
         )
@@ -5451,11 +5515,12 @@ async fn apply_client_move(
                 owner_id,
                 "move rejected: actor owned by different session"
             );
-            return if enqueue_error(
+            return if enqueue_request_error(
                 tx,
                 cell,
                 epoch,
                 request_id,
+                request_trace,
                 "actor_owned_by_other",
                 "move rejected: actor owned by another client",
             )
@@ -5488,11 +5553,12 @@ async fn apply_client_move(
                     actor = actor.0,
                     "move rejected: actor not joined"
                 );
-                return if enqueue_error(
+                return if enqueue_request_error(
                     tx,
                     cell,
                     epoch,
                     request_id,
+                    request_trace,
                     "actor_not_joined",
                     "move rejected: actor not joined",
                 )
@@ -5518,11 +5584,12 @@ async fn apply_client_move(
                     actor = actor.0,
                     "move rejected: cell has no actors"
                 );
-                return if enqueue_error(
+                return if enqueue_request_error(
                     tx,
                     cell,
                     epoch,
                     request_id,
+                    request_trace,
                     "actor_not_joined",
                     "move rejected: actor not joined",
                 )
@@ -5544,11 +5611,12 @@ async fn apply_client_move(
                     actor = actor.0,
                     "move rejected: actor not found in cell"
                 );
-                return if enqueue_error(
+                return if enqueue_request_error(
                     tx,
                     cell,
                     epoch,
                     request_id,
+                    request_trace,
                     "actor_not_joined",
                     "move rejected: actor not joined",
                 )
@@ -5570,11 +5638,12 @@ async fn apply_client_move(
                 actor = actor.0,
                 "move rejected: position overflow"
             );
-            return if enqueue_error(
+            return if enqueue_request_error(
                 tx,
                 cell,
                 epoch,
                 request_id,
+                request_trace,
                 "position_overflow",
                 "move rejected: position overflow",
             )
@@ -5603,7 +5672,13 @@ async fn apply_client_move(
         moved: vec![moved],
     };
     if tx
-        .try_send(OutboundMsg::new(cell, Some(epoch), request_id, delta))
+        .try_send(OutboundMsg::direct_response(
+            cell,
+            Some(epoch),
+            request_id,
+            request_trace,
+            delta,
+        ))
         .is_err()
     {
         warn!(
@@ -5698,6 +5773,7 @@ async fn handle_upstream_inner(
             let mut seq_out: u64 = 0;
             let mut writer = writer;
             while let Some(outbound) = rx.recv().await {
+                let request_trace = outbound.request_trace;
                 let env_out = ServerEnvelope {
                     cell: outbound.cell,
                     seq: seq_out,
@@ -5712,6 +5788,9 @@ async fn handle_upstream_inner(
                 if let Err(e) = writer.write_all(&frame).await {
                     error!(target: "worker", %peer, error = ?e, "write error");
                     break;
+                }
+                if let Some(trace) = request_trace {
+                    emit_request_lifecycle(RequestLifecycleEvent::WorkerResponseSent, trace);
                 }
             }
             info!(target: "worker", %peer, "writer task ended");
@@ -5744,6 +5823,10 @@ async fn handle_upstream_inner(
                 }
             }
         };
+        let request_trace = RequestTraceContext::from_client_envelope(&env_in);
+        if let Some(trace) = request_trace {
+            emit_request_lifecycle(RequestLifecycleEvent::WorkerRequestReceived, trace);
+        }
         let cell = env_in.cell;
         let owner_id = env_in.session.unwrap_or(client_id);
         owner_id_for_connection = owner_id;
@@ -5757,11 +5840,12 @@ async fn handle_upstream_inner(
                 cell = ?cell,
                 "received message for cell not owned by this worker"
             );
-            if enqueue_error(
+            if enqueue_request_error(
                 &tx,
                 cell,
                 env_in.epoch,
                 env_in.request_id,
+                request_trace,
                 "cell_not_owned",
                 "cell not owned by this worker",
             )
@@ -5807,11 +5891,12 @@ async fn handle_upstream_inner(
                         actor = actor.0,
                         "join rejected: non-finite position"
                     );
-                    if enqueue_error(
+                    if enqueue_request_error(
                         &tx,
                         cell,
                         env_in.epoch,
                         env_in.request_id,
+                        request_trace,
                         "invalid_position",
                         "join rejected: invalid position",
                     )
@@ -5837,11 +5922,12 @@ async fn handle_upstream_inner(
                         owner_id,
                         "join rejected: actor owned by different session"
                     );
-                    if enqueue_error(
+                    if enqueue_request_error(
                         &tx,
                         cell,
                         env_in.epoch,
                         env_in.request_id,
+                        request_trace,
                         "actor_owned_by_other",
                         "join rejected: actor owned by another client",
                     )
@@ -5868,6 +5954,7 @@ async fn handle_upstream_inner(
                         &subscriber,
                         env_in.epoch,
                         env_in.request_id,
+                        request_trace,
                         matches!(claim, ClaimOutcome::GrantedReplayed),
                     )
                     .await
@@ -5978,6 +6065,7 @@ async fn handle_upstream_inner(
                         dy,
                         epoch: env_in.epoch,
                         request_id: env_in.request_id,
+                        request_trace,
                         buffered_at: Instant::now(),
                     };
                     if state.buffer_client_move(cell, buffered).await.is_err() {
@@ -5991,11 +6079,12 @@ async fn handle_upstream_inner(
                             target_worker_id = %policy.target_worker_id,
                             "handover move buffer full; rejecting move"
                         );
-                        if enqueue_error(
+                        if enqueue_request_error(
                             &tx,
                             cell,
                             env_in.epoch,
                             env_in.request_id,
+                            request_trace,
                             "handover_move_buffer_full",
                             "move rejected: handover move buffer is full",
                         )
@@ -6023,6 +6112,7 @@ async fn handle_upstream_inner(
                     dy,
                     env_in.epoch,
                     env_in.request_id,
+                    request_trace,
                 )
                 .await
                 {
@@ -7360,6 +7450,7 @@ mod tests {
                     dy: 4.0,
                     epoch: 11,
                     request_id: None,
+                    request_trace: None,
                     buffered_at: Instant::now(),
                 },
             )
@@ -7560,6 +7651,7 @@ mod tests {
             1.0,
             13,
             None,
+            None,
         )
         .await;
         assert_eq!(outcome, MoveApplyOutcome::Applied);
@@ -7627,6 +7719,7 @@ mod tests {
             1.0,
             12,
             None,
+            None,
         )
         .await;
         assert_eq!(denied, MoveApplyOutcome::Rejected);
@@ -7652,6 +7745,7 @@ mod tests {
             1.0,
             1.0,
             13,
+            None,
             None,
         )
         .await;
@@ -7738,6 +7832,7 @@ mod tests {
                     dy: 4.0,
                     epoch: 11,
                     request_id: None,
+                    request_trace: None,
                     buffered_at: Instant::now(),
                 },
             )
@@ -7945,6 +8040,7 @@ mod tests {
                     dy: 0.0,
                     epoch: 12,
                     request_id: None,
+                    request_trace: None,
                     buffered_at: Instant::now(),
                 },
             )
@@ -8120,6 +8216,7 @@ mod tests {
                     dy: 0.0,
                     epoch: 12,
                     request_id: None,
+                    request_trace: None,
                     buffered_at: Instant::now(),
                 },
             )
@@ -10503,7 +10600,7 @@ mod tests {
         let state_clone = Arc::clone(&state);
         let join_handle = tokio::spawn(async move {
             state_clone
-                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0, None, false)
+                .snapshot_and_subscribe(cell, actor, pos, &subscriber, 0, None, None, false)
                 .await
                 .expect("snapshot");
         });
