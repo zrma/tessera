@@ -23,8 +23,8 @@ find deeper runbooks.
 ## Active Planning
 
 `todo-next.md` is the active open-work index. P12 read-only operator evidence,
-P13 portable Kubernetes packaging, and P14 runtime hardening are closed. The
-next milestone is selected there.
+P13 portable Kubernetes packaging, and P14 runtime hardening are closed. P15
+deterministic simulation harness work is active.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -44,13 +44,14 @@ or completion audit.
 | P12 read-only operator evidence | Complete support packet; live operations out of scope | `todo-p12-ops-readiness.md` |
 | P13 Kubernetes packaging template | Complete; portable chart and render gate | `todo-p13-k8s-packaging.md` |
 | P14 runtime hardening | Complete; packet, route/state, replay, and planner hardening | `todo-p14-runtime-hardening.md` |
+| P15 deterministic simulation harness | Active; reproducible plans and bounded local execution | `todo-p15-simulation-harness.md` |
 
 The P6/P7/P8/P9/P10/P11 documents are retained because they define evidence
 contracts, report shapes, and completion gates. P12 records a completed
 read-only support packet. P13 records the completed portable packaging
-boundary, and P14 records the completed runtime-hardening evidence. Older
-milestone docs should not be treated as active TODO lists unless
-`todo-next.md` explicitly reopens a boundary.
+boundary, P14 records the completed runtime-hardening evidence, and P15 owns the
+active simulator contract. Older milestone docs should not be treated as active
+TODO lists unless `todo-next.md` explicitly reopens a boundary.
 
 ## Design Notes
 

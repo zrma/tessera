@@ -11,7 +11,7 @@ operations stack.
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
 - Current state: P0 through P14 runtime/evidence/packaging and hardening gates
-  are complete. The next open boundary is selected in `docs/todo-next.md`.
+  are complete. P15 deterministic simulation harness work is active.
 
 ## Workspace
 
@@ -107,13 +107,13 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
   schema-checked values, deterministic default/scale-out renders, explicit
   namespace and Secret-reference boundaries, probes, and optional state mounts.
 
-### Latest Closed Boundary
+### Current Open Boundary
 
-P14 hardened runtime behavior exposed by horizontal packaging: fragmented and
-bursty packet ingress, bounded correlation pressure, route and pre-publish
-replay convergence, assignment-state compatibility, and planner quality. Its
-completed evidence map is in `docs/todo-p14-runtime-hardening.md`; the next open
-boundary is tracked in `docs/todo-next.md`.
+P15 turns the existing `tessera-sim` placeholder into a bounded, deterministic
+player and load simulation harness. It starts with network-free reproducible
+scenario planning, then adds independent Gateway sessions, a versioned result
+contract, and a small local full-stack smoke. The active contract is in
+`docs/todo-p15-simulation-harness.md`.
 
 ## Protocol Snapshot
 

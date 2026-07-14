@@ -38,7 +38,8 @@ Last reviewed: 2026-07-14
   containerized environment, but cluster-specific inventory and live operations
   policy remain outside this repository.
 - P12 read-only operator evidence is complete as a historical support packet.
-  P13 portable Kubernetes packaging and P14 runtime hardening are complete.
+  P13 portable Kubernetes packaging and P14 runtime hardening are complete. P15
+  deterministic simulation harness work is active.
 
 ## Next
 
@@ -48,9 +49,10 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-P14 is closed in `docs/todo-p14-runtime-hardening.md`. The next milestone should
-be selected from a fresh architecture/backlog review and recorded as a separate
-planning change.
+The active planning source is `docs/todo-p15-simulation-harness.md`. The fresh
+architecture/backlog review selected the existing `tessera-sim` placeholder:
+the repository already promises load and player simulation helpers and defines
+their dependency boundary, but the crate has no scenario or execution behavior.
 
 P13 closure:
 
@@ -80,6 +82,16 @@ P14 runtime hardening queue:
    Workers, removing drained Workers, and rejecting implicit cell adoption.
 4. Complete: load-based planner quality datasets and parent/child operation
    overlap prevention under global churn budgets.
+
+P15 deterministic simulation harness queue:
+
+1. Active: deterministic, bounded, network-free scenario planning and a
+   versioned JSON plan contract.
+2. Planned: independent multi-client Join/Move/Ping execution with operation
+   timeouts and bounded concurrency.
+3. Planned: versioned aggregate result, failure classes, latency summaries, and
+   caller-owned thresholds.
+4. Planned: a small local full-stack simulator smoke integrated into CI.
 
 ## Guardrails
 
