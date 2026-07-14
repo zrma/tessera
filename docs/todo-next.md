@@ -38,8 +38,8 @@ Last reviewed: 2026-07-14
   containerized environment, but cluster-specific inventory and live operations
   policy remain outside this repository.
 - P12 read-only operator evidence is complete as a historical support packet.
-  P13 portable Kubernetes packaging and P14 runtime hardening are complete. P15
-  deterministic simulation harness work is active.
+  P13 portable Kubernetes packaging, P14 runtime hardening, and P15
+  deterministic simulation harness work are complete.
 
 ## Next
 
@@ -49,10 +49,9 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-The active planning source is `docs/todo-p15-simulation-harness.md`. The fresh
-architecture/backlog review selected the existing `tessera-sim` placeholder:
-the repository already promises load and player simulation helpers and defines
-their dependency boundary, but the crate has no scenario or execution behavior.
+P15 is closed in `docs/todo-p15-simulation-harness.md`. The next milestone
+should be selected from a fresh architecture/backlog review and recorded as a
+separate planning change.
 
 P13 closure:
 
@@ -93,7 +92,9 @@ P15 deterministic simulation harness queue:
 3. Complete: `tessera.sim.result.v1` aggregate counts, classified failures,
    elapsed/throughput/latency summaries, privacy-safe output, and caller-owned
    failure/latency thresholds with deterministic exit behavior.
-4. Active: a small local full-stack simulator smoke integrated into CI.
+4. Complete: `cargo xt dev simulation-smoke` starts the local stack, executes a
+   fixed four-client profile, validates the privacy-safe result, tears down, and
+   runs in CI.
 
 ## Guardrails
 

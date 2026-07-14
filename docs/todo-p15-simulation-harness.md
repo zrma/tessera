@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-14
 
-Status: active
+Status: complete
 
 ## Objective
 
@@ -59,11 +59,16 @@ capacity, alerting, or incident policy.
    - `--max-failed-clients` and optional `--max-p95-latency-ms` are
      caller-owned gates. Violations are stable typed records and produce a
      non-zero exit after the JSON is emitted; they are not production SLOs.
-4. **Repository smoke integration (active)**
-   - Add a small full-stack simulator smoke that starts the local stack,
-     executes a bounded scenario, checks the report, and tears the stack down.
-   - Keep CI traffic local and small. Broader capacity or cluster tests remain
-     explicit external work.
+4. **Repository smoke integration (complete)**
+   - `cargo xt dev simulation-smoke` builds the simulator, starts the local
+     Worker/Gateway/Orchestrator stack, executes a fixed four-client and
+     sixteen-operation profile, validates `tessera.sim.result.v1`, and tears
+     the stack down on both success and failure.
+   - The validator checks counts, failure classes, latency sample count,
+     positive elapsed/throughput values, threshold success, and absence of
+     target-address fields. Focused fixtures cover success and rejection.
+   - CI runs the same small local profile. Broader capacity or cluster tests
+     remain explicit external work.
 
 ## Verification
 
@@ -96,10 +101,16 @@ cargo xt dev down --with-orch
 The third slice checks both successful JSON parsing and a deliberately strict
 latency gate that must emit a failed result and return non-zero.
 
+The final repository-owned smoke is:
+
+```text
+cargo xt dev simulation-smoke
+```
+
 ## Completion Boundary
 
-P15 is complete when all four slices are separate verified changes, scenario
-planning is reproducible without a runtime, bounded multi-client execution and
-failure classification are covered, the versioned result contract is checked,
-and the local simulator smoke runs in CI. Production capacity decisions and
+All four slices are separate verified changes. Scenario planning is
+reproducible without a runtime, bounded multi-client execution and failure
+classification are covered, the versioned result contract is checked, and the
+local simulator smoke runs in CI. Production capacity decisions and
 live-service load execution remain outside this milestone.

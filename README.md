@@ -10,8 +10,9 @@ operations stack.
 
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
-- Current state: P0 through P14 runtime/evidence/packaging and hardening gates
-  are complete. P15 deterministic simulation harness work is active.
+- Current state: P0 through P15 runtime/evidence/packaging, hardening, and
+  deterministic simulation gates are complete. The next open boundary is
+  selected in `docs/todo-next.md`.
 
 ## Workspace
 
@@ -34,7 +35,7 @@ operations stack.
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
-- Active milestone: `docs/todo-p15-simulation-harness.md`
+- Latest completed milestone: `docs/todo-p15-simulation-harness.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -122,14 +123,18 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
 - Portable P13 Helm packaging for Gateway, Worker, and Orchestrator with
   schema-checked values, deterministic default/scale-out renders, explicit
   namespace and Secret-reference boundaries, probes, and optional state mounts.
+- P14 packet/route/state/planner hardening and the P15 deterministic simulator
+  with bounded clients, classified failures, versioned aggregate results,
+  caller-owned gates, and a CI full-stack smoke.
 
-### Current Open Boundary
+### Latest Closed Boundary
 
-P15 turns the existing `tessera-sim` placeholder into a bounded, deterministic
-player and load simulation harness. It starts with network-free reproducible
-scenario planning, then adds independent Gateway sessions, a versioned result
-contract, and a small local full-stack smoke. The active contract is in
-`docs/todo-p15-simulation-harness.md`.
+P15 turned the existing `tessera-sim` placeholder into a bounded,
+deterministic player and load simulation harness with network-free planning,
+independent Gateway sessions, `tessera.sim.result.v1`, and the repo-native
+`cargo xt dev simulation-smoke` CI gate. Its completed evidence map is in
+`docs/todo-p15-simulation-harness.md`; the next boundary is tracked in
+`docs/todo-next.md`.
 
 ## Protocol Snapshot
 
@@ -165,9 +170,10 @@ contract, and a small local full-stack smoke. The active contract is in
   crate dependency boundaries.
 - `cargo xt` runs fmt, clippy, check, and harness.
 - `cargo test` remains the broad Rust test gate.
-- CI runs `cargo xt`, `cargo test`, and the local dev ping smoke with
+- CI runs `cargo xt`, `cargo test`, the local dev ping smoke, and the bounded
+  simulator smoke with
   `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`,
-  and `cargo xt dev down --with-orch`.
+  `cargo xt dev down --with-orch`, and `cargo xt dev simulation-smoke`.
 
 ## Design Overview
 

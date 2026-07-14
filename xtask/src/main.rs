@@ -1332,6 +1332,8 @@ enum DevSub {
     },
     /// Start dev stack with metrics enabled and assert /metrics responses
     MetricsSmoke,
+    /// Start the local stack and validate a bounded simulator JSON result
+    SimulationSmoke,
     /// Start a two-worker dev stack and prove manual split activation converges
     ActivationSmoke,
     /// Start a two-worker dev stack and prove post-publish failure is detected and recoverable
@@ -2572,6 +2574,7 @@ fn main() -> Result<()> {
                 lines,
             } => dev_logs(&target, follow, lines)?,
             DevSub::MetricsSmoke => dev_metrics_smoke()?,
+            DevSub::SimulationSmoke => dev_simulation_smoke()?,
             DevSub::ActivationSmoke => dev_activation_smoke()?,
             DevSub::ActivationFailureSmoke => dev_activation_failure_smoke()?,
             DevSub::ActivationRestartSmoke => dev_activation_restart_smoke()?,
@@ -2907,6 +2910,7 @@ fn check_harness_docs(root: &Path) -> Result<()> {
                 "cargo test",
                 "cargo xt dev up --with-orch",
                 "cargo run -p tessera-client -- ping --ts 123",
+                "cargo xt dev simulation-smoke",
                 "cargo xt dev down --with-orch",
             ],
         ),
@@ -3318,6 +3322,119 @@ fn dev_down(with_orch: bool) -> Result<()> {
         println!("dev down: no pid files found");
     }
     Ok(())
+}
+
+fn dev_simulation_smoke() -> Result<()> {
+    let mut build = Command::new("cargo");
+    build.args(["build", "--bin", "tessera-sim"]);
+    run(&mut build)?;
+
+    dev_up(true, None)?;
+    let smoke_result = run_simulation_smoke_command();
+    let down_result = dev_down(true);
+
+    smoke_result?;
+    down_result?;
+    println!(
+        "simulation smoke: bounded local clients completed and tessera.sim.result.v1 is valid"
+    );
+    Ok(())
+}
+
+fn run_simulation_smoke_command() -> Result<()> {
+    let root = workspace_root();
+    let simulator = root.join("target/debug/tessera-sim");
+    let gateway_addr =
+        std::env::var("TESSERA_GW_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
+    let output = Command::new(simulator)
+        .current_dir(&root)
+        .args([
+            "run",
+            "--addr",
+            &gateway_addr,
+            "--seed",
+            "7",
+            "--clients",
+            "4",
+            "--cells",
+            "1",
+            "--moves-per-client",
+            "2",
+            "--operation-timeout-ms",
+            "5000",
+            "--max-concurrency",
+            "2",
+            "--max-failed-clients",
+            "0",
+            "--json",
+        ])
+        .output()?;
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse tessera-sim smoke JSON output")?;
+    validate_simulation_smoke_result(&result)?;
+    if !output.status.success() {
+        bail!("tessera-sim smoke command returned a failing status");
+    }
+    Ok(())
+}
+
+fn validate_simulation_smoke_result(result: &serde_json::Value) -> Result<()> {
+    if json_str(result, &["schema_version"])? != "tessera.sim.result.v1" {
+        bail!("simulation smoke result has an unexpected schema version");
+    }
+    if json_str(result, &["plan_schema_version"])? != "tessera.sim.plan.v1" {
+        bail!("simulation smoke result has an unexpected plan schema version");
+    }
+    for (path, expected) in [
+        (&["client_count"][..], 4),
+        (&["cell_count"][..], 1),
+        (&["operations_planned"][..], 16),
+        (&["operations_completed"][..], 16),
+        (&["completed_clients"][..], 4),
+        (&["failed_clients"][..], 0),
+        (&["failures", "connect"][..], 0),
+        (&["failures", "protocol"][..], 0),
+        (&["failures", "timeout"][..], 0),
+        (&["failures", "server_close"][..], 0),
+        (&["operation_latency_micros", "samples"][..], 16),
+        (&["thresholds", "max_failed_clients"][..], 0),
+    ] {
+        let actual = json_u64(result, path)?;
+        if actual != expected {
+            bail!(
+                "simulation smoke result field {} expected {expected}, got {actual}",
+                path.join(".")
+            );
+        }
+    }
+    if !json_bool(result, &["passed"])? {
+        bail!("simulation smoke result did not pass its caller-owned thresholds");
+    }
+    if !json_array(result, &["threshold_violations"])?.is_empty() {
+        bail!("simulation smoke result contains threshold violations");
+    }
+    if json_u64(result, &["elapsed_micros"])? == 0 {
+        bail!("simulation smoke result has zero elapsed time");
+    }
+    if json_f64(result, &["throughput_operations_per_second"])? <= 0.0 {
+        bail!("simulation smoke result has non-positive throughput");
+    }
+    if json_contains_key(result, "addr") || json_contains_key(result, "address") {
+        bail!("simulation smoke result must not retain target addresses");
+    }
+    Ok(())
+}
+
+fn json_contains_key(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key == needle || json_contains_key(value, needle)),
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| json_contains_key(value, needle))
+        }
+        _ => false,
+    }
 }
 
 fn dev_metrics_smoke() -> Result<()> {
@@ -39787,6 +39904,62 @@ fn dev_logs(target: &str, follow: bool, lines: Option<usize>) -> Result<()> {
 mod tests {
     use super::*;
     use tessera_proto::orch::v1::AssignmentBundle;
+
+    fn complete_simulation_smoke_result() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "tessera.sim.result.v1",
+            "plan_schema_version": "tessera.sim.plan.v1",
+            "seed": 7,
+            "client_count": 4,
+            "cell_count": 1,
+            "operations_planned": 16,
+            "operations_completed": 16,
+            "completed_clients": 4,
+            "failed_clients": 0,
+            "failures": {
+                "connect": 0,
+                "protocol": 0,
+                "timeout": 0,
+                "server_close": 0
+            },
+            "elapsed_micros": 1_000,
+            "throughput_operations_per_second": 16_000.0,
+            "operation_latency_micros": {
+                "samples": 16,
+                "p50": 50,
+                "p95": 100,
+                "p99": 120,
+                "max": 120
+            },
+            "thresholds": {
+                "max_failed_clients": 0,
+                "max_p95_latency_ms": null
+            },
+            "threshold_violations": [],
+            "passed": true
+        })
+    }
+
+    #[test]
+    fn simulation_smoke_result_accepts_complete_privacy_safe_output() {
+        validate_simulation_smoke_result(&complete_simulation_smoke_result())
+            .expect("complete simulation result");
+    }
+
+    #[test]
+    fn simulation_smoke_result_rejects_failures_and_addresses() {
+        let mut failed = complete_simulation_smoke_result();
+        failed["failed_clients"] = serde_json::json!(1);
+        let err = validate_simulation_smoke_result(&failed)
+            .expect_err("failed client count must be rejected");
+        assert!(err.to_string().contains("failed_clients"));
+
+        let mut leaked = complete_simulation_smoke_result();
+        leaked["addr"] = serde_json::json!("127.0.0.1:4000");
+        let err =
+            validate_simulation_smoke_result(&leaked).expect_err("target address must be rejected");
+        assert!(err.to_string().contains("addresses"));
+    }
 
     #[test]
     fn readiness_addr_maps_unspecified_ipv4_to_loopback() {

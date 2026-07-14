@@ -29,6 +29,7 @@ cargo xt dev up
 cargo xt dev up --with-orch
 cargo xt dev logs --target all --follow
 cargo xt dev down --with-orch
+cargo xt dev simulation-smoke
 ```
 
 Useful client commands:
