@@ -101,7 +101,7 @@ P15 deterministic simulation harness queue:
 
 P16 distributed simulation and topology convergence queue:
 
-1. Pending: deterministic cell-level completion aggregates in
+1. Complete: deterministic cell-level completion aggregates in
    `tessera.sim.result.v1`.
 2. Pending: bounded two-Worker/two-cell simulator smoke through one Gateway.
 3. Pending: repeat the exact plan after a stable Worker identity changes its

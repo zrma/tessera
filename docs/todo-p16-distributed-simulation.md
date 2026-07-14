@@ -33,13 +33,15 @@ execution, or live-service operations policy.
 
 ## Milestone Queue
 
-1. **Cell coverage result contract**
-   - Add deterministic per-cell planned/completed/failed client and completed
-     operation aggregates to `tessera.sim.result.v1`.
-   - Keep ordering stable and reject execution summaries that cannot be joined
-     back to the plan without ambiguity.
-   - Cover complete, partial-failure, multi-cell, and privacy serialization
-     cases without a listening runtime.
+1. **Cell coverage result contract (complete)**
+   - `tessera.sim.result.v1` includes deterministic per-cell planned,
+     completed, and failed client counts plus planned/completed operation
+     counts.
+   - Coverage uses canonical cell ordering and rejects duplicate client
+     indexes, actor mismatches, incomplete successful clients, and inconsistent
+     plan/summary totals before emitting a result.
+   - Runtime-free tests cover complete and partial-failure multi-cell results,
+     ambiguous inputs, round-trip serialization, and privacy shape.
 2. **Two-Worker distributed simulation smoke**
    - Add `cargo xt dev distributed-simulation-smoke` with two root cells owned
      by distinct Workers and routed through one Gateway.

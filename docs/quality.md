@@ -74,6 +74,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   operation latency percentiles in microseconds. Caller-owned failed-client and
   p95 thresholds control the exit gate; no default is presented as a
   production SLO.
+- Simulator results include canonical per-cell planned/completed/failed client
+  and operation aggregates. Result construction fails closed when client
+  indexes, actors, operation totals, latency samples, or declared cell coverage
+  cannot be joined unambiguously to the deterministic plan.
 - `cargo xt dev simulation-smoke` owns local stack startup/teardown, runs a
   fixed four-client profile, and validates complete/privacy-safe simulator JSON.
   CI runs this bounded profile after the existing client ping smoke.

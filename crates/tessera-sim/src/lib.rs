@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::{Duration, Instant},
+};
 use tessera_core::{
     CellId, ClientEnvelope, ClientMsg, EntityId, MAX_FRAME_LEN, Position, ServerEnvelope,
     ServerMsg, encode_frame,
@@ -176,6 +179,16 @@ pub struct LatencySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellCoverage {
+    pub cell: CellId,
+    pub clients_planned: u32,
+    pub clients_completed: u32,
+    pub clients_failed: u32,
+    pub operations_planned: u64,
+    pub operations_completed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThresholdViolation {
     FailedClients { actual: u32, max: u32 },
@@ -194,6 +207,8 @@ pub struct SimulationResult {
     pub completed_clients: u32,
     pub failed_clients: u32,
     pub failures: FailureCounts,
+    #[serde(default)]
+    pub cell_coverage: Vec<CellCoverage>,
     pub elapsed_micros: u64,
     pub throughput_operations_per_second: f64,
     pub operation_latency_micros: LatencySummary,
@@ -215,6 +230,7 @@ pub fn build_result(
         summary.client_count == plan.client_count,
         "execution client count does not match plan"
     );
+    let cell_coverage = build_cell_coverage(plan, summary)?;
 
     let failures = FailureCounts {
         connect: summary.failure_count(ExecutionFailureKind::Connect) as u32,
@@ -254,6 +270,7 @@ pub fn build_result(
         completed_clients: summary.completed_clients,
         failed_clients: summary.failed_clients,
         failures,
+        cell_coverage,
         elapsed_micros: summary.elapsed_micros,
         throughput_operations_per_second,
         operation_latency_micros,
@@ -261,6 +278,132 @@ pub fn build_result(
         passed: threshold_violations.is_empty(),
         threshold_violations,
     })
+}
+
+fn build_cell_coverage(
+    plan: &ScenarioPlan,
+    summary: &ExecutionSummary,
+) -> Result<Vec<CellCoverage>> {
+    ensure!(
+        plan.players.len() == plan.client_count as usize,
+        "plan client count does not match player entries"
+    );
+    ensure!(
+        summary.clients.len() == plan.players.len(),
+        "execution client entries do not match plan"
+    );
+
+    let mut clients_by_index = HashMap::with_capacity(summary.clients.len());
+    for client in &summary.clients {
+        ensure!(
+            clients_by_index
+                .insert(client.client_index, client)
+                .is_none(),
+            "execution contains duplicate client index {}",
+            client.client_index
+        );
+    }
+
+    let mut coverage = BTreeMap::new();
+    let mut completed_clients = 0_u32;
+    let mut failed_clients = 0_u32;
+    let mut operations_planned = 0_u64;
+    let mut operations_completed = 0_u64;
+    for player in &plan.players {
+        let client = clients_by_index
+            .remove(&player.client_index)
+            .with_context(|| {
+                format!(
+                    "execution is missing planned client index {}",
+                    player.client_index
+                )
+            })?;
+        ensure!(
+            client.actor_id == player.actor_id,
+            "execution actor does not match planned client index {}",
+            player.client_index
+        );
+
+        let player_operations = player.steps.len() as u64;
+        ensure!(
+            client.operations_completed == client.operation_latency_micros.len() as u64,
+            "execution latency samples do not match completed operations for client index {}",
+            player.client_index
+        );
+        ensure!(
+            client.operations_completed <= player_operations,
+            "execution completed more operations than planned for client index {}",
+            player.client_index
+        );
+        if client.failure.is_none() {
+            ensure!(
+                client.operations_completed == player_operations,
+                "successful client index {} did not complete its plan",
+                player.client_index
+            );
+            completed_clients += 1;
+        } else {
+            ensure!(
+                client.operations_completed < player_operations,
+                "failed client index {} completed its full plan",
+                player.client_index
+            );
+            failed_clients += 1;
+        }
+
+        let cell_key = (
+            player.cell.world,
+            player.cell.cx,
+            player.cell.cy,
+            player.cell.depth,
+            player.cell.sub,
+        );
+        let cell = coverage.entry(cell_key).or_insert(CellCoverage {
+            cell: player.cell,
+            clients_planned: 0,
+            clients_completed: 0,
+            clients_failed: 0,
+            operations_planned: 0,
+            operations_completed: 0,
+        });
+        cell.clients_planned += 1;
+        if client.failure.is_none() {
+            cell.clients_completed += 1;
+        } else {
+            cell.clients_failed += 1;
+        }
+        cell.operations_planned += player_operations;
+        cell.operations_completed += client.operations_completed;
+        operations_planned += player_operations;
+        operations_completed += client.operations_completed;
+    }
+
+    ensure!(
+        clients_by_index.is_empty(),
+        "execution contains an unplanned client index"
+    );
+    ensure!(
+        coverage.len() == plan.cell_count as usize,
+        "plan cell count does not match planned cell coverage"
+    );
+    ensure!(
+        operations_planned == plan.operation_count,
+        "plan operation count does not match player steps"
+    );
+    ensure!(
+        completed_clients == summary.completed_clients && failed_clients == summary.failed_clients,
+        "execution completion counts do not match client entries"
+    );
+    ensure!(
+        operations_completed == summary.operations_completed,
+        "execution operation count does not match client entries"
+    );
+    ensure!(
+        summary.operation_latency_micros.len() as u64 == summary.operations_completed,
+        "execution latency samples do not match completed operations"
+    );
+
+    Ok(coverage.into_values().collect())
 }
 
 fn summarize_latencies(samples: &[u64]) -> LatencySummary {
@@ -879,6 +1022,7 @@ mod tests {
     fn result_contract_aggregates_counts_latency_and_thresholds() {
         let plan = build_plan(&ScenarioConfig {
             clients: 2,
+            cells: 2,
             moves_per_client: 0,
             ..ScenarioConfig::default()
         })
@@ -922,6 +1066,27 @@ mod tests {
         assert_eq!(result.operations_planned, 4);
         assert_eq!(result.operations_completed, 3);
         assert_eq!(result.failures.timeout, 1);
+        assert_eq!(
+            result.cell_coverage,
+            vec![
+                CellCoverage {
+                    cell: CellId::grid(0, 0, 0),
+                    clients_planned: 1,
+                    clients_completed: 0,
+                    clients_failed: 1,
+                    operations_planned: 2,
+                    operations_completed: 1,
+                },
+                CellCoverage {
+                    cell: CellId::grid(0, 1, 0),
+                    clients_planned: 1,
+                    clients_completed: 1,
+                    clients_failed: 0,
+                    operations_planned: 2,
+                    operations_completed: 2,
+                },
+            ]
+        );
         assert_eq!(result.throughput_operations_per_second, 3.0);
         assert_eq!(
             result.operation_latency_micros,
@@ -935,6 +1100,60 @@ mod tests {
         );
         assert!(!result.passed);
         assert_eq!(result.threshold_violations.len(), 2);
+    }
+
+    #[test]
+    fn complete_multi_cell_coverage_is_canonical() {
+        let plan = build_plan(&ScenarioConfig {
+            clients: 2,
+            cells: 2,
+            moves_per_client: 0,
+            ..ScenarioConfig::default()
+        })
+        .expect("build plan");
+        let summary = ExecutionSummary {
+            client_count: 2,
+            completed_clients: 2,
+            failed_clients: 0,
+            operations_completed: 4,
+            elapsed_micros: 1_000,
+            operation_latency_micros: vec![100, 200, 300, 400],
+            clients: vec![
+                ClientExecution {
+                    client_index: 1,
+                    actor_id: 2,
+                    operations_completed: 2,
+                    operation_latency_micros: vec![300, 400],
+                    failure: None,
+                },
+                ClientExecution {
+                    client_index: 0,
+                    actor_id: 1,
+                    operations_completed: 2,
+                    operation_latency_micros: vec![100, 200],
+                    failure: None,
+                },
+            ],
+        };
+
+        let result = build_result(&plan, &summary, RunThresholds::default())
+            .expect("build multi-cell result");
+
+        assert_eq!(
+            result
+                .cell_coverage
+                .iter()
+                .map(|coverage| coverage.cell)
+                .collect::<Vec<_>>(),
+            vec![CellId::grid(0, 0, 0), CellId::grid(0, 1, 0)]
+        );
+        assert!(result.cell_coverage.iter().all(|coverage| {
+            coverage.clients_planned == 1
+                && coverage.clients_completed == 1
+                && coverage.clients_failed == 0
+                && coverage.operations_planned == 2
+                && coverage.operations_completed == 2
+        }));
     }
 
     #[test]
@@ -1007,6 +1226,41 @@ mod tests {
         assert!(json.contains(RESULT_SCHEMA_VERSION));
         assert!(!json.contains("127.0.0.1"));
         assert!(!json.contains("addr"));
+        assert!(!json.contains("actor_id"));
+        assert!(!json.contains("raw_error"));
+    }
+
+    #[test]
+    fn result_rejects_ambiguous_or_mismatched_client_entries() {
+        let plan = build_plan(&ScenarioConfig {
+            clients: 2,
+            cells: 2,
+            moves_per_client: 0,
+            ..ScenarioConfig::default()
+        })
+        .expect("build plan");
+        let successful_client = |client_index: u32, actor_id: u64| ClientExecution {
+            client_index,
+            actor_id,
+            operations_completed: 2,
+            operation_latency_micros: vec![100, 200],
+            failure: None,
+        };
+        let summary = |clients: Vec<ClientExecution>| ExecutionSummary {
+            client_count: 2,
+            completed_clients: 2,
+            failed_clients: 0,
+            operations_completed: 4,
+            elapsed_micros: 1_000,
+            operation_latency_micros: vec![100, 200, 100, 200],
+            clients,
+        };
+
+        let duplicate = summary(vec![successful_client(0, 1), successful_client(0, 1)]);
+        assert!(build_result(&plan, &duplicate, RunThresholds::default()).is_err());
+
+        let mismatched_actor = summary(vec![successful_client(0, 1), successful_client(1, 999)]);
+        assert!(build_result(&plan, &mismatched_actor, RunThresholds::default()).is_err());
     }
 
     #[test]
