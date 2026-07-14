@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tessera_core::{
     CellId, ClientEnvelope, ClientMsg, EntityId, MAX_FRAME_LEN, Position, ServerEnvelope,
     ServerMsg, encode_frame,
@@ -13,6 +13,7 @@ use tokio::{
 };
 
 pub const PLAN_SCHEMA_VERSION: &str = "tessera.sim.plan.v1";
+pub const RESULT_SCHEMA_VERSION: &str = "tessera.sim.result.v1";
 pub const DEFAULT_CLIENTS: u32 = 4;
 pub const DEFAULT_CELLS: u32 = 1;
 pub const DEFAULT_MOVES_PER_CLIENT: u32 = 3;
@@ -127,6 +128,7 @@ pub struct ClientExecution {
     pub client_index: u32,
     pub actor_id: u64,
     pub operations_completed: u64,
+    pub operation_latency_micros: Vec<u64>,
     pub failure: Option<ExecutionFailureKind>,
 }
 
@@ -136,6 +138,8 @@ pub struct ExecutionSummary {
     pub completed_clients: u32,
     pub failed_clients: u32,
     pub operations_completed: u64,
+    pub elapsed_micros: u64,
+    pub operation_latency_micros: Vec<u64>,
     pub clients: Vec<ClientExecution>,
 }
 
@@ -146,6 +150,144 @@ impl ExecutionSummary {
             .filter(|client| client.failure == Some(kind))
             .count()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunThresholds {
+    pub max_failed_clients: u32,
+    pub max_p95_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureCounts {
+    pub connect: u32,
+    pub protocol: u32,
+    pub timeout: u32,
+    pub server_close: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencySummary {
+    pub samples: u64,
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
+    pub max: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThresholdViolation {
+    FailedClients { actual: u32, max: u32 },
+    P95Latency { actual_micros: u64, max_micros: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulationResult {
+    pub schema_version: String,
+    pub plan_schema_version: String,
+    pub seed: u64,
+    pub client_count: u32,
+    pub cell_count: u32,
+    pub operations_planned: u64,
+    pub operations_completed: u64,
+    pub completed_clients: u32,
+    pub failed_clients: u32,
+    pub failures: FailureCounts,
+    pub elapsed_micros: u64,
+    pub throughput_operations_per_second: f64,
+    pub operation_latency_micros: LatencySummary,
+    pub thresholds: RunThresholds,
+    pub threshold_violations: Vec<ThresholdViolation>,
+    pub passed: bool,
+}
+
+pub fn build_result(
+    plan: &ScenarioPlan,
+    summary: &ExecutionSummary,
+    thresholds: RunThresholds,
+) -> Result<SimulationResult> {
+    ensure!(
+        thresholds.max_failed_clients <= plan.client_count,
+        "max failed clients must not exceed planned clients"
+    );
+    ensure!(
+        summary.client_count == plan.client_count,
+        "execution client count does not match plan"
+    );
+
+    let failures = FailureCounts {
+        connect: summary.failure_count(ExecutionFailureKind::Connect) as u32,
+        protocol: summary.failure_count(ExecutionFailureKind::Protocol) as u32,
+        timeout: summary.failure_count(ExecutionFailureKind::Timeout) as u32,
+        server_close: summary.failure_count(ExecutionFailureKind::ServerClose) as u32,
+    };
+    let operation_latency_micros = summarize_latencies(&summary.operation_latency_micros);
+    let mut threshold_violations = Vec::new();
+    if summary.failed_clients > thresholds.max_failed_clients {
+        threshold_violations.push(ThresholdViolation::FailedClients {
+            actual: summary.failed_clients,
+            max: thresholds.max_failed_clients,
+        });
+    }
+    if let Some(max_p95_latency_ms) = thresholds.max_p95_latency_ms {
+        let max_micros = max_p95_latency_ms.saturating_mul(1_000);
+        if operation_latency_micros.p95 > max_micros {
+            threshold_violations.push(ThresholdViolation::P95Latency {
+                actual_micros: operation_latency_micros.p95,
+                max_micros,
+            });
+        }
+    }
+    let elapsed_for_rate = summary.elapsed_micros.max(1);
+    let throughput_operations_per_second =
+        summary.operations_completed as f64 * 1_000_000.0 / elapsed_for_rate as f64;
+
+    Ok(SimulationResult {
+        schema_version: RESULT_SCHEMA_VERSION.to_owned(),
+        plan_schema_version: plan.schema_version.clone(),
+        seed: plan.seed,
+        client_count: plan.client_count,
+        cell_count: plan.cell_count,
+        operations_planned: plan.operation_count,
+        operations_completed: summary.operations_completed,
+        completed_clients: summary.completed_clients,
+        failed_clients: summary.failed_clients,
+        failures,
+        elapsed_micros: summary.elapsed_micros,
+        throughput_operations_per_second,
+        operation_latency_micros,
+        thresholds,
+        passed: threshold_violations.is_empty(),
+        threshold_violations,
+    })
+}
+
+fn summarize_latencies(samples: &[u64]) -> LatencySummary {
+    if samples.is_empty() {
+        return LatencySummary {
+            samples: 0,
+            p50: 0,
+            p95: 0,
+            p99: 0,
+            max: 0,
+        };
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    LatencySummary {
+        samples: sorted.len() as u64,
+        p50: percentile(&sorted, 50),
+        p95: percentile(&sorted, 95),
+        p99: percentile(&sorted, 99),
+        max: *sorted.last().expect("non-empty latency samples"),
+    }
+}
+
+fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    let rank = (sorted.len() * percentile).div_ceil(100);
+    sorted[rank.saturating_sub(1)]
 }
 
 pub fn build_plan(config: &ScenarioConfig) -> Result<ScenarioPlan> {
@@ -198,6 +340,7 @@ pub async fn execute_plan(
     plan: &ScenarioPlan,
     config: &ExecutionConfig,
 ) -> Result<ExecutionSummary> {
+    let execution_started = Instant::now();
     validate_execution_config(config)?;
     ensure!(
         plan.players.len() == plan.client_count as usize,
@@ -230,12 +373,18 @@ pub async fn execute_plan(
         .iter()
         .map(|client| client.operations_completed)
         .sum();
+    let operation_latency_micros = clients
+        .iter()
+        .flat_map(|client| client.operation_latency_micros.iter().copied())
+        .collect();
 
     Ok(ExecutionSummary {
         client_count: plan.client_count,
         completed_clients,
         failed_clients,
         operations_completed,
+        elapsed_micros: duration_micros(execution_started.elapsed()),
+        operation_latency_micros,
         clients,
     })
 }
@@ -256,13 +405,14 @@ async fn execute_player(
     operation_timeout: Duration,
 ) -> ClientExecution {
     let mut stream = match time::timeout(operation_timeout, TcpStream::connect(addr)).await {
-        Err(_) => return failed_client(&player, 0, ExecutionFailureKind::Timeout),
-        Ok(Err(_)) => return failed_client(&player, 0, ExecutionFailureKind::Connect),
+        Err(_) => return failed_client(&player, Vec::new(), ExecutionFailureKind::Timeout),
+        Ok(Err(_)) => return failed_client(&player, Vec::new(), ExecutionFailureKind::Connect),
         Ok(Ok(stream)) => stream,
     };
 
-    let mut operations_completed = 0;
+    let mut operation_latency_micros = Vec::with_capacity(player.steps.len());
     for (seq, step) in player.steps.iter().enumerate() {
+        let operation_started = Instant::now();
         match time::timeout(
             operation_timeout,
             execute_step(&mut stream, &player, seq as u64, step),
@@ -270,32 +420,44 @@ async fn execute_player(
         .await
         {
             Err(_) => {
-                return failed_client(&player, operations_completed, ExecutionFailureKind::Timeout);
+                return failed_client(
+                    &player,
+                    operation_latency_micros,
+                    ExecutionFailureKind::Timeout,
+                );
             }
-            Ok(Err(kind)) => return failed_client(&player, operations_completed, kind),
-            Ok(Ok(())) => operations_completed += 1,
+            Ok(Err(kind)) => return failed_client(&player, operation_latency_micros, kind),
+            Ok(Ok(())) => {
+                operation_latency_micros.push(duration_micros(operation_started.elapsed()));
+            }
         }
     }
 
     ClientExecution {
         client_index: player.client_index,
         actor_id: player.actor_id,
-        operations_completed,
+        operations_completed: operation_latency_micros.len() as u64,
+        operation_latency_micros,
         failure: None,
     }
 }
 
 fn failed_client(
     player: &PlayerPlan,
-    operations_completed: u64,
+    operation_latency_micros: Vec<u64>,
     failure: ExecutionFailureKind,
 ) -> ClientExecution {
     ClientExecution {
         client_index: player.client_index,
         actor_id: player.actor_id,
-        operations_completed,
+        operations_completed: operation_latency_micros.len() as u64,
+        operation_latency_micros,
         failure: Some(failure),
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 async fn execute_step(
@@ -646,6 +808,8 @@ mod tests {
         assert_eq!(summary.completed_clients, 3);
         assert_eq!(summary.failed_clients, 0);
         assert_eq!(summary.operations_completed, 9);
+        assert_eq!(summary.operation_latency_micros.len(), 9);
+        assert!(summary.elapsed_micros > 0);
         assert!(
             summary
                 .clients
@@ -709,6 +873,150 @@ mod tests {
                 "accepted invalid execution config: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn result_contract_aggregates_counts_latency_and_thresholds() {
+        let plan = build_plan(&ScenarioConfig {
+            clients: 2,
+            moves_per_client: 0,
+            ..ScenarioConfig::default()
+        })
+        .expect("build plan");
+        let summary = ExecutionSummary {
+            client_count: 2,
+            completed_clients: 1,
+            failed_clients: 1,
+            operations_completed: 3,
+            elapsed_micros: 1_000_000,
+            operation_latency_micros: vec![100, 200, 300],
+            clients: vec![
+                ClientExecution {
+                    client_index: 0,
+                    actor_id: 1,
+                    operations_completed: 2,
+                    operation_latency_micros: vec![100, 200],
+                    failure: None,
+                },
+                ClientExecution {
+                    client_index: 1,
+                    actor_id: 2,
+                    operations_completed: 1,
+                    operation_latency_micros: vec![300],
+                    failure: Some(ExecutionFailureKind::Timeout),
+                },
+            ],
+        };
+
+        let result = build_result(
+            &plan,
+            &summary,
+            RunThresholds {
+                max_failed_clients: 0,
+                max_p95_latency_ms: Some(0),
+            },
+        )
+        .expect("build result");
+
+        assert_eq!(result.schema_version, RESULT_SCHEMA_VERSION);
+        assert_eq!(result.operations_planned, 4);
+        assert_eq!(result.operations_completed, 3);
+        assert_eq!(result.failures.timeout, 1);
+        assert_eq!(result.throughput_operations_per_second, 3.0);
+        assert_eq!(
+            result.operation_latency_micros,
+            LatencySummary {
+                samples: 3,
+                p50: 200,
+                p95: 300,
+                p99: 300,
+                max: 300,
+            }
+        );
+        assert!(!result.passed);
+        assert_eq!(result.threshold_violations.len(), 2);
+    }
+
+    #[test]
+    fn caller_owned_thresholds_can_accept_same_execution_result() {
+        let plan = build_plan(&ScenarioConfig {
+            clients: 1,
+            moves_per_client: 0,
+            ..ScenarioConfig::default()
+        })
+        .expect("build plan");
+        let summary = ExecutionSummary {
+            client_count: 1,
+            completed_clients: 0,
+            failed_clients: 1,
+            operations_completed: 0,
+            elapsed_micros: 50,
+            operation_latency_micros: Vec::new(),
+            clients: vec![ClientExecution {
+                client_index: 0,
+                actor_id: 1,
+                operations_completed: 0,
+                operation_latency_micros: Vec::new(),
+                failure: Some(ExecutionFailureKind::Connect),
+            }],
+        };
+
+        let result = build_result(
+            &plan,
+            &summary,
+            RunThresholds {
+                max_failed_clients: 1,
+                max_p95_latency_ms: Some(1),
+            },
+        )
+        .expect("build result");
+
+        assert!(result.passed);
+        assert!(result.threshold_violations.is_empty());
+    }
+
+    #[test]
+    fn result_json_is_versioned_and_round_trips_without_network_inventory() {
+        let plan = build_plan(&ScenarioConfig {
+            clients: 1,
+            moves_per_client: 0,
+            ..ScenarioConfig::default()
+        })
+        .expect("build plan");
+        let summary = ExecutionSummary {
+            client_count: 1,
+            completed_clients: 1,
+            failed_clients: 0,
+            operations_completed: 2,
+            elapsed_micros: 1_000,
+            operation_latency_micros: vec![100, 200],
+            clients: vec![ClientExecution {
+                client_index: 0,
+                actor_id: 1,
+                operations_completed: 2,
+                operation_latency_micros: vec![100, 200],
+                failure: None,
+            }],
+        };
+        let result = build_result(&plan, &summary, RunThresholds::default()).expect("build result");
+
+        let json = serde_json::to_string(&result).expect("serialize result");
+        let decoded: SimulationResult = serde_json::from_str(&json).expect("decode result");
+
+        assert_eq!(decoded, result);
+        assert!(json.contains(RESULT_SCHEMA_VERSION));
+        assert!(!json.contains("127.0.0.1"));
+        assert!(!json.contains("addr"));
+    }
+
+    #[test]
+    fn latency_percentiles_use_nearest_rank_boundaries() {
+        let samples = (1..=100).collect::<Vec<_>>();
+
+        assert_eq!(summarize_latencies(&[]).samples, 0);
+        assert_eq!(summarize_latencies(&samples).p50, 50);
+        assert_eq!(summarize_latencies(&samples).p95, 95);
+        assert_eq!(summarize_latencies(&samples).p99, 99);
     }
 
     async fn start_success_server(
@@ -865,6 +1173,7 @@ mod tests {
         assert_eq!(summary.completed_clients, 0);
         assert_eq!(summary.failed_clients, 1);
         assert_eq!(summary.operations_completed, 0);
+        assert!(summary.operation_latency_micros.is_empty());
         assert_eq!(summary.failure_count(kind), 1);
     }
 }

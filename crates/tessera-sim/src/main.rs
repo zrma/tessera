@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tessera_sim::{
     DEFAULT_CELLS, DEFAULT_CLIENTS, DEFAULT_MAX_CONCURRENCY, DEFAULT_MOVES_PER_CLIENT,
-    DEFAULT_OPERATION_TIMEOUT_MS, ExecutionConfig, ExecutionFailureKind, ScenarioConfig,
-    build_plan, execute_plan,
+    DEFAULT_OPERATION_TIMEOUT_MS, ExecutionConfig, RunThresholds, ScenarioConfig, build_plan,
+    build_result, execute_plan,
 };
 
 #[derive(Parser, Debug)]
@@ -39,6 +39,18 @@ enum Command {
         /// Maximum number of active client sessions.
         #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENCY)]
         max_concurrency: usize,
+        /// Maximum failed clients accepted by this caller-owned gate.
+        #[arg(long, default_value_t = 0)]
+        max_failed_clients: u32,
+        /// Optional caller-owned p95 operation latency ceiling.
+        #[arg(long)]
+        max_p95_latency_ms: Option<u64>,
+        /// Emit the versioned machine-readable result.
+        #[arg(long)]
+        json: bool,
+        /// Pretty-print the versioned JSON result.
+        #[arg(long, requires = "json")]
+        pretty: bool,
     },
 }
 
@@ -94,6 +106,10 @@ async fn main() -> Result<()> {
             addr,
             operation_timeout_ms,
             max_concurrency,
+            max_failed_clients,
+            max_p95_latency_ms,
+            json,
+            pretty,
         } => {
             let plan = build_plan(&scenario.into())?;
             let summary = execute_plan(
@@ -105,25 +121,41 @@ async fn main() -> Result<()> {
                 },
             )
             .await?;
-            let failures = ExecutionFailureKind::ALL
-                .iter()
-                .map(|kind| format!("{}:{}", kind.as_str(), summary.failure_count(*kind)))
-                .collect::<Vec<_>>()
-                .join(",");
-            println!(
-                "simulation complete: clients={} completed={} failed={} operations={}/{} failures={}",
-                summary.client_count,
-                summary.completed_clients,
-                summary.failed_clients,
-                summary.operations_completed,
-                plan.operation_count,
-                failures
-            );
-            if summary.failed_clients > 0 {
-                bail!(
-                    "simulation completed with {} failed clients",
-                    summary.failed_clients
+            let result = build_result(
+                &plan,
+                &summary,
+                RunThresholds {
+                    max_failed_clients,
+                    max_p95_latency_ms,
+                },
+            )?;
+            if json {
+                let output = if pretty {
+                    serde_json::to_string_pretty(&result)?
+                } else {
+                    serde_json::to_string(&result)?
+                };
+                println!("{output}");
+            } else {
+                println!(
+                    "simulation complete: clients={} completed={} failed={} operations={}/{} elapsed_us={} throughput_ops_s={:.2} p95_us={} failures=connect:{},protocol:{},timeout:{},server_close:{} passed={}",
+                    result.client_count,
+                    result.completed_clients,
+                    result.failed_clients,
+                    result.operations_completed,
+                    result.operations_planned,
+                    result.elapsed_micros,
+                    result.throughput_operations_per_second,
+                    result.operation_latency_micros.p95,
+                    result.failures.connect,
+                    result.failures.protocol,
+                    result.failures.timeout,
+                    result.failures.server_close,
+                    result.passed
                 );
+            }
+            if !result.passed {
+                bail!("simulation thresholds failed");
             }
         }
     }
@@ -207,6 +239,10 @@ mod tests {
             addr,
             operation_timeout_ms,
             max_concurrency,
+            max_failed_clients,
+            max_p95_latency_ms,
+            json,
+            pretty,
         } = cli.command
         else {
             panic!("expected run command");
@@ -217,5 +253,39 @@ mod tests {
         assert_eq!(addr, "127.0.0.1:4000");
         assert_eq!(operation_timeout_ms, 500);
         assert_eq!(max_concurrency, 2);
+        assert_eq!(max_failed_clients, 0);
+        assert_eq!(max_p95_latency_ms, None);
+        assert!(!json);
+        assert!(!pretty);
+    }
+
+    #[test]
+    fn parse_run_machine_output_and_thresholds() {
+        let cli = Cli::try_parse_from([
+            "tessera-sim",
+            "run",
+            "--max-failed-clients",
+            "2",
+            "--max-p95-latency-ms",
+            "50",
+            "--json",
+            "--pretty",
+        ])
+        .expect("parse machine output");
+        let Command::Run {
+            max_failed_clients,
+            max_p95_latency_ms,
+            json,
+            pretty,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(max_failed_clients, 2);
+        assert_eq!(max_p95_latency_ms, Some(50));
+        assert!(json);
+        assert!(pretty);
     }
 }

@@ -49,12 +49,17 @@ capacity, alerting, or incident policy.
    - Connect, protocol, timeout, and server-close failures have stable classes.
      Focused fake-network tests cover every class and prove the active session
      cap; a four-client local full-stack run completed all operations cleanly.
-3. **Result and threshold contract (active)**
-   - Emit versioned JSON counts, failure classes, elapsed time, throughput, and
-     latency summaries.
-   - Add caller-owned failure thresholds and a deterministic non-zero exit
-     contract; do not label development defaults as production SLOs.
-4. **Repository smoke integration**
+3. **Result and threshold contract (complete)**
+   - `--json` emits `tessera.sim.result.v1` with aggregate planned/completed
+     counts, failure classes, monotonic elapsed time, throughput, and nearest-rank
+     p50/p95/p99/max operation latency in microseconds.
+   - The result omits target addresses, actor-level records, and raw errors.
+     Focused tests cover JSON round-trip, empty/boundary percentiles, failure
+     counts, and privacy shape.
+   - `--max-failed-clients` and optional `--max-p95-latency-ms` are
+     caller-owned gates. Violations are stable typed records and produce a
+     non-zero exit after the JSON is emitted; they are not production SLOs.
+4. **Repository smoke integration (active)**
    - Add a small full-stack simulator smoke that starts the local stack,
      executes a bounded scenario, checks the report, and tears the stack down.
    - Keep CI traffic local and small. Broader capacity or cluster tests remain
@@ -87,6 +92,9 @@ cargo xt dev up --with-orch
 cargo run -p tessera-sim -- run --seed 7 --clients 4 --cells 1 --moves-per-client 2 --operation-timeout-ms 2000 --max-concurrency 2
 cargo xt dev down --with-orch
 ```
+
+The third slice checks both successful JSON parsing and a deliberately strict
+latency gate that must emit a failed result and return non-zero.
 
 ## Completion Boundary
 

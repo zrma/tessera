@@ -60,6 +60,10 @@ With the local stack running, execute independent bounded client sessions:
 cargo run -p tessera-sim -- run --seed 7 --clients 4 --cells 1 --moves-per-client 2 --max-concurrency 2
 ```
 
+Add `--json` for the `tessera.sim.result.v1` aggregate and use caller-owned
+gates such as `--max-failed-clients 0 --max-p95-latency-ms 100` when a concrete
+development check needs them. These thresholds are not production SLOs.
+
 Useful variants:
 
 - Logs: `cargo xt dev logs --target all --follow`

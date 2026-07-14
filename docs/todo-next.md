@@ -90,9 +90,10 @@ P15 deterministic simulation harness queue:
 2. Complete: independent multi-client Join/Move/Ping execution with operation
    timeouts, bounded concurrency, unsolicited-push handling, and stable failure
    classes.
-3. Active: versioned aggregate result, failure classes, latency summaries, and
-   caller-owned thresholds.
-4. Planned: a small local full-stack simulator smoke integrated into CI.
+3. Complete: `tessera.sim.result.v1` aggregate counts, classified failures,
+   elapsed/throughput/latency summaries, privacy-safe output, and caller-owned
+   failure/latency thresholds with deterministic exit behavior.
+4. Active: a small local full-stack simulator smoke integrated into CI.
 
 ## Guardrails
 

@@ -69,6 +69,11 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   sessions and operation timeouts, skips unsolicited AOI pushes while matching
   direct replies, and classifies connect, protocol, timeout, and server-close
   failures without retaining raw network errors.
+- Simulator machine output is `tessera.sim.result.v1`: aggregate counts,
+  classified failures, monotonic elapsed time, throughput, and nearest-rank
+  operation latency percentiles in microseconds. Caller-owned failed-client and
+  p95 thresholds control the exit gate; no default is presented as a
+  production SLO.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

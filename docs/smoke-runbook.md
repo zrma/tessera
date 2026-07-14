@@ -45,11 +45,18 @@ P15 simulator commands:
 ```sh
 cargo run -p tessera-sim -- plan --seed 7 --clients 4 --cells 2
 cargo run -p tessera-sim -- run --seed 7 --clients 4 --cells 1 --moves-per-client 2 --max-concurrency 2
+cargo run -p tessera-sim -- run --clients 4 --moves-per-client 2 --json --max-failed-clients 0 --max-p95-latency-ms 100
 ```
 
 `plan` is network-free. `run` requires the local Gateway path above and keeps
 each player on an independent connection. Both commands reject scenarios or
 execution limits outside the repository-owned bounds.
+
+The JSON form is `tessera.sim.result.v1` and contains aggregate counts,
+classified failures, elapsed time, throughput, operation latency percentiles in
+microseconds, the caller's thresholds, and stable threshold violations. It does
+not retain the target address or raw network errors. Threshold failure returns a
+non-zero exit after writing the result to stdout.
 
 ## Metrics And Readiness
 
