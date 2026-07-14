@@ -275,10 +275,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   `cargo xt p12-readiness-audit --json`.
 - P13 Kubernetes packaging is complete with a portable chart, deterministic
   default/scale-out render validation, and a caller-owned install/smoke
-  runbook. P14 runtime hardening is the active planning boundary; it must not
-  expand this repository into owning a specific live service's alerting,
-  ingress, registry, secret, certificate, incident, or production rollout
-  policy.
+  runbook. P14 through P17 are complete. P18 packaged log-format parity is the
+  active planning boundary; it must not expand this repository into owning a
+  specific live service's telemetry backend, alerting, ingress, registry,
+  secret, certificate, incident, or production rollout policy.
 - `docs/completed-milestones.md` records completed P0 through P4 work and
   `docs/todo-next.md` is the current execution-plan index. Keep README's
   implemented/planned sections and detailed `docs/` notes in sync when a task

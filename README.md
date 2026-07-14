@@ -12,7 +12,8 @@ operations stack.
 - Deployment target: container-first and Kubernetes-template friendly
 - Current state: P0 through P17 runtime/evidence/packaging, hardening,
   deterministic simulation, distributed topology convergence, and bounded
-  runtime trace-correlation gates are complete.
+  runtime trace-correlation gates are complete. P18 packaged log-format parity
+  is active in `docs/todo-next.md`.
 
 ## Workspace
 
@@ -36,6 +37,7 @@ operations stack.
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
 - Latest completed milestone: `docs/todo-p17-runtime-trace-correlation.md`
+- Active milestone: `docs/todo-p18-packaged-log-format.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 

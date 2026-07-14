@@ -54,8 +54,10 @@ expand into owning a specific live service's operations stack.
 P16 is closed in `docs/todo-p16-distributed-simulation.md`. P17 is closed in
 `docs/todo-p17-runtime-trace-correlation.md` with opt-in structured logs, stable
 Gateway/Worker request lifecycle events, and a twice-run bounded correlation
-gate. The next milestone must come from a fresh architecture and quality-gap
-review; production telemetry policy remains outside this repository.
+gate. A fresh review found that the repository-owned Helm, Compose, and static
+Kubernetes deployment surfaces do not expose P17's shared log-format contract.
+P18 is active in `docs/todo-p18-packaged-log-format.md` to close that packaging
+parity gap; production telemetry policy remains outside this repository.
 
 P13 closure:
 
@@ -122,6 +124,16 @@ P17 runtime trace correlation queue:
    and command-scoped raw-log cleanup.
 4. Complete: the trace profile runs twice with an exact harness assertion, CI
    integration, command/non-goal documentation, and milestone closeout.
+
+P18 packaged log-format parity queue:
+
+1. Complete: contract, gap review, non-goals, and milestone evidence map.
+2. Pending: Helm compact/JSON schema, all-runtime environment wiring, positive
+   render matrix, and invalid-value rejection.
+3. Pending: Docker Compose and static Kubernetes sample parity with drift
+   validation.
+4. Pending: packaging runbook, repository/harness integration, and milestone
+   closeout.
 
 ## Guardrails
 
