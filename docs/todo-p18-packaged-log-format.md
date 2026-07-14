@@ -43,12 +43,15 @@ collector, retention policy, or environment-specific inventory.
    - Evidence: the default fixture renders exact `compact` values into every
      runtime Deployment, the scale-out fixture does the same for `json`, and
      the packaging gate rejects case-drifted or unsupported values.
-3. **Example surface parity**
+3. **Complete: example surface parity**
    - Expose a compact-default caller override in Docker Compose.
    - Make the static Kubernetes sample explicit about compact output for all
      three runtimes.
    - Add a repo-native check that prevents those examples from drifting away
      from the shared contract.
+   - Evidence: Compose maps one caller override with compact fallback into all
+     three services; the static manifest sets compact explicitly in all three
+     Deployments; the packaging gate asserts both exact counts.
 4. **Runbook and closeout**
    - Document Helm, Compose, and static-manifest configuration without
      presenting JSON output as a production policy.

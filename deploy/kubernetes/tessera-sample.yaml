@@ -49,6 +49,8 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: TESSERA_LOG_FORMAT
+              value: compact
             - name: TESSERA_ORCH_ADDR
               value: 0.0.0.0:6000
             - name: TESSERA_ORCH_METRICS_ADDR
@@ -120,6 +122,8 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: TESSERA_LOG_FORMAT
+              value: compact
             - name: TESSERA_ORCH_ADDR
               value: tessera-orch:6000
             - name: TESSERA_WORKER_ID
@@ -187,6 +191,8 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: TESSERA_LOG_FORMAT
+              value: compact
             - name: TESSERA_ORCH_ADDR
               value: tessera-orch:6000
             - name: TESSERA_GW_ADDR

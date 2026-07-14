@@ -15,6 +15,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "deploy" / "helm" / "tessera"
 SCALE_VALUES = CHART / "ci" / "scale-out-values.yaml"
+COMPOSE = ROOT / "deploy" / "docker-compose.yml"
+KUBERNETES_SAMPLE = ROOT / "deploy" / "kubernetes" / "tessera-sample.yaml"
 
 
 class PackagingCheckError(RuntimeError):
@@ -267,6 +269,22 @@ def validate_negative_cases() -> None:
     )
 
 
+def validate_example_surfaces() -> None:
+    compose = COMPOSE.read_text()
+    compose_contract = "TESSERA_LOG_FORMAT: ${TESSERA_LOG_FORMAT:-compact}"
+    require(
+        compose.count(compose_contract) == 3,
+        "Docker Compose runtime log format contract drifted",
+    )
+
+    sample = KUBERNETES_SAMPLE.read_text()
+    sample_contract = "- name: TESSERA_LOG_FORMAT\n              value: compact"
+    require(
+        sample.count(sample_contract) == 3,
+        "static Kubernetes runtime log format contract drifted",
+    )
+
+
 def main() -> int:
     if shutil.which("helm") is None:
         raise PackagingCheckError("helm is required; install Helm v3 before running the packaging gate")
@@ -280,7 +298,8 @@ def main() -> int:
         require(first == second, f"{case.name}: Helm render is not deterministic")
         validate_case(case, first)
     validate_negative_cases()
-    print("k8s packaging check passed: deterministic default and scale-out renders")
+    validate_example_surfaces()
+    print("k8s packaging check passed: deterministic default and scale-out renders plus example parity")
     return 0
 
 

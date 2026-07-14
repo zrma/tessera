@@ -6,6 +6,7 @@ services:
     command: ["tessera-orch"]
     environment:
       RUST_LOG: info
+      TESSERA_LOG_FORMAT: ${TESSERA_LOG_FORMAT:-compact}
       TESSERA_ORCH_ADDR: 0.0.0.0:6000
       TESSERA_ORCH_METRICS_ADDR: 0.0.0.0:6100
       TESSERA_ORCH_OPERATOR_TOKEN: ${TESSERA_ORCH_OPERATOR_TOKEN:?set TESSERA_ORCH_OPERATOR_TOKEN}
@@ -22,6 +23,7 @@ services:
       - orchestrator
     environment:
       RUST_LOG: info
+      TESSERA_LOG_FORMAT: ${TESSERA_LOG_FORMAT:-compact}
       TESSERA_ORCH_ADDR: orchestrator:6000
       TESSERA_WORKER_ID: worker-a
       TESSERA_WORKER_ADDR: 0.0.0.0:5001
@@ -40,6 +42,7 @@ services:
       - worker
     environment:
       RUST_LOG: info
+      TESSERA_LOG_FORMAT: ${TESSERA_LOG_FORMAT:-compact}
       TESSERA_ORCH_ADDR: orchestrator:6000
       TESSERA_GW_ADDR: 0.0.0.0:4000
       TESSERA_GW_METRICS_ADDR: 0.0.0.0:4100

@@ -130,7 +130,7 @@ P18 packaged log-format parity queue:
 1. Complete: contract, gap review, non-goals, and milestone evidence map.
 2. Complete: Helm compact/JSON schema, all-runtime environment wiring, positive
    render matrix, and invalid-value rejection.
-3. Pending: Docker Compose and static Kubernetes sample parity with drift
+3. Complete: Docker Compose and static Kubernetes sample parity with drift
    validation.
 4. Pending: packaging runbook, repository/harness integration, and milestone
    closeout.
