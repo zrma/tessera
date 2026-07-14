@@ -53,9 +53,9 @@ The active planning source is `docs/todo-p13-k8s-packaging.md`.
 
 Recommended P13 slices:
 
-1. Pending: `docs: define p13 packaging contract` - make the chart/template
-   boundary explicit, including placeholders, values, render checks, and
-   non-goals.
+1. Complete: `docs: define p13 packaging contract` - Helm v3 chart shape,
+   caller-owned namespace, existing-secret references, values validation,
+   cluster-free render checks, and non-goals are explicit.
 2. Pending: `build: add k8s packaging template` - add reusable Gateway, Worker,
    and Orchestrator Kubernetes templates with Services, probes, metrics ports,
    ConfigMap wiring, and optional persistent state mounts.

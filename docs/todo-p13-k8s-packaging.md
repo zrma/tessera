@@ -41,8 +41,10 @@ The target is a portable chart/template contract for:
 
 ## Candidate Slices
 
-1. **Packaging contract**: define the chart/template shape, supported values,
-   required placeholders, and validation commands.
+1. **Packaging contract (complete)**: Helm v3 chart at
+   `deploy/helm/tessera`, caller-owned namespace, existing-secret references,
+   default-off mutation, values schema, and a cluster-free two-case render
+   matrix are defined in `docs/packaging.md`.
 2. **Template structure**: add reusable Gateway, Worker, and Orchestrator
    workload templates with Services, probes, metrics ports, and config wiring.
 3. **Topology values**: model worker roles, worker replica/identity policy,
@@ -56,6 +58,25 @@ The target is a portable chart/template contract for:
 6. **Runtime follow-up map**: capture remaining cell-orchestration hardening
    work that packaging exposes, such as packet backpressure, route convergence,
    assignment-state compatibility, and scale-out worker identity.
+
+## Selected Contract
+
+- Package format: Helm v3 application chart.
+- Namespace ownership: caller supplied; no `Namespace` object is rendered.
+- Workload boundary: namespaced Gateway, Worker, and Orchestrator workloads and
+  their `ClusterIP` Services only.
+- Credential boundary: references to a caller-owned `Secret`; no secret values
+  or credential objects in the chart.
+- Topology boundary: deterministic Worker identity/address values and explicit
+  assignment seeds, with scale-out exercised by a committed example values
+  file.
+- Persistence boundary: optional Orchestrator assignment/ledger mounts with no
+  environment-specific storage class default.
+- Safety boundary: split/merge activation and operation execution remain
+  `disabled` unless the caller deliberately overrides them.
+- Validation boundary: Helm lint, deterministic default/scale-out renders,
+  Kubernetes object policy checks, harness checks, and publication-boundary
+  checks; no live cluster dependency.
 
 ## Done Criteria
 

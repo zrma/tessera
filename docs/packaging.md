@@ -1,6 +1,6 @@
 # Tessera Packaging Examples
 
-Last reviewed: 2026-04-26
+Last reviewed: 2026-07-14
 
 This document records the repository-owned packaging boundary for local
 containers and Kubernetes templates. Tessera should provide portable
@@ -113,3 +113,50 @@ separate environment-owned layer. That layer should decide ingress, Service
 type, resource requests, PodDisruptionBudget, rollout policy, certificate
 handling, registry credentials, scrape discovery, alert routing, and incident
 process.
+
+## P13 Helm Chart Contract
+
+The reusable package is a Helm v3 application chart rooted at
+`deploy/helm/tessera`. Helm owns value substitution and Kubernetes object
+rendering only; it is not the production deployment source of truth.
+
+The chart contract is:
+
+- The caller supplies the release name and namespace. The chart does not create
+  a `Namespace` or assume cluster-scoped permissions.
+- The default render uses a placeholder image and refers to an existing runtime
+  authentication `Secret`. The chart never creates credentials or embeds token
+  values.
+- Gateway, Worker, and Orchestrator ports, probes, metrics annotations, log
+  level, image coordinates, and replica counts are values-backed.
+- Worker identity and advertised addresses are deterministic Kubernetes DNS
+  names. Initial cell assignments are explicit values and must refer to a
+  declared Worker identity.
+- Orchestrator assignment state and operation ledger storage are disabled by
+  default. A caller may opt into an `emptyDir`, an existing claim, or a
+  chart-created claim without providing any site-specific storage class.
+- Mutation remains default-off. `splitMergeActivation` and
+  `operationExecution` default to `disabled`; enabling either one is a
+  controlled runtime decision outside install/render behavior.
+- Services remain `ClusterIP`. Ingress, load balancers, certificates, registry
+  credentials, scheduling policy, disruption budgets, alert rules, and scrape
+  discovery are environment-owned overlays.
+
+The supported values are validated by `values.schema.json`. Unknown top-level
+or component keys are rejected so a misspelled safety value cannot silently
+render with an unintended default.
+
+The required render matrix is intentionally cluster-free:
+
+```sh
+helm lint deploy/helm/tessera
+helm template tessera-example deploy/helm/tessera \
+  --namespace tessera-example > <rendered-output>
+helm template tessera-scale deploy/helm/tessera \
+  --namespace tessera-scale \
+  --values deploy/helm/tessera/ci/scale-out-values.yaml > <rendered-output>
+```
+
+Repository validation must render each case twice, prove byte-stable output,
+validate the Kubernetes object shape, and run the publication-boundary checks.
+It must not contact a live cluster.
