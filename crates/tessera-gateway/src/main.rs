@@ -51,6 +51,8 @@ struct GatewayMetricsCounters {
     invalid_client_frames: AtomicU64,
     no_route_lookup_failures: AtomicU64,
     pending_ping_replays: AtomicU64,
+    pending_ping_tracking_evictions: AtomicU64,
+    pending_request_tracking_evictions: AtomicU64,
     client_closes_no_route: AtomicU64,
     client_closes_upstream_retry_exhausted: AtomicU64,
     client_closes_pending_ping_route_change: AtomicU64,
@@ -127,6 +129,8 @@ struct GatewayMetricsSnapshot {
     invalid_client_frames: u64,
     no_route_lookup_failures: u64,
     pending_ping_replays: u64,
+    pending_ping_tracking_evictions: u64,
+    pending_request_tracking_evictions: u64,
     client_closes_no_route: u64,
     client_closes_upstream_retry_exhausted: u64,
     client_closes_pending_ping_route_change: u64,
@@ -261,6 +265,14 @@ impl RoutingTable {
                 .no_route_lookup_failures
                 .load(Ordering::Relaxed),
             pending_ping_replays: self.metrics.pending_ping_replays.load(Ordering::Relaxed),
+            pending_ping_tracking_evictions: self
+                .metrics
+                .pending_ping_tracking_evictions
+                .load(Ordering::Relaxed),
+            pending_request_tracking_evictions: self
+                .metrics
+                .pending_request_tracking_evictions
+                .load(Ordering::Relaxed),
             client_closes_no_route: self.metrics.client_closes_no_route.load(Ordering::Relaxed),
             client_closes_upstream_retry_exhausted: self
                 .metrics
@@ -1000,17 +1012,24 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                     continue;
                                 }
                                 if let Some(ts) = ping_ts {
-                                    push_pending_ping(&mut pending_pings, PendingPing {
-                                        cell,
-                                        ts,
-                                        frame: frame.clone(),
-                                        sent_at: ping_sent_at.expect("ping timestamp"),
-                                    });
+                                    let evicted = push_pending_ping(
+                                        &mut pending_pings,
+                                        PendingPing {
+                                            cell,
+                                            ts,
+                                            frame: frame.clone(),
+                                            sent_at: ping_sent_at.expect("ping timestamp"),
+                                        },
+                                    );
+                                    routing
+                                        .metrics
+                                        .pending_ping_tracking_evictions
+                                        .fetch_add(evicted as u64, Ordering::Relaxed);
                                 } else {
                                     if let (Some(kind), Some(request_id), Some(sent_at)) =
                                         (request_kind, request_id, request_sent_at)
                                     {
-                                        push_pending_request(
+                                        let evicted = push_pending_request(
                                             &mut pending_requests,
                                             PendingRequest {
                                                 cell,
@@ -1019,6 +1038,10 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, routing: RoutingTable)
                                                 sent_at,
                                             },
                                         );
+                                        routing
+                                            .metrics
+                                            .pending_request_tracking_evictions
+                                            .fetch_add(evicted as u64, Ordering::Relaxed);
                                     }
                                     conn.has_non_ping_traffic = true;
                                 }
@@ -1226,18 +1249,27 @@ fn acknowledge_pending_request(
     None
 }
 
-fn push_pending_ping(pending_pings: &mut VecDeque<PendingPing>, ping: PendingPing) {
+fn push_pending_ping(pending_pings: &mut VecDeque<PendingPing>, ping: PendingPing) -> usize {
+    let mut evicted = 0;
     while pending_pings.len() >= MAX_PENDING_PINGS {
         pending_pings.pop_front();
+        evicted += 1;
     }
     pending_pings.push_back(ping);
+    evicted
 }
 
-fn push_pending_request(pending_requests: &mut VecDeque<PendingRequest>, request: PendingRequest) {
+fn push_pending_request(
+    pending_requests: &mut VecDeque<PendingRequest>,
+    request: PendingRequest,
+) -> usize {
+    let mut evicted = 0;
     while pending_requests.len() >= MAX_PENDING_REQUESTS {
         pending_requests.pop_front();
+        evicted += 1;
     }
     pending_requests.push_back(request);
+    evicted
 }
 
 fn observe_request_latency(
@@ -1600,6 +1632,20 @@ fn format_gateway_prometheus_metrics(metrics: &GatewayMetricsSnapshot) -> String
         "tessera_gateway_pending_ping_replays_total",
         "Pending ping frames replayed after upstream reconnect.",
         metrics.pending_ping_replays,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_pending_ping_tracking_evictions_total",
+        "Oldest pending ping correlation entries evicted at the fixed tracking limit.",
+        metrics.pending_ping_tracking_evictions,
+    );
+    push_prometheus_metric(
+        &mut out,
+        "counter",
+        "tessera_gateway_pending_request_tracking_evictions_total",
+        "Oldest pending Join or Move correlation entries evicted at the fixed tracking limit.",
+        metrics.pending_request_tracking_evictions,
     );
     push_prometheus_metric(
         &mut out,
@@ -2139,10 +2185,12 @@ mod tests {
             invalid_client_frames: 31,
             no_route_lookup_failures: 37,
             pending_ping_replays: 41,
-            client_closes_no_route: 43,
-            client_closes_upstream_retry_exhausted: 47,
-            client_closes_pending_ping_route_change: 53,
-            client_closes_ambiguous_upstream: 59,
+            pending_ping_tracking_evictions: 43,
+            pending_request_tracking_evictions: 47,
+            client_closes_no_route: 53,
+            client_closes_upstream_retry_exhausted: 59,
+            client_closes_pending_ping_route_change: 61,
+            client_closes_ambiguous_upstream: 67,
             ping_roundtrip_latency: GatewayLatencySnapshot {
                 buckets: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
                 sum_micros: 1_250_000,
@@ -2170,12 +2218,14 @@ mod tests {
         assert!(text.contains("tessera_gateway_upstream_connect_failures_total 11\n"));
         assert!(text.contains("tessera_gateway_upstream_route_change_reconnects_total 15\n"));
         assert!(text.contains("tessera_gateway_pending_ping_replays_total 41\n"));
-        assert!(text.contains("tessera_gateway_client_closes_no_route_total 43\n"));
-        assert!(text.contains("tessera_gateway_client_closes_upstream_retry_exhausted_total 47\n"));
+        assert!(text.contains("tessera_gateway_pending_ping_tracking_evictions_total 43\n"));
+        assert!(text.contains("tessera_gateway_pending_request_tracking_evictions_total 47\n"));
+        assert!(text.contains("tessera_gateway_client_closes_no_route_total 53\n"));
+        assert!(text.contains("tessera_gateway_client_closes_upstream_retry_exhausted_total 59\n"));
         assert!(
-            text.contains("tessera_gateway_client_closes_pending_ping_route_change_total 53\n")
+            text.contains("tessera_gateway_client_closes_pending_ping_route_change_total 61\n")
         );
-        assert!(text.contains("tessera_gateway_client_closes_ambiguous_upstream_total 59\n"));
+        assert!(text.contains("tessera_gateway_client_closes_ambiguous_upstream_total 67\n"));
         assert!(text.contains("# TYPE tessera_gateway_ping_roundtrip_seconds histogram\n"));
         assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_bucket{le=\"0.001\"} 1\n"));
         assert!(text.contains("tessera_gateway_ping_roundtrip_seconds_bucket{le=\"0.005\"} 3\n"));
@@ -3847,6 +3897,199 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].cell, cell);
         assert_eq!(pending[0].ts, 7);
+    }
+
+    #[test]
+    fn pending_correlation_queues_evict_oldest_at_fixed_capacity() {
+        let cell = CellId::grid(0, 0, 0);
+        let sent_at = Instant::now();
+        let mut pings = VecDeque::new();
+        let mut requests = VecDeque::new();
+
+        for index in 0..(MAX_PENDING_PINGS + 3) {
+            let evicted = push_pending_ping(
+                &mut pings,
+                PendingPing {
+                    cell,
+                    ts: index as u64,
+                    frame: Bytes::from_static(b"ping"),
+                    sent_at,
+                },
+            );
+            assert_eq!(evicted, usize::from(index >= MAX_PENDING_PINGS));
+        }
+        for index in 0..(MAX_PENDING_REQUESTS + 3) {
+            let evicted = push_pending_request(
+                &mut requests,
+                PendingRequest {
+                    cell,
+                    request_id: index as u64,
+                    kind: if index % 2 == 0 {
+                        PendingRequestKind::Join
+                    } else {
+                        PendingRequestKind::Move
+                    },
+                    sent_at,
+                },
+            );
+            assert_eq!(evicted, usize::from(index >= MAX_PENDING_REQUESTS));
+        }
+
+        assert_eq!(pings.len(), MAX_PENDING_PINGS);
+        assert_eq!(pings.front().expect("oldest retained ping").ts, 3);
+        assert_eq!(
+            pings.back().expect("newest retained ping").ts,
+            (MAX_PENDING_PINGS + 2) as u64
+        );
+        assert_eq!(requests.len(), MAX_PENDING_REQUESTS);
+        assert_eq!(
+            requests
+                .front()
+                .expect("oldest retained request")
+                .request_id,
+            3
+        );
+        assert_eq!(
+            requests.back().expect("newest retained request").request_id,
+            (MAX_PENDING_REQUESTS + 2) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_client_frame_reaches_upstream_once() {
+        let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+        let mut worker_task = tokio::spawn(async move {
+            run_stub_worker(worker_listener).await;
+        });
+        let routing = routing_for_worker(worker_addr);
+        let (gateway_addr, mut gateway_task) = spawn_gateway_once(routing.clone()).await;
+        let mut client = TcpStream::connect(gateway_addr)
+            .await
+            .expect("connect gateway");
+        let frame = encode_frame(&Envelope {
+            cell: CellId::grid(0, 0, 0),
+            seq: 0,
+            epoch: 0,
+            payload: ClientMsg::Ping { ts: 42 },
+        });
+
+        for byte in frame.iter() {
+            client
+                .write_all(std::slice::from_ref(byte))
+                .await
+                .expect("write fragmented byte");
+            tokio::task::yield_now().await;
+        }
+
+        let reply = read_env_with_timeout(&mut client, Duration::from_millis(500)).await;
+        assert!(matches!(reply.payload, ServerMsg::Pong { ts: 42 }));
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.upstream_connects, 1);
+        assert_eq!(metrics.invalid_client_frames, 0);
+
+        drop(client);
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker", &mut worker_task).await;
+    }
+
+    #[tokio::test]
+    async fn pipelined_ping_burst_preserves_order_and_observes_tracking_pressure() {
+        let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+        let mut worker_task = tokio::spawn(async move {
+            run_stub_worker(worker_listener).await;
+        });
+        let routing = routing_for_worker(worker_addr);
+        let (gateway_addr, mut gateway_task) = spawn_gateway_once(routing.clone()).await;
+        let mut client = TcpStream::connect(gateway_addr)
+            .await
+            .expect("connect gateway");
+        let burst_len = MAX_PENDING_PINGS * 3;
+        let mut burst = Vec::new();
+        for index in 0..burst_len {
+            burst.extend_from_slice(&encode_frame(&Envelope {
+                cell: CellId::grid(0, 0, 0),
+                seq: index as u64,
+                epoch: 0,
+                payload: ClientMsg::Ping { ts: index as u64 },
+            }));
+        }
+        client
+            .write_all(&burst)
+            .await
+            .expect("write pipelined burst");
+
+        for expected in 0..burst_len {
+            let reply = read_env_with_timeout(&mut client, Duration::from_secs(1)).await;
+            assert!(matches!(reply.payload, ServerMsg::Pong { ts } if ts == expected as u64));
+        }
+        let metrics = routing.metrics_snapshot().await;
+        assert!(
+            metrics.pending_ping_tracking_evictions > 0,
+            "burst should exceed the bounded correlation window"
+        );
+
+        drop(client);
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker", &mut worker_task).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_client_prefix_closes_before_upstream_connect() {
+        let worker_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind worker");
+        let worker_addr = worker_listener.local_addr().expect("worker addr");
+        let mut worker_task = tokio::spawn(async move {
+            run_worker_expect_no_connection(worker_listener, "oversized client frame").await;
+        });
+        let routing = routing_for_worker(worker_addr);
+        let (gateway_addr, mut gateway_task) = spawn_gateway_once(routing.clone()).await;
+        let mut client = TcpStream::connect(gateway_addr)
+            .await
+            .expect("connect gateway");
+
+        let oversized_len = u32::try_from(MAX_FRAME_LEN + 1).expect("frame limit fits u32");
+        client
+            .write_all(&oversized_len.to_be_bytes())
+            .await
+            .expect("write oversized prefix");
+        expect_client_close(&mut client).await;
+
+        let metrics = routing.metrics_snapshot().await;
+        assert_eq!(metrics.invalid_client_frames, 1);
+        assert_eq!(metrics.upstream_connect_attempts, 0);
+        assert_eq!(metrics.upstream_connects, 0);
+
+        wait_task("gateway", &mut gateway_task).await;
+        wait_task("worker", &mut worker_task).await;
+    }
+
+    fn routing_for_worker(worker_addr: SocketAddr) -> RoutingTable {
+        let mut routes = HashMap::new();
+        routes.insert(
+            CellKey(CellId::grid(0, 0, 0)),
+            WorkerRoute {
+                worker_id: "worker-test".to_string(),
+                addr: worker_addr.to_string(),
+            },
+        );
+        RoutingTable::new(routes)
+    }
+
+    async fn spawn_gateway_once(
+        routing: RoutingTable,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
+        let address = listener.local_addr().expect("gateway addr");
+        let task = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.expect("accept gateway client");
+            handle_conn(socket, peer, routing)
+                .await
+                .expect("handle gateway client");
+        });
+        (address, task)
     }
 
     async fn run_stub_worker(listener: TcpListener) {

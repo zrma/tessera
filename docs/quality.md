@@ -46,6 +46,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   `cargo xt harness` and CI run it automatically; code changes still require
   `cargo xt` and `cargo test`.
 - Runtime or networking changes also need the local smoke loop: `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`, and `cargo xt dev down --with-orch`.
+- Gateway packet-pressure coverage includes fragmented client ingress,
+  oversized-prefix rejection before upstream connect, ordered pipelined bursts,
+  fixed pending correlation limits, and separate Ping/request tracking-eviction
+  counters.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

@@ -44,16 +44,18 @@ ownership boundaries and default-off mutation gates.
 
 ## Planned Slices
 
-1. **Packet ingress stress (active)**
-   - Add Gateway tests that send a valid client frame in many header/payload
-     fragments and verify one ordered Ping/Pong result.
-   - Add an oversized-prefix case that proves the client closes before any
-     upstream connection.
-   - Add a pipelined burst case and focused pending Ping/Join/Move queue tests
-     that prove fixed capacity and deterministic oldest-entry eviction.
-   - Reuse existing Worker saturation and mid-frame coverage; add Worker code
-     only if the focused stress exposes a missing invariant.
-2. **Route convergence under topology changes**
+1. **Packet ingress stress (complete)**
+   - A byte-fragmented Gateway client frame produces exactly one Ping/Pong
+     result through one upstream connection.
+   - An oversized prefix closes the client before any upstream connection.
+   - A pipelined burst preserves response order while exercising the fixed
+     pending-Ping tracking window.
+   - Focused Ping and Join/Move queue tests prove fixed capacity and
+     deterministic oldest-entry eviction. New Prometheus counters expose
+     correlation-tracking eviction without reporting it as packet loss.
+   - Existing Worker saturation and mid-frame disconnect coverage remained
+     green, so no Worker behavior change was needed.
+2. **Route convergence under topology changes (active)**
    - Exercise Worker identity/address replacement and scale-out assignment
      listings while a Gateway session remains active.
    - Prove convergence from both watch updates and periodic snapshot refresh.
@@ -78,6 +80,17 @@ cargo test
 
 If the slice changes runtime networking behavior, also run the local
 Worker/Gateway/Orchestrator ping smoke from `docs/smoke-runbook.md`.
+
+## Completed Slice Evidence
+
+Packet ingress stress is covered by:
+
+- `fragmented_client_frame_reaches_upstream_once`
+- `pipelined_ping_burst_preserves_order_and_observes_tracking_pressure`
+- `oversized_client_prefix_closes_before_upstream_connect`
+- `pending_correlation_queues_evict_oldest_at_fixed_capacity`
+- `tessera_gateway_pending_ping_tracking_evictions_total`
+- `tessera_gateway_pending_request_tracking_evictions_total`
 
 ## Completion Boundary
 

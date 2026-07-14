@@ -72,8 +72,9 @@ P13 closure:
 
 P14 runtime hardening queue:
 
-1. Active: packet pipeline backpressure and partial-frame stress coverage.
-2. Pending: route convergence behavior under worker scale-out/identity changes.
+1. Complete: packet pipeline backpressure and partial-frame stress coverage,
+   including observable bounded correlation tracking.
+2. Active: route convergence behavior under worker scale-out/identity changes.
 3. Pending: assignment-state compatibility rules for generalized topology.
 4. Pending: load-based split/merge planner quality beyond current guarded
    operator evidence.
