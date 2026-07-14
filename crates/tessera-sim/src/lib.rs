@@ -1,6 +1,16 @@
-use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
-use tessera_core::CellId;
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::time::Duration;
+use tessera_core::{
+    CellId, ClientEnvelope, ClientMsg, EntityId, MAX_FRAME_LEN, Position, ServerEnvelope,
+    ServerMsg, encode_frame,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    task::JoinSet,
+    time,
+};
 
 pub const PLAN_SCHEMA_VERSION: &str = "tessera.sim.plan.v1";
 pub const DEFAULT_CLIENTS: u32 = 4;
@@ -10,6 +20,10 @@ pub const MAX_CLIENTS: u32 = 10_000;
 pub const MAX_CELLS: u32 = 4_096;
 pub const MAX_MOVES_PER_CLIENT: u32 = 10_000;
 pub const MAX_OPERATIONS: u64 = 1_000_000;
+pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 2_000;
+pub const DEFAULT_MAX_CONCURRENCY: usize = 16;
+pub const MAX_OPERATION_TIMEOUT_MS: u64 = 60_000;
+pub const MAX_CONCURRENCY: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScenarioConfig {
@@ -65,6 +79,75 @@ pub enum PlannedStep {
     Ping { ts: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionConfig {
+    pub addr: String,
+    pub operation_timeout_ms: u64,
+    pub max_concurrency: usize,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            addr: "127.0.0.1:4000".to_owned(),
+            operation_timeout_ms: DEFAULT_OPERATION_TIMEOUT_MS,
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionFailureKind {
+    Connect,
+    Protocol,
+    Timeout,
+    ServerClose,
+}
+
+impl ExecutionFailureKind {
+    pub const ALL: [Self; 4] = [
+        Self::Connect,
+        Self::Protocol,
+        Self::Timeout,
+        Self::ServerClose,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Protocol => "protocol",
+            Self::Timeout => "timeout",
+            Self::ServerClose => "server_close",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientExecution {
+    pub client_index: u32,
+    pub actor_id: u64,
+    pub operations_completed: u64,
+    pub failure: Option<ExecutionFailureKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionSummary {
+    pub client_count: u32,
+    pub completed_clients: u32,
+    pub failed_clients: u32,
+    pub operations_completed: u64,
+    pub clients: Vec<ClientExecution>,
+}
+
+impl ExecutionSummary {
+    pub fn failure_count(&self, kind: ExecutionFailureKind) -> usize {
+        self.clients
+            .iter()
+            .filter(|client| client.failure == Some(kind))
+            .count()
+    }
+}
+
 pub fn build_plan(config: &ScenarioConfig) -> Result<ScenarioPlan> {
     validate_config(config)?;
 
@@ -111,6 +194,218 @@ pub fn build_plan(config: &ScenarioConfig) -> Result<ScenarioPlan> {
     })
 }
 
+pub async fn execute_plan(
+    plan: &ScenarioPlan,
+    config: &ExecutionConfig,
+) -> Result<ExecutionSummary> {
+    validate_execution_config(config)?;
+    ensure!(
+        plan.players.len() == plan.client_count as usize,
+        "plan client count does not match player entries"
+    );
+
+    let mut pending = plan.players.clone().into_iter();
+    let mut tasks = JoinSet::new();
+    for _ in 0..config.max_concurrency.min(plan.players.len()) {
+        if let Some(player) = pending.next() {
+            spawn_player(&mut tasks, player, config);
+        }
+    }
+
+    let mut clients = Vec::with_capacity(plan.players.len());
+    while let Some(joined) = tasks.join_next().await {
+        clients.push(joined.context("simulated client task failed")?);
+        if let Some(player) = pending.next() {
+            spawn_player(&mut tasks, player, config);
+        }
+    }
+    clients.sort_by_key(|client| client.client_index);
+
+    let completed_clients = clients
+        .iter()
+        .filter(|client| client.failure.is_none())
+        .count() as u32;
+    let failed_clients = plan.client_count - completed_clients;
+    let operations_completed = clients
+        .iter()
+        .map(|client| client.operations_completed)
+        .sum();
+
+    Ok(ExecutionSummary {
+        client_count: plan.client_count,
+        completed_clients,
+        failed_clients,
+        operations_completed,
+        clients,
+    })
+}
+
+fn spawn_player(
+    tasks: &mut JoinSet<ClientExecution>,
+    player: PlayerPlan,
+    config: &ExecutionConfig,
+) {
+    let addr = config.addr.clone();
+    let operation_timeout = Duration::from_millis(config.operation_timeout_ms);
+    tasks.spawn(async move { execute_player(player, &addr, operation_timeout).await });
+}
+
+async fn execute_player(
+    player: PlayerPlan,
+    addr: &str,
+    operation_timeout: Duration,
+) -> ClientExecution {
+    let mut stream = match time::timeout(operation_timeout, TcpStream::connect(addr)).await {
+        Err(_) => return failed_client(&player, 0, ExecutionFailureKind::Timeout),
+        Ok(Err(_)) => return failed_client(&player, 0, ExecutionFailureKind::Connect),
+        Ok(Ok(stream)) => stream,
+    };
+
+    let mut operations_completed = 0;
+    for (seq, step) in player.steps.iter().enumerate() {
+        match time::timeout(
+            operation_timeout,
+            execute_step(&mut stream, &player, seq as u64, step),
+        )
+        .await
+        {
+            Err(_) => {
+                return failed_client(&player, operations_completed, ExecutionFailureKind::Timeout);
+            }
+            Ok(Err(kind)) => return failed_client(&player, operations_completed, kind),
+            Ok(Ok(())) => operations_completed += 1,
+        }
+    }
+
+    ClientExecution {
+        client_index: player.client_index,
+        actor_id: player.actor_id,
+        operations_completed,
+        failure: None,
+    }
+}
+
+fn failed_client(
+    player: &PlayerPlan,
+    operations_completed: u64,
+    failure: ExecutionFailureKind,
+) -> ClientExecution {
+    ClientExecution {
+        client_index: player.client_index,
+        actor_id: player.actor_id,
+        operations_completed,
+        failure: Some(failure),
+    }
+}
+
+async fn execute_step(
+    stream: &mut TcpStream,
+    player: &PlayerPlan,
+    seq: u64,
+    step: &PlannedStep,
+) -> std::result::Result<(), ExecutionFailureKind> {
+    let payload = match step {
+        PlannedStep::Join { x_milli, y_milli } => ClientMsg::Join {
+            actor: EntityId(player.actor_id),
+            pos: Position::new(*x_milli as f32 / 1_000.0, *y_milli as f32 / 1_000.0),
+        },
+        PlannedStep::Move { dx_milli, dy_milli } => ClientMsg::Move {
+            actor: EntityId(player.actor_id),
+            dx: *dx_milli as f32 / 1_000.0,
+            dy: *dy_milli as f32 / 1_000.0,
+        },
+        PlannedStep::Ping { ts } => ClientMsg::Ping { ts: *ts },
+    };
+    let frame = encode_frame(&ClientEnvelope {
+        cell: player.cell,
+        seq,
+        epoch: 0,
+        session: None,
+        request_id: Some(seq + 1),
+        payload,
+    });
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(|_| ExecutionFailureKind::ServerClose)?;
+
+    loop {
+        let reply: ServerEnvelope = read_frame(stream).await?;
+        match reply_matches(step, player, &reply)? {
+            true => return Ok(()),
+            false => continue,
+        }
+    }
+}
+
+fn reply_matches(
+    step: &PlannedStep,
+    player: &PlayerPlan,
+    reply: &ServerEnvelope,
+) -> std::result::Result<bool, ExecutionFailureKind> {
+    if matches!(reply.payload, ServerMsg::Error { .. }) {
+        return Err(ExecutionFailureKind::Protocol);
+    }
+
+    match (step, &reply.payload) {
+        (PlannedStep::Join { .. }, ServerMsg::Snapshot { cell, actors })
+            if reply.request_id.is_some() =>
+        {
+            if *cell == player.cell
+                && actors
+                    .iter()
+                    .any(|actor| actor.id == EntityId(player.actor_id))
+            {
+                Ok(true)
+            } else {
+                Err(ExecutionFailureKind::Protocol)
+            }
+        }
+        (PlannedStep::Move { .. }, ServerMsg::Delta { cell, moved })
+            if reply.request_id.is_some() =>
+        {
+            if *cell == player.cell
+                && moved
+                    .iter()
+                    .any(|actor| actor.id == EntityId(player.actor_id))
+            {
+                Ok(true)
+            } else {
+                Err(ExecutionFailureKind::Protocol)
+            }
+        }
+        (PlannedStep::Ping { ts }, ServerMsg::Pong { ts: reply_ts }) => {
+            if ts == reply_ts {
+                Ok(true)
+            } else {
+                Err(ExecutionFailureKind::Protocol)
+            }
+        }
+        (_, _) if reply.request_id.is_some() => Err(ExecutionFailureKind::Protocol),
+        _ => Ok(false),
+    }
+}
+
+async fn read_frame<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+) -> std::result::Result<T, ExecutionFailureKind> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|_| ExecutionFailureKind::ServerClose)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(ExecutionFailureKind::Protocol);
+    }
+    let mut payload = vec![0u8; len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| ExecutionFailureKind::ServerClose)?;
+    serde_json::from_slice(&payload).map_err(|_| ExecutionFailureKind::Protocol)
+}
+
 fn validate_config(config: &ScenarioConfig) -> Result<()> {
     ensure!(config.clients > 0, "clients must be greater than zero");
     ensure!(
@@ -155,6 +450,30 @@ fn validate_config(config: &ScenarioConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_execution_config(config: &ExecutionConfig) -> Result<()> {
+    ensure!(
+        !config.addr.trim().is_empty(),
+        "gateway address is required"
+    );
+    ensure!(
+        config.operation_timeout_ms > 0,
+        "operation timeout must be greater than zero"
+    );
+    ensure!(
+        config.operation_timeout_ms <= MAX_OPERATION_TIMEOUT_MS,
+        "operation timeout must not exceed {MAX_OPERATION_TIMEOUT_MS} ms"
+    );
+    ensure!(
+        config.max_concurrency > 0,
+        "max concurrency must be greater than zero"
+    );
+    ensure!(
+        config.max_concurrency <= MAX_CONCURRENCY,
+        "max concurrency must not exceed {MAX_CONCURRENCY}"
+    );
+    Ok(())
+}
+
 struct SplitMix64 {
     state: u64,
 }
@@ -181,7 +500,15 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tessera_core::ActorState;
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     #[test]
     fn default_plan_is_safe_and_versioned() {
@@ -291,5 +618,253 @@ mod tests {
                 "accepted invalid config: {invalid:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn multi_client_execution_is_independent_and_concurrency_bounded() {
+        let scenario = ScenarioConfig {
+            clients: 3,
+            moves_per_client: 1,
+            ..ScenarioConfig::default()
+        };
+        let plan = build_plan(&scenario).expect("build plan");
+        let (addr, server, max_active) = start_success_server(3, 3).await;
+
+        let summary = execute_plan(
+            &plan,
+            &ExecutionConfig {
+                addr,
+                operation_timeout_ms: 500,
+                max_concurrency: 2,
+            },
+        )
+        .await
+        .expect("execute plan");
+        server.await.expect("success server");
+
+        assert_eq!(summary.client_count, 3);
+        assert_eq!(summary.completed_clients, 3);
+        assert_eq!(summary.failed_clients, 0);
+        assert_eq!(summary.operations_completed, 9);
+        assert!(
+            summary
+                .clients
+                .iter()
+                .all(|client| client.failure.is_none())
+        );
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn execution_classifies_connect_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        drop(listener);
+
+        let summary = execute_single_client(addr, 100).await;
+
+        assert_single_failure(&summary, ExecutionFailureKind::Connect);
+    }
+
+    #[tokio::test]
+    async fn execution_classifies_protocol_failure() {
+        let summary = execute_with_failure_server(FailureMode::Protocol, 100).await;
+
+        assert_single_failure(&summary, ExecutionFailureKind::Protocol);
+    }
+
+    #[tokio::test]
+    async fn execution_classifies_operation_timeout() {
+        let summary = execute_with_failure_server(FailureMode::Timeout, 20).await;
+
+        assert_single_failure(&summary, ExecutionFailureKind::Timeout);
+    }
+
+    #[tokio::test]
+    async fn execution_classifies_server_close() {
+        let summary = execute_with_failure_server(FailureMode::ServerClose, 100).await;
+
+        assert_single_failure(&summary, ExecutionFailureKind::ServerClose);
+    }
+
+    #[tokio::test]
+    async fn invalid_execution_bounds_fail_before_connect() {
+        let plan = build_plan(&ScenarioConfig::default()).expect("build plan");
+        for invalid in [
+            ExecutionConfig {
+                addr: String::new(),
+                ..ExecutionConfig::default()
+            },
+            ExecutionConfig {
+                operation_timeout_ms: 0,
+                ..ExecutionConfig::default()
+            },
+            ExecutionConfig {
+                max_concurrency: 0,
+                ..ExecutionConfig::default()
+            },
+        ] {
+            assert!(
+                execute_plan(&plan, &invalid).await.is_err(),
+                "accepted invalid execution config: {invalid:?}"
+            );
+        }
+    }
+
+    async fn start_success_server(
+        clients: usize,
+        operations_per_client: usize,
+    ) -> (String, JoinHandle<()>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let server_active = Arc::clone(&active);
+        let server_max = Arc::clone(&max_active);
+        let server = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            for _ in 0..clients {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let active = Arc::clone(&server_active);
+                let max_active = Arc::clone(&server_max);
+                connections.spawn(async move {
+                    serve_success_connection(stream, operations_per_client, active, max_active)
+                        .await;
+                });
+            }
+            while let Some(connection) = connections.join_next().await {
+                connection.expect("connection task");
+            }
+        });
+        (addr, server, max_active)
+    }
+
+    async fn serve_success_connection(
+        mut stream: TcpStream,
+        operations: usize,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    ) {
+        let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(active_now, Ordering::SeqCst);
+        time::sleep(Duration::from_millis(10)).await;
+
+        for _ in 0..operations {
+            let request: ClientEnvelope = read_frame(&mut stream).await.expect("client frame");
+            if request.seq == 0 {
+                let push = ServerEnvelope {
+                    cell: request.cell,
+                    seq: 0,
+                    epoch: request.epoch,
+                    request_id: None,
+                    payload: ServerMsg::Delta {
+                        cell: request.cell,
+                        moved: Vec::new(),
+                    },
+                };
+                write_server_frame(&mut stream, &push).await;
+            }
+
+            let (request_id, payload) = match request.payload {
+                ClientMsg::Join { actor, pos } => (
+                    Some(request.seq + 100),
+                    ServerMsg::Snapshot {
+                        cell: request.cell,
+                        actors: vec![ActorState { id: actor, pos }],
+                    },
+                ),
+                ClientMsg::Move { actor, .. } => (
+                    Some(request.seq + 100),
+                    ServerMsg::Delta {
+                        cell: request.cell,
+                        moved: vec![ActorState {
+                            id: actor,
+                            pos: Position::new(0.0, 0.0),
+                        }],
+                    },
+                ),
+                ClientMsg::Ping { ts } => (None, ServerMsg::Pong { ts }),
+            };
+            let reply = ServerEnvelope {
+                cell: request.cell,
+                seq: request.seq,
+                epoch: request.epoch,
+                request_id,
+                payload,
+            };
+            write_server_frame(&mut stream, &reply).await;
+        }
+
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    enum FailureMode {
+        Protocol,
+        Timeout,
+        ServerClose,
+    }
+
+    async fn execute_with_failure_server(
+        mode: FailureMode,
+        operation_timeout_ms: u64,
+    ) -> ExecutionSummary {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: ClientEnvelope = read_frame(&mut stream).await.expect("client frame");
+            match mode {
+                FailureMode::Protocol => {
+                    let reply = ServerEnvelope {
+                        cell: request.cell,
+                        seq: request.seq,
+                        epoch: request.epoch,
+                        request_id: Some(1),
+                        payload: ServerMsg::Pong { ts: 0 },
+                    };
+                    write_server_frame(&mut stream, &reply).await;
+                }
+                FailureMode::Timeout => time::sleep(Duration::from_millis(60)).await,
+                FailureMode::ServerClose => {}
+            }
+        });
+
+        let summary = execute_single_client(addr, operation_timeout_ms).await;
+        server.await.expect("failure server");
+        summary
+    }
+
+    async fn execute_single_client(addr: String, operation_timeout_ms: u64) -> ExecutionSummary {
+        let plan = build_plan(&ScenarioConfig {
+            clients: 1,
+            moves_per_client: 0,
+            ..ScenarioConfig::default()
+        })
+        .expect("build plan");
+        execute_plan(
+            &plan,
+            &ExecutionConfig {
+                addr,
+                operation_timeout_ms,
+                max_concurrency: 1,
+            },
+        )
+        .await
+        .expect("execute plan")
+    }
+
+    async fn write_server_frame(stream: &mut TcpStream, reply: &ServerEnvelope) {
+        stream
+            .write_all(&encode_frame(reply))
+            .await
+            .expect("write server frame");
+    }
+
+    fn assert_single_failure(summary: &ExecutionSummary, kind: ExecutionFailureKind) {
+        assert_eq!(summary.client_count, 1);
+        assert_eq!(summary.completed_clients, 0);
+        assert_eq!(summary.failed_clients, 1);
+        assert_eq!(summary.operations_completed, 0);
+        assert_eq!(summary.failure_count(kind), 1);
     }
 }

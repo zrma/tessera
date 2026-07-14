@@ -1,7 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tessera_sim::{
-    DEFAULT_CELLS, DEFAULT_CLIENTS, DEFAULT_MOVES_PER_CLIENT, ScenarioConfig, build_plan,
+    DEFAULT_CELLS, DEFAULT_CLIENTS, DEFAULT_MAX_CONCURRENCY, DEFAULT_MOVES_PER_CLIENT,
+    DEFAULT_OPERATION_TIMEOUT_MS, ExecutionConfig, ExecutionFailureKind, ScenarioConfig,
+    build_plan, execute_plan,
 };
 
 #[derive(Parser, Debug)]
@@ -23,6 +25,20 @@ enum Command {
         /// Pretty-print the versioned JSON plan.
         #[arg(long)]
         pretty: bool,
+    },
+    /// Execute a bounded scenario against a Gateway.
+    Run {
+        #[command(flatten)]
+        scenario: ScenarioArgs,
+        /// Gateway address (host:port).
+        #[arg(long, default_value = "127.0.0.1:4000")]
+        addr: String,
+        /// Per-connect and per-operation timeout in milliseconds.
+        #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_MS)]
+        operation_timeout_ms: u64,
+        /// Maximum number of active client sessions.
+        #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENCY)]
+        max_concurrency: usize,
     },
 }
 
@@ -61,7 +77,8 @@ impl From<ScenarioArgs> for ScenarioConfig {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Plan { scenario, pretty } => {
             let plan = build_plan(&scenario.into())?;
@@ -71,6 +88,43 @@ fn main() -> Result<()> {
                 serde_json::to_string(&plan)?
             };
             println!("{json}");
+        }
+        Command::Run {
+            scenario,
+            addr,
+            operation_timeout_ms,
+            max_concurrency,
+        } => {
+            let plan = build_plan(&scenario.into())?;
+            let summary = execute_plan(
+                &plan,
+                &ExecutionConfig {
+                    addr,
+                    operation_timeout_ms,
+                    max_concurrency,
+                },
+            )
+            .await?;
+            let failures = ExecutionFailureKind::ALL
+                .iter()
+                .map(|kind| format!("{}:{}", kind.as_str(), summary.failure_count(*kind)))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "simulation complete: clients={} completed={} failed={} operations={}/{} failures={}",
+                summary.client_count,
+                summary.completed_clients,
+                summary.failed_clients,
+                summary.operations_completed,
+                plan.operation_count,
+                failures
+            );
+            if summary.failed_clients > 0 {
+                bail!(
+                    "simulation completed with {} failed clients",
+                    summary.failed_clients
+                );
+            }
         }
     }
     Ok(())
@@ -83,7 +137,9 @@ mod tests {
     #[test]
     fn parse_plan_defaults() {
         let cli = Cli::try_parse_from(["tessera-sim", "plan"]).expect("parse defaults");
-        let Command::Plan { scenario, pretty } = cli.command;
+        let Command::Plan { scenario, pretty } = cli.command else {
+            panic!("expected plan command");
+        };
 
         assert_eq!(scenario.seed, 1);
         assert_eq!(scenario.clients, DEFAULT_CLIENTS);
@@ -116,7 +172,9 @@ mod tests {
             "--pretty",
         ])
         .expect("parse overrides");
-        let Command::Plan { scenario, pretty } = cli.command;
+        let Command::Plan { scenario, pretty } = cli.command else {
+            panic!("expected plan command");
+        };
 
         assert_eq!(scenario.seed, 42);
         assert_eq!(scenario.clients, 8);
@@ -127,5 +185,37 @@ mod tests {
         assert_eq!(scenario.start_cx, -2);
         assert_eq!(scenario.cy, 5);
         assert!(pretty);
+    }
+
+    #[test]
+    fn parse_run_defaults_and_bounds() {
+        let cli = Cli::try_parse_from([
+            "tessera-sim",
+            "run",
+            "--clients",
+            "8",
+            "--cells",
+            "4",
+            "--operation-timeout-ms",
+            "500",
+            "--max-concurrency",
+            "2",
+        ])
+        .expect("parse run");
+        let Command::Run {
+            scenario,
+            addr,
+            operation_timeout_ms,
+            max_concurrency,
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(scenario.clients, 8);
+        assert_eq!(scenario.cells, 4);
+        assert_eq!(addr, "127.0.0.1:4000");
+        assert_eq!(operation_timeout_ms, 500);
+        assert_eq!(max_concurrency, 2);
     }
 }

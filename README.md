@@ -54,6 +54,12 @@ Build a deterministic simulator plan without starting the runtime:
 cargo run -p tessera-sim -- plan --seed 7 --clients 4 --cells 2
 ```
 
+With the local stack running, execute independent bounded client sessions:
+
+```sh
+cargo run -p tessera-sim -- run --seed 7 --clients 4 --cells 1 --moves-per-client 2 --max-concurrency 2
+```
+
 Useful variants:
 
 - Logs: `cargo xt dev logs --target all --follow`

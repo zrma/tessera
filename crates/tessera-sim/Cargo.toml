@@ -9,3 +9,4 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tessera-core = { path = "../tessera-core" }
+tokio = { workspace = true, features = ["io-util", "net"] }

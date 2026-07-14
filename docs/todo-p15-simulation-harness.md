@@ -40,14 +40,16 @@ capacity, alerting, or incident policy.
      `--pretty` is presentation-only.
    - Unit tests cover CLI defaults/overrides, byte-stable reproducibility, seed
      variation, complete bounded mappings, and fail-closed invalid boundaries.
-2. **Bounded multi-client execution**
-   - Give each simulated player an independent Gateway connection and actor
-     identity.
-   - Execute Join, Move, and Ping steps with explicit per-operation timeouts and
-     a bounded concurrency limit.
-   - Classify connect, protocol, timeout, and server-close failures without
-     leaking raw environment details into reports.
-3. **Result and threshold contract**
+2. **Bounded multi-client execution (complete)**
+   - `tessera-sim run` gives each player an independent Gateway connection and
+     actor identity, while a rolling task set enforces the concurrency bound.
+   - Join, Move, and Ping steps use per-connect/per-operation timeouts. Direct
+     replies are distinguished from unsolicited AOI pushes before payload,
+     cell, and actor validation.
+   - Connect, protocol, timeout, and server-close failures have stable classes.
+     Focused fake-network tests cover every class and prove the active session
+     cap; a four-client local full-stack run completed all operations cleanly.
+3. **Result and threshold contract (active)**
    - Emit versioned JSON counts, failure classes, elapsed time, throughput, and
      latency summaries.
    - Add caller-owned failure thresholds and a deterministic non-zero exit
@@ -76,6 +78,14 @@ The first slice also has a runtime-free command check:
 
 ```text
 cargo run -p tessera-sim -- plan --seed 7 --clients 4 --cells 2
+```
+
+The second slice full-stack check is:
+
+```text
+cargo xt dev up --with-orch
+cargo run -p tessera-sim -- run --seed 7 --clients 4 --cells 1 --moves-per-client 2 --operation-timeout-ms 2000 --max-concurrency 2
+cargo xt dev down --with-orch
 ```
 
 ## Completion Boundary

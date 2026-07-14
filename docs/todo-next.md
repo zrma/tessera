@@ -87,9 +87,10 @@ P15 deterministic simulation harness queue:
 
 1. Complete: deterministic, bounded, network-free scenario planning and the
    `tessera.sim.plan.v1` JSON contract.
-2. Active: independent multi-client Join/Move/Ping execution with operation
-   timeouts and bounded concurrency.
-3. Planned: versioned aggregate result, failure classes, latency summaries, and
+2. Complete: independent multi-client Join/Move/Ping execution with operation
+   timeouts, bounded concurrency, unsolicited-push handling, and stable failure
+   classes.
+3. Active: versioned aggregate result, failure classes, latency summaries, and
    caller-owned thresholds.
 4. Planned: a small local full-stack simulator smoke integrated into CI.
 

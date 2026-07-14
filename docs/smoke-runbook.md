@@ -1,6 +1,6 @@
 # Tessera Smoke Runbook
 
-Last reviewed: 2026-05-11
+Last reviewed: 2026-07-14
 
 This runbook holds the command catalog that used to make `README.md` hard to
 scan. Prefer the narrowest smoke that covers the changed surface, then close a
@@ -39,6 +39,17 @@ cargo run -p tessera-client -- join --actor 1 --x 0 --y 0
 cargo run -p tessera-client -- move --actor 1 --dx 1 --dy 0.5
 cargo run -p tessera-client -- repl --actor 1
 ```
+
+P15 simulator commands:
+
+```sh
+cargo run -p tessera-sim -- plan --seed 7 --clients 4 --cells 2
+cargo run -p tessera-sim -- run --seed 7 --clients 4 --cells 1 --moves-per-client 2 --max-concurrency 2
+```
+
+`plan` is network-free. `run` requires the local Gateway path above and keeps
+each player on an independent connection. Both commands reject scenarios or
+execution limits outside the repository-owned bounds.
 
 ## Metrics And Readiness
 

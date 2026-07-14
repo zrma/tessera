@@ -65,6 +65,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - `tessera-sim plan` builds a network-free `tessera.sim.plan.v1` scenario with
   bounded clients, cells, moves, actor/cell ranges, and total operations. The
   same inputs produce byte-stable compact JSON.
+- `tessera-sim run` uses one Gateway connection per player, bounds active
+  sessions and operation timeouts, skips unsolicited AOI pushes while matching
+  direct replies, and classifies connect, protocol, timeout, and server-close
+  failures without retaining raw network errors.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy
