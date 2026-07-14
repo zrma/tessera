@@ -62,11 +62,15 @@ ownership boundaries and default-off mutation gates.
      identity, and the active session reconnects to the replacement endpoint.
    - Existing identity replacement and stale-refresh guards remain green, so
      watch updates cannot be overwritten by an older snapshot.
-3. **Assignment-state compatibility (active)**
-   - Define compatibility for Worker additions/removals and persisted
-     assignment state without silently adopting unknown identities.
-   - Cover restart and rejected-incompatible-state behavior.
-4. **Planner quality under load**
+3. **Assignment-state compatibility (complete)**
+   - Configured empty Worker additions and removal of drained persisted Workers
+     are compatible across Orchestrator restart.
+   - A new configured Worker with static cells, or a removed Worker that still
+     owns persisted cells, is rejected instead of being silently adopted or
+     reassigned.
+   - The durable-state guide and packaging contract now define the required
+     drain/migration boundary.
+4. **Planner quality under load (active)**
    - Add representative skew, hysteresis, and churn-budget datasets.
    - Improve split/merge ranking only where a failing quality case justifies a
      runtime change.
@@ -102,6 +106,14 @@ Route convergence is covered by:
 - `route_change_reconnects_to_new_worker`
 - `route_change_after_non_ping_reconnects_with_stable_session`
 - `refresh_skips_stale_snapshot_after_watch_update`
+
+Assignment-state compatibility is covered by:
+
+- `assignment_state_accepts_configured_empty_worker_addition`
+- `assignment_state_accepts_removed_empty_worker`
+- `assignment_state_rejects_removed_worker_with_owned_cells`
+- `assignment_state_rejects_missing_configured_worker_with_static_cells`
+- `persistent_assignment_state_applies_compatible_worker_changes_on_restart`
 
 ## Completion Boundary
 

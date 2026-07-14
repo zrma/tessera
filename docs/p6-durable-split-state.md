@@ -1,6 +1,6 @@
 # P6 Durable Split State
 
-Last reviewed: 2026-05-09
+Last reviewed: 2026-07-14
 
 This document records the first P6 slice after P5 internal activation
 completion. It is intentionally narrower than the full P6+ objective: it makes
@@ -26,8 +26,8 @@ Implemented behavior:
    listing update.
 4. If persistence fails, the in-memory assignment mutation is rolled back before
    `ListAssignments` or `WatchAssignments` can expose it.
-5. The state file validates schema, configured Worker ids, duplicate Worker ids,
-   and duplicate cell ownership before it is trusted.
+5. The state file validates schema, Worker topology compatibility, duplicate
+   Worker ids, and duplicate cell ownership before it is trusted.
 6. In-flight `staged_splits` remain memory-only. A process restart clears
    incomplete staged operations instead of trying to resume partially replayed
    Worker state.
@@ -51,8 +51,32 @@ Example shape:
 ```
 
 The state file may contain dynamically published child cells that were not in
-the static config. Worker ids must still exist in the current Orchestrator
-config so runtime addresses and health/listing shape remain policy-controlled.
+the static config. Every Worker id that owns cells must still exist in the
+current Orchestrator config so runtime addresses and health/listing shape remain
+policy-controlled.
+
+## Worker Topology Compatibility
+
+Persisted assignment state is the authoritative assignment map after it exists;
+static config is not merged into it implicitly. Restart compatibility is:
+
+- A newly configured Worker is accepted only when its static `cells` list is
+  empty. It enters the listing with no assignments and can receive later
+  policy-gated assignment changes.
+- A configured Worker missing from persisted state is rejected when its static
+  `cells` list is non-empty. This avoids silently dropping or adopting a new
+  static assignment while durable state is authoritative.
+- A removed Worker entry is ignored only when its persisted `cells` list is
+  empty. The Orchestrator emits a warning and does not retain that identity.
+- A removed or otherwise unknown Worker that still owns persisted cells is a
+  startup error. Cells are never silently reassigned to another identity.
+- Existing schema, duplicate-Worker, and duplicate-cell checks remain
+  fail-closed.
+
+Therefore an environment may safely add empty Worker capacity or remove an
+already drained Worker across restart. Adding preassigned capacity or removing
+a Worker that still owns cells requires an explicit assignment-state migration
+or a policy-gated runtime assignment change first.
 
 ## Local Evidence
 
@@ -68,8 +92,16 @@ Relevant checks:
   a split, verifies the state file, creates a fresh Orchestrator with manual
   activation disabled, and verifies the restarted listing and Worker
   registration snapshot contain the four child assignments.
-- `load_assignment_state_rejects_unknown_worker` verifies stale state cannot add
-  an unconfigured Worker id.
+- `load_assignment_state_rejects_unknown_worker` verifies stale state cannot
+  retain cells under an unconfigured Worker id.
+- `assignment_state_accepts_configured_empty_worker_addition` and
+  `assignment_state_accepts_removed_empty_worker` cover compatible topology
+  changes.
+- `assignment_state_rejects_removed_worker_with_owned_cells` and
+  `assignment_state_rejects_missing_configured_worker_with_static_cells` cover
+  fail-closed incompatibilities.
+- `persistent_assignment_state_applies_compatible_worker_changes_on_restart`
+  verifies both compatible changes through fresh Orchestrator construction.
 
 Dev smoke:
 

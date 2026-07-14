@@ -76,8 +76,9 @@ P14 runtime hardening queue:
    including observable bounded correlation tracking.
 2. Complete: route convergence under worker scale-out/identity changes through
    both watch and refresh paths while a Gateway session remains active.
-3. Active: assignment-state compatibility rules for generalized topology.
-4. Pending: load-based split/merge planner quality beyond current guarded
+3. Complete: fail-closed assignment-state compatibility for adding empty
+   Workers, removing drained Workers, and rejecting implicit cell adoption.
+4. Active: load-based split/merge planner quality beyond current guarded
    operator evidence.
 
 ## Guardrails

@@ -826,9 +826,17 @@ fn assignments_from_state_file(
                 "assignment state contains duplicate worker_id={worker_id}"
             ));
         }
+        if config.worker(worker_id).is_none() && worker_state.cells.is_empty() {
+            warn!(
+                target: "orch",
+                worker_id,
+                "ignoring empty assignment state entry for worker absent from current config"
+            );
+            continue;
+        }
         if config.worker(worker_id).is_none() {
             return Err(anyhow!(
-                "assignment state references unknown worker_id={worker_id}"
+                "assignment state references unknown worker_id={worker_id} with assigned cells"
             ));
         }
         let cells = assignments
@@ -850,6 +858,21 @@ fn assignments_from_state_file(
             cells.push(cell);
         }
         sort_cells(cells);
+    }
+
+    let mut missing_workers_with_static_cells = config
+        .workers
+        .iter()
+        .filter(|(worker_id, worker)| {
+            !seen_workers.contains_key(worker_id.as_str()) && !worker.cells.is_empty()
+        })
+        .map(|(worker_id, _)| worker_id.as_str())
+        .collect::<Vec<_>>();
+    missing_workers_with_static_cells.sort_unstable();
+    if let Some(worker_id) = missing_workers_with_static_cells.first() {
+        return Err(anyhow!(
+            "assignment state omits configured worker_id={worker_id} with static cells"
+        ));
     }
     Ok(assignments)
 }
@@ -7372,6 +7395,147 @@ mod tests {
         let err = load_assignment_state_file(&two_worker_handover_config(), &state_path)
             .expect_err("unknown worker should fail");
         assert!(err.to_string().contains("unknown worker_id"));
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn assignment_state_accepts_configured_empty_worker_addition() {
+        let state = AssignmentStateFile {
+            schema: ASSIGNMENT_STATE_SCHEMA.to_string(),
+            workers: vec![AssignmentStateWorker {
+                worker_id: "worker-a".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            }],
+        };
+
+        let assignments = assignments_from_state_file(&two_worker_handover_config(), state)
+            .expect("configured empty worker addition should be compatible");
+
+        assert_eq!(
+            assignments.get("worker-a").map(Vec::as_slice),
+            Some([CellId::grid(0, 0, 0)].as_slice())
+        );
+        assert_eq!(
+            assignments.get("worker-b").map(Vec::as_slice),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn assignment_state_accepts_removed_empty_worker() {
+        let mut config = two_worker_handover_config();
+        config.workers.remove("worker-b");
+        let state = AssignmentStateFile {
+            schema: ASSIGNMENT_STATE_SCHEMA.to_string(),
+            workers: vec![
+                AssignmentStateWorker {
+                    worker_id: "worker-a".to_string(),
+                    cells: vec![CellId::grid(0, 0, 0)],
+                },
+                AssignmentStateWorker {
+                    worker_id: "worker-b".to_string(),
+                    cells: Vec::new(),
+                },
+            ],
+        };
+
+        let assignments = assignments_from_state_file(&config, state)
+            .expect("removed empty worker should be compatible");
+
+        assert_eq!(assignments.len(), 1);
+        assert!(!assignments.contains_key("worker-b"));
+    }
+
+    #[test]
+    fn assignment_state_rejects_removed_worker_with_owned_cells() {
+        let mut config = two_worker_handover_config();
+        config.workers.remove("worker-b");
+        let state = AssignmentStateFile {
+            schema: ASSIGNMENT_STATE_SCHEMA.to_string(),
+            workers: vec![
+                AssignmentStateWorker {
+                    worker_id: "worker-a".to_string(),
+                    cells: Vec::new(),
+                },
+                AssignmentStateWorker {
+                    worker_id: "worker-b".to_string(),
+                    cells: vec![CellId::grid(0, 0, 0)],
+                },
+            ],
+        };
+
+        let err = assignments_from_state_file(&config, state)
+            .expect_err("removed worker with owned cells should fail");
+        assert!(err.to_string().contains("unknown worker_id=worker-b"));
+        assert!(err.to_string().contains("assigned cells"));
+    }
+
+    #[test]
+    fn assignment_state_rejects_missing_configured_worker_with_static_cells() {
+        let mut config = two_worker_handover_config();
+        config
+            .workers
+            .get_mut("worker-b")
+            .expect("worker-b")
+            .cells
+            .push(CellId::grid(0, 1, 0));
+        let state = AssignmentStateFile {
+            schema: ASSIGNMENT_STATE_SCHEMA.to_string(),
+            workers: vec![AssignmentStateWorker {
+                worker_id: "worker-a".to_string(),
+                cells: vec![CellId::grid(0, 0, 0)],
+            }],
+        };
+
+        let err = assignments_from_state_file(&config, state)
+            .expect_err("missing configured worker with static cells should fail");
+        assert!(
+            err.to_string()
+                .contains("omits configured worker_id=worker-b with static cells")
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_assignment_state_applies_compatible_worker_changes_on_restart() {
+        let state_path = unique_assignment_state_path("compatible-worker-change-restart");
+        let initial_assignments = two_worker_handover_config().initial_assignments();
+        write_assignment_state_file(&state_path, &initial_assignments)
+            .expect("write assignment state");
+
+        let mut expanded_config = two_worker_handover_config();
+        expanded_config.workers.insert(
+            "worker-c".to_string(),
+            WorkerStatic {
+                addr: "10.0.0.3:5001".to_string(),
+                cells: Vec::new(),
+            },
+        );
+        let expanded = OrchestratorService::try_new_with_split_activation(
+            expanded_config,
+            SplitActivationMode::Disabled,
+            Some(state_path.clone()),
+        )
+        .expect("restart with configured empty worker addition");
+        let expanded_listing = expanded.listing().await;
+        let added = expanded_listing
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == "worker-c")
+            .expect("added worker listing");
+        assert!(added.cells.is_empty());
+
+        let mut reduced_config = two_worker_handover_config();
+        reduced_config.workers.remove("worker-b");
+        let reduced = OrchestratorService::try_new_with_split_activation(
+            reduced_config,
+            SplitActivationMode::Disabled,
+            Some(state_path.clone()),
+        )
+        .expect("restart after removing empty worker");
+        let reduced_listing = reduced.listing().await;
+        assert_eq!(reduced_listing.workers.len(), 1);
+        assert_eq!(reduced_listing.workers[0].worker_id, "worker-a");
+
         let _ = fs::remove_file(state_path);
     }
 

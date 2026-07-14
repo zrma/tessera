@@ -53,6 +53,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - Gateway route-convergence coverage exercises active-session scale-out through
   watch listings, stable Worker identity with an address replacement through
   snapshot refresh, and stale-refresh rejection after newer watch updates.
+- Durable Orchestrator assignments accept configured empty Worker additions and
+  removal of drained Worker identities across restart, while rejecting new
+  static assignments or removed identities that still own cells.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

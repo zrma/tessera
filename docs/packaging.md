@@ -137,6 +137,9 @@ The chart contract is:
 - Orchestrator assignment state and operation ledger storage are disabled by
   default. A caller may opt into an `emptyDir`, an existing claim, or a
   chart-created claim without providing any site-specific storage class.
+- When durable assignment state is enabled, Worker-list changes follow the
+  compatibility contract in `docs/p6-durable-split-state.md`: new Workers must
+  start with no static cells, and removed Workers must already be drained.
 - Mutation remains default-off. `splitMergeActivation` and
   `operationExecution` default to `disabled`; enabling either one is a
   controlled runtime decision outside install/render behavior.
