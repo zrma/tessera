@@ -61,6 +61,8 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ $root.Values.logLevel | quote }}
+            - name: TESSERA_LOG_FORMAT
+              value: {{ $root.Values.logFormat | quote }}
             - name: TESSERA_ORCH_ADDR
               value: {{ printf "%s-orchestrator:%v" (include "tessera.fullname" $root) $root.Values.orchestrator.servicePort | quote }}
             - name: TESSERA_WORKER_ID

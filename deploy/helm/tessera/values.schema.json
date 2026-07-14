@@ -5,6 +5,7 @@
   "required": [
     "image",
     "logLevel",
+    "logFormat",
     "auth",
     "gateway",
     "orchestrator",
@@ -48,6 +49,10 @@
     "logLevel": {
       "type": "string",
       "minLength": 1
+    },
+    "logFormat": {
+      "type": "string",
+      "enum": ["compact", "json"]
     },
     "auth": {
       "type": "object",

@@ -31,6 +31,7 @@ class RenderCase:
     worker_cells: tuple[tuple[dict[str, int], ...], ...]
     gateway_replicas: int
     persistence: bool
+    log_format: str
     values_file: Path | None = None
 
 
@@ -44,6 +45,7 @@ CASES = (
         worker_cells=(({"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},),),
         gateway_replicas=1,
         persistence=False,
+        log_format="compact",
     ),
     RenderCase(
         name="scale-out",
@@ -58,6 +60,7 @@ CASES = (
         ),
         gateway_replicas=2,
         persistence=True,
+        log_format="json",
         values_file=SCALE_VALUES,
     ),
 )
@@ -176,6 +179,10 @@ def validate_case(case: RenderCase, rendered: str) -> None:
         require("automountServiceAccountToken: false" in document, f"{case.name}: service account token mount enabled")
         require("readinessProbe:" in document, f"{case.name}: missing readiness probe")
         require("livenessProbe:" in document, f"{case.name}: missing liveness probe")
+        require(
+            f'- name: TESSERA_LOG_FORMAT\n              value: "{case.log_format}"' in document,
+            f"{case.name}: runtime log format drifted",
+        )
 
     expected_secret_refs = 1 + len(case.worker_names)
     require(rendered.count("secretKeyRef:") == expected_secret_refs, f"{case.name}: runtime Secret reference count drifted")
@@ -231,6 +238,7 @@ def validate_case(case: RenderCase, rendered: str) -> None:
 def validate_negative_cases() -> None:
     base = ["helm", "template", "tessera-negative", str(CHART)]
     run([*base, "--set", "unexpected=true"], expect_success=False)
+    run([*base, "--set", "logFormat=JSON"], expect_success=False)
     run(
         [
             *base,

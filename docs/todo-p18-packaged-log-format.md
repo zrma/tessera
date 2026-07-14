@@ -34,12 +34,15 @@ collector, retention policy, or environment-specific inventory.
    - Record the P17-to-packaging mismatch and make P18 the active boundary.
    - Keep automatic handover policy, production telemetry, and live cluster
      operation outside this milestone.
-2. **Helm schema and render parity**
+2. **Complete: Helm schema and render parity**
    - Add a `compact|json` value with compact default and exact schema enum.
    - Render `TESSERA_LOG_FORMAT` into every Gateway, Worker, and Orchestrator
      container.
    - Extend deterministic render validation across the default compact case,
      an opt-in JSON case, and an invalid-value negative case.
+   - Evidence: the default fixture renders exact `compact` values into every
+     runtime Deployment, the scale-out fixture does the same for `json`, and
+     the packaging gate rejects case-drifted or unsupported values.
 3. **Example surface parity**
    - Expose a compact-default caller override in Docker Compose.
    - Make the static Kubernetes sample explicit about compact output for all

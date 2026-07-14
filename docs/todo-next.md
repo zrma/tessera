@@ -128,7 +128,7 @@ P17 runtime trace correlation queue:
 P18 packaged log-format parity queue:
 
 1. Complete: contract, gap review, non-goals, and milestone evidence map.
-2. Pending: Helm compact/JSON schema, all-runtime environment wiring, positive
+2. Complete: Helm compact/JSON schema, all-runtime environment wiring, positive
    render matrix, and invalid-value rejection.
 3. Pending: Docker Compose and static Kubernetes sample parity with drift
    validation.

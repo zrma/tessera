@@ -58,6 +58,8 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            - name: TESSERA_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
             - name: TESSERA_ORCH_ADDR
               value: {{ printf "0.0.0.0:%v" .Values.orchestrator.servicePort | quote }}
             - name: TESSERA_ORCH_CONFIG

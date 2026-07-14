@@ -1,3 +1,5 @@
+logFormat: json
+
 gateway:
   replicaCount: 2
 
