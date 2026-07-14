@@ -329,6 +329,10 @@ Rollback rules:
   attempted.
 - A target Worker must reject replay for cells it neither owns nor has been
   explicitly staged to own by the active split operation.
+- A source Worker validates an unpublished replay target against the current
+  Orchestrator Worker identity/address directory. If an active cell route
+  already exists, that exact route takes precedence. This keeps pre-publish
+  cells private without accepting a stale or command-supplied endpoint.
 - AOI subscriptions must be recalculated after a split/merge assignment update.
 - Planner output must be reproducible from the same metrics snapshot and config.
 

@@ -56,6 +56,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - Durable Orchestrator assignments accept configured empty Worker additions and
   removal of drained Worker identities across restart, while rejecting new
   static assignments or removed identities that still own cells.
+- Worker replay validates unpublished split/merge targets through the current
+  listing identity/address directory, while an already published cell route
+  remains the stricter source of truth.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

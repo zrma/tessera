@@ -62,6 +62,10 @@ ownership boundaries and default-off mutation gates.
      identity, and the active session reconnects to the replacement endpoint.
    - Existing identity replacement and stale-refresh guards remain green, so
      watch updates cannot be overwritten by an older snapshot.
+   - Split child and merge parent replay targets remain unpublished during
+     staging, while Workers validate their identities and addresses against the
+     current listing directory rather than requiring an impossible active cell
+     route.
 3. **Assignment-state compatibility (complete)**
    - Configured empty Worker additions and removal of drained persisted Workers
      are compatible across Orchestrator restart.
@@ -106,6 +110,10 @@ Route convergence is covered by:
 - `route_change_reconnects_to_new_worker`
 - `route_change_after_non_ping_reconnects_with_stable_session`
 - `refresh_skips_stale_snapshot_after_watch_update`
+- `worker_directory_from_listing_keeps_empty_and_self_workers`
+- `replay_target_uses_worker_directory_before_cell_publish`
+- `cargo xt dev activation-restart-smoke`
+- `cargo xt dev merge-activation-cross-worker-smoke`
 
 Assignment-state compatibility is covered by:
 

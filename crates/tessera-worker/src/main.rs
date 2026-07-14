@@ -94,6 +94,7 @@ type RemoteActorCache = HashMap<CellId, HashMap<EntityId, Position>>;
 type PendingMoveQueues = HashMap<CellId, HashMap<EntityId, PendingMoveBroadcast>>;
 type OwnedActors = HashSet<(CellId, EntityId)>;
 type PeerRoutes = HashMap<CellId, PeerRoute>;
+type WorkerDirectory = HashMap<String, String>;
 type RemoteInterestMap = HashMap<u64, HashMap<CellId, PeerRoute>>;
 type RemotePeerSessionMap = HashMap<String, RemotePeerSessionHandle>;
 type HandoverPolicyMap = HashMap<CellId, HandoverCellPolicy>;
@@ -242,6 +243,7 @@ struct SharedState {
     pending_moves: Mutex<PendingMoveQueues>,
     client_sessions: Mutex<HashMap<u64, ClientSession>>,
     peer_routes: RwLock<PeerRoutes>,
+    worker_directory: RwLock<WorkerDirectory>,
     remote_interests: Mutex<RemoteInterestMap>,
     remote_peer_sessions: Mutex<RemotePeerSessionMap>,
     handover_policies: RwLock<HandoverPolicyMap>,
@@ -312,6 +314,7 @@ impl SharedState {
             pending_moves: Mutex::new(HashMap::new()),
             client_sessions: Mutex::new(HashMap::new()),
             peer_routes: RwLock::new(HashMap::new()),
+            worker_directory: RwLock::new(HashMap::new()),
             remote_interests: Mutex::new(HashMap::new()),
             remote_peer_sessions: Mutex::new(HashMap::new()),
             handover_policies: RwLock::new(HashMap::new()),
@@ -723,6 +726,15 @@ impl SharedState {
         true
     }
 
+    async fn update_worker_directory(&self, directory: WorkerDirectory) -> bool {
+        let mut worker_directory = self.worker_directory.write().await;
+        if *worker_directory == directory {
+            return false;
+        }
+        *worker_directory = directory;
+        true
+    }
+
     async fn peer_route_for(&self, cell: CellId) -> Option<PeerRoute> {
         let peer_routes = self.peer_routes.read().await;
         peer_routes.get(&cell).cloned()
@@ -735,25 +747,39 @@ impl SharedState {
         target_addr: &str,
         label: &str,
     ) -> Result<PeerRoute, String> {
-        let Some(route) = self.peer_route_for(cell).await else {
+        if let Some(route) = self.peer_route_for(cell).await {
+            if route.worker_id != target_worker_id {
+                return Err(format!(
+                    "{label} target cell {:?} route worker {} does not match requested worker {}",
+                    cell, route.worker_id, target_worker_id
+                ));
+            }
+            if route.addr != target_addr {
+                return Err(format!(
+                    "{label} target cell {:?} route addr {} does not match requested addr {}",
+                    cell, route.addr, target_addr
+                ));
+            }
+            return Ok(route);
+        }
+
+        let worker_directory = self.worker_directory.read().await;
+        let Some(current_addr) = worker_directory.get(target_worker_id) else {
             return Err(format!(
-                "{label} target cell {:?} has no current peer route",
-                cell
+                "{label} target cell {:?} has no current route or worker directory entry for {}",
+                cell, target_worker_id
             ));
         };
-        if route.worker_id != target_worker_id {
+        if current_addr != target_addr {
             return Err(format!(
-                "{label} target cell {:?} route worker {} does not match requested worker {}",
-                cell, route.worker_id, target_worker_id
+                "{label} target cell {:?} directory addr {} does not match requested addr {} for worker {}",
+                cell, current_addr, target_addr, target_worker_id
             ));
         }
-        if route.addr != target_addr {
-            return Err(format!(
-                "{label} target cell {:?} route addr {} does not match requested addr {}",
-                cell, route.addr, target_addr
-            ));
-        }
-        Ok(route)
+        Ok(PeerRoute {
+            worker_id: target_worker_id.to_string(),
+            addr: current_addr.clone(),
+        })
     }
 
     async fn update_handover_policies(
@@ -2200,8 +2226,10 @@ async fn apply_peer_routes_update(
 ) -> Result<bool> {
     let updated_owned_cells = owned_cells_from_listing(&listing, worker_id)?;
     let routes = peer_routes_from_listing(&listing, worker_id)?;
+    let worker_directory = worker_directory_from_listing(&listing)?;
     let policies = handover_policies_from_listing(&listing, worker_id)?;
     let route_count = routes.len();
+    let worker_count = worker_directory.len();
     let updated_owned_count = updated_owned_cells.len();
     let (owned_changed, removed_owned_cells, added_owned_cells) = {
         let mut guard = owned_cells.write().await;
@@ -2220,6 +2248,7 @@ async fn apply_peer_routes_update(
         (changed, removed, added)
     };
     let routes_changed = state.update_peer_routes(routes).await;
+    let directory_changed = state.update_worker_directory(worker_directory).await;
     let (policies_changed, released_policies) = state.update_handover_policies(policies).await;
     if !added_owned_cells.is_empty() {
         state.clear_prepared_cells(&added_owned_cells).await;
@@ -2294,7 +2323,16 @@ async fn apply_peer_routes_update(
         }
     }
 
-    Ok(routes_changed || policies_changed || owned_changed)
+    if directory_changed {
+        info!(
+            target: "worker",
+            worker_id,
+            workers = worker_count,
+            "worker identity directory updated from orchestrator listing"
+        );
+    }
+
+    Ok(routes_changed || directory_changed || policies_changed || owned_changed)
 }
 
 fn same_worker_merge_coalesces(
@@ -2403,6 +2441,29 @@ fn peer_routes_from_listing(
         }
     }
     Ok(routes)
+}
+
+fn worker_directory_from_listing(listing: &AssignmentListing) -> Result<WorkerDirectory> {
+    let mut directory = HashMap::new();
+    for bundle in &listing.workers {
+        let worker_id = bundle.worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!("worker directory contains empty worker id"));
+        }
+        let addr = bundle.addr.trim();
+        if addr.is_empty() {
+            return Err(anyhow!("worker addr empty for {worker_id}"));
+        }
+        if directory
+            .insert(worker_id.to_string(), addr.to_string())
+            .is_some()
+        {
+            return Err(anyhow!(
+                "worker directory contains duplicate worker id {worker_id}"
+            ));
+        }
+    }
+    Ok(directory)
 }
 
 fn handover_policies_from_listing(
@@ -6548,6 +6609,81 @@ mod tests {
             })
         );
         assert!(!routes.contains_key(&CellId::grid(0, 0, 0)));
+    }
+
+    #[test]
+    fn worker_directory_from_listing_keeps_empty_and_self_workers() {
+        let listing = AssignmentListing {
+            workers: vec![
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-a".into(),
+                    addr: "127.0.0.1:5001".into(),
+                    cells: vec![Assignment {
+                        world: 0,
+                        cx: 0,
+                        cy: 0,
+                        depth: 0,
+                        sub: 0,
+                    }],
+                },
+                tessera_proto::orch::v1::AssignmentBundle {
+                    worker_id: "worker-b".into(),
+                    addr: "127.0.0.1:5002".into(),
+                    cells: Vec::new(),
+                },
+            ],
+            handovers: vec![],
+        };
+
+        let directory = worker_directory_from_listing(&listing).expect("worker directory");
+        assert_eq!(
+            directory,
+            HashMap::from([
+                ("worker-a".to_string(), "127.0.0.1:5001".to_string()),
+                ("worker-b".to_string(), "127.0.0.1:5002".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_target_uses_worker_directory_before_cell_publish() {
+        let state = SharedState::default();
+        state
+            .update_worker_directory(HashMap::from([
+                ("worker-a".to_string(), "127.0.0.1:5001".to_string()),
+                ("worker-b".to_string(), "127.0.0.1:5002".to_string()),
+            ]))
+            .await;
+        let unpublished_child = CellId {
+            world: 0,
+            cx: 0,
+            cy: 0,
+            depth: 1,
+            sub: 1,
+        };
+
+        let route = state
+            .validated_peer_route_for(
+                unpublished_child,
+                "worker-b",
+                "127.0.0.1:5002",
+                "split replay",
+            )
+            .await
+            .expect("validate unpublished replay target");
+        assert_eq!(route.worker_id, "worker-b");
+        assert_eq!(route.addr, "127.0.0.1:5002");
+
+        let err = state
+            .validated_peer_route_for(
+                unpublished_child,
+                "worker-b",
+                "127.0.0.1:5999",
+                "split replay",
+            )
+            .await
+            .expect_err("reject stale replay address");
+        assert!(err.contains("directory addr"));
     }
 
     #[test]
