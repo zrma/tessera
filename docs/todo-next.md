@@ -49,9 +49,12 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-P15 is closed in `docs/todo-p15-simulation-harness.md`. The next milestone
-should be selected from a fresh architecture/backlog review and recorded as a
-separate planning change.
+P15 is closed in `docs/todo-p15-simulation-harness.md`. A fresh architecture
+and backlog review found that P10 already owns long-running observability and
+soak evidence, while P15's repository smoke still exercises only one root cell
+on the default Worker. P16 is therefore active in
+`docs/todo-p16-distributed-simulation.md` and extends deterministic simulation
+to multiple cell owners plus stable-identity address convergence.
 
 P13 closure:
 
@@ -95,6 +98,16 @@ P15 deterministic simulation harness queue:
 4. Complete: `cargo xt dev simulation-smoke` starts the local stack, executes a
    fixed four-client profile, validates the privacy-safe result, tears down, and
    runs in CI.
+
+P16 distributed simulation and topology convergence queue:
+
+1. Pending: deterministic cell-level completion aggregates in
+   `tessera.sim.result.v1`.
+2. Pending: bounded two-Worker/two-cell simulator smoke through one Gateway.
+3. Pending: repeat the exact plan after a stable Worker identity changes its
+   advertised address and routing converges.
+4. Pending: CI/harness integration, command documentation, and milestone
+   closeout.
 
 ## Guardrails
 

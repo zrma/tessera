@@ -11,8 +11,8 @@ operations stack.
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
 - Current state: P0 through P15 runtime/evidence/packaging, hardening, and
-  deterministic simulation gates are complete. The next open boundary is
-  selected in `docs/todo-next.md`.
+  deterministic simulation gates are complete. P16 distributed simulation and
+  topology convergence is active in `docs/todo-next.md`.
 
 ## Workspace
 
@@ -35,7 +35,7 @@ operations stack.
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
-- Latest completed milestone: `docs/todo-p15-simulation-harness.md`
+- Active milestone: `docs/todo-p16-distributed-simulation.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
