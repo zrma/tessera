@@ -84,6 +84,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - P15's repository smoke covers one root cell on the default Worker. P16 owns
   the still-open evidence for deterministic per-cell result coverage, a
   two-Worker workload, and stable-identity advertised-address convergence.
+- `cargo xt dev distributed-simulation-smoke` starts an isolated two-Worker
+  topology with two statically assigned root cells, validates complete
+  canonical cell coverage through one Gateway, and requires both Workers'
+  accepted-connection counters to grow by their planned client counts.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

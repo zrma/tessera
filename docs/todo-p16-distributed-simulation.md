@@ -42,12 +42,14 @@ execution, or live-service operations policy.
      plan/summary totals before emitting a result.
    - Runtime-free tests cover complete and partial-failure multi-cell results,
      ambiguous inputs, round-trip serialization, and privacy shape.
-2. **Two-Worker distributed simulation smoke**
-   - Add `cargo xt dev distributed-simulation-smoke` with two root cells owned
-     by distinct Workers and routed through one Gateway.
-   - Run a fixed bounded simulator plan across both cells and verify complete
-     cell coverage, clean failure classes, Gateway route count, and evidence
-     that both Workers accepted the planned sessions.
+2. **Two-Worker distributed simulation smoke (complete)**
+   - `cargo xt dev distributed-simulation-smoke` owns an isolated local
+     Orchestrator, Gateway, and two Workers with one root cell per owner.
+   - The fixed four-client and sixteen-operation plan completes canonical
+     coverage for both cells with clean failure classes and two Gateway routes.
+   - Before/after Worker metrics require each owner to accept at least its two
+     planned client sessions; focused validator fixtures reject incomplete or
+     reordered cell coverage.
 3. **Advertised-address convergence under workload**
    - Replace the second Worker's local address while retaining its identity and
      assigned cell, wait for Orchestrator/Gateway convergence, and rerun the

@@ -30,6 +30,7 @@ cargo xt dev up --with-orch
 cargo xt dev logs --target all --follow
 cargo xt dev down --with-orch
 cargo xt dev simulation-smoke
+cargo xt dev distributed-simulation-smoke
 ```
 
 Useful client commands:
@@ -58,6 +59,12 @@ classified failures, elapsed time, throughput, operation latency percentiles in
 microseconds, the caller's thresholds, and stable threshold violations. It does
 not retain the target address or raw network errors. Threshold failure returns a
 non-zero exit after writing the result to stdout.
+
+`cargo xt dev distributed-simulation-smoke` owns an isolated Orchestrator,
+Gateway, and two-Worker stack. It assigns two root cells to distinct Worker
+identities, runs the fixed four-client profile across both cells, validates
+canonical complete cell coverage, and proves both Workers accepted the planned
+sessions before tearing the stack down.
 
 ## Metrics And Readiness
 

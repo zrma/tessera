@@ -103,7 +103,8 @@ P16 distributed simulation and topology convergence queue:
 
 1. Complete: deterministic cell-level completion aggregates in
    `tessera.sim.result.v1`.
-2. Pending: bounded two-Worker/two-cell simulator smoke through one Gateway.
+2. Complete: bounded two-Worker/two-cell simulator smoke through one Gateway,
+   including complete cell coverage and per-Worker connection evidence.
 3. Pending: repeat the exact plan after a stable Worker identity changes its
    advertised address and routing converges.
 4. Pending: CI/harness integration, command documentation, and milestone

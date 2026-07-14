@@ -1334,6 +1334,8 @@ enum DevSub {
     MetricsSmoke,
     /// Start the local stack and validate a bounded simulator JSON result
     SimulationSmoke,
+    /// Start a two-Worker stack and validate bounded simulator traffic across both cells
+    DistributedSimulationSmoke,
     /// Start a two-worker dev stack and prove manual split activation converges
     ActivationSmoke,
     /// Start a two-worker dev stack and prove post-publish failure is detected and recoverable
@@ -2575,6 +2577,7 @@ fn main() -> Result<()> {
             } => dev_logs(&target, follow, lines)?,
             DevSub::MetricsSmoke => dev_metrics_smoke()?,
             DevSub::SimulationSmoke => dev_simulation_smoke()?,
+            DevSub::DistributedSimulationSmoke => dev_distributed_simulation_smoke()?,
             DevSub::ActivationSmoke => dev_activation_smoke()?,
             DevSub::ActivationFailureSmoke => dev_activation_failure_smoke()?,
             DevSub::ActivationRestartSmoke => dev_activation_restart_smoke()?,
@@ -3341,23 +3344,183 @@ fn dev_simulation_smoke() -> Result<()> {
     Ok(())
 }
 
-fn run_simulation_smoke_command() -> Result<()> {
+fn dev_distributed_simulation_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4740";
+    let gateway_metrics_addr = "127.0.0.1:4741";
+    let worker_a_addr = "127.0.0.1:5741";
+    let worker_b_addr = "127.0.0.1:5742";
+    let worker_a_metrics_addr = "127.0.0.1:5743";
+    let worker_b_metrics_addr = "127.0.0.1:5744";
+    let orch_addr = "127.0.0.1:6740";
+    let orch_metrics_addr = "127.0.0.1:6741";
+    let orch_endpoint = format!("http://{orch_addr}");
     let root = workspace_root();
-    let simulator = root.join("target/debug/tessera-sim");
+    let (_dev, logs, pids) = dev_dirs();
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&pids)?;
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-sim",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[{{"world":0,"cx":1,"cy":0}}]}}]}}"#
+    );
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "distributed-simulation-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+                ("TESSERA_ORCH_METRICS_ADDR", orch_metrics_addr),
+                ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "distributed-simulation-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_a_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "distributed-simulation-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_METRICS_ADDR", worker_b_metrics_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "distributed-simulation-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", rust_log.as_str()),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 2)?;
+
+    let worker_a_before = assert_metrics_endpoint_body(
+        "distributed simulation worker-a",
+        worker_a_metrics_addr,
+        &["tessera_worker_accepted_connections_total"],
+    )?;
+    let worker_b_before = assert_metrics_endpoint_body(
+        "distributed simulation worker-b",
+        worker_b_metrics_addr,
+        &["tessera_worker_accepted_connections_total"],
+    )?;
+    let worker_a_connections_before = prometheus_sample_value(
+        &worker_a_before,
+        "tessera_worker_accepted_connections_total",
+    )?;
+    let worker_b_connections_before = prometheus_sample_value(
+        &worker_b_before,
+        "tessera_worker_accepted_connections_total",
+    )?;
+
+    let result = run_simulation_smoke_profile(gateway_addr, 2)?;
+    validate_distributed_simulation_smoke_result(&result)?;
+
+    assert_prometheus_sample_at_least_until(
+        "distributed simulation worker-a",
+        worker_a_metrics_addr,
+        "tessera_worker_accepted_connections_total",
+        worker_a_connections_before + 2.0,
+    )?;
+    assert_prometheus_sample_at_least_until(
+        "distributed simulation worker-b",
+        worker_b_metrics_addr,
+        "tessera_worker_accepted_connections_total",
+        worker_b_connections_before + 2.0,
+    )?;
+
+    println!("distributed simulation smoke: two cells completed through distinct Worker owners");
+    Ok(())
+}
+
+fn run_simulation_smoke_command() -> Result<()> {
     let gateway_addr =
         std::env::var("TESSERA_GW_ADDR").unwrap_or_else(|_| "127.0.0.1:4000".to_string());
+    let result = run_simulation_smoke_profile(&gateway_addr, 1)?;
+    validate_simulation_smoke_result(&result)
+}
+
+fn run_simulation_smoke_profile(gateway_addr: &str, cells: u32) -> Result<serde_json::Value> {
+    let root = workspace_root();
+    let simulator = root.join("target/debug/tessera-sim");
+    let cells = cells.to_string();
     let output = Command::new(simulator)
         .current_dir(&root)
         .args([
             "run",
             "--addr",
-            &gateway_addr,
+            gateway_addr,
             "--seed",
             "7",
             "--clients",
             "4",
             "--cells",
-            "1",
+            &cells,
             "--moves-per-client",
             "2",
             "--operation-timeout-ms",
@@ -3371,14 +3534,20 @@ fn run_simulation_smoke_command() -> Result<()> {
         .output()?;
     let result: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("parse tessera-sim smoke JSON output")?;
-    validate_simulation_smoke_result(&result)?;
     if !output.status.success() {
         bail!("tessera-sim smoke command returned a failing status");
     }
-    Ok(())
+    Ok(result)
 }
 
 fn validate_simulation_smoke_result(result: &serde_json::Value) -> Result<()> {
+    validate_simulation_smoke_profile(result, 1)
+}
+
+fn validate_simulation_smoke_profile(
+    result: &serde_json::Value,
+    expected_cells: u64,
+) -> Result<()> {
     if json_str(result, &["schema_version"])? != "tessera.sim.result.v1" {
         bail!("simulation smoke result has an unexpected schema version");
     }
@@ -3387,7 +3556,7 @@ fn validate_simulation_smoke_result(result: &serde_json::Value) -> Result<()> {
     }
     for (path, expected) in [
         (&["client_count"][..], 4),
-        (&["cell_count"][..], 1),
+        (&["cell_count"][..], expected_cells),
         (&["operations_planned"][..], 16),
         (&["operations_completed"][..], 16),
         (&["completed_clients"][..], 4),
@@ -3421,6 +3590,44 @@ fn validate_simulation_smoke_result(result: &serde_json::Value) -> Result<()> {
     }
     if json_contains_key(result, "addr") || json_contains_key(result, "address") {
         bail!("simulation smoke result must not retain target addresses");
+    }
+    if json_contains_key(result, "actor_id") {
+        bail!("simulation smoke result must not retain actor-level records");
+    }
+    if json_contains_key(result, "raw_error") {
+        bail!("simulation smoke result must not retain raw errors");
+    }
+    Ok(())
+}
+
+fn validate_distributed_simulation_smoke_result(result: &serde_json::Value) -> Result<()> {
+    validate_simulation_smoke_profile(result, 2)?;
+    let coverage = json_array(result, &["cell_coverage"])?;
+    if coverage.len() != 2 {
+        bail!(
+            "distributed simulation smoke expected 2 cell coverage entries, got {}",
+            coverage.len()
+        );
+    }
+    for (entry, expected_cx) in coverage.iter().zip([0_i64, 1_i64]) {
+        let cell = json_cell_id(entry, &["cell"])?;
+        if cell != CellId::grid(0, expected_cx as i32, 0) {
+            bail!("distributed simulation smoke cell coverage is not canonical");
+        }
+        for (field, expected) in [
+            ("clients_planned", 2),
+            ("clients_completed", 2),
+            ("clients_failed", 0),
+            ("operations_planned", 8),
+            ("operations_completed", 8),
+        ] {
+            let actual = json_u64(entry, &[field])?;
+            if actual != expected {
+                bail!(
+                    "distributed simulation smoke cell {expected_cx} field {field} expected {expected}, got {actual}"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -39940,6 +40147,30 @@ mod tests {
         })
     }
 
+    fn complete_distributed_simulation_smoke_result() -> serde_json::Value {
+        let mut result = complete_simulation_smoke_result();
+        result["cell_count"] = serde_json::json!(2);
+        result["cell_coverage"] = serde_json::json!([
+            {
+                "cell": {"world": 0, "cx": 0, "cy": 0, "depth": 0, "sub": 0},
+                "clients_planned": 2,
+                "clients_completed": 2,
+                "clients_failed": 0,
+                "operations_planned": 8,
+                "operations_completed": 8
+            },
+            {
+                "cell": {"world": 0, "cx": 1, "cy": 0, "depth": 0, "sub": 0},
+                "clients_planned": 2,
+                "clients_completed": 2,
+                "clients_failed": 0,
+                "operations_planned": 8,
+                "operations_completed": 8
+            }
+        ]);
+        result
+    }
+
     #[test]
     fn simulation_smoke_result_accepts_complete_privacy_safe_output() {
         validate_simulation_smoke_result(&complete_simulation_smoke_result())
@@ -39959,6 +40190,32 @@ mod tests {
         let err =
             validate_simulation_smoke_result(&leaked).expect_err("target address must be rejected");
         assert!(err.to_string().contains("addresses"));
+    }
+
+    #[test]
+    fn distributed_simulation_smoke_result_accepts_complete_cell_coverage() {
+        validate_distributed_simulation_smoke_result(
+            &complete_distributed_simulation_smoke_result(),
+        )
+        .expect("complete distributed simulation result");
+    }
+
+    #[test]
+    fn distributed_simulation_smoke_result_rejects_incomplete_or_reordered_coverage() {
+        let mut incomplete = complete_distributed_simulation_smoke_result();
+        incomplete["cell_coverage"][1]["clients_completed"] = serde_json::json!(1);
+        let err = validate_distributed_simulation_smoke_result(&incomplete)
+            .expect_err("incomplete cell coverage must be rejected");
+        assert!(err.to_string().contains("clients_completed"));
+
+        let mut reordered = complete_distributed_simulation_smoke_result();
+        reordered["cell_coverage"]
+            .as_array_mut()
+            .expect("coverage array")
+            .reverse();
+        let err = validate_distributed_simulation_smoke_result(&reordered)
+            .expect_err("reordered cell coverage must be rejected");
+        assert!(err.to_string().contains("canonical"));
     }
 
     #[test]
