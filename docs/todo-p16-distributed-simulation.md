@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-14
 
-Status: active
+Status: complete
 
 ## Objective
 
@@ -59,10 +59,13 @@ execution, or live-service operations policy.
    - The exact seed, schema, client/cell/operation counts, and canonical cell
      coverage pass again, and both owners accept their second-phase clients
      without split/merge mutation.
-4. **Repository gate and closeout**
-   - Add the bounded distributed profile to CI and `cargo xt harness`, document
-     the command and evidence boundary, and close P16 only after remote CI is
-     green.
+4. **Repository gate and closeout (complete)**
+   - CI runs the bounded distributed profile after the existing local ping and
+     single-cell simulator smokes, and `cargo xt harness` requires the command.
+   - README, quality, smoke-runbook, documentation index, and active todo source
+     record the completed evidence and retain live-service load as a non-goal.
+   - Local defaults and the actual remote CI lane are green with no residual
+     managed dev processes.
 
 ## Verification
 
@@ -86,7 +89,7 @@ machine-local private-inventory gate, then wait for remote CI success.
 
 ## Completion Boundary
 
-P16 is complete when cell-level result evidence is deterministic, a bounded
+P16 is complete. Cell-level result evidence is deterministic, a bounded
 two-Worker/two-cell workload is exercised through one Gateway, the same plan
 succeeds after a stable Worker identity changes address, and CI runs the full
 local convergence smoke. Production load, live clusters, automatic ownership

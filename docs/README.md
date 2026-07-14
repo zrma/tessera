@@ -25,7 +25,7 @@ find deeper runbooks.
 `todo-next.md` is the active open-work index. P12 read-only operator evidence,
 P13 portable Kubernetes packaging, P14 runtime hardening, and P15 deterministic
 simulation harness work are closed. P16 distributed simulation and topology
-convergence is active there.
+convergence is also closed; the next boundary is selected there.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -46,15 +46,15 @@ or completion audit.
 | P13 Kubernetes packaging template | Complete; portable chart and render gate | `todo-p13-k8s-packaging.md` |
 | P14 runtime hardening | Complete; packet, route/state, replay, and planner hardening | `todo-p14-runtime-hardening.md` |
 | P15 deterministic simulation harness | Complete; plans, bounded execution, result gates, and CI smoke | `todo-p15-simulation-harness.md` |
-| P16 distributed simulation and topology convergence | Active; cell coverage, two-Worker workload, address convergence, and CI gate | `todo-p16-distributed-simulation.md` |
+| P16 distributed simulation and topology convergence | Complete; cell coverage, two-Worker workload, address convergence, and CI gate | `todo-p16-distributed-simulation.md` |
 
 The P6/P7/P8/P9/P10/P11 documents are retained because they define evidence
 contracts, report shapes, and completion gates. P12 records a completed
 read-only support packet. P13 records the completed portable packaging
 boundary, P14 records the completed runtime-hardening evidence, and P15 records
-the completed simulator contract. P16 owns the active distributed simulator
-evidence. Older milestone docs should not be treated as active TODO lists
-unless `todo-next.md` explicitly reopens a boundary.
+the completed simulator contract. P16 records the completed distributed
+simulator evidence. Older milestone docs should not be treated as active TODO
+lists unless `todo-next.md` explicitly reopens a boundary.
 
 ## Design Notes
 

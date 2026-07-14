@@ -2914,6 +2914,7 @@ fn check_harness_docs(root: &Path) -> Result<()> {
                 "cargo xt dev up --with-orch",
                 "cargo run -p tessera-client -- ping --ts 123",
                 "cargo xt dev simulation-smoke",
+                "cargo xt dev distributed-simulation-smoke",
                 "cargo xt dev down --with-orch",
             ],
         ),
@@ -18119,7 +18120,7 @@ impl ManagedDevProcess {
         }
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.pid_path);
-        println!("dev activation smoke: stopped {}", self.name);
+        println!("dev managed stack: stopped {}", self.name);
     }
 }
 

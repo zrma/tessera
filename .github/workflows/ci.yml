@@ -39,3 +39,4 @@ jobs:
           cargo run -p tessera-client -- ping --ts 123
           cargo xt dev down --with-orch
           cargo xt dev simulation-smoke
+          cargo xt dev distributed-simulation-smoke

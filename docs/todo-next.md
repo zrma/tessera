@@ -39,7 +39,8 @@ Last reviewed: 2026-07-14
   policy remain outside this repository.
 - P12 read-only operator evidence is complete as a historical support packet.
   P13 portable Kubernetes packaging, P14 runtime hardening, and P15
-  deterministic simulation harness work are complete.
+  deterministic simulation harness work are complete. P16 distributed
+  simulation and topology convergence is complete.
 
 ## Next
 
@@ -49,12 +50,11 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-P15 is closed in `docs/todo-p15-simulation-harness.md`. A fresh architecture
-and backlog review found that P10 already owns long-running observability and
-soak evidence, while P15's repository smoke still exercises only one root cell
-on the default Worker. P16 is therefore active in
-`docs/todo-p16-distributed-simulation.md` and extends deterministic simulation
-to multiple cell owners plus stable-identity address convergence.
+P16 is closed in `docs/todo-p16-distributed-simulation.md`. It extends
+deterministic simulation to multiple cell owners plus stable-identity address
+convergence and runs the bounded profile in CI. The next milestone should be
+selected from a fresh architecture/backlog review and recorded as a separate
+planning change.
 
 P13 closure:
 
@@ -108,7 +108,7 @@ P16 distributed simulation and topology convergence queue:
 3. Complete: repeat the exact plan after a stable Worker identity changes its
    advertised address, with unchanged ownership plus Orchestrator listing and
    Gateway routing-version convergence.
-4. Pending: CI/harness integration, command documentation, and milestone
+4. Complete: CI/harness integration, command documentation, and milestone
    closeout.
 
 ## Guardrails

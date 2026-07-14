@@ -10,9 +10,9 @@ operations stack.
 
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
-- Current state: P0 through P15 runtime/evidence/packaging, hardening, and
-  deterministic simulation gates are complete. P16 distributed simulation and
-  topology convergence is active in `docs/todo-next.md`.
+- Current state: P0 through P16 runtime/evidence/packaging, hardening,
+  deterministic simulation, and distributed topology-convergence gates are
+  complete. The next open boundary is selected in `docs/todo-next.md`.
 
 ## Workspace
 
@@ -35,7 +35,7 @@ operations stack.
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
-- Active milestone: `docs/todo-p16-distributed-simulation.md`
+- Latest completed milestone: `docs/todo-p16-distributed-simulation.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -124,18 +124,19 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
 - Portable P13 Helm packaging for Gateway, Worker, and Orchestrator with
   schema-checked values, deterministic default/scale-out renders, explicit
   namespace and Secret-reference boundaries, probes, and optional state mounts.
-- P14 packet/route/state/planner hardening and the P15 deterministic simulator
-  with bounded clients, classified failures, versioned aggregate results,
-  caller-owned gates, and a CI full-stack smoke.
+- P14 packet/route/state/planner hardening, the P15 deterministic simulator,
+  and P16 distributed simulation across two cell owners with cell-level result
+  evidence, stable-identity address convergence, and bounded CI smoke gates.
 
 ### Latest Closed Boundary
 
-P15 turned the existing `tessera-sim` placeholder into a bounded,
-deterministic player and load simulation harness with network-free planning,
-independent Gateway sessions, `tessera.sim.result.v1`, and the repo-native
-`cargo xt dev simulation-smoke` CI gate. Its completed evidence map is in
-`docs/todo-p15-simulation-harness.md`; the next boundary is tracked in
-`docs/todo-next.md`.
+P16 extends the deterministic simulator result with canonical per-cell
+coverage and adds `cargo xt dev distributed-simulation-smoke`. The bounded
+full-stack gate routes the same two-cell profile through distinct Workers,
+replaces one Worker's advertised address without changing identity or
+ownership, waits for Orchestrator/Gateway convergence, and reruns the profile.
+Its completed evidence map is in `docs/todo-p16-distributed-simulation.md`; the
+next boundary is tracked in `docs/todo-next.md`.
 
 ## Protocol Snapshot
 
@@ -171,10 +172,11 @@ independent Gateway sessions, `tessera.sim.result.v1`, and the repo-native
   crate dependency boundaries.
 - `cargo xt` runs fmt, clippy, check, and harness.
 - `cargo test` remains the broad Rust test gate.
-- CI runs `cargo xt`, `cargo test`, the local dev ping smoke, and the bounded
-  simulator smoke with
+- CI runs `cargo xt`, `cargo test`, the local dev ping smoke, and both bounded
+  simulator smokes with
   `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`,
-  `cargo xt dev down --with-orch`, and `cargo xt dev simulation-smoke`.
+  `cargo xt dev down --with-orch`, `cargo xt dev simulation-smoke`, and
+  `cargo xt dev distributed-simulation-smoke`.
 
 ## Design Overview
 

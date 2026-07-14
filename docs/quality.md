@@ -81,16 +81,17 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - `cargo xt dev simulation-smoke` owns local stack startup/teardown, runs a
   fixed four-client profile, and validates complete/privacy-safe simulator JSON.
   CI runs this bounded profile after the existing client ping smoke.
-- P15's repository smoke covers one root cell on the default Worker. P16 owns
-  the still-open evidence for deterministic per-cell result coverage, a
-  two-Worker workload, and stable-identity advertised-address convergence.
+- P15's repository smoke covers one root cell on the default Worker. P16 closes
+  deterministic per-cell result coverage, a two-Worker workload, and
+  stable-identity advertised-address convergence.
 - `cargo xt dev distributed-simulation-smoke` starts an isolated two-Worker
   topology with two statically assigned root cells, validates complete
   canonical cell coverage through one Gateway, and requires both Workers'
   accepted-connection counters to grow by their planned client counts. The
   command replaces one Worker's advertised address without changing identity
   or ownership, waits for listing/routing-version convergence, and reruns the
-  same deterministic plan successfully.
+  same deterministic plan successfully. CI runs this bounded profile after the
+  existing client ping and single-cell simulator smokes.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy
