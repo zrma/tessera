@@ -55,7 +55,7 @@ correlation regression lane.
      that context; Worker responses emit only after a direct reply is written.
      Focused tests and an opt-in JSON metrics smoke proved one ordered lifecycle
      per Join/Move request with the exact allowed field set.
-3. **Two-Worker trace correlation smoke**
+3. **Complete: two-Worker trace correlation smoke**
    - Add `cargo xt dev trace-correlation-smoke` with an isolated two-cell and
      two-Worker topology plus opt-in JSON logs.
    - Run a fixed simulator profile, parse only the stable lifecycle events, and
@@ -63,6 +63,10 @@ correlation regression lane.
      the correct cell owner.
    - Emit a compact privacy-safe aggregate verdict and remove raw logs with the
      managed dev stack.
+   - Evidence: the smoke validates 12 planned Join/Move requests as 48 exact
+     lifecycle events across two correct cell owners; focused parser tests
+     reject duplicate stages, wrong owners, and fields outside the privacy
+     contract; command-scoped logs and PID files are absent after teardown.
 4. **Bounded soak gate and closeout**
    - Repeat the correlation profile enough to catch missing/duplicate events
      while retaining explicit CI bounds.

@@ -92,6 +92,10 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   or ownership, waits for listing/routing-version convergence, and reruns the
   same deterministic plan successfully. CI runs this bounded profile after the
   existing client ping and single-cell simulator smokes.
+- `cargo xt dev trace-correlation-smoke` runs the fixed two-cell simulator
+  profile against isolated Workers, requires exactly one four-stage lifecycle
+  per planned Join/Move on the correct cell owner, and emits only aggregate
+  counts. Its temporary structured logs are removed after validation.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

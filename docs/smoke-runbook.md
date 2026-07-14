@@ -31,6 +31,7 @@ cargo xt dev logs --target all --follow
 cargo xt dev down --with-orch
 cargo xt dev simulation-smoke
 cargo xt dev distributed-simulation-smoke
+cargo xt dev trace-correlation-smoke
 ```
 
 Useful client commands:
@@ -99,6 +100,13 @@ Each event contains only `event`, `component`, `operation`, `session_id`,
 `request_id`, and the scalar `cell_world`, `cell_cx`, `cell_cy`, `cell_depth`,
 and `cell_sub` fields. Actor ids, peer or Worker addresses, payloads, and raw
 errors are not part of this event contract.
+
+`cargo xt dev trace-correlation-smoke` owns an isolated Gateway, Orchestrator,
+and two Workers. It runs the fixed four-client/two-move profile over two cells,
+requires 12 correlated requests and 48 exact lifecycle events, verifies each
+Worker emitted events only for its assigned cell, and reports aggregate counts
+only. Its JSON logs and PID files live in a command-scoped local directory that
+is removed on success or failure.
 
 ## Metrics And Readiness
 

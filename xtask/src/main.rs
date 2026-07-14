@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tessera_core::{
     CellChildFamilyKind, CellId, ClientMsg, EntityId, Envelope, MAX_FRAME_LEN, Position,
-    ServerEnvelope, ServerMsg, encode_frame,
+    REQUEST_LIFECYCLE_TARGET, RequestLifecycleEvent, RequestOperation, ServerEnvelope, ServerMsg,
+    encode_frame,
 };
 use tessera_proto::orch::v1::orchestrator_client::OrchestratorClient;
 use tessera_proto::orch::v1::{
@@ -1336,6 +1337,8 @@ enum DevSub {
     SimulationSmoke,
     /// Start a two-Worker stack and validate bounded simulator traffic across both cells
     DistributedSimulationSmoke,
+    /// Start a two-Worker stack and validate privacy-bounded request lifecycle traces
+    TraceCorrelationSmoke,
     /// Start a two-worker dev stack and prove manual split activation converges
     ActivationSmoke,
     /// Start a two-worker dev stack and prove post-publish failure is detected and recoverable
@@ -2578,6 +2581,7 @@ fn main() -> Result<()> {
             DevSub::MetricsSmoke => dev_metrics_smoke()?,
             DevSub::SimulationSmoke => dev_simulation_smoke()?,
             DevSub::DistributedSimulationSmoke => dev_distributed_simulation_smoke()?,
+            DevSub::TraceCorrelationSmoke => dev_trace_correlation_smoke()?,
             DevSub::ActivationSmoke => dev_activation_smoke()?,
             DevSub::ActivationFailureSmoke => dev_activation_failure_smoke()?,
             DevSub::ActivationRestartSmoke => dev_activation_restart_smoke()?,
@@ -3582,6 +3586,440 @@ fn dev_distributed_simulation_smoke() -> Result<()> {
         "distributed simulation smoke: two cells completed before and after stable Worker identity address convergence"
     );
     Ok(())
+}
+
+fn dev_trace_correlation_smoke() -> Result<()> {
+    let gateway_addr = "127.0.0.1:4750";
+    let gateway_metrics_addr = "127.0.0.1:4751";
+    let worker_a_addr = "127.0.0.1:5751";
+    let worker_b_addr = "127.0.0.1:5752";
+    let orch_addr = "127.0.0.1:6750";
+    let orch_endpoint = format!("http://{orch_addr}");
+    let cell_a = CellId::grid(0, 0, 0);
+    let cell_b = CellId::grid(0, 1, 0);
+    let root = workspace_root();
+    let mut artifacts = ManagedTraceArtifacts::create()?;
+    let logs = artifacts.logs_dir();
+    let pids = artifacts.pids_dir();
+
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "--bin",
+        "tessera-sim",
+        "--bin",
+        "tessera-worker",
+        "--bin",
+        "tessera-gateway",
+        "--bin",
+        "tessera-orch",
+    ]);
+    run(&mut build)?;
+
+    let worker_bin = root.join("target/debug/tessera-worker");
+    let gateway_bin = root.join("target/debug/tessera-gateway");
+    let orchestrator_bin = root.join("target/debug/tessera-orch");
+    let orch_config_json = format!(
+        r#"{{"workers":[{{"id":"worker-a","addr":"{worker_a_addr}","cells":[{{"world":0,"cx":0,"cy":0}}]}},{{"id":"worker-b","addr":"{worker_b_addr}","cells":[{{"world":0,"cx":1,"cy":0}}]}}]}}"#
+    );
+
+    let mut stack = ManagedDevStack::default();
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "trace-correlation-orch",
+            bin: &orchestrator_bin,
+            ready_addr: orch_addr,
+            envs: &[
+                ("RUST_LOG", "info"),
+                ("TESSERA_LOG_FORMAT", "json"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+                ("TESSERA_ORCH_CONFIG_JSON", orch_config_json.as_str()),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "trace-correlation-worker-a",
+            bin: &worker_bin,
+            ready_addr: worker_a_addr,
+            envs: &[
+                ("RUST_LOG", "info"),
+                ("TESSERA_LOG_FORMAT", "json"),
+                ("TESSERA_WORKER_ID", "worker-a"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_a_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "trace-correlation-worker-b",
+            bin: &worker_bin,
+            ready_addr: worker_b_addr,
+            envs: &[
+                ("RUST_LOG", "info"),
+                ("TESSERA_LOG_FORMAT", "json"),
+                ("TESSERA_WORKER_ID", "worker-b"),
+                ("TESSERA_WORKER_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_ADVERTISE_ADDR", worker_b_addr),
+                ("TESSERA_WORKER_REFRESH_SECS", "1"),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(wait_for_orchestrator_registered(&orch_endpoint, 2))?;
+    stack.spawn(
+        &root,
+        &logs,
+        &pids,
+        DevProcessSpec {
+            name: "trace-correlation-gateway",
+            bin: &gateway_bin,
+            ready_addr: gateway_addr,
+            envs: &[
+                ("RUST_LOG", "info"),
+                ("TESSERA_LOG_FORMAT", "json"),
+                ("TESSERA_GW_ADDR", gateway_addr),
+                ("TESSERA_GW_METRICS_ADDR", gateway_metrics_addr),
+                ("TESSERA_GW_REFRESH_SECS", "1"),
+                ("TESSERA_WORKER_ADDR", worker_a_addr),
+                ("TESSERA_ORCH_ADDR", orch_addr),
+            ],
+        },
+    )?;
+    assert_gateway_ready_routes(gateway_metrics_addr, 2)?;
+
+    let result = run_simulation_smoke_profile(gateway_addr, 2)?;
+    validate_distributed_simulation_smoke_result(&result)?;
+
+    drop(stack);
+    let summary = validate_trace_correlation_logs(
+        &logs.join("trace-correlation-gateway.log"),
+        &[
+            (cell_a, logs.join("trace-correlation-worker-a.log")),
+            (cell_b, logs.join("trace-correlation-worker-b.log")),
+        ],
+    )?;
+    artifacts.cleanup()?;
+
+    println!(
+        "trace correlation smoke: requests={} join={} move={} cells={} events={} verdict=pass",
+        summary.requests, summary.joins, summary.moves, summary.cells, summary.events
+    );
+    Ok(())
+}
+
+struct ManagedTraceArtifacts {
+    root: PathBuf,
+    active: bool,
+}
+
+impl ManagedTraceArtifacts {
+    fn create() -> Result<Self> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = workspace_root()
+            .join(".dev")
+            .join(format!("trace-correlation-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(root.join("logs"))?;
+        fs::create_dir_all(root.join("pids"))?;
+        Ok(Self { root, active: true })
+    }
+
+    fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
+    fn pids_dir(&self) -> PathBuf {
+        self.root.join("pids")
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        fs::remove_dir_all(&self.root)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedTraceArtifacts {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceLogSource {
+    Gateway,
+    Worker(CellId),
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonTraceLine {
+    timestamp: String,
+    target: String,
+    fields: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestLifecycleFields {
+    event: String,
+    component: String,
+    operation: String,
+    session_id: u64,
+    request_id: u64,
+    cell_world: u32,
+    cell_cx: i32,
+    cell_cy: i32,
+    cell_depth: u8,
+    cell_sub: u8,
+}
+
+impl RequestLifecycleFields {
+    fn cell(&self) -> CellId {
+        CellId {
+            world: self.cell_world,
+            cx: self.cell_cx,
+            cy: self.cell_cy,
+            depth: self.cell_depth,
+            sub: self.cell_sub,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestLifecycleRecord {
+    timestamp: String,
+    source: TraceLogSource,
+    fields: RequestLifecycleFields,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraceCorrelationSummary {
+    requests: usize,
+    joins: usize,
+    moves: usize,
+    cells: usize,
+    events: usize,
+}
+
+fn validate_trace_correlation_logs(
+    gateway_log: &Path,
+    worker_logs: &[(CellId, PathBuf)],
+) -> Result<TraceCorrelationSummary> {
+    let mut records = parse_request_lifecycle_log(TraceLogSource::Gateway, gateway_log)?;
+    let mut expected_cells = Vec::with_capacity(worker_logs.len());
+    for (cell, path) in worker_logs {
+        expected_cells.push(*cell);
+        records.extend(parse_request_lifecycle_log(
+            TraceLogSource::Worker(*cell),
+            path,
+        )?);
+    }
+    validate_trace_correlation_records(&records, &expected_cells)
+}
+
+fn parse_request_lifecycle_log(
+    source: TraceLogSource,
+    path: &Path,
+) -> Result<Vec<RequestLifecycleRecord>> {
+    let raw = fs::read_to_string(path).context("read local request lifecycle log")?;
+    parse_request_lifecycle_lines(source, &raw)
+}
+
+fn parse_request_lifecycle_lines(
+    source: TraceLogSource,
+    raw: &str,
+) -> Result<Vec<RequestLifecycleRecord>> {
+    let mut records = Vec::new();
+    for line in raw.lines().filter(|line| line.starts_with('{')) {
+        let entry: JsonTraceLine =
+            serde_json::from_str(line).context("parse local structured runtime log")?;
+        if entry.target != REQUEST_LIFECYCLE_TARGET {
+            continue;
+        }
+        let fields = serde_json::from_value(entry.fields)
+            .context("validate privacy-bounded request lifecycle fields")?;
+        records.push(RequestLifecycleRecord {
+            timestamp: entry.timestamp,
+            source,
+            fields,
+        });
+    }
+    Ok(records)
+}
+
+fn validate_trace_correlation_records(
+    records: &[RequestLifecycleRecord],
+    expected_cells: &[CellId],
+) -> Result<TraceCorrelationSummary> {
+    const EXPECTED_CLIENTS: usize = 4;
+    const EXPECTED_MOVES_PER_CLIENT: usize = 2;
+    const EVENTS_PER_REQUEST: usize = 4;
+
+    if expected_cells.len() != 2 {
+        bail!("trace correlation smoke requires exactly two expected cells");
+    }
+    let expected_requests = EXPECTED_CLIENTS * (EXPECTED_MOVES_PER_CLIENT + 1);
+    let expected_events = expected_requests * EVENTS_PER_REQUEST;
+    if records.len() != expected_events {
+        bail!("trace correlation smoke has an unexpected aggregate event count");
+    }
+
+    let lifecycle = [
+        RequestLifecycleEvent::GatewayRequestForwarded,
+        RequestLifecycleEvent::WorkerRequestReceived,
+        RequestLifecycleEvent::WorkerResponseSent,
+        RequestLifecycleEvent::GatewayResponseForwarded,
+    ];
+    let mut grouped = std::collections::HashMap::<(u64, u64), Vec<&RequestLifecycleRecord>>::new();
+    for record in records {
+        let event = lifecycle
+            .iter()
+            .copied()
+            .find(|event| event.as_str() == record.fields.event)
+            .context("trace correlation smoke found an unsupported lifecycle event")?;
+        if record.fields.component != event.component() {
+            bail!("trace correlation smoke found a component/event mismatch");
+        }
+        match record.source {
+            TraceLogSource::Gateway if event.component() != "gateway" => {
+                bail!("trace correlation smoke found a Worker event in the Gateway log");
+            }
+            TraceLogSource::Worker(owner_cell)
+                if event.component() != "worker" || record.fields.cell() != owner_cell =>
+            {
+                bail!("trace correlation smoke found a mismatched Worker cell owner");
+            }
+            _ => {}
+        }
+        if record.fields.operation != RequestOperation::Join.as_str()
+            && record.fields.operation != RequestOperation::Move.as_str()
+        {
+            bail!("trace correlation smoke found an unsupported operation");
+        }
+        grouped
+            .entry((record.fields.session_id, record.fields.request_id))
+            .or_default()
+            .push(record);
+    }
+
+    if grouped.len() != expected_requests {
+        bail!("trace correlation smoke has an unexpected aggregate request count");
+    }
+
+    let expected_cell_set = expected_cells
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if expected_cell_set.len() != expected_cells.len() {
+        bail!("trace correlation smoke expected cells must be unique");
+    }
+    let mut session_operations = std::collections::HashMap::<u64, (usize, usize)>::new();
+    let mut cell_requests = std::collections::HashMap::<CellId, usize>::new();
+    let mut joins = 0_usize;
+    let mut moves = 0_usize;
+
+    for group in grouped.values() {
+        if group.len() != EVENTS_PER_REQUEST {
+            bail!("trace correlation smoke found a missing or duplicate lifecycle event");
+        }
+        let first = group[0];
+        if group.iter().any(|record| {
+            record.fields.operation != first.fields.operation
+                || record.fields.cell() != first.fields.cell()
+        }) {
+            bail!("trace correlation smoke found inconsistent request correlation fields");
+        }
+        if !expected_cell_set.contains(&first.fields.cell()) {
+            bail!("trace correlation smoke found an unexpected cell");
+        }
+        for expected in lifecycle {
+            if group
+                .iter()
+                .filter(|record| record.fields.event == expected.as_str())
+                .count()
+                != 1
+            {
+                bail!("trace correlation smoke found a missing or duplicate lifecycle stage");
+            }
+        }
+
+        let timestamp = |event: RequestLifecycleEvent| {
+            group
+                .iter()
+                .find(|record| record.fields.event == event.as_str())
+                .map(|record| record.timestamp.as_str())
+                .expect("validated lifecycle stage")
+        };
+        if timestamp(RequestLifecycleEvent::GatewayRequestForwarded)
+            >= timestamp(RequestLifecycleEvent::GatewayResponseForwarded)
+            || timestamp(RequestLifecycleEvent::WorkerRequestReceived)
+                >= timestamp(RequestLifecycleEvent::WorkerResponseSent)
+        {
+            bail!("trace correlation smoke found an out-of-order component lifecycle");
+        }
+
+        *cell_requests.entry(first.fields.cell()).or_default() += 1;
+        let session = session_operations
+            .entry(first.fields.session_id)
+            .or_default();
+        match first.fields.operation.as_str() {
+            operation if operation == RequestOperation::Join.as_str() => {
+                joins += 1;
+                session.0 += 1;
+            }
+            operation if operation == RequestOperation::Move.as_str() => {
+                moves += 1;
+                session.1 += 1;
+            }
+            _ => unreachable!("operation validated above"),
+        }
+    }
+
+    if session_operations.len() != EXPECTED_CLIENTS
+        || session_operations
+            .values()
+            .any(|counts| *counts != (1, EXPECTED_MOVES_PER_CLIENT))
+        || joins != EXPECTED_CLIENTS
+        || moves != EXPECTED_CLIENTS * EXPECTED_MOVES_PER_CLIENT
+    {
+        bail!("trace correlation smoke has unexpected aggregate operation coverage");
+    }
+    let expected_requests_per_cell = expected_requests / expected_cells.len();
+    if expected_requests % expected_cells.len() != 0
+        || cell_requests.len() != expected_cells.len()
+        || expected_cells
+            .iter()
+            .any(|cell| cell_requests.get(cell).copied() != Some(expected_requests_per_cell))
+    {
+        bail!("trace correlation smoke has incomplete per-cell request coverage");
+    }
+
+    Ok(TraceCorrelationSummary {
+        requests: grouped.len(),
+        joins,
+        moves,
+        cells: cell_requests.len(),
+        events: records.len(),
+    })
 }
 
 fn run_simulation_smoke_command() -> Result<()> {
@@ -40395,6 +40833,119 @@ mod tests {
         let err = validate_same_simulation_plan(&first, &changed_cell)
             .expect_err("changed cell plan must be rejected");
         assert!(err.to_string().contains("cell_coverage"));
+    }
+
+    fn complete_trace_correlation_records() -> Vec<RequestLifecycleRecord> {
+        let lifecycle = [
+            RequestLifecycleEvent::GatewayRequestForwarded,
+            RequestLifecycleEvent::WorkerRequestReceived,
+            RequestLifecycleEvent::WorkerResponseSent,
+            RequestLifecycleEvent::GatewayResponseForwarded,
+        ];
+        let mut records = Vec::new();
+        for client_index in 0..4_u64 {
+            let cell = CellId::grid(0, (client_index % 2) as i32, 0);
+            for (operation_index, operation) in [
+                RequestOperation::Join,
+                RequestOperation::Move,
+                RequestOperation::Move,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request_id = client_index * 3 + operation_index as u64 + 1;
+                for (stage_index, event) in lifecycle.into_iter().enumerate() {
+                    records.push(RequestLifecycleRecord {
+                        timestamp: format!("2026-07-14T00:00:{request_id:02}.{stage_index:03}Z"),
+                        source: if event.component() == "gateway" {
+                            TraceLogSource::Gateway
+                        } else {
+                            TraceLogSource::Worker(cell)
+                        },
+                        fields: RequestLifecycleFields {
+                            event: event.as_str().to_string(),
+                            component: event.component().to_string(),
+                            operation: operation.as_str().to_string(),
+                            session_id: client_index + 1,
+                            request_id,
+                            cell_world: cell.world,
+                            cell_cx: cell.cx,
+                            cell_cy: cell.cy,
+                            cell_depth: cell.depth,
+                            cell_sub: cell.sub,
+                        },
+                    });
+                }
+            }
+        }
+        records
+    }
+
+    #[test]
+    fn trace_correlation_records_accept_complete_two_worker_profile() {
+        let summary = validate_trace_correlation_records(
+            &complete_trace_correlation_records(),
+            &[CellId::grid(0, 0, 0), CellId::grid(0, 1, 0)],
+        )
+        .expect("complete trace correlation records");
+        assert_eq!(
+            summary,
+            TraceCorrelationSummary {
+                requests: 12,
+                joins: 4,
+                moves: 8,
+                cells: 2,
+                events: 48,
+            }
+        );
+    }
+
+    #[test]
+    fn trace_correlation_records_reject_duplicate_stage_and_wrong_owner() {
+        let cells = [CellId::grid(0, 0, 0), CellId::grid(0, 1, 0)];
+        let mut duplicate = complete_trace_correlation_records();
+        duplicate[3].fields.event = RequestLifecycleEvent::GatewayRequestForwarded
+            .as_str()
+            .to_string();
+        let err = validate_trace_correlation_records(&duplicate, &cells)
+            .expect_err("duplicate stage must fail");
+        assert!(err.to_string().contains("duplicate lifecycle stage"));
+
+        let mut wrong_owner = complete_trace_correlation_records();
+        let worker_record = wrong_owner
+            .iter_mut()
+            .find(|record| record.source == TraceLogSource::Worker(CellId::grid(0, 0, 0)))
+            .expect("cell-zero Worker record");
+        worker_record.source = TraceLogSource::Worker(CellId::grid(0, 1, 0));
+        let err = validate_trace_correlation_records(&wrong_owner, &cells)
+            .expect_err("wrong Worker owner must fail");
+        assert!(err.to_string().contains("mismatched Worker cell owner"));
+    }
+
+    #[test]
+    fn trace_correlation_parser_rejects_fields_outside_privacy_contract() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-07-14T00:00:00.000Z",
+            "level": "INFO",
+            "target": REQUEST_LIFECYCLE_TARGET,
+            "fields": {
+                "event": "gateway.request.forwarded",
+                "component": "gateway",
+                "operation": "join",
+                "session_id": 1,
+                "request_id": 1,
+                "cell_world": 0,
+                "cell_cx": 0,
+                "cell_cy": 0,
+                "cell_depth": 0,
+                "cell_sub": 0,
+                "actor_id": 99
+            }
+        })
+        .to_string();
+        let err = parse_request_lifecycle_lines(TraceLogSource::Gateway, &raw)
+            .expect_err("actor field must fail privacy contract");
+        assert!(err.to_string().contains("privacy-bounded"));
     }
 
     #[test]

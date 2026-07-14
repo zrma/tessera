@@ -73,6 +73,7 @@ Useful variants:
 - Gateway only smoke: `cargo xt dev up`, client ping, then `cargo xt dev down`
 - Metrics smoke: `cargo xt dev metrics-smoke`
 - Two-Worker simulator smoke: `cargo xt dev distributed-simulation-smoke`
+- Two-Worker trace smoke: `cargo xt dev trace-correlation-smoke`
 - P9 regression lane:
   - `cargo xt dev p9-recommend-loop-soak`
   - `cargo xt dev p9-replay-audit`
