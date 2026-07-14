@@ -2919,6 +2919,7 @@ fn check_harness_docs(root: &Path) -> Result<()> {
                 "cargo run -p tessera-client -- ping --ts 123",
                 "cargo xt dev simulation-smoke",
                 "cargo xt dev distributed-simulation-smoke",
+                "cargo xt dev trace-correlation-smoke",
                 "cargo xt dev down --with-orch",
             ],
         ),
@@ -2926,6 +2927,14 @@ fn check_harness_docs(root: &Path) -> Result<()> {
 
     for (relative_path, needles) in required_files {
         check_file_contains(root, relative_path, needles)?;
+    }
+
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .context("harness check failed: read .github/workflows/ci.yml")?;
+    if ci.matches("cargo xt dev trace-correlation-smoke").count() != 2 {
+        bail!(
+            "harness check failed: CI must run the bounded trace correlation smoke exactly twice"
+        );
     }
 
     Ok(())

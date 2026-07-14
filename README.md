@@ -10,9 +10,9 @@ operations stack.
 
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
-- Current state: P0 through P16 runtime/evidence/packaging, hardening,
-  deterministic simulation, and distributed topology-convergence gates are
-  complete. P17 runtime trace correlation is active in `docs/todo-next.md`.
+- Current state: P0 through P17 runtime/evidence/packaging, hardening,
+  deterministic simulation, distributed topology convergence, and bounded
+  runtime trace-correlation gates are complete.
 
 ## Workspace
 
@@ -35,8 +35,7 @@ operations stack.
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
-- Latest completed milestone: `docs/todo-p16-distributed-simulation.md`
-- Active milestone: `docs/todo-p17-runtime-trace-correlation.md`
+- Latest completed milestone: `docs/todo-p17-runtime-trace-correlation.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -133,13 +132,13 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
 
 ### Latest Closed Boundary
 
-P16 extends the deterministic simulator result with canonical per-cell
-coverage and adds `cargo xt dev distributed-simulation-smoke`. The bounded
-full-stack gate routes the same two-cell profile through distinct Workers,
-replaces one Worker's advertised address without changing identity or
-ownership, waits for Orchestrator/Gateway convergence, and reruns the profile.
-Its completed evidence map is in `docs/todo-p16-distributed-simulation.md`; the
-next boundary is tracked in `docs/todo-next.md`.
+P17 adds a shared fail-closed compact/JSON logging contract and stable,
+privacy-bounded Join/Move lifecycle events across Gateway and Worker. The
+isolated `cargo xt dev trace-correlation-smoke` proves 12 requests produce 48
+exact lifecycle stages on the correct two cell owners, removes command-scoped
+raw artifacts, and runs twice in CI. Its completed evidence map is in
+`docs/todo-p17-runtime-trace-correlation.md`; the next boundary is tracked in
+`docs/todo-next.md`.
 
 ## Protocol Snapshot
 
@@ -180,11 +179,12 @@ next boundary is tracked in `docs/todo-next.md`.
   crate dependency boundaries.
 - `cargo xt` runs fmt, clippy, check, and harness.
 - `cargo test` remains the broad Rust test gate.
-- CI runs `cargo xt`, `cargo test`, the local dev ping smoke, and both bounded
-  simulator smokes with
+- CI runs `cargo xt`, `cargo test`, the local dev ping smoke, both bounded
+  simulator smokes, and the bounded trace-correlation smoke twice with
   `cargo xt dev up --with-orch`, `cargo run -p tessera-client -- ping --ts 123`,
   `cargo xt dev down --with-orch`, `cargo xt dev simulation-smoke`, and
-  `cargo xt dev distributed-simulation-smoke`.
+  `cargo xt dev distributed-simulation-smoke`, followed by two explicit
+  `cargo xt dev trace-correlation-smoke` invocations.
 
 ## Design Overview
 

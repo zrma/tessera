@@ -40,3 +40,5 @@ jobs:
           cargo xt dev down --with-orch
           cargo xt dev simulation-smoke
           cargo xt dev distributed-simulation-smoke
+          cargo xt dev trace-correlation-smoke
+          cargo xt dev trace-correlation-smoke

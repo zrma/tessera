@@ -106,7 +106,9 @@ and two Workers. It runs the fixed four-client/two-move profile over two cells,
 requires 12 correlated requests and 48 exact lifecycle events, verifies each
 Worker emitted events only for its assigned cell, and reports aggregate counts
 only. Its JSON logs and PID files live in a command-scoped local directory that
-is removed on success or failure.
+is removed on success or failure. CI invokes the exact bounded command twice;
+the repository harness rejects an unbounded loop or any invocation count other
+than two.
 
 ## Metrics And Readiness
 

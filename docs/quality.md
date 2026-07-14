@@ -95,7 +95,8 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - `cargo xt dev trace-correlation-smoke` runs the fixed two-cell simulator
   profile against isolated Workers, requires exactly one four-stage lifecycle
   per planned Join/Move on the correct cell owner, and emits only aggregate
-  counts. Its temporary structured logs are removed after validation.
+  counts. Its temporary structured logs are removed after validation. CI runs
+  the profile exactly twice, and the harness enforces that explicit bound.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy
@@ -127,9 +128,8 @@ The common model, prompt-budget, permission, persistence, verification, output, 
   histograms. All three runtimes share a fail-closed `TESSERA_LOG_FORMAT`
   contract with compact default and opt-in JSON output. Join/Move lifecycle
   events now use stable privacy-bounded fields from Gateway forwarding through
-  Worker response and back to the client. P17 still owns the bounded
-  two-Worker correlation assertion; P10 remains the long-running scrape/report
-  owner.
+  Worker response and back to the client. P17 closes the bounded two-Worker
+  correlation assertion; P10 remains the long-running scrape/report owner.
 - Docker/Compose/Kubernetes sample packaging, the portable Helm chart, and the
   operator-facing example runbook exist. Cluster-specific live operations
   policy remains outside this repository.

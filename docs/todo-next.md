@@ -40,7 +40,8 @@ Last reviewed: 2026-07-14
 - P12 read-only operator evidence is complete as a historical support packet.
   P13 portable Kubernetes packaging, P14 runtime hardening, and P15
   deterministic simulation harness work are complete. P16 distributed
-  simulation and topology convergence is complete.
+  simulation and topology convergence is complete. P17 runtime trace
+  correlation is complete.
 
 ## Next
 
@@ -50,11 +51,11 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-P16 is closed in `docs/todo-p16-distributed-simulation.md`. A fresh review found
-that P10 already owns metrics and long-running observability reports, while the
-runtime still lacks machine-checkable request trace correlation. P17 is active
-in `docs/todo-p17-runtime-trace-correlation.md` and adds opt-in structured logs,
-stable Gateway/Worker request lifecycle events, and a bounded correlation gate.
+P16 is closed in `docs/todo-p16-distributed-simulation.md`. P17 is closed in
+`docs/todo-p17-runtime-trace-correlation.md` with opt-in structured logs, stable
+Gateway/Worker request lifecycle events, and a twice-run bounded correlation
+gate. The next milestone must come from a fresh architecture and quality-gap
+review; production telemetry policy remains outside this repository.
 
 P13 closure:
 
@@ -119,8 +120,8 @@ P17 runtime trace correlation queue:
    events using existing session and request ids.
 3. Complete: two-Worker trace correlation smoke with aggregate-only verdict
    and command-scoped raw-log cleanup.
-4. Pending: bounded repetition, CI/harness integration, documentation, and
-   milestone closeout.
+4. Complete: the trace profile runs twice with an exact harness assertion, CI
+   integration, command/non-goal documentation, and milestone closeout.
 
 ## Guardrails
 

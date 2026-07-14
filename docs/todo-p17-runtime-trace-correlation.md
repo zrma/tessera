@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-14
 
-Status: active
+Status: complete
 
 ## Objective
 
@@ -67,11 +67,14 @@ correlation regression lane.
      lifecycle events across two correct cell owners; focused parser tests
      reject duplicate stages, wrong owners, and fields outside the privacy
      contract; command-scoped logs and PID files are absent after teardown.
-4. **Bounded soak gate and closeout**
+4. **Complete: bounded soak gate and closeout**
    - Repeat the correlation profile enough to catch missing/duplicate events
      while retaining explicit CI bounds.
    - Add the trace smoke to CI and `cargo xt harness`, document the command and
      non-goals, and close P17 only after remote CI executes the new lane.
+   - Evidence: CI invokes the fixed profile exactly twice; the harness rejects
+     any other invocation count; local repeated execution, repository gates,
+     and remote CI validate the bounded lane.
 
 ## Verification
 
@@ -90,6 +93,7 @@ cargo test
 Network/trace slices also require:
 
 ```text
+cargo xt dev trace-correlation-smoke
 cargo xt dev trace-correlation-smoke
 ```
 
