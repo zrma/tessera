@@ -25,7 +25,7 @@ find deeper runbooks.
 `todo-next.md` is the active open-work index. P12 read-only operator evidence,
 P13 portable Kubernetes packaging, P14 runtime hardening, and P15 deterministic
 simulation harness work are closed. P16 distributed simulation and topology
-convergence is also closed; the next boundary is selected there.
+convergence is also closed. P17 runtime trace correlation is active there.
 
 When a new milestone is chosen, update `todo-next.md` first, then add a focused
 milestone contract only if the new work needs its own checklist, evidence map,
@@ -47,6 +47,7 @@ or completion audit.
 | P14 runtime hardening | Complete; packet, route/state, replay, and planner hardening | `todo-p14-runtime-hardening.md` |
 | P15 deterministic simulation harness | Complete; plans, bounded execution, result gates, and CI smoke | `todo-p15-simulation-harness.md` |
 | P16 distributed simulation and topology convergence | Complete; cell coverage, two-Worker workload, address convergence, and CI gate | `todo-p16-distributed-simulation.md` |
+| P17 runtime trace correlation | Active; structured logs, lifecycle events, two-Worker trace smoke, and CI gate | `todo-p17-runtime-trace-correlation.md` |
 
 The P6/P7/P8/P9/P10/P11 documents are retained because they define evidence
 contracts, report shapes, and completion gates. P12 records a completed
@@ -68,6 +69,7 @@ lists unless `todo-next.md` explicitly reopens a boundary.
 | P13 packaging template plan | `todo-p13-k8s-packaging.md` |
 | P14 runtime hardening plan | `todo-p14-runtime-hardening.md` |
 | P16 distributed simulation plan | `todo-p16-distributed-simulation.md` |
+| P17 runtime trace correlation plan | `todo-p17-runtime-trace-correlation.md` |
 
 These files contain useful implementation detail and evidence history, but
 new work should read them through the current status in `todo-next.md`.

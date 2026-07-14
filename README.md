@@ -12,7 +12,7 @@ operations stack.
 - Deployment target: container-first and Kubernetes-template friendly
 - Current state: P0 through P16 runtime/evidence/packaging, hardening,
   deterministic simulation, and distributed topology-convergence gates are
-  complete. The next open boundary is selected in `docs/todo-next.md`.
+  complete. P17 runtime trace correlation is active in `docs/todo-next.md`.
 
 ## Workspace
 
@@ -36,6 +36,7 @@ operations stack.
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
 - Latest completed milestone: `docs/todo-p16-distributed-simulation.md`
+- Active milestone: `docs/todo-p17-runtime-trace-correlation.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 

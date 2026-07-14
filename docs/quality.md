@@ -117,7 +117,11 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 
 ## Known gaps
 
-- Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, Gateway has a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram, and Join/Move request latency is covered by request-id correlation histograms. Long-running scrape/tracing assertions are not covered yet.
+- Orchestrator/Gateway/Worker have opt-in Prometheus text endpoints, Gateway has
+  a `/ready` endpoint, Ping/Pong round-trip latency is covered by a histogram,
+  and Join/Move request latency is covered by request-id correlation
+  histograms. P17 owns the still-open structured lifecycle trace and bounded
+  correlation assertions; P10 remains the long-running scrape/report owner.
 - Docker/Compose/Kubernetes sample packaging, the portable Helm chart, and the
   operator-facing example runbook exist. Cluster-specific live operations
   policy remains outside this repository.

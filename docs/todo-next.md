@@ -50,11 +50,11 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-P16 is closed in `docs/todo-p16-distributed-simulation.md`. It extends
-deterministic simulation to multiple cell owners plus stable-identity address
-convergence and runs the bounded profile in CI. The next milestone should be
-selected from a fresh architecture/backlog review and recorded as a separate
-planning change.
+P16 is closed in `docs/todo-p16-distributed-simulation.md`. A fresh review found
+that P10 already owns metrics and long-running observability reports, while the
+runtime still lacks machine-checkable request trace correlation. P17 is active
+in `docs/todo-p17-runtime-trace-correlation.md` and adds opt-in structured logs,
+stable Gateway/Worker request lifecycle events, and a bounded correlation gate.
 
 P13 closure:
 
@@ -110,6 +110,16 @@ P16 distributed simulation and topology convergence queue:
    Gateway routing-version convergence.
 4. Complete: CI/harness integration, command documentation, and milestone
    closeout.
+
+P17 runtime trace correlation queue:
+
+1. Pending: shared compact/JSON runtime logging contract with fail-closed
+   configuration and parseable startup evidence.
+2. Pending: stable privacy-bounded Gateway/Worker Join and Move lifecycle
+   events using existing session and request ids.
+3. Pending: two-Worker trace correlation smoke with aggregate-only verdict.
+4. Pending: bounded repetition, CI/harness integration, documentation, and
+   milestone closeout.
 
 ## Guardrails
 
