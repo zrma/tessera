@@ -2,11 +2,12 @@
 
 Last reviewed: 2026-04-26
 
-This document records sample packaging entry points for local container and
-Kubernetes experiments. These files are examples, not a production deployment
-contract. Replace image names, resource policy, networking, storage, and scrape
-metadata with the target cluster convention before treating them as live
-infrastructure.
+This document records the repository-owned packaging boundary for local
+containers and Kubernetes templates. Tessera should provide portable
+Gateway/Worker/Orchestrator packaging that demonstrates the horizontally
+deployable cell-orchestration architecture. It should not own a specific live
+service's cluster inventory, alerting, ingress, certificate, registry, secret,
+or incident-response policy.
 
 ## Container Image
 
@@ -67,7 +68,7 @@ Stop and remove the sample stack:
 docker compose -f deploy/docker-compose.yml down
 ```
 
-## Kubernetes Sample
+## Kubernetes Sample And Template Boundary
 
 `deploy/kubernetes/tessera-sample.yaml` is a non-production single-worker
 sample. It shows:
@@ -93,6 +94,22 @@ kubectl -n tessera-sample port-forward svc/tessera-gateway 4100:4100
 curl http://127.0.0.1:4100/ready
 ```
 
-Cluster-specific production manifests should be added separately once the
-target ingress, Service type, resource requests, PodDisruptionBudget, rollout
-policy, and Prometheus discovery convention are known.
+P13 should promote this sample into a reusable chart/template boundary. The
+repository-owned template should cover:
+
+- Gateway, Worker, and Orchestrator workloads.
+- Services for client ingress, internal component traffic, and optional
+  metrics.
+- Configurable image, runtime addresses, advertised Worker addresses, worker
+  ids, assignment seed config, and default-off mutation flags.
+- Gateway readiness, TCP liveness probes, and optional metrics annotations.
+- Optional state mounts for Orchestrator assignment state and operation ledger
+  files.
+- Render validation that keeps private inventory, credentials, concrete
+  hostnames, and site-specific operations policy out of tracked artifacts.
+
+Cluster-specific live-service manifests belong outside this repository or in a
+separate environment-owned layer. That layer should decide ingress, Service
+type, resource requests, PodDisruptionBudget, rollout policy, certificate
+handling, registry credentials, scrape discovery, alert routing, and incident
+process.

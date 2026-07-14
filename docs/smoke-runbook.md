@@ -281,10 +281,10 @@ cargo xt k8s p11-endurance-recovery-smoke \
   --allow-controlled-failure
 ```
 
-## P12 Operator Readiness
+## P12 Read-Only Operator Evidence
 
-P12 read-only operator handoff is generated from local report writers and stays
-clear of external observability wiring:
+P12 read-only evidence is generated from local report writers. It is support
+material for runtime and packaging work, not a live-service operations track:
 
 ```sh
 cargo xt dev p12-local-report-replay
@@ -301,6 +301,21 @@ Implemented P12 reports:
 - `.dev/reports/p12-slo-alert-candidates-latest.json`
 - `.dev/reports/p12-runbook-drill-latest.json`
 - `.dev/reports/p12-decision-packet-latest.json`
+
+## P13 Kubernetes Packaging Template
+
+P13 should add render/template validation for portable Gateway, Worker, and
+Orchestrator Kubernetes packaging. Until a dedicated render check exists, use
+the public sample and publication boundary gate:
+
+```sh
+kubectl apply --dry-run=client -f deploy/kubernetes/tessera-sample.yaml
+scripts/check-publication-boundary.py
+cargo xt harness
+```
+
+P13 packaging checks should not require a live cluster and should not encode
+private registry, host, ingress, certificate, alert, or credential policy.
 
 ## Guarded Kubernetes Activation
 
