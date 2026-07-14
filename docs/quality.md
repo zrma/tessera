@@ -62,6 +62,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - Split/merge planner quality coverage includes skew and exact hysteresis
   boundaries, global multi-world churn budgets, and parent/direct-child touched
   sets that prevent overlapping operations in one family.
+- `tessera-sim plan` builds a network-free `tessera.sim.plan.v1` scenario with
+  bounded clients, cells, moves, actor/cell ranges, and total operations. The
+  same inputs produce byte-stable compact JSON.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy

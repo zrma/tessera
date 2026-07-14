@@ -1022,6 +1022,13 @@ dependencies = [
 [[package]]
 name = "tessera-sim"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tessera-core",
+]
 
 [[package]]
 name = "tessera-worker"

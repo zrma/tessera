@@ -34,7 +34,7 @@ operations stack.
 - Historical P11 audit: `cargo xt p11-completion-audit --json`
 - Active plan: `docs/todo-next.md`
 - Kubernetes packaging runbook: `docs/packaging.md`
-- Active runtime milestone: `docs/todo-p14-runtime-hardening.md`
+- Active milestone: `docs/todo-p15-simulation-harness.md`
 - Documentation index: `docs/README.md`
 - Smoke/runbook commands: `docs/smoke-runbook.md`
 
@@ -46,6 +46,12 @@ Start the local Worker + Gateway + Orchestrator stack:
 cargo xt dev up --with-orch
 cargo run -p tessera-client -- ping --ts 123
 cargo xt dev down --with-orch
+```
+
+Build a deterministic simulator plan without starting the runtime:
+
+```sh
+cargo run -p tessera-sim -- plan --seed 7 --clients 4 --cells 2
 ```
 
 Useful variants:

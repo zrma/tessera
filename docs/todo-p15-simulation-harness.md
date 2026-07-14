@@ -32,13 +32,14 @@ capacity, alerting, or incident policy.
 
 ## Milestone Queue
 
-1. **Deterministic scenario contract (active)**
-   - Add a CLI that validates bounded scenario inputs and supports a
-     network-free `plan` command.
-   - Deterministically map seed, actors, cells, and operation order into a
-     versioned JSON plan.
-   - Cover default, override, reproducibility, and invalid-boundary behavior
-     with unit tests.
+1. **Deterministic scenario contract (complete)**
+   - `tessera-sim plan` validates client, cell, move, actor-range, cell-range,
+     and total-operation bounds before allocating a plan.
+   - Seeded actor/cell placement and Join/Move/Ping steps serialize as
+     `tessera.sim.plan.v1`; the default output is stable compact JSON and
+     `--pretty` is presentation-only.
+   - Unit tests cover CLI defaults/overrides, byte-stable reproducibility, seed
+     variation, complete bounded mappings, and fail-closed invalid boundaries.
 2. **Bounded multi-client execution**
    - Give each simulated player an independent Gateway connection and actor
      identity.
@@ -70,6 +71,12 @@ cargo test
 Network execution slices also require the narrowest matching local full-stack
 smoke. Before each push, run both repository and authorized machine-local
 publication gates and wait for remote CI success.
+
+The first slice also has a runtime-free command check:
+
+```text
+cargo run -p tessera-sim -- plan --seed 7 --clients 4 --cells 2
+```
 
 ## Completion Boundary
 

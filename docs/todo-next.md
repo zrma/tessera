@@ -85,9 +85,9 @@ P14 runtime hardening queue:
 
 P15 deterministic simulation harness queue:
 
-1. Active: deterministic, bounded, network-free scenario planning and a
-   versioned JSON plan contract.
-2. Planned: independent multi-client Join/Move/Ping execution with operation
+1. Complete: deterministic, bounded, network-free scenario planning and the
+   `tessera.sim.plan.v1` JSON contract.
+2. Active: independent multi-client Join/Move/Ping execution with operation
    timeouts and bounded concurrency.
 3. Planned: versioned aggregate result, failure classes, latency summaries, and
    caller-owned thresholds.
