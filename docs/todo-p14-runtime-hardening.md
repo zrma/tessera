@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-14
 
-Status: active
+Status: complete
 
 ## Objective
 
@@ -74,10 +74,15 @@ ownership boundaries and default-off mutation gates.
      reassigned.
    - The durable-state guide and packaging contract now define the required
      drain/migration boundary.
-4. **Planner quality under load (active)**
-   - Add representative skew, hysteresis, and churn-budget datasets.
-   - Improve split/merge ranking only where a failing quality case justifies a
-     runtime change.
+4. **Planner quality under load (complete)**
+   - Representative datasets cover a single-signal spike versus sustained
+     multi-signal pressure, exact hysteresis/age boundaries, and global churn
+     selection across multiple worlds.
+   - Planner overlap now uses the parent plus direct-child touched set. An
+     active or newly selected parent operation blocks child operations in the
+     same interval without blocking unrelated cell families.
+   - Existing score ordering remained valid; only the failing parent/child
+     overlap invariant required a planner behavior change.
 
 ## First Slice Verification
 
@@ -123,9 +128,17 @@ Assignment-state compatibility is covered by:
 - `assignment_state_rejects_missing_configured_worker_with_static_cells`
 - `persistent_assignment_state_applies_compatible_worker_changes_on_restart`
 
+Planner quality is covered by:
+
+- `split_merge_planner_quality_dataset_handles_skew_and_threshold_boundaries`
+- `split_merge_planner_applies_global_churn_budget_across_worlds`
+- `split_merge_planner_blocks_parent_child_overlap_from_active_plan`
+- `split_merge_planner_does_not_plan_parent_and_child_operations_together`
+
 ## Completion Boundary
 
-P14 is complete only when all four slices have focused regression evidence,
-the runtime docs describe the resulting compatibility/overload contracts, and
-`cargo xt`, `cargo test`, the task-relevant smoke, publication gates, and remote
-CI are green. Each slice remains a separate change and push.
+All four P14 slices have focused regression evidence. The runtime docs describe
+the resulting overload, route/replay, assignment compatibility, and planner
+overlap contracts. Completion requires `cargo xt`, `cargo test`, the
+task-relevant smoke, publication gates, and remote CI to remain green for the
+closing change.

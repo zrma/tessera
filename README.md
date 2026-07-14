@@ -10,9 +10,8 @@ operations stack.
 
 - Runtime: Rust + Tokio
 - Deployment target: container-first and Kubernetes-template friendly
-- Current state: P0 through P13 runtime/evidence/packaging gates are complete.
-  The active boundary is P14 packet, route-convergence, and generalized
-  topology runtime hardening.
+- Current state: P0 through P14 runtime/evidence/packaging and hardening gates
+  are complete. The next open boundary is selected in `docs/todo-next.md`.
 
 ## Workspace
 
@@ -108,13 +107,13 @@ P6/P7/P8 lanes, and packaging-template boundary are kept in
   schema-checked values, deterministic default/scale-out renders, explicit
   namespace and Secret-reference boundaries, probes, and optional state mounts.
 
-### Current Open Boundary
+### Latest Closed Boundary
 
-P14 hardens runtime behavior exposed by horizontal packaging: fragmented and
-bursty packet ingress, bounded pending/outbound pressure, route convergence when
-Worker identity changes, assignment-state compatibility, and planner quality.
-The active contract and first executable slice are in
-`docs/todo-p14-runtime-hardening.md`.
+P14 hardened runtime behavior exposed by horizontal packaging: fragmented and
+bursty packet ingress, bounded correlation pressure, route and pre-publish
+replay convergence, assignment-state compatibility, and planner quality. Its
+completed evidence map is in `docs/todo-p14-runtime-hardening.md`; the next open
+boundary is tracked in `docs/todo-next.md`.
 
 ## Protocol Snapshot
 

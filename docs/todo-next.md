@@ -38,9 +38,7 @@ Last reviewed: 2026-07-14
   containerized environment, but cluster-specific inventory and live operations
   policy remain outside this repository.
 - P12 read-only operator evidence is complete as a historical support packet.
-  P13 portable Kubernetes packaging is also complete with deterministic
-  default/scale-out render validation. The active boundary is P14 runtime
-  hardening.
+  P13 portable Kubernetes packaging and P14 runtime hardening are complete.
 
 ## Next
 
@@ -50,7 +48,9 @@ structures, and a horizontally deployable container architecture. Kubernetes
 work in this repository should stop at a reusable chart/template boundary, not
 expand into owning a specific live service's operations stack.
 
-The active planning source is `docs/todo-p14-runtime-hardening.md`.
+P14 is closed in `docs/todo-p14-runtime-hardening.md`. The next milestone should
+be selected from a fresh architecture/backlog review and recorded as a separate
+planning change.
 
 P13 closure:
 
@@ -78,8 +78,8 @@ P14 runtime hardening queue:
    both watch and refresh paths while a Gateway session remains active.
 3. Complete: fail-closed assignment-state compatibility for adding empty
    Workers, removing drained Workers, and rejecting implicit cell adoption.
-4. Active: load-based split/merge planner quality beyond current guarded
-   operator evidence.
+4. Complete: load-based planner quality datasets and parent/child operation
+   overlap prevention under global churn budgets.
 
 ## Guardrails
 

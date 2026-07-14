@@ -59,6 +59,9 @@ The common model, prompt-budget, permission, persistence, verification, output, 
 - Worker replay validates unpublished split/merge targets through the current
   listing identity/address directory, while an already published cell route
   remains the stricter source of truth.
+- Split/merge planner quality coverage includes skew and exact hysteresis
+  boundaries, global multi-world churn budgets, and parent/direct-child touched
+  sets that prevent overlapping operations in one family.
 - GitHub Actions runs the same verification and smoke loop on push and pull requests.
 
 ## Crate boundary policy
